@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Deja BookOS en la lista de sesiones del gestor de login.
+#
+# Hace falta root: /usr/share/wayland-sessions es del sistema. Se instala el
+# guion en /usr/local/bin y la entrada .desktop, que es lo que lee SDDM (y
+# GDM, y greetd) para saber qué sesiones ofrecer.
+set -eu
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Hace falta root: sudo $0" >&2
+    exit 1
+fi
+
+aqui="$(cd "$(dirname "$0")" && pwd)"
+install -Dm755 "$aqui/bookos-session" /usr/local/bin/bookos-session
+install -Dm644 "$aqui/bookos.desktop" /usr/share/wayland-sessions/bookos.desktop
+
+echo "Instalado. En la pantalla de login ya sale 'BookOS' en la lista de sesiones."
+echo "El registro de cada arranque queda en \$XDG_RUNTIME_DIR/bookos-session.log"

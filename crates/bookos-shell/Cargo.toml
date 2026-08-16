@@ -1,0 +1,26 @@
+[package]
+name = "bookos-shell"
+description = "Panel, dock e isla de BookOS — widgets iced dibujados dentro del compositor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+iced_core = "0.14"
+iced_runtime = "0.14"
+# iced_widget arrastra iced_renderer, que en release exige elegir rasterizador
+# explícitamente. Aquí se fija tiny-skia y se deja wgpu fuera: es la decisión
+# de H2 y así no entra un segundo backend GPU por la puerta de atrás.
+iced_widget = { version = "0.14", features = ["image", "svg"] }
+iced_renderer = { version = "0.14", default-features = false, features = ["tiny-skia", "image", "svg"] }
+# softbuffer es dependencia dura de iced_tiny_skia (es como iced presenta sus
+# propias ventanas) y no compila sin un backend, así que se le deja el de
+# Wayland. Nosotros no lo usamos: dibujamos a memoria y presenta el compositor.
+iced_tiny_skia = { version = "0.14", default-features = false, features = ["wayland", "image", "svg"] }
+iced_graphics = "0.14"
+tiny-skia = "0.11"
+# iced_graphics mete el crate `image` sin códecs: por eso `Handle::from_path`
+# de un PNG falla y iced entra en panic ("Image should be allocated"). Aquí se
+# decodifica antes y se le pasan píxeles ya listos, así esa ruta no existe.
+image = { version = "0.25", default-features = false, features = ["png"] }
+tracing.workspace = true

@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Arranca BookOS como sesión de verdad, la que ofrece el gestor de login.
+#
+# Por qué existe además de `bookos-tty.sh`: aquel es para desarrollo —lleva un
+# límite de tiempo, lanza un terminal de prueba y da por hecho que estás en un
+# TTY—. Este es el que ejecuta SDDM cuando eliges "BookOS" en la lista de
+# sesiones, y no puede hacer nada de eso.
+#
+# Se instala con `session/instalar.sh`, que necesita root para escribir en
+# /usr/share/wayland-sessions.
+set -u
+
+# Lo que anuncia la sesión al resto del sistema. `XDG_CURRENT_DESKTOP` es lo
+# que miran los portales y las bibliotecas de toolkit para decidir cómo
+# comportarse; sin él, GTK y Qt caen a sus valores genéricos.
+export XDG_CURRENT_DESKTOP=BookOS
+export XDG_SESSION_DESKTOP=BookOS
+export XDG_SESSION_TYPE=wayland
+
+# Qt y GTK a Wayland nativo. Sin esto, las aplicaciones Qt entran por XWayland
+# aunque haya un compositor Wayland delante, y se ven borrosas a escala
+# fraccionaria.
+export QT_QPA_PLATFORM=wayland
+export GDK_BACKEND=wayland,x11
+export MOZ_ENABLE_WAYLAND=1
+
+# El binario: primero el instalado, y si no, el del árbol de desarrollo. Así la
+# misma entrada de sesión sirve para probar sin instalar nada.
+binario=/usr/local/bin/bookos-comp
+if [ ! -x "$binario" ]; then
+    raiz="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+    for candidato in "$raiz/target/release/bookos-comp" "$raiz/target/debug/bookos-comp"; do
+        [ -x "$candidato" ] && binario="$candidato" && break
+    done
+fi
+if [ ! -x "$binario" ]; then
+    echo "no encuentro bookos-comp" >&2
+    exit 1
+fi
+
+# El registro va a un fichero y no a la salida estándar porque SDDM se la come:
+# cuando la sesión no arranca, esto es lo único que queda para saber por qué.
+registro="${XDG_RUNTIME_DIR:-/tmp}/bookos-session.log"
+exec "$binario" >"$registro" 2>&1

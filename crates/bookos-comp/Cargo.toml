@@ -1,0 +1,44 @@
+[package]
+name = "bookos-comp"
+description = "Compositor Wayland de BookOS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Por defecto solo el backend anidado: se desarrolla dentro de la sesión Plasma
+# actual sin salir a un TTY, y no necesita las cabeceras de DRM/libinput/libseat.
+default = ["winit", "udev"]
+winit = ["smithay/backend_winit"]
+# El backend real sobre KMS. Requiere estas cabeceras, ya instaladas:
+#   libinput-devel mesa-libgbm-devel libdrm-devel libseat-devel
+#   libdisplay-info-devel
+udev = [
+    "smithay/backend_drm",
+    "smithay/backend_gbm",
+    "smithay/backend_libinput",
+    "smithay/backend_udev",
+    "smithay/backend_session_libseat",
+]
+
+[dependencies]
+smithay = { workspace = true, features = [
+    "backend_egl",
+    "renderer_gl",      # GLES2: un único contexto GPU en el proceso
+    "wayland_frontend",
+    "desktop",
+    "use_system_lib",
+    # XWayland. Habla X11 con x11rb, en Rust puro, así que no añade ninguna
+    # cabecera de sistema a las que ya hacían falta. Va siempre activado y no
+    # detrás de una característica: si el binario `Xwayland` no está instalado
+    # se avisa y la sesión sigue sin él, que es el mismo resultado que apagarlo
+    # en tiempo de compilación pero sin partir el código en dos.
+    "xwayland",
+] }
+bookos-shell = { path = "../bookos-shell" }
+# Para dibujar el cursor del tema del sistema. Un compositor tiene que pintar
+# el cursor él mismo; si no, el puntero funciona pero es invisible.
+xcursor = "0.3"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true

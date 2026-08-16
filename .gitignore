@@ -1,0 +1,50 @@
+# Lo que compila cargo. Son 7,5 GB: un `git add .` sin esta línea se lleva
+# 1,7 GB de objetos antes de que te dé tiempo a pararlo, y con el índice aún
+# vacío — parece que no ha hecho nada y ya ha escrito medio disco.
+/target/
+
+# Cargo.lock **sí** se versiona: esto es un binario, no una biblioteca, y que
+# la sesión de mañana compile con las mismas versiones que la de hoy es la
+# diferencia entre "no arranca" y "no arranca desde el jueves".
+
+# --- Medición y depuración ---------------------------------------------------
+# Sale de `perf record`, de cargo-flamegraph y de los volcados de núcleo. Todo
+# eso pesa decenas de megas y solo vale para la sesión en la que se generó.
+perf.data
+perf.data.old
+flamegraph.svg
+*.folded
+core
+core.*
+vgcore.*
+*.profraw
+*.profdata
+
+# --- Volcados de las pruebas visuales ----------------------------------------
+# `BOOKOS_PANEL_PNG=... cargo test` guarda lo que pinta el shell para poder
+# mirarlo. Se ignoran por nombre y no con `*.png` a secas: los iconos propios
+# que algún día tenga BookOS sí tienen que estar en el repositorio.
+/capturas/
+panel*.png
+dock*.png
+menu*.png
+calendario*.png
+launchpad*.png
+
+# --- Salida de una sesión de verdad ------------------------------------------
+*.log
+
+# --- Editores ----------------------------------------------------------------
+.vscode/
+.idea/
+*.kdev4
+.kdev4/
+*.swp
+*.swo
+*~
+\#*\#
+.\#*
+
+# --- Escritorio --------------------------------------------------------------
+# `.directory` lo deja Dolphin en cuanto cambias la vista de una carpeta.
+.directory

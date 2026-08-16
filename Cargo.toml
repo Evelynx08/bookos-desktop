@@ -1,0 +1,37 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/bookos/bookos-desktop"
+
+[workspace.dependencies]
+smithay = { version = "0.7", default-features = false }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+
+# El perfil de release importa aquí: el compositor corre en el bucle de frames.
+# fat LTO + 1 unidad de codegen dan menos saltos indirectos y binario más
+# pequeño, que en un portátil se traduce en menos I-cache miss por frame.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "unwind"        # el shell in-process se recupera con catch_unwind
+strip = "debuginfo"
+
+# Las **dependencias** se optimizan también en depuración. Sin esto, un
+# `cargo run` normal es inusable: medido en esta máquina, dibujar el dock pasa
+# de 1 ms a 59 y el panel de 1 a 45, o sea unas 43 veces más lento, y mover el
+# ratón por el dock daba 17 fotogramas por segundo. No es el código de aquí: casi
+# todo ese tiempo se va dentro de `tiny-skia`, `resvg` y `cosmic-text`, que sin
+# optimizar son otro programa.
+#
+# El código propio se queda **sin** optimizar, así que compilar sigue siendo
+# rápido y las trazas y los pánicos siguen apuntando a la línea correcta. Solo
+# se paga la primera compilación de las dependencias, que ya se hacía una vez.
+[profile.dev.package."*"]
+opt-level = 3

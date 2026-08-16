@@ -1,0 +1,361 @@
+//! Backend anidado: el compositor corre como una ventana dentro de la sesión
+//! actual. Es la forma de iterar sin salir a un TTY.
+//!
+//! **No es el camino de producción y no mide nada útil de consumo**: aquí hay
+//! un compositor por debajo (KWin) haciendo el trabajo de verdad, y el pump de
+//! winit obliga a un temporizador. El ahorro real se juega en el backend udev,
+//! donde el ritmo lo marcan los eventos de vblank de DRM.
+
+use std::time::Duration;
+
+use smithay::backend::renderer::damage::OutputDamageTracker;
+use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::winit::{self, WinitEvent, WinitGraphicsBackend};
+use smithay::desktop::utils::surface_primary_scanout_output;
+use smithay::desktop::space::render_output;
+use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
+use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+use smithay::reexports::calloop::EventLoop;
+use smithay::utils::Transform;
+
+use crate::state::BookosComp;
+
+/// Cadencia del pump de winit **mientras pasa algo**: 8 ms ≈ 120 Hz, que es lo
+/// que da el panel del Book5. Marca cada cuánto se *consultan* eventos; que se
+/// dibuje o no lo sigue decidiendo `needs_redraw`.
+const PUMP_ACTIVE: Duration = Duration::from_millis(8);
+/// Lo más rápido que se dibuja: 8 ms ≈ 120 Hz, que es lo que da el panel del
+/// Book5. **No es lo mismo que la cadencia del pump.**
+///
+/// Preguntar por eventos es barato y conviene hacerlo a menudo para que el
+/// cursor no se arrastre; dibujar es caro. Al juntarlos, bombear a 1 kHz
+/// significaba componer mil fotogramas por segundo —cada uno con su subida de
+/// texturas y su pasada por el compositor anfitrión— y el escritorio se movía a
+/// tirones justo cuando más se le pedía. Son dos ritmos y van por separado.
+const MIN_FRAME: Duration = Duration::from_millis(8);
+/// Cadencia mientras la cola del anfitrión **todavía trae eventos**.
+///
+/// Un ratón manda a 1 kHz y el pump se llamaba cada 8 ms, así que cada vuelta
+/// se tragaba una ráfaga entera y el cursor —que aquí lo dibujamos nosotros,
+/// con el del anfitrión oculto— avanzaba a saltos de 8 ms. No es cero para no
+/// dejar el bucle girando sin ceder la CPU.
+const PUMP_BUSY: Duration = Duration::from_millis(1);
+/// Cadencia en reposo. Sondear a 120 Hz un escritorio quieto es justo el goteo
+/// de despertares que este proyecto intenta evitar, así que en cuanto deja de
+/// haber actividad el sondeo se relaja.
+const PUMP_IDLE: Duration = Duration::from_millis(33);
+/// Cuánto se sigue considerando "activo" tras el último evento de entrada. Sin
+/// esta cola, mover el ratón despacio alternaría entre 8 y 33 ms y se notaría.
+const ACTIVE_TAIL: Duration = Duration::from_millis(400);
+
+pub fn run(
+    event_loop: &mut EventLoop<'static, BookosComp>,
+    state: &mut BookosComp,
+    client: Option<String>,
+    fullscreen: bool,
+) -> anyhow::Result<()> {
+    // Esto conecta con el compositor *anfitrión*, leyendo el WAYLAND_DISPLAY
+    // del entorno. Tiene que ocurrir antes de anunciar el nuestro a nadie.
+    let (mut backend, mut winit_loop) = winit::init::<GlesRenderer>()
+        .map_err(|err| anyhow::anyhow!("no se pudo iniciar el backend winit: {err}"))?;
+
+    if fullscreen {
+        // Previsualizar el DE entero: la ventana anidada ocupa la pantalla y lo
+        // que se ve es exactamente lo que verá la sesión real, salvo que debajo
+        // sigue habiendo un compositor anfitrión.
+        use smithay::reexports::winit::window::Fullscreen;
+        backend
+            .window()
+            .set_fullscreen(Some(Fullscreen::Borderless(None)));
+    }
+
+    let size = backend.window_size();
+    // La escala la marca el anfitrión (aquí KWin), salvo que la configuración
+    // diga otra cosa. Esa excepción existe para poder **ver** el escritorio a
+    // otra escala sin cambiar de monitor ni arrancar en un TTY: es la única
+    // forma de comprobar aquí lo que le va a pasar a la sesión real, donde la
+    // escala se deduce del tamaño físico del panel.
+    let scale = state
+        .config
+        .as_ref()
+        .and_then(|c| c.escala)
+        .unwrap_or_else(|| backend.scale_factor());
+    let mode = Mode {
+        size,
+        refresh: 60_000,
+    };
+    let output = Output::new(
+        "winit".to_string(),
+        PhysicalProperties {
+            size: (0, 0).into(),
+            subpixel: Subpixel::Unknown,
+            make: "BookOS".into(),
+            model: "Anidado".into(),
+        },
+    );
+    output.create_global::<BookosComp>(&state.display_handle);
+    output.change_current_state(
+        Some(mode),
+        Some(Transform::Flipped180),
+        Some(Scale::Fractional(scale)),
+        Some((0, 0).into()),
+    );
+    output.set_preferred(mode);
+    state.space.map_output(&output, (0, 0));
+
+    // El shell se crea aquí, en cuanto se sabe el ancho de la pantalla, y ya
+    // queda pintado para el primer frame: no hay un segundo proceso al que
+    // esperar ni un hueco en el que se vea el escritorio a medio montar.
+    state.shell = Some(crate::shell::ShellHost::new(
+        size.w.max(1) as u32,
+        size.h.max(1) as u32,
+        scale as f32,
+        state.config.take(),
+    ));
+    if let Some(shell) = state.shell.as_mut() {
+        shell.refresh();
+    }
+    crate::backend::schedule_panel_tick(state);
+    // También anidado: los estados salen de sysfs, no del compositor de debajo,
+    // así que aquí se ven igual de vivos que en la sesión real.
+    crate::backend::watch_hardware(state);
+    state.cursor_theme = Some(crate::cursor::CursorTheme::con_tamano(scale, state.cursor_nominal));
+    state.cristal = crate::desenfoque::Cristal::new(backend.renderer());
+    state.fondo = crate::fondo::Fondo::cargar(state.fondo_config.as_deref());
+    // El cristal desenfoca el fondo, así que necesita su propia copia con
+    // mipmaps. Se sube aquí, una vez, y no se vuelve a tocar.
+    if let (Some(fondo), Some(cristal)) = (state.fondo.as_ref(), state.cristal.as_ref()) {
+        let (rgba, tam) = fondo.rgba();
+        cristal.borrow_mut().preparar(backend.renderer(), rgba, tam);
+    }
+    // El anfitrión no debe pintar *también* su cursor encima del nuestro: se
+    // verían dos punteros desalineados.
+    backend.window().set_cursor_visible(false);
+    crate::selftest::schedule(state);
+
+    let mut damage_tracker = OutputDamageTracker::from_output(&output);
+    // EGL_BUFFER_AGE_EXT no es válido hasta que la superficie ha pasado por un
+    // swap: preguntarlo antes devuelve EGL_BAD_SURFACE. Da igual, porque el
+    // primer frame tiene que ser un redibujo completo de todas formas, que es
+    // justo lo que significa age = 0.
+    let mut rendered_once = false;
+    let mut ultimo_frame = std::time::Instant::now() - MIN_FRAME;
+    let mut vueltas = 0u32;
+    let mut con_pendiente = 0u32;
+    let mut reloj_vueltas = std::time::Instant::now();
+
+    state
+        .loop_handle
+        .insert_source(Timer::immediate(), move |_, _, state| {
+            let hubo_eventos = pump(&mut winit_loop, state);
+            let toca_dibujar = ultimo_frame.elapsed() >= MIN_FRAME;
+            vueltas += 1;
+            if state.needs_redraw {
+                con_pendiente += 1;
+            }
+            if std::env::var_os("BOOKOS_PERFIL").is_some()
+                && reloj_vueltas.elapsed() >= Duration::from_secs(1)
+            {
+                tracing::info!(vueltas, con_pendiente, "vueltas del pump por segundo");
+                vueltas = 0;
+                con_pendiente = 0;
+                reloj_vueltas = std::time::Instant::now();
+            }
+            if state.needs_redraw && toca_dibujar {
+                ultimo_frame = std::time::Instant::now();
+                let cronometro = std::time::Instant::now();
+                let age = if rendered_once {
+                    backend.buffer_age().unwrap_or(0)
+                } else {
+                    0
+                };
+                match draw(&mut backend, state, &output, &mut damage_tracker, age) {
+                    Ok(submitted) => {
+                        rendered_once |= submitted;
+                        if submitted {
+                            state.frames.submitted += 1;
+                        } else {
+                            state.frames.skipped += 1;
+                        }
+                    }
+                    Err(err) => tracing::error!("fallo al dibujar: {err}"),
+                }
+                state.frames.dibujado(cronometro.elapsed());
+            }
+            // Sin post_dispatch aquí: el callback de `event_loop.run` ya lo hace
+            // al cerrar cada vuelta, y repetirlo son refresh + flush por
+            // segundo tirados.
+            //
+            // El backend anidado no tiene forma de esperar en `epoll` a los
+            // eventos de winit —no expone su descriptor—, así que hay que
+            // sondear. Lo que sí se puede es sondear rápido solo cuando hay
+            // algo en marcha.
+            // Con trabajo pendiente que no se ha podido dibujar todavía, hay
+            // que volver justo cuando toque el siguiente fotograma; ni antes,
+            // que sería girar en vacío, ni después, que se vería a saltos.
+            if state.needs_redraw && !toca_dibujar {
+                return TimeoutAction::ToDuration(
+                    MIN_FRAME.saturating_sub(ultimo_frame.elapsed()),
+                );
+            }
+            // `hay_animacion` va aquí porque `needs_redraw` ya se ha limpiado
+            // al dibujar: sin preguntarlo, el ritmo se relajaba a 33 ms en
+            // mitad de cualquier animación y se veían cuatro fotogramas de los
+            // veintidós que caben en 180 ms. Medido abriendo el launchpad.
+            let activo = state.needs_redraw
+                || state.hay_animacion()
+                || state
+                    .last_input
+                    .is_some_and(|t| t.elapsed() < ACTIVE_TAIL);
+            // Si esta vuelta trajo eventos, el anfitrión tiene más en camino:
+            // esperar 8 ms a preguntar otra vez es exactamente lo que se veía
+            // como cursor pastoso sobre el dock. Mientras el ratón se mueve se
+            // pregunta a 1 kHz; en cuanto la cola se vacía, se vuelve a dormir.
+            TimeoutAction::ToDuration(if hubo_eventos {
+                PUMP_BUSY
+            } else if activo {
+                PUMP_ACTIVE
+            } else {
+                PUMP_IDLE
+            })
+        })
+        .map_err(|err| anyhow::anyhow!("insert_source(timer): {err}"))?;
+
+    tracing::info!(socket = ?state.socket_name, "compositor listo (backend anidado)");
+
+    if let Some(cmd) = client {
+        crate::keybinds::lanzar(state, &cmd);
+    }
+
+    event_loop.run(None, state, |state| {
+        state.post_dispatch();
+    })?;
+    Ok(())
+}
+
+/// Vacía la cola de eventos del anfitrión. Devuelve `true` si había alguno.
+fn pump(winit_loop: &mut winit::WinitEventLoop, state: &mut BookosComp) -> bool {
+    let mut hubo = false;
+    winit_loop.dispatch_new_events(|event| {
+        hubo = true;
+        match event {
+        WinitEvent::Resized { size, scale_factor } => {
+            // La escala de la configuración vuelve a mandar sobre la del
+            // anfitrión: sin esto, el primer cambio de tamaño —que con
+            // --fullscreen llega siempre— deshacía lo que se pidió.
+            let scale_factor = state.escala_forzada.unwrap_or(scale_factor);
+            tracing::info!(w = size.w, h = size.h, escala = scale_factor, "salida reconfigurada");
+            // Con --fullscreen el tamaño llega después de que el anfitrión
+            // conceda la pantalla completa, así que la salida y el shell se
+            // reconfiguran aquí y no en el arranque.
+            let mode = Mode {
+                size,
+                refresh: 60_000,
+            };
+            if let Some(output) = state.space.outputs().next().cloned() {
+                output.change_current_state(
+                    Some(mode),
+                    None,
+                    Some(Scale::Fractional(scale_factor)),
+                    None,
+                );
+                output.set_preferred(mode);
+            }
+            if let Some(shell) = state.shell.as_mut() {
+                shell.resize(
+                    size.w.max(1) as u32,
+                    size.h.max(1) as u32,
+                    scale_factor as f32,
+                );
+                shell.refresh();
+            }
+            // Los clientes ya conectados tienen que enterarse de la escala nueva.
+            state.broadcast_preferred_scale(scale_factor);
+            state.cursor_theme =
+                Some(crate::cursor::CursorTheme::con_tamano(scale_factor, state.cursor_nominal));
+            state.needs_redraw = true;
+        }
+        WinitEvent::Redraw => {
+            state.needs_redraw = true;
+        }
+        WinitEvent::CloseRequested => {
+            state.loop_signal.stop();
+        }
+        WinitEvent::Input(event) => crate::input::handle(state, event),
+        _ => {}
+        }
+    });
+    hubo
+}
+
+/// Devuelve `true` si llegó a enviarse un frame a la pantalla.
+fn draw(
+    backend: &mut WinitGraphicsBackend<GlesRenderer>,
+    state: &mut BookosComp,
+    output: &Output,
+    damage_tracker: &mut OutputDamageTracker,
+    age: usize,
+) -> anyhow::Result<bool> {
+    let (renderer, mut framebuffer) = backend
+        .bind()
+        .map_err(|err| anyhow::anyhow!("bind del framebuffer: {err}"))?;
+
+    // El panel va por delante de las ventanas: `custom_elements` se apila
+    // encima de los espacios.
+    let _t = std::time::Instant::now();
+    let overlay = crate::backend::escena(state, renderer, output);
+    let t_escena = _t.elapsed();
+    let _t = std::time::Instant::now();
+
+    let result = render_output::<_, crate::cursor::OverlayElement, _, _>(
+        output,
+        renderer,
+        &mut framebuffer,
+        1.0,
+        age,
+        [] as [&smithay::desktop::Space<smithay::desktop::Window>; 0],
+        &overlay,
+        damage_tracker,
+        [0.05, 0.05, 0.06, 1.0],
+    )
+    .map_err(|err| anyhow::anyhow!("render_output: {err:?}"))?;
+    let t_render = _t.elapsed();
+    let _t = std::time::Instant::now();
+
+    drop(framebuffer);
+
+    // `damage == None` significa que el damage tracker no encontró nada que
+    // cambiara: se salta el submit entero y no se toca la pantalla.
+    match result.damage {
+        Some(damage) => {
+            backend
+                .submit(Some(damage))
+                .map_err(|err| anyhow::anyhow!("submit: {err}"))?;
+        }
+        None => {
+            state.needs_redraw = false;
+            return Ok(false);
+        }
+    }
+
+    if std::env::var_os("BOOKOS_PERFIL").is_some() {
+        tracing::info!(
+            escena_ms = format_args!("{:.2}", t_escena.as_secs_f64() * 1000.0),
+            render_ms = format_args!("{:.2}", t_render.as_secs_f64() * 1000.0),
+            submit_ms = format_args!("{:.2}", _t.elapsed().as_secs_f64() * 1000.0),
+            elementos = overlay.len(),
+            "frame"
+        );
+    }
+
+    // Los frame callbacks salen después del submit: es la señal de "puedes
+    // dibujar el siguiente". Enviarlos antes hace que los clientes corran en
+    // vacío y es una fuga de consumo clásica.
+    let time = state.start_time.elapsed();
+    for window in state.space.elements() {
+        window.send_frame(output, time, Some(Duration::ZERO), surface_primary_scanout_output);
+    }
+
+    state.needs_redraw = false;
+    Ok(true)
+}
