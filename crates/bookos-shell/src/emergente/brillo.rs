@@ -176,8 +176,7 @@ impl Brillo {
         let Some(teclado) = self.teclado.as_mut() else {
             return false;
         };
-        let crudo =
-            (teclado.maximo as f64 * porciento as f64 / 100.0).round() as u32;
+        let crudo = (teclado.maximo as f64 * porciento as f64 / 100.0).round() as u32;
         let crudo = crudo.min(teclado.maximo);
         if crudo == teclado.nivel {
             return false;
@@ -264,7 +263,10 @@ impl Brillo {
         if holgada(self.rect_pildora()).contains(punto) {
             self.agarrada = Agarre::Pantalla;
             self.poner(nivel);
-        } else if self.rect_teclado().is_some_and(|r| holgada(r).contains(punto)) {
+        } else if self
+            .rect_teclado()
+            .is_some_and(|r| holgada(r).contains(punto))
+        {
             self.agarrada = Agarre::Teclado;
             self.poner_teclado(nivel);
         }
@@ -306,12 +308,15 @@ impl Brillo {
             Space::new().width(crate::FILL),
             text(format!("{}%", self.nivel))
                 .size(tema::T_CUERPO)
-                .color(tema::TEXTO),
+                .color(tema::texto()),
         ];
         let controles = row![
             control::pildora(BARRA, self.nivel, false),
             Space::new().width(Length::Fixed(HUECO)),
-            control::boton(self.icono.as_ref(), false),
+            // Sin realce de puntero: este botón no se pulsa —el brillo se
+            // cambia con la píldora— y encenderlo al pasar por encima
+            // prometería una acción que no existe.
+            control::boton(self.icono.as_ref(), false, 0.0),
         ]
         .align_y(Vertical::Center);
         // «Config» arriba a la derecha, como en el diseño.
@@ -320,7 +325,7 @@ impl Brillo {
             .center_y(Length::Fixed(24.0))
             .padding([0, 10])
             .style(|_theme: &iced_widget::Theme| container::Style {
-                background: Some(tema::HOVER.into()),
+                background: Some(tema::hover().into()),
                 border: Border {
                     radius: 12.0.into(),
                     ..Default::default()
@@ -329,7 +334,7 @@ impl Brillo {
             });
         let mut contenido = column![
             row![
-                text("Brillo").size(tema::T_TITULO).color(tema::TEXTO),
+                text("Brillo").size(tema::T_TITULO).color(tema::texto()),
                 Space::new().width(crate::FILL),
                 config,
             ]
@@ -348,14 +353,14 @@ impl Brillo {
                     Space::new().width(crate::FILL),
                     text(format!("{porciento}%"))
                         .size(tema::T_CUERPO)
-                        .color(tema::TEXTO),
+                        .color(tema::texto()),
                 ])
                 .push(Space::new().height(Length::Fixed(8.0)))
                 .push(
                     row![
                         control::pildora(BARRA, porciento, false),
                         Space::new().width(Length::Fixed(HUECO)),
-                        control::boton(self.icono_teclado.as_ref(), false),
+                        control::boton(self.icono_teclado.as_ref(), false, 0.0),
                     ]
                     .align_y(Vertical::Center),
                 );
@@ -367,11 +372,11 @@ impl Brillo {
         let nocturna = container(
             row![
                 column![
-                    text("Luz nocturna").size(14.0).color(tema::TEXTO),
+                    text("Luz nocturna").size(14.0).color(tema::texto()),
                     text("Suspendida").size(10.0).color(tema::TEXTO2),
                 ],
                 Space::new().width(crate::FILL),
-                super::lista::interruptor(false),
+                super::lista::interruptor(0.0),
             ]
             .align_y(Vertical::Center),
         )
@@ -380,7 +385,13 @@ impl Brillo {
         .padding([0, 10])
         .center_y(Length::Fixed(NOCTURNA))
         .style(|_theme: &iced_widget::Theme| container::Style {
-            background: Some(Color { a: 0.05, ..Color::WHITE }.into()),
+            background: Some(
+                Color {
+                    a: 0.05,
+                    ..tema::tinta()
+                }
+                .into(),
+            ),
             border: Border {
                 radius: tema::R_CONTROL.into(),
                 ..Default::default()

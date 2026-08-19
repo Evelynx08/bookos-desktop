@@ -46,10 +46,25 @@ impl Bluetooth {
             icono_nombre: "",
             pendiente: None,
         };
-        if let Some(estado) = consultar_ahora() {
-            b.aplicar(estado);
-        }
+        // Lanzada y sin esperar: la recoge `esperar_arranque`, ya con la del
+        // volumen corriendo a la vez. Ver [`crate::widget::Widget::esperar_arranque`].
+        b.pendiente = lanzar();
         b
+    }
+
+    /// Recoge la consulta del arranque, esperándola si hace falta.
+    fn recoger_arranque(&mut self) {
+        let Some(hijo) = self.pendiente.take() else {
+            return;
+        };
+        if let Some(estado) = hijo
+            .wait_with_output()
+            .ok()
+            .filter(|s| s.status.success())
+            .map(|s| interpretar(&String::from_utf8_lossy(&s.stdout)))
+        {
+            self.aplicar(estado);
+        }
     }
 
     fn aplicar(&mut self, estado: Estado) -> bool {
@@ -63,7 +78,9 @@ impl Bluetooth {
             Estado::Encendido | Estado::Conectado => "bluetooth",
         };
         if nombre != self.icono_nombre {
-            self.icono = (!nombre.is_empty()).then(|| icono::propio(nombre)).flatten();
+            self.icono = (!nombre.is_empty())
+                .then(|| icono::propio(nombre))
+                .flatten();
             self.icono_nombre = nombre;
         }
         true
@@ -73,6 +90,10 @@ impl Bluetooth {
 impl Widget for Bluetooth {
     fn nombre(&self) -> &'static str {
         "bluetooth"
+    }
+
+    fn esperar_arranque(&mut self) {
+        self.recoger_arranque();
     }
 
     fn refrescar(&mut self) -> bool {
@@ -118,8 +139,8 @@ impl Widget for Bluetooth {
         // queda en gris, que es lo que distingue de un vistazo.
         let color = match self.estado {
             Estado::Apagado => tema::TEXTO2,
-            Estado::Encendido | Estado::Conectado => tema::ACENTO,
-            Estado::SinAdaptador => TEXT,
+            Estado::Encendido | Estado::Conectado => tema::acento(),
+            Estado::SinAdaptador => TEXT(),
         };
         icono::ver_teñido(ic, tema::ICONO_PANEL, Some(color))
     }
@@ -139,19 +160,6 @@ fn lanzar() -> Option<Child> {
         .ok()
 }
 
-fn consultar_ahora() -> Option<Estado> {
-    let salida = Command::new("sh")
-        .arg("-c")
-        .arg(ORDEN)
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    salida
-        .status
-        .success()
-        .then(|| interpretar(&String::from_utf8_lossy(&salida.stdout)))
-}
-
 /// Saca el estado de lo que escupen `bluetoothctl show` y `devices Connected`.
 ///
 /// `show` sin adaptador dice "No default controller available"; con él,
@@ -164,7 +172,10 @@ fn interpretar(salida: &str) -> Estado {
     if !salida.contains("Powered: yes") {
         return Estado::Apagado;
     }
-    if salida.lines().any(|l| l.trim_start().starts_with("Device ")) {
+    if salida
+        .lines()
+        .any(|l| l.trim_start().starts_with("Device "))
+    {
         Estado::Conectado
     } else {
         Estado::Encendido
@@ -177,14 +188,20 @@ mod tests {
 
     #[test]
     fn sin_adaptador_no_se_dibuja_nada() {
-        assert_eq!(interpretar("No default controller available\n"), Estado::SinAdaptador);
+        assert_eq!(
+            interpretar("No default controller available\n"),
+            Estado::SinAdaptador
+        );
         assert_eq!(interpretar(""), Estado::SinAdaptador);
     }
 
     #[test]
     fn distingue_apagado_de_encendido() {
         let base = "Controller 40:C7:3C:E2:53:D2 (public)\n\tName: book5-pro\n";
-        assert_eq!(interpretar(&format!("{base}\tPowered: no\n")), Estado::Apagado);
+        assert_eq!(
+            interpretar(&format!("{base}\tPowered: no\n")),
+            Estado::Apagado
+        );
         assert_eq!(
             interpretar(&format!("{base}\tPowered: yes\n")),
             Estado::Encendido

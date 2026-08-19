@@ -48,7 +48,7 @@ enum Entrada {
 
 pub struct MenuDock {
     entradas: Vec<Entrada>,
-    señalada: Option<usize>,
+    señalada: tema::Realce,
     x: f32,
 }
 
@@ -86,7 +86,7 @@ impl MenuDock {
         }
         Self {
             entradas,
-            señalada: None,
+            señalada: tema::Realce::nuevo(),
             x: objetivo.x,
         }
     }
@@ -126,12 +126,12 @@ impl MenuDock {
     }
 
     pub fn puntero(&mut self, punto: Option<(f32, f32)>) -> bool {
-        let señalada = punto.and_then(|(x, y)| self.entrada_en(x, y));
-        if self.señalada == señalada {
-            return false;
-        }
-        self.señalada = señalada;
-        true
+        self.señalada
+            .señalar(punto.and_then(|(x, y)| self.entrada_en(x, y)))
+    }
+
+    pub fn animando(&self) -> bool {
+        self.señalada.animando()
     }
 
     pub fn pulsar(&mut self, x: f32, y: f32) -> Option<Accion> {
@@ -153,9 +153,9 @@ impl MenuDock {
         let mut col = column![Space::new().height(Length::Fixed(BORDE_SUP))];
         for (i, entrada) in self.entradas.iter().enumerate() {
             col = col.push(match entrada {
-                Entrada::Item { etiqueta, icono, .. } => {
-                    fila(etiqueta, None, icono, self.señalada == Some(i))
-                }
+                Entrada::Item {
+                    etiqueta, icono, ..
+                } => fila(etiqueta, None, icono, self.señalada.intensidad(i)),
                 Entrada::Divisor => divisor(),
             });
         }
@@ -164,11 +164,11 @@ impl MenuDock {
         container(col)
             .width(Length::Fixed(ANCHO))
             .style(|_theme| container::Style {
-                background: Some(tema::CARD.into()),
+                background: Some(tema::card().into()),
                 border: Border {
                     radius: tema::R_POPOVER.into(),
                     width: 1.0,
-                    color: tema::BORDE,
+                    color: tema::borde(),
                 },
                 ..Default::default()
             })

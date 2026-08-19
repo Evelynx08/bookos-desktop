@@ -42,7 +42,7 @@ impl Widget for Control {
 
     fn ver(&self) -> PanelElement<'_> {
         match &self.icono {
-            Some(ic) => icono::ver_teñido(ic, tema::ICONO_PANEL, Some(TEXT)),
+            Some(ic) => icono::ver_teñido(ic, tema::ICONO_PANEL, Some(TEXT())),
             None => crate::widget::vacio(),
         }
     }

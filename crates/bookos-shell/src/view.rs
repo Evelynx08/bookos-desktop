@@ -16,21 +16,21 @@ use crate::widget::Panel;
 
 // Los nombres viejos siguen valiendo dentro del crate: son los roles que usan
 // los widgets, y apuntan a los tokens del sistema.
-pub use tema::ACENTO;
-pub use tema::ROJO as PELIGRO;
-pub use tema::TEXTO as TEXT;
-pub use tema::VERDE as OK;
+pub use tema::acento as ACENTO;
+pub use tema::rojo as PELIGRO;
+pub use tema::texto as TEXT;
+pub use tema::verde as OK;
 
 pub fn theme() -> Theme {
     Theme::custom(
         "BookOS",
         Palette {
-            background: tema::PANEL,
-            text: tema::TEXTO,
-            primary: tema::ACENTO,
-            success: tema::VERDE,
-            warning: tema::AMARILLO,
-            danger: tema::ROJO,
+            background: tema::panel(),
+            text: tema::texto(),
+            primary: tema::acento(),
+            success: tema::verde(),
+            warning: tema::amarillo(),
+            danger: tema::rojo(),
         },
     )
 }
@@ -93,7 +93,7 @@ pub fn panel(widgets: &Panel) -> PanelElement<'_> {
         .width(Length::Fill)
         .height(Length::Fill)
         .style(|_theme| container::Style {
-            background: Some(tema::PANEL.into()),
+            background: Some(tema::panel().into()),
             ..Default::default()
         })
         .into()

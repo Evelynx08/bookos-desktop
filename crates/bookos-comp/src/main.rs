@@ -6,13 +6,21 @@
 mod backend;
 mod cursor;
 mod desenfoque;
+mod conmutador;
+mod decoracion;
+mod escritorios;
 mod fondo;
+mod genio;
+mod gestos;
 mod drminfo;
 mod handlers;
 mod input;
 mod keybinds;
 mod multimedia;
 mod autenticar;
+mod ajustes;
+mod notificaciones;
+mod pantallas;
 mod selftest;
 mod shell;
 mod state;
@@ -54,8 +62,10 @@ fn main() -> anyhow::Result<()> {
                        programa           cliente que lanzar dentro (p. ej. konsole)\n\n\
                      Atajos:\n  \
                        Meta+Return        abrir un terminal (BOOKOS_TERMINAL, konsole por defecto)\n  \
-                       Meta+Espacio       abrir o cerrar el launchpad\n  \
-                       Meta+Tab           pasar a la siguiente ventana\n  \
+                       Meta+Espacio       buscar aplicaciones, comandos y estados\n  \
+                       Meta               abrir o cerrar el launchpad\n  \
+                       Alt+Tab            elegir aplicación por icono\n  \
+                       Meta+Tab           elegir ventana por previsualización\n  \
                        Meta+F             maximizar la ventana con foco, o restaurarla\n  \
                        Meta+flechas       encajar en media pantalla; otra flecha, en un cuarto\n  \
                        Meta+Q             cerrar la ventana con foco\n  \

@@ -23,11 +23,13 @@ use smithay::reexports::wayland_server::backend::{ClientData, ClientId, Disconne
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
 use smithay::wayland::compositor::{CompositorClientState, CompositorState};
 use smithay::wayland::fractional_scale::FractionalScaleManagerState;
-use smithay::wayland::viewporter::ViewporterState;
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
+use smithay::wayland::selection::primary_selection::PrimarySelectionState;
+use smithay::wayland::selection::wlr_data_control::DataControlState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
+use smithay::wayland::viewporter::ViewporterState;
 
 /// Lo que se está escribiendo en la pantalla de bloqueo.
 ///
@@ -80,6 +82,65 @@ pub struct BookosComp {
     /// El shell in-process. `None` hasta que el backend sabe el tamaño de la
     /// pantalla.
     pub shell: Option<crate::shell::ShellHost>,
+    /// Los gestos de touchpad en curso. Ver [`crate::gestos`].
+    pub gestos: crate::gestos::Gestos,
+    /// Los escritorios virtuales. Ver [`crate::escritorios`].
+    pub escritorios: crate::escritorios::Escritorios,
+    /// La ventana a la que lleva cada celda del conmutador, en el mismo orden.
+    ///
+    /// Vive aquí y no en el shell porque el shell no ve ventanas: elige un
+    /// índice y el compositor lo traduce. Es lo que permite que una celda sea
+    /// una ventana concreta sin que el shell sepa qué es una ventana.
+    pub conmutador_destinos: Vec<smithay::desktop::Window>,
+    /// Modo del selector abierto. También identifica qué modificador debe
+    /// soltarse para confirmar: Alt en aplicaciones, Meta en ventanas.
+    pub conmutador_modo: Option<bookos_shell::conmutador::Modo>,
+    /// Se ha soltado el modificador con el conmutador abierto.
+    ///
+    /// La acción no puede ejecutarse dentro del filtro de `kbd.input`: allí hay
+    /// que devolver `Forward` para que la suelta de Alt llegue al cliente, y
+    /// `Intercept` se la traga. Se marca aquí y se resuelve al volver.
+    pub conmutador_resolver: bool,
+    /// Un clic que empezó sobre el selector no debe entregar su liberación al
+    /// cliente que acaba de recibir el foco.
+    pub conmutador_clic: bool,
+    /// Meta se pulsó y desde entonces no ha pasado nada más.
+    ///
+    /// Es lo que hace que **Meta a secas** abra el launchpad sin robarle
+    /// Meta+algo a nadie: la tecla sola solo significa algo al soltarla, y
+    /// cualquier otra tecla o clic por el medio la deja en un modificador
+    /// normal. Se decide al soltar y no al pulsar porque al pulsar todavía no se
+    /// sabe si va a ser un atajo.
+    pub meta_sola: bool,
+    /// Hay un launchpad pendiente de abrir por la suelta de Meta.
+    pub abrir_launchpad: bool,
+    /// El shader del «magic lamp», compilado al arrancar el backend. `None` si
+    /// el driver no lo acepta: entonces el minimizar encoge sin deformar.
+    pub genio: Option<crate::genio::Genio>,
+    /// Las ventanas congeladas que se están yendo al dock —o volviendo—, con la
+    /// textura de la que sale su deformación.
+    pub capturas: Vec<(smithay::desktop::Window, crate::genio::Captura)>,
+    /// Sube en cada frame mientras haya alguna en marcha: el elemento cambia de
+    /// forma sin cambiar de sitio, y sin esto el damage tracker lo daría por
+    /// quieto y no lo repintaría.
+    pub genio_commit: smithay::backend::renderer::utils::CommitCounter,
+    /// El botón de barra de título bajo el cursor y el que se está pulsando.
+    pub decoracion: crate::decoracion::Interaccion,
+    /// Ventanas minimizadas, con la posición a la que vuelven.
+    ///
+    /// Igual que las de otro escritorio: fuera del `Space` pero vivas, con su
+    /// buffer intacto. La lista es del compositor y no del `Escritorios` porque
+    /// una minimizada no pertenece a ningún escritorio mientras está guardada:
+    /// vuelve al que esté activo cuando se restaure.
+    pub minimizadas: Vec<crate::escritorios::Apartada>,
+    /// Las que se están yendo al dock y todavía se dibujan.
+    pub minimizando: Vec<crate::escritorios::Apartada>,
+    /// El conmutador se abrió con un gesto y **no** se cierra al soltar teclas.
+    ///
+    /// El de Alt+Tab vive mientras sostienes el modificador; la exposición de
+    /// tres dedos no tiene ninguno que sostener, así que sin esto la primera
+    /// tecla que se soltara la daría por resuelta y saltaría a una ventana.
+    pub conmutador_pegado: bool,
     /// La configuración del escritorio, leída una vez al arrancar.
     ///
     /// El backend la consulta para la escala **antes** de que exista el shell
@@ -137,6 +198,11 @@ pub struct BookosComp {
 
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
+    /// `xdg-decoration`: por él se reclama dibujar la barra de título. Nadie lo
+    /// lee después de crearlo, pero soltarlo retiraría el global y los clientes
+    /// volverían a decorarse solos.
+    #[allow(dead_code)]
+    pub xdg_decoration_state: smithay::wayland::shell::xdg::decoration::XdgDecorationState,
     pub shm_state: ShmState,
     /// Nadie lo lee, pero tiene que seguir vivo: al soltarse se retiran los
     /// globales `wl_output` y `xdg_output_manager` y los clientes dejan de ver
@@ -145,6 +211,37 @@ pub struct BookosComp {
     pub output_manager_state: OutputManagerState,
     pub seat_state: SeatState<Self>,
     pub data_device_state: DataDeviceState,
+    /// La selección primaria: lo que se copia con solo seleccionar y se pega
+    /// con el botón central. Es de X11 de toda la vida y en Linux se usa a
+    /// diario; sin ella, el botón central no pega nada.
+    pub primary_selection_state: PrimarySelectionState,
+    /// `wlr-data-control`: deja que un programa **lea y escriba** el
+    /// portapapeles sin tener ventana ni foco. Es lo que necesitan los
+    /// gestores de historial (`clipman`, `cliphist`) y `wl-copy`/`wl-paste`.
+    pub data_control_state: DataControlState,
+    /// La conexión al bus de sesión donde vive el servidor de notificaciones.
+    /// Hay que guardarla: al soltarla se cierra el bus y se pierde el nombre.
+    /// `None` si no había bus con quien hablar, o si el nombre ya estaba cogido
+    /// por otro escritorio —lo normal desarrollando anidado dentro de Plasma—.
+    pub bus_notificaciones: Option<zbus::blocking::Connection>,
+    /// Interfaz privada de la sesión (`org.bookos.Desktop`) para que BookOS
+    /// Settings recargue la configuración y reconfigure las pantallas. Hay que
+    /// guardarla por lo mismo que la de notificaciones —al soltarla se pierde
+    /// el nombre en el bus— y además es por donde sale `OutputsChanged`.
+    pub bus_ajustes: Option<zbus::blocking::Connection>,
+    /// El censo de pantallas y lo último que se aplicó. Ver [`crate::pantallas`].
+    pub pantallas: crate::pantallas::Estado,
+    /// Cómo reconfigurar las pantallas. Lo rellena el backend; es el único
+    /// camino desde D-Bus hasta KMS, y pasa siempre por este hilo.
+    pub aplicar_pantallas: Option<crate::pantallas::Aplicador>,
+    /// Cómo volver a mirar qué hay enchufado, sin cambiar nada.
+    pub censar_pantallas: Option<crate::pantallas::Censador>,
+    /// Entrega al bucle la lectura MPRIS hecha después de echar el bloqueo.
+    /// Lleva una generación para que una consulta lenta de un bloqueo anterior
+    /// no aparezca en el siguiente.
+    pub medios_bloqueo:
+        smithay::reexports::calloop::channel::Sender<(u64, Option<bookos_shell::medios::Sonando>)>,
+    pub bloqueo_generacion: u64,
     /// `wp_fractional_scale` + `wp_viewporter`: la pareja que permite a un
     /// cliente dibujar a 1,75× y decirle al compositor "recórtame a este
     /// tamaño lógico". Sin viewporter, la escala fraccional no sirve de nada.
@@ -194,8 +291,12 @@ fn distribucion_teclado(config: Option<&str>) -> smithay::input::keyboard::XkbCo
     let options = std::env::var("XKB_DEFAULT_OPTIONS").ok();
     tracing::info!(?layout, ?variant, "distribución de teclado");
     smithay::input::keyboard::XkbConfig {
-        layout: layout.map(|s| &*Box::leak(s.into_boxed_str())).unwrap_or(""),
-        variant: variant.map(|s| &*Box::leak(s.into_boxed_str())).unwrap_or(""),
+        layout: layout
+            .map(|s| &*Box::leak(s.into_boxed_str()))
+            .unwrap_or(""),
+        variant: variant
+            .map(|s| &*Box::leak(s.into_boxed_str()))
+            .unwrap_or(""),
         options: options.map(|s| Box::leak(s.into_boxed_str()).to_string()),
         ..Default::default()
     }
@@ -227,13 +328,24 @@ impl BookosComp {
             .as_ref()
             .and_then(|s| s.osd_queda())
             .is_some_and(|q| q <= bookos_shell::osd::SALIDA);
+        let toast_saliendo = self
+            .shell
+            .as_ref()
+            .and_then(|s| s.toast_queda())
+            .is_some_and(|q| q <= bookos_shell::toast::SALIDA);
         osd_saliendo
+            || toast_saliendo
             || self
                 .shell
                 .as_ref()
                 .is_some_and(|s| s.animando() || s.barras_animando())
             || self.space.elements().any(crate::ventanas::animando)
             || self.arrastre.as_ref().is_some_and(|a| a.animando())
+            // El deslizamiento entre escritorios mueve ventanas en el `Space`,
+            // no dentro de un buffer del shell, así que ninguna de las de
+            // arriba lo ve. Sin esto el bucle se relajaba a mitad de la
+            // transición y el cambio de escritorio salía a trompicones.
+            || self.escritorios.deslizando()
     }
 
     pub fn new(
@@ -245,9 +357,17 @@ impl BookosComp {
 
         let compositor_state = CompositorState::new::<Self>(&dh);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
+        let xdg_decoration_state =
+            smithay::wayland::shell::xdg::decoration::XdgDecorationState::new::<Self>(&dh);
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let data_device_state = DataDeviceState::new::<Self>(&dh);
+        let primary_selection_state = PrimarySelectionState::new::<Self>(&dh);
+        // Se le pasa la selección primaria para que un cliente de data-control
+        // pueda leer también esa, no solo el portapapeles: `wl-paste
+        // --primary` es justo para lo que existe el protocolo.
+        let data_control_state =
+            DataControlState::new::<Self, _>(&dh, Some(&primary_selection_state), |_| true);
         let fractional_scale_state = FractionalScaleManagerState::new::<Self>(&dh);
         let viewporter_state = ViewporterState::new::<Self>(&dh);
         let cursor_shape_state =
@@ -272,6 +392,54 @@ impl BookosComp {
         // Se saca de la `Config` antes de que el shell se la lleve entera: los
         // dispositivos no se configuran al arrancar sino cada vez que libinput
         // anuncia uno, y eso vuelve a pasar tras cada cambio de TTY.
+        // El servidor de notificaciones: un canal hacia este bucle, y zbus
+        // atendiendo el bus en su propio hilo. Va aquí y no en `init_wayland`
+        // porque no tiene nada que ver con el socket de Wayland: son dos
+        // conversaciones distintas con dos mundos distintos.
+        let (avisos, fuente) = smithay::reexports::calloop::channel::channel();
+        loop_handle
+            .insert_source(fuente, |evento, _, state| {
+                use smithay::reexports::calloop::channel::Event;
+                if let Event::Msg(aviso) = evento {
+                    crate::notificaciones::recibir(state, aviso);
+                }
+            })
+            .map_err(|err| anyhow::anyhow!("insert_source(notificaciones): {err}"))?;
+        let bus_notificaciones = crate::notificaciones::arrancar(avisos);
+
+        // Settings escribe el fichero y solo manda una orden pequeña por
+        // D-Bus. La lectura y aplicación se hacen aquí, en el hilo dueño del
+        // shell, para no compartir estado gráfico entre hilos.
+        let (ajustes, fuente_ajustes) = smithay::reexports::calloop::channel::channel();
+        loop_handle
+            .insert_source(fuente_ajustes, |evento, _, state| {
+                use smithay::reexports::calloop::channel::Event;
+                if let Event::Msg(aviso) = evento {
+                    crate::ajustes::recibir(state, aviso);
+                }
+            })
+            .map_err(|err| anyhow::anyhow!("insert_source(ajustes): {err}"))?;
+        let pantallas = crate::pantallas::Estado::default();
+        let bus_ajustes = crate::ajustes::arrancar(ajustes, pantallas.compartido.clone());
+
+        // MPRIS puede lanzar varios procesos `busctl`; se consulta después de
+        // que el bloqueo ya esté visible y en un hilo corto. El resultado
+        // vuelve por calloop, igual que las notificaciones, sin bloquear frames.
+        let (medios_bloqueo, fuente_medios) = smithay::reexports::calloop::channel::channel();
+        loop_handle
+            .insert_source(fuente_medios, |evento, _, state| {
+                use smithay::reexports::calloop::channel::Event;
+                if let Event::Msg((generacion, sonando)) = evento {
+                    if generacion == state.bloqueo_generacion {
+                        if let Some(shell) = state.shell.as_mut() {
+                            shell.bloqueo_medio(sonando);
+                            state.needs_redraw = true;
+                        }
+                    }
+                }
+            })
+            .map_err(|err| anyhow::anyhow!("insert_source(medios bloqueo): {err}"))?;
+
         let entrada = std::mem::take(&mut config.entrada);
         let cursor_nominal = config.cursor;
         let fondo_config = config.fondo.clone();
@@ -296,6 +464,24 @@ impl BookosComp {
             cristal_commit: Default::default(),
             pointer_location: (0.0, 0.0).into(),
             shell: None,
+            gestos: crate::gestos::Gestos::default(),
+            escritorios: crate::escritorios::Escritorios::new(
+                config.escritorios,
+                config.nombres_escritorios.clone(),
+            ),
+            conmutador_destinos: Vec::new(),
+            conmutador_modo: None,
+            conmutador_resolver: false,
+            conmutador_clic: false,
+            meta_sola: false,
+            abrir_launchpad: false,
+            conmutador_pegado: false,
+            genio: None,
+            capturas: Vec::new(),
+            genio_commit: Default::default(),
+            decoracion: crate::decoracion::Interaccion::default(),
+            minimizadas: Vec::new(),
+            minimizando: Vec::new(),
             config: Some(config),
             escala_forzada,
             entrada,
@@ -311,10 +497,20 @@ impl BookosComp {
             display_x11: None,
             compositor_state,
             xdg_shell_state,
+            xdg_decoration_state,
             shm_state,
             output_manager_state,
             seat_state,
             data_device_state,
+            primary_selection_state,
+            data_control_state,
+            bus_notificaciones,
+            bus_ajustes,
+            pantallas,
+            aplicar_pantallas: None,
+            censar_pantallas: None,
+            medios_bloqueo,
+            bloqueo_generacion: 0,
             fractional_scale_state,
             viewporter_state,
             cursor_shape_state,
@@ -396,7 +592,11 @@ impl BookosComp {
         // puntero esté sobre ellos, para los clientes no hay nada bajo el
         // cursor. Sin esto la ventana de debajo se cree señalada y cambia la
         // forma del cursor al pasar por encima del dock.
-        if self.shell.as_ref().is_some_and(|s| s.contiene(point.x, point.y)) {
+        if self
+            .shell
+            .as_ref()
+            .is_some_and(|s| s.contiene(point.x, point.y))
+        {
             return None;
         }
         let (window, location) = self.space.element_under(point)?;

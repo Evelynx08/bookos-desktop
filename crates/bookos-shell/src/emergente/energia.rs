@@ -93,19 +93,19 @@ fn nombrar(clave: &str) -> (&'static str, &'static str, Color, &'static str) {
         "power-saver" => (
             "Ahorro de energía",
             "Máx. duración de batería",
-            tema::PERFIL_AHORRO,
+            tema::perfil_ahorro(),
             "perfil-ahorro",
         ),
         "balanced" => (
             "Equilibrado",
             "Rendimiento equilibrado",
-            tema::PERFIL_EQUILIBRADO,
+            tema::perfil_equilibrado(),
             "perfil-equilibrado",
         ),
         "performance" => (
             "Alto rendimiento",
             "Máx. potencia del sistema",
-            tema::PERFIL_RENDIMIENTO,
+            tema::perfil_rendimiento(),
             "perfil-rendimiento",
         ),
         // Los hay con un cuarto perfil propio del fabricante; se enseña con el
@@ -225,10 +225,7 @@ fn ruta_bateria() -> Option<std::path::PathBuf> {
     let mut rutas: Vec<_> = dir
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| {
-            std::fs::read_to_string(p.join("type"))
-                .is_ok_and(|t| t.trim() == "Battery")
-        })
+        .filter(|p| std::fs::read_to_string(p.join("type")).is_ok_and(|t| t.trim() == "Battery"))
         .collect();
     // Ordenadas para que BAT0 gane a BAT1 y la elección no dependa del orden
     // del directorio, que no está garantizado.
@@ -246,7 +243,7 @@ pub struct Energia {
     perfiles: Vec<Perfil>,
     activo: Option<String>,
     /// Sobre qué fila está el ratón, para el realce.
-    señalado: Option<usize>,
+    señalado: tema::Realce,
     /// El del renglón del consumo por aplicación.
     icono_consumo: Option<Icono>,
 }
@@ -254,7 +251,9 @@ pub struct Energia {
 impl Energia {
     pub fn new() -> Self {
         Self {
-            bateria: Battery::read(),
+            // Con tiempo restante: es la tarjeta que lo enseña, y solo se lee
+            // mientras está abierta.
+            bateria: Battery::read(true),
             vatios: vatios(),
             ciclos: ciclos(),
             // Saber **qué** aplicación consume exige contabilidad por proceso
@@ -263,7 +262,7 @@ impl Energia {
             consumo: "Sin datos de consumo por aplicación".into(),
             perfiles: perfiles(),
             activo: perfil_activo(),
-            señalado: None,
+            señalado: tema::Realce::nuevo(),
             icono_consumo: icono::propio("cpu"),
         }
     }
@@ -316,12 +315,13 @@ impl Energia {
     }
 
     pub fn puntero(&mut self, punto: Option<(f32, f32)>) -> bool {
-        let nuevo = punto.and_then(|(x, y)| self.fila_en(x, y));
-        if nuevo == self.señalado {
-            return false;
-        }
-        self.señalado = nuevo;
-        true
+        self.señalado
+            .señalar(punto.and_then(|(x, y)| self.fila_en(x, y)))
+    }
+
+    /// ¿Se mueve algo dentro de la tarjeta?
+    pub fn animando(&self) -> bool {
+        self.señalado.animando()
     }
 
     pub fn pulsar(&mut self, x: f32, y: f32) -> Option<Accion> {
@@ -370,7 +370,7 @@ impl Energia {
         self.activo
             .as_deref()
             .and_then(|a| self.perfiles.iter().find(|p| p.clave == a))
-            .map_or(tema::TEXTO, |p| p.color)
+            .map_or(tema::texto(), |p| p.color)
     }
 
     /// La cabecera: «Batería» con la fuente debajo y el nivel a la derecha.
@@ -403,7 +403,7 @@ impl Energia {
         };
         row![
             column![
-                text("Batería").size(tema::T_TITULO).color(tema::TEXTO),
+                text("Batería").size(tema::T_TITULO).color(tema::texto()),
                 text(detalle).size(tema::T_CUERPO).color(tema::TEXTO2),
             ],
             Space::new().width(Length::Fill),
@@ -432,7 +432,9 @@ impl Energia {
     fn pie(&self) -> PanelElement<'_> {
         container(
             row![
-                text("Preferencias de batería").size(13.0).color(tema::TEXTO2),
+                text("Preferencias de batería")
+                    .size(13.0)
+                    .color(tema::TEXTO2),
                 Space::new().width(Length::Fill),
                 text("›").size(15.0).color(tema::TEXTO2),
             ]
@@ -449,7 +451,7 @@ impl Energia {
         container(Space::new().height(Length::Fixed(1.0)))
             .width(Length::Fixed(ANCHO - MARGEN * 2.0))
             .style(|_theme: &iced_widget::Theme| container::Style {
-                background: Some(tema::DIVISOR.into()),
+                background: Some(tema::divisor().into()),
                 ..Default::default()
             })
             .into()
@@ -467,12 +469,16 @@ impl Energia {
         // perfiles se veían azules al seleccionarlos y el color de cada uno solo
         // vivía en un disco de 22 px.
         let sobre = tema::tinta_sobre(perfil.color);
-        let (fondo, color) = match (activo, self.señalado == Some(i)) {
-            (true, _) => (perfil.color, sobre),
-            (false, true) => (tema::HOVER, tema::TEXTO),
-            // Un fondo tenue permanente: sin él las filas no se leen como algo
-            // que se pueda pulsar hasta que el ratón pasa por encima.
-            (false, false) => (Color { a: 0.04, ..Color::WHITE }, tema::TEXTO),
+        let señalado = self.señalado.intensidad(i);
+        let (fondo, color) = if activo {
+            (perfil.color, sobre)
+        } else {
+            (
+                // Un fondo tenue permanente: sin él las filas no se leen como
+                // algo que se pueda pulsar hasta que el ratón pasa por encima.
+                tema::mezclar(tema::alfa(tema::tinta(), 0.04), tema::hover(), señalado),
+                tema::texto(),
+            )
         };
         let detalle_color = if activo {
             Color { a: 0.65, ..sobre }
@@ -490,7 +496,13 @@ impl Energia {
         let (pastilla_fondo, tinta) = if activo {
             (Color { a: 0.22, ..sobre }, sobre)
         } else {
-            (Color { a: 0.16, ..perfil.color }, perfil.color)
+            (
+                Color {
+                    a: 0.16,
+                    ..perfil.color
+                },
+                perfil.color,
+            )
         };
         let pastilla = container(icono_o_hueco(perfil.icono.as_ref(), ICONO_FILA, tinta))
             .width(Length::Fixed(PASTILLA))
@@ -505,12 +517,8 @@ impl Energia {
                 },
                 ..Default::default()
             });
-        let contenido = row![
-            pastilla,
-            Space::new().width(Length::Fixed(12.0)),
-            textos,
-        ]
-        .align_y(Vertical::Center);
+        let contenido = row![pastilla, Space::new().width(Length::Fixed(12.0)), textos,]
+            .align_y(Vertical::Center);
         container(contenido)
             .width(Length::Fixed(ANCHO - MARGEN * 2.0))
             .height(Length::Fixed(FILA))
@@ -535,7 +543,7 @@ impl Energia {
         ];
         if !self.perfiles.is_empty() {
             contenido = contenido.push(
-                container(text("Modo de energía").size(15.0).color(tema::TEXTO))
+                container(text("Modo de energía").size(15.0).color(tema::texto()))
                     .height(Length::Fixed(ROTULO))
                     .center_y(Length::Fixed(ROTULO)),
             );
@@ -597,6 +605,10 @@ mod tests {
         }];
         let con = e.size().1;
         e.perfiles.clear();
-        assert!(e.size().1 < con, "{} debería ser menor que {con}", e.size().1);
+        assert!(
+            e.size().1 < con,
+            "{} debería ser menor que {con}",
+            e.size().1
+        );
     }
 }

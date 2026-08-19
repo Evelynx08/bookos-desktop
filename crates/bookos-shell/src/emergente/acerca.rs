@@ -53,7 +53,8 @@ pub struct Acerca {
     sistema: String,
     datos: Vec<Dato>,
     /// Si el ratón está sobre el botón de «Más información…».
-    señalado: bool,
+    /// El botón bajo el puntero, con su realce entrando y saliendo.
+    señalado: tema::Transicion,
 }
 
 impl Acerca {
@@ -96,7 +97,7 @@ impl Acerca {
             modelo,
             sistema,
             datos,
-            señalado: false,
+            señalado: tema::Transicion::nueva(0.0, tema::D_HOVER, tema::C_SUAVE),
         }
     }
 
@@ -124,14 +125,14 @@ impl Acerca {
     }
 
     pub fn puntero(&mut self, punto: Option<(f32, f32)>) -> bool {
-        let dentro = punto.is_some_and(|(x, y)| {
-            self.rect_boton().contains(iced_core::Point::new(x, y))
-        });
-        if dentro == self.señalado {
-            return false;
-        }
-        self.señalado = dentro;
-        true
+        let dentro =
+            punto.is_some_and(|(x, y)| self.rect_boton().contains(iced_core::Point::new(x, y)));
+        self.señalado.ir_a(dentro as u8 as f32)
+    }
+
+    /// ¿Se mueve algo dentro de la tarjeta?
+    pub fn animando(&self) -> bool {
+        self.señalado.animando()
     }
 
     pub fn pulsar(&mut self, x: f32, y: f32) -> Option<Accion> {
@@ -156,7 +157,10 @@ impl Acerca {
     /// El velo de detrás: la tarjeta ocupa el centro de la pantalla y sin él se
     /// leería como una ventana más del escritorio.
     pub fn velo(&self) -> Color {
-        Color { a: 0.45, ..tema::BG }
+        Color {
+            a: 0.45,
+            ..tema::bg()
+        }
     }
 
     /// El portátil dibujado de arriba.
@@ -183,7 +187,13 @@ impl Acerca {
             .width(Length::Fixed(300.0))
             .height(Length::Fixed(8.0))
             .style(|_theme: &iced_widget::Theme| container::Style {
-                background: Some(Color { a: 0.55, ..Color::WHITE }.into()),
+                background: Some(
+                    Color {
+                        a: 0.55,
+                        ..tema::tinta()
+                    }
+                    .into(),
+                ),
                 border: Border {
                     radius: 4.0.into(),
                     ..Default::default()
@@ -208,7 +218,7 @@ impl Acerca {
                         container(
                             text(dato.etiqueta)
                                 .size(tema::T_CUERPO)
-                                .color(tema::TEXTO)
+                                .color(tema::texto())
                                 .align_x(Horizontal::Right),
                         )
                         .width(Length::Fixed(ETIQUETAS))
@@ -233,27 +243,27 @@ impl Acerca {
             container(
                 text("Más información…")
                     .size(tema::T_CUERPO)
-                    .color(tema::TEXTO),
+                    .color(tema::texto()),
             )
             .width(Length::Fixed(220.0))
             .height(Length::Fixed(BOTON))
             .center_x(Length::Fixed(220.0))
             .center_y(Length::Fixed(BOTON))
             .style({
-                let señalado = self.señalado;
+                let señalado = self.señalado.valor();
                 move |_theme: &iced_widget::Theme| container::Style {
                     background: Some(
-                        if señalado {
-                            Color { a: 0.16, ..Color::WHITE }
-                        } else {
-                            Color { a: 0.08, ..Color::WHITE }
-                        }
+                        tema::mezclar(
+                            tema::alfa(tema::tinta(), 0.08),
+                            tema::alfa(tema::tinta(), 0.16),
+                            señalado,
+                        )
                         .into(),
                     ),
                     border: Border {
                         radius: tema::R_BOTON.into(),
                         width: 1.0,
-                        color: tema::BORDE,
+                        color: tema::borde(),
                     },
                     ..Default::default()
                 }
@@ -267,7 +277,7 @@ impl Acerca {
             Space::new().height(Length::Fixed(24.0)),
             text(self.modelo.clone())
                 .size(30.0)
-                .color(tema::TEXTO)
+                .color(tema::texto())
                 .align_x(Horizontal::Center),
             text(self.sistema.clone())
                 .size(tema::T_CUERPO)
@@ -283,11 +293,11 @@ impl Acerca {
         container(container(contenido).padding(MARGEN as u16))
             .width(Length::Fixed(ANCHO))
             .style(|_theme: &iced_widget::Theme| container::Style {
-                background: Some(tema::CARD.into()),
+                background: Some(tema::card().into()),
                 border: Border {
                     radius: tema::R_TARJETA.into(),
                     width: 1.0,
-                    color: tema::BORDE,
+                    color: tema::borde(),
                 },
                 ..Default::default()
             })
@@ -322,7 +332,12 @@ fn cpu() -> Option<String> {
     let texto = std::fs::read_to_string("/proc/cpuinfo").ok()?;
     let linea = texto.lines().find(|l| l.starts_with("model name"))?;
     let modelo = linea.split_once(':')?.1.trim();
-    Some(modelo.replace("(R)", "").replace("(TM)", "").replace("  ", " "))
+    Some(
+        modelo
+            .replace("(R)", "")
+            .replace("(TM)", "")
+            .replace("  ", " "),
+    )
 }
 
 /// La memoria en GB redondeados.

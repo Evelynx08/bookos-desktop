@@ -25,7 +25,9 @@ use smithay::backend::renderer::element::memory::{
 };
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
-use smithay::backend::renderer::element::utils::RescaleRenderElement;
+use smithay::backend::renderer::element::utils::{
+    CropRenderElement, RelocateRenderElement, RescaleRenderElement,
+};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Physical, Point, Rectangle, Transform};
 
@@ -42,6 +44,9 @@ smithay::render_elements! {
     pub OverlayElement<=GlesRenderer>;
     Memory=MemoryRenderBufferRenderElement<GlesRenderer>,
     Surface=WaylandSurfaceRenderElement<GlesRenderer>,
+    /// La ventana congelada y deformada del minimizar «magic lamp». Es la
+    /// única que dibuja con un shader propio sobre una textura nuestra.
+    Genio=crate::genio::Elemento,
     /// Un rectángulo de color, para el velo del launchpad. Va aparte porque
     /// pintarlo dentro del buffer del shell obligaría a rasterizar la pantalla
     /// entera en CPU; aquí lo compone la GPU y no cuesta nada.
@@ -51,6 +56,12 @@ smithay::render_elements! {
     /// ventana quieta va por `Surface`, sin capa de por medio, para no darle al
     /// damage tracker geometría redondeada donde puede tener la exacta.
     Escalada=RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>,
+    /// La barra de título mientras su ventana crece al aparecer. Va aparte de
+    /// `Memory` por lo mismo que `Escalada`: una barra quieta no pasa por la
+    /// capa de escala, para no darle al damage tracker geometría redondeada.
+    MemoriaEscalada=RescaleRenderElement<MemoryRenderBufferRenderElement<GlesRenderer>>,
+    /// Superficie viva ajustada al hueco de Meta+Tab.
+    Miniatura=CropRenderElement<RelocateRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>>,
     /// El fondo esmerilado que va detrás del panel y del dock. Solo existe
     /// para el renderer de GLES: desenfocar necesita copiar el framebuffer, y
     /// eso es GL crudo.

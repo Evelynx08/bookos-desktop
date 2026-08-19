@@ -11,7 +11,7 @@
 //! deliberado allí y se mantiene aquí para que el escritorio se comporte igual
 //! desde los dos sitios.
 
-use iced_core::{Border, Color, Length};
+use iced_core::{Border, Length};
 use iced_widget::{column, container, row, text, Space};
 
 use crate::tema;
@@ -67,6 +67,14 @@ fn entradas() -> Vec<Entrada> {
         },
         Divisor,
         Item {
+            // Antes de «Preferencias del sistema…», que abre otro programa:
+            // esta es del propio escritorio y se aplica al pulsarla.
+            etiqueta: "Apariencia…",
+            icono: "apariencia",
+            atajo: None,
+            accion: || Accion::Emergente("apariencia"),
+        },
+        Item {
             etiqueta: "Preferencias del sistema…",
             icono: "preferencias",
             atajo: None,
@@ -89,17 +97,13 @@ fn entradas() -> Vec<Entrada> {
             etiqueta: "Reiniciar…",
             icono: "reiniciar",
             atajo: None,
-            accion: || {
-                Accion::Lanzar("systemctl reboot -i || systemctl reboot --force".into())
-            },
+            accion: || Accion::Lanzar("systemctl reboot -i || systemctl reboot --force".into()),
         },
         Item {
             etiqueta: "Apagar…",
             icono: "apagar",
             atajo: None,
-            accion: || {
-                Accion::Lanzar("systemctl poweroff -i || systemctl poweroff --force".into())
-            },
+            accion: || Accion::Lanzar("systemctl poweroff -i || systemctl poweroff --force".into()),
         },
         Divisor,
         Item {
@@ -134,16 +138,22 @@ fn entradas() -> Vec<Entrada> {
 
 pub struct Menu {
     entradas: Vec<Entrada>,
-    /// Índice de la entrada bajo el puntero, o seleccionada con el teclado.
-    señalada: Option<usize>,
+    /// La entrada bajo el puntero —o la elegida con el teclado— y cuánto le
+    /// queda a la anterior para apagarse.
+    señalada: tema::Realce,
 }
 
 impl Menu {
     pub fn new() -> Self {
         Self {
             entradas: entradas(),
-            señalada: None,
+            señalada: tema::Realce::nuevo(),
         }
+    }
+
+    /// El realce entrando o saliendo. Mientras dure, el compositor repinta.
+    pub fn animando(&self) -> bool {
+        self.señalada.animando()
     }
 
     pub fn size(&self) -> (f32, f32) {
@@ -185,12 +195,8 @@ impl Menu {
     }
 
     pub fn puntero(&mut self, punto: Option<(f32, f32)>) -> bool {
-        let señalada = punto.and_then(|(x, y)| self.entrada_en(x, y));
-        if self.señalada == señalada {
-            return false;
-        }
-        self.señalada = señalada;
-        true
+        self.señalada
+            .señalar(punto.and_then(|(x, y)| self.entrada_en(x, y)))
     }
 
     pub fn pulsar(&mut self, x: f32, y: f32) -> Option<Accion> {
@@ -218,7 +224,7 @@ impl Menu {
     /// Mueve la selección saltándose los divisores.
     fn mover(&mut self, paso: isize) -> Tecla {
         let n = self.entradas.len();
-        let mut i = match self.señalada {
+        let mut i = match self.señalada.actual() {
             Some(i) => i as isize,
             // Al entrar por teclado se empieza por el extremo que toque.
             None if paso > 0 => -1,
@@ -230,7 +236,7 @@ impl Menu {
                 return Tecla::Consumida;
             }
             if matches!(self.entradas[i as usize], Entrada::Item { .. }) {
-                self.señalada = Some(i as usize);
+                self.señalada.señalar(Some(i as usize));
                 return Tecla::Consumida;
             }
         }
@@ -246,7 +252,7 @@ impl Menu {
                     atajo,
                     icono,
                     ..
-                } => fila(etiqueta, *atajo, icono, self.señalada == Some(i)),
+                } => fila(etiqueta, *atajo, icono, self.señalada.intensidad(i)),
                 Entrada::Divisor => divisor(),
             });
         }
@@ -255,11 +261,11 @@ impl Menu {
         container(col)
             .width(Length::Fixed(ANCHO))
             .style(|_theme| container::Style {
-                background: Some(tema::CARD.into()),
+                background: Some(tema::card().into()),
                 border: Border {
                     radius: tema::R_POPOVER.into(),
                     width: 1.0,
-                    color: tema::BORDE,
+                    color: tema::borde(),
                 },
                 ..Default::default()
             })
@@ -267,19 +273,24 @@ impl Menu {
     }
 }
 
+/// Una fila del menú. `señalada` va de 0 a 1: es el realce entrando.
+///
+/// El color se **interpola** en vez de conmutar. Con el hover de acento sólido
+/// del plasmoide, encender y apagar de golpe se lee como un parpadeo al pasar
+/// el ratón por el menú de arriba abajo; los 120 ms del token de hover lo
+/// convierten en un rastro.
 pub(super) fn fila(
     etiqueta: &str,
     atajo: Option<&str>,
     icono: &str,
-    señalada: bool,
+    señalada: f32,
 ) -> PanelElement<'static> {
     // El hover del plasmoide es acento **sólido** con el texto en blanco, no un
-    // gris sutil: es lo que hace que se lea como un menú de sistema.
-    let (fondo, color) = if señalada {
-        (tema::ACENTO, Color::WHITE)
-    } else {
-        (Color::TRANSPARENT, tema::TEXTO)
-    };
+    // gris sutil: es lo que hace que se lea como un menú de sistema. El fondo
+    // entra por alfa y no mezclándose con la tarjeta porque debajo hay un
+    // popover translúcido: mezclar con `card()` dejaría un rectángulo opaco.
+    let fondo = tema::alfa(tema::acento(), señalada);
+    let color = tema::mezclar(tema::texto(), tema::sobre_acento(), señalada);
 
     // El icono se tiñe del color de la fila para que siga al texto al pasar a
     // fondo de acento; si no, quedaría blanco sobre azul con el mismo tono y
@@ -298,7 +309,7 @@ pub(super) fn fila(
     .align_y(iced_core::alignment::Vertical::Center);
     contenido = contenido.push(Space::new().width(Length::Fill));
     if let Some(atajo) = atajo {
-        let color_atajo = if señalada { Color::WHITE } else { tema::TEXTO2 };
+        let color_atajo = tema::mezclar(tema::TEXTO2, tema::sobre_acento(), señalada);
         contenido = contenido.push(
             text(atajo.to_string())
                 .size(tema::T_PEQUENO - 1.0)
@@ -330,7 +341,7 @@ pub(super) fn divisor() -> PanelElement<'static> {
         container(Space::new().height(Length::Fixed(1.0)))
             .width(Length::Fill)
             .style(|_theme| container::Style {
-                background: Some(tema::DIVISOR.into()),
+                background: Some(tema::divisor().into()),
                 ..Default::default()
             }),
     )

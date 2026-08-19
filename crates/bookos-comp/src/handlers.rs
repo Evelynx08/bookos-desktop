@@ -14,19 +14,26 @@ use smithay::wayland::compositor::{
     get_parent, is_sync_subsurface, CompositorClientState, CompositorHandler, CompositorState,
 };
 use smithay::wayland::selection::data_device::{
-    ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
+    set_data_device_focus, ClientDndGrabHandler, DataDeviceHandler, DataDeviceState,
+    ServerDndGrabHandler,
 };
 use smithay::wayland::fractional_scale::{with_fractional_scale, FractionalScaleHandler};
 use smithay::wayland::output::OutputHandler;
 use smithay::wayland::seat::WaylandFocus;
+use smithay::wayland::selection::primary_selection::{
+    set_primary_focus, PrimarySelectionHandler, PrimarySelectionState,
+};
+use smithay::wayland::selection::wlr_data_control::{DataControlHandler, DataControlState};
 use smithay::wayland::selection::SelectionHandler;
+use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
 };
 use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::{
-    delegate_compositor, delegate_data_device, delegate_fractional_scale, delegate_output,
-    delegate_seat, delegate_shm, delegate_viewporter, delegate_xdg_shell,
+    delegate_compositor, delegate_data_control, delegate_data_device, delegate_fractional_scale,
+    delegate_output, delegate_primary_selection, delegate_seat, delegate_shm, delegate_viewporter,
+    delegate_xdg_shell,
 };
 
 use crate::state::{BookosComp, ClientState};
@@ -133,14 +140,31 @@ impl BookosComp {
     /// deba pasar sesenta veces por segundo.
     pub fn actualizar_dock(&mut self) {
         use smithay::utils::IsAlive;
+        // Una minimizada puede morir mientras está guardada —el cliente se
+        // cierra solo, o lo mata alguien—: aquí es donde se entierra, que es el
+        // mismo momento en que el dock se entera de que ya no está.
+        self.minimizadas.retain(|(w, _)| w.alive());
+        self.minimizando.retain(|(w, _)| w.alive());
+        // Las minimizadas y las de otros escritorios cuentan como abiertas: no
+        // están en el `Space`, pero el punto del dock dice «esta aplicación
+        // está en marcha», no «esta aplicación se ve ahora mismo». Sin ellas, el
+        // icono se apagaba al minimizar y volvía a encenderse al restaurar.
         let ids: Vec<String> = self
             .space
             .elements()
+            .chain(self.minimizadas.iter().map(|(w, _)| w))
             .filter(|w| w.alive())
             .filter_map(app_id)
             .collect();
         if self.shell.as_mut().is_some_and(|s| s.ventanas(&ids)) {
             self.needs_redraw = true;
+        }
+        // Aquí es también donde se tiran las barras de las ventanas que ya no
+        // están: son los mismos tres momentos —mapear, cerrar, cambiar de
+        // app_id— y así no hay una segunda lista que purgar.
+        let barras = crate::decoracion::vivas(self);
+        if let Some(shell) = self.shell.as_mut() {
+            shell.barras_retener(&barras);
         }
     }
 
@@ -196,6 +220,32 @@ pub fn app_id(window: &Window) -> Option<String> {
     })
 }
 
+/// El título de la ventana, para distinguir dos del mismo programa.
+///
+/// Mismo camino que [`app_id`]: X11 lo lleva en su propia propiedad y Wayland en
+/// el estado del `xdg_toplevel`. Un título vacío es `None` y no una cadena
+/// vacía — quien lo enseña tiene que poder caer al nombre de la aplicación.
+pub fn titulo(window: &Window) -> Option<String> {
+    use smithay::wayland::compositor::with_states;
+    use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
+
+    if let Some(x11) = window.x11_surface() {
+        return Some(x11.title()).filter(|t| !t.trim().is_empty());
+    }
+
+    let surface = window.wl_surface()?;
+    with_states(&surface, |states| {
+        states
+            .data_map
+            .get::<XdgToplevelSurfaceData>()?
+            .lock()
+            .ok()?
+            .title
+            .clone()
+    })
+    .filter(|t| !t.trim().is_empty())
+}
+
 impl XdgShellHandler for BookosComp {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
         &mut self.xdg_shell_state
@@ -231,8 +281,17 @@ impl XdgShellHandler for BookosComp {
     }
 
     fn toplevel_destroyed(&mut self, _surface: ToplevelSurface) {
+        // La lista y sus geometrías dejarían de corresponderse al desaparecer
+        // una celda. Cancelar es seguro y evita enfocar o renderizar un destino
+        // muerto mientras se mantiene el modificador.
+        if self.shell.as_ref().is_some_and(|s| s.hay_conmutador()) {
+            crate::keybinds::ejecutar(self, crate::keybinds::Accion::ConmutarCancelar);
+        }
         // Al cerrarse una ventana puede quedar libre el sitio de una barra.
         self.revisar_barras();
+        // Y si estaba apartada en otro escritorio, sacarla de allí: nadie la ha
+        // desmapeado del `Space` porque no estaba en él.
+        crate::escritorios::purgar(self);
         // El foco de teclado apuntaba a la ventana que acaba de morir: si no se
         // reasigna, las que siguen abiertas dejan de recibir teclas y el
         // escritorio parece congelado sin estarlo.
@@ -332,7 +391,19 @@ impl SeatHandler for BookosComp {
         &mut self.seat_state
     }
 
-    fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
+    /// El portapapeles va **con el foco**: el cliente enfocado es el único al
+    /// que se le ofrece la selección, y el único al que se le puede aceptar que
+    /// la cambie.
+    ///
+    /// Esto estaba vacío, y por eso copiar y pegar entre dos aplicaciones no
+    /// terminaba de funcionar: sin este aviso, el `wl_data_device` del cliente
+    /// nuevo nunca recibía la oferta de lo que había en el portapapeles.
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        use smithay::reexports::wayland_server::Resource as _;
+        let cliente = focused.and_then(|s| self.display_handle.get_client(s.id()).ok());
+        set_data_device_focus(&self.display_handle, seat, cliente.clone());
+        set_primary_focus(&self.display_handle, seat, cliente);
+    }
 
     fn cursor_image(
         &mut self,
@@ -384,14 +455,71 @@ impl DataDeviceHandler for BookosComp {
     }
 }
 
+impl PrimarySelectionHandler for BookosComp {
+    fn primary_selection_state(&self) -> &PrimarySelectionState {
+        &self.primary_selection_state
+    }
+}
+
+impl DataControlHandler for BookosComp {
+    fn data_control_state(&self) -> &DataControlState {
+        &self.data_control_state
+    }
+}
+
 impl ClientDndGrabHandler for BookosComp {}
 impl ServerDndGrabHandler for BookosComp {}
 
+/// La decoración: por defecto la dibuja el escritorio.
+///
+/// Un cliente que pida `ClientSide` se sale con la suya —Wayland es así, y
+/// pelearse con GTK acaba en dos barras de título—, pero el que no diga nada o
+/// deje elegir se lleva la nuestra.
+impl smithay::wayland::shell::xdg::decoration::XdgDecorationHandler for BookosComp {
+    fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        self.modo_decoracion(&toplevel, DecorationMode::ServerSide);
+    }
+
+    fn request_mode(&mut self, toplevel: ToplevelSurface, mode: DecorationMode) {
+        self.modo_decoracion(&toplevel, mode);
+    }
+
+    /// «Me da igual»: entonces la ponemos nosotros.
+    fn unset_mode(&mut self, toplevel: ToplevelSurface) {
+        self.modo_decoracion(&toplevel, DecorationMode::ServerSide);
+    }
+}
+
+impl BookosComp {
+    /// Le dice al cliente quién dibuja su barra y lo apunta para el render.
+    ///
+    /// El `configure` sale aquí mismo salvo que el cliente aún no haya recibido
+    /// el primero: en ese caso lo manda `send_initial_configure` con el modo ya
+    /// puesto, que es lo que espera el protocolo.
+    fn modo_decoracion(&mut self, toplevel: &ToplevelSurface, modo: DecorationMode) {
+        toplevel.with_pending_state(|state| state.decoration_mode = Some(modo));
+        if let Some(window) = self.window_de_toplevel(toplevel) {
+            crate::decoracion::decorar(&window, modo == DecorationMode::ServerSide);
+            // La ventana ya colocada se baja para dejar sitio a la barra: sin
+            // esto, una que se decore después de mapearse se queda con la barra
+            // metida bajo el panel.
+            self.recolocar_por_barra(&window);
+        }
+        if toplevel.is_initial_configure_sent() {
+            toplevel.send_pending_configure();
+        }
+        self.needs_redraw = true;
+    }
+}
+
+smithay::delegate_xdg_decoration!(BookosComp);
 delegate_compositor!(BookosComp);
 delegate_xdg_shell!(BookosComp);
 delegate_shm!(BookosComp);
 delegate_seat!(BookosComp);
 delegate_data_device!(BookosComp);
+delegate_primary_selection!(BookosComp);
+delegate_data_control!(BookosComp);
 delegate_output!(BookosComp);
 delegate_fractional_scale!(BookosComp);
 delegate_viewporter!(BookosComp);

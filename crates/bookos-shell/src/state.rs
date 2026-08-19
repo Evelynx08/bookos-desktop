@@ -53,7 +53,7 @@ impl PanelData {
     pub fn read() -> Self {
         Self {
             clock: local_hhmm(),
-            battery: Battery::read(),
+            battery: Battery::read(true),
             network: Network::read(),
             brightness: read_brightness(),
         }
@@ -61,7 +61,11 @@ impl PanelData {
 }
 
 impl Battery {
-    pub(crate) fn read() -> Option<Self> {
+    /// `con_minutos` decide si además se estima el tiempo restante, que es la
+    /// parte cara: exige `current_now`, y eso es una consulta al controlador
+    /// embebido —0,53 ms medidos— frente a los 0,02 de `capacity`. Quien llama
+    /// decide con qué cadencia la quiere; ver `widgets::bateria::CADA_MINUTOS`.
+    pub(crate) fn read(con_minutos: bool) -> Option<Self> {
         let path = battery_path()?;
         let percent = read_num(path.join("capacity"))?.min(100) as u8;
         let status = fs::read_to_string(path.join("status")).ok()?;
@@ -81,7 +85,9 @@ impl Battery {
                 "Discharging" => false,
                 _ => ac_online().unwrap_or(false),
             },
-            minutes: remaining_minutes(&path, charging),
+            minutes: con_minutos
+                .then(|| remaining_minutes(&path, charging))
+                .flatten(),
         })
     }
 }
@@ -94,6 +100,10 @@ impl Battery {
 /// corriente— y por tanto salta al vuelo con cada pico de consumo: sirve para
 /// "me queda tarde o me queda un rato", no como promesa.
 fn remaining_minutes(path: &Path, charging: bool) -> Option<u32> {
+    // El `exists()` se repite en cada lectura a propósito: recordarlo en un
+    // global ataría la respuesta a la primera batería que se mirase, y lo que
+    // cuesta aquí es `current_now` —0,53 ms medidos, una consulta al
+    // controlador embebido— no este `stat`, que son 0,02.
     let (ahora, tope, flujo) = if path.join("charge_now").exists() {
         ("charge_now", "charge_full", "current_now")
     } else {
@@ -150,8 +160,7 @@ impl Network {
             // `operstate` es lo que dice el driver; `carrier` es si hay cable o
             // asociación. Se piden los dos porque una interfaz puede estar
             // "up" administrativamente con el cable fuera.
-            let up = fs::read_to_string(path.join("operstate"))
-                .is_ok_and(|s| s.trim() == "up")
+            let up = fs::read_to_string(path.join("operstate")).is_ok_and(|s| s.trim() == "up")
                 && read_num(path.join("carrier")) == Some(1);
             if up {
                 return Some(Self { kind, up });
@@ -180,40 +189,93 @@ pub(crate) fn backlight_device() -> Option<String> {
 /// El valor crudo máximo del dispositivo. En este panel es 400: mandarle un
 /// tanto por ciento directamente lo dejaría al 25 % de lo pedido.
 pub(crate) fn backlight_max(dispositivo: &str) -> Option<u32> {
-    read_num(PathBuf::from("/sys/class/backlight").join(dispositivo).join("max_brightness"))
-        .map(|v| v as u32)
+    read_num(
+        PathBuf::from("/sys/class/backlight")
+            .join(dispositivo)
+            .join("max_brightness"),
+    )
+    .map(|v| v as u32)
+}
+
+/// Recuerda el resultado de buscar un dispositivo en sysfs.
+///
+/// La ruta del backlight o de la batería **no cambia en toda la sesión**: son
+/// dispositivos del portátil, no cosas que se enchufen. Buscarla otra vez en
+/// cada refresco es un `readdir` con sus asignaciones y su ordenación por cada
+/// evento del kernel, y los eventos del kernel llegan en ráfagas: al mover el
+/// brillo con la tecla, uno por paso.
+///
+/// **El fallo no se cachea.** Si no hay nada, se vuelve a mirar la próxima vez:
+/// un módulo puede cargarse después de arrancar la sesión, y recordar «aquí no
+/// hay batería» dejaría el panel sin ella hasta reiniciar. Buscar y no
+/// encontrar es justo el caso barato —un `readdir` de un directorio vacío—, así
+/// que reintentarlo no cuesta.
+fn recordar(
+    cache: &std::sync::OnceLock<PathBuf>,
+    buscar: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(ruta) = cache.get() {
+        return Some(ruta.clone());
+    }
+    let encontrada = buscar()?;
+    // Si dos hilos llegan a la vez gana el primero; los dos devuelven una ruta
+    // válida, que es lo único que importa.
+    let _ = cache.set(encontrada.clone());
+    Some(encontrada)
 }
 
 fn backlight_path() -> Option<PathBuf> {
-    let dir = fs::read_dir("/sys/class/backlight").ok()?;
-    let mut paths: Vec<PathBuf> = dir.filter_map(|e| e.ok()).map(|e| e.path()).collect();
-    paths.sort();
-    paths.into_iter().next()
+    static CACHE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    recordar(&CACHE, || {
+        let dir = fs::read_dir("/sys/class/backlight").ok()?;
+        let mut paths: Vec<PathBuf> = dir.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+        paths.sort();
+        paths.into_iter().next()
+    })
 }
 
 pub(crate) fn read_brightness() -> Option<u8> {
     let path = backlight_path()?;
-    let max = read_num(path.join("max_brightness"))?;
+    // El máximo es una constante del panel: se lee una vez por sesión.
+    static MAXIMO: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let max = match MAXIMO.get() {
+        Some(max) => *max,
+        None => {
+            let max = read_num(path.join("max_brightness"))?;
+            let _ = MAXIMO.set(max);
+            max
+        }
+    };
     if max == 0 {
         return None;
     }
-    let ahora = read_num(path.join("actual_brightness"))?;
+    // `brightness` y no `actual_brightness`: **medido en esta máquina, leer
+    // `actual_brightness` cuesta 0,512 ms y `brightness` 0,030**, diecisiete
+    // veces menos. La diferencia es que el primero le pregunta al hardware por
+    // el valor efectivo y el segundo devuelve el que se pidió, y en un panel de
+    // portátil son el mismo número salvo durante la rampa de una transición.
+    // Ese medio milisegundo se pagaba en **cada** evento de udev, que llegan en
+    // ráfaga al mover el brillo con la tecla.
+    let ahora = read_num(path.join("brightness"))?;
     Some((ahora.min(max) * 100 / max) as u8)
 }
 
 fn battery_path() -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = fs::read_dir("/sys/class/power_supply")
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("BAT"))
-        })
-        .collect();
-    candidates.sort();
-    candidates.into_iter().next()
+    static CACHE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    recordar(&CACHE, || {
+        let mut candidates: Vec<PathBuf> = fs::read_dir("/sys/class/power_supply")
+            .ok()?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("BAT"))
+            })
+            .collect();
+        candidates.sort();
+        candidates.into_iter().next()
+    })
 }
 
 fn read_num(path: impl AsRef<Path>) -> Option<u32> {

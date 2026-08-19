@@ -51,6 +51,8 @@ pub struct Sonido {
     entrada: Canal,
     /// Qué píldora está agarrada ahora mismo, si alguna.
     agarrada: Option<Fila>,
+    /// El botón de silencio bajo el puntero: 0 la salida, 1 la entrada.
+    boton: tema::Realce,
 }
 
 /// Un destino de PipeWire tal y como lo enseña el emergente.
@@ -107,7 +109,11 @@ impl Canal {
             self.silenciado = false;
             let _ = lanzar(&["set-mute", self.destino, "0"]);
         }
-        let _ = lanzar(&["set-volume", self.destino, &format!("{:.2}", self.nivel as f32 / 100.0)]);
+        let _ = lanzar(&[
+            "set-volume",
+            self.destino,
+            &format!("{:.2}", self.nivel as f32 / 100.0),
+        ]);
         self.actualizar_icono();
     }
 
@@ -132,6 +138,7 @@ impl Sonido {
             salida: Canal::nuevo("@DEFAULT_AUDIO_SINK@", false),
             entrada: Canal::nuevo("@DEFAULT_AUDIO_SOURCE@", true),
             agarrada: None,
+            boton: tema::Realce::nuevo(),
         }
     }
 
@@ -139,7 +146,10 @@ impl Sonido {
         // Cabecera + dos secciones. Cada sección es su etiqueta (18) y su fila
         // de controles, que la marca el botón por ser lo más alto.
         let seccion = 18.0 + 8.0 + BOTON;
-        (ANCHO, MARGEN * 2.0 + 22.0 + 14.0 + seccion * 2.0 + ENTRE_SECCIONES)
+        (
+            ANCHO,
+            MARGEN * 2.0 + 22.0 + 14.0 + seccion * 2.0 + ENTRE_SECCIONES,
+        )
     }
 
     /// Cuelga del icono del volumen, como el calendario cuelga del reloj.
@@ -197,15 +207,29 @@ impl Sonido {
     }
 
     pub fn puntero(&mut self, punto: Option<(f32, f32)>) -> bool {
-        let (Some(fila), Some((x, _))) = (self.agarrada, punto) else {
-            return false;
-        };
-        let nivel = self.nivel_en(fila, x);
-        if self.canal(fila).nivel == nivel {
-            return false;
+        // Con una píldora agarrada, el puntero es el deslizador y nada más: el
+        // ratón puede estar sobre un botón mientras se arrastra, y encenderlo
+        // ahí sería prometer una pulsación que no va a ocurrir.
+        if let (Some(fila), Some((x, _))) = (self.agarrada, punto) {
+            let nivel = self.nivel_en(fila, x);
+            if self.canal(fila).nivel == nivel {
+                return false;
+            }
+            self.canal(fila).poner(nivel);
+            return true;
         }
-        self.canal(fila).poner(nivel);
-        true
+        let sobre = punto.and_then(|(x, y)| {
+            let p = iced_core::Point::new(x, y);
+            [Fila::Salida, Fila::Entrada]
+                .into_iter()
+                .position(|f| self.rect_boton(f).contains(p))
+        });
+        self.boton.señalar(sobre)
+    }
+
+    /// ¿Se mueve algo dentro de la tarjeta?
+    pub fn animando(&self) -> bool {
+        self.boton.animando()
     }
 
     pub fn pulsar(&mut self, x: f32, y: f32) -> Option<Accion> {
@@ -269,23 +293,23 @@ impl Sonido {
 
     pub fn view(&self) -> PanelElement<'_> {
         let contenido = column![
-            text("Sonido")
-                .size(tema::T_TITULO)
-                .color(tema::TEXTO),
+            text("Sonido").size(tema::T_TITULO).color(tema::texto()),
             Space::new().height(Length::Fixed(14.0)),
-            self.seccion("Altavoces", &self.salida),
+            self.seccion("Altavoces", &self.salida, self.boton.intensidad(0)),
             Space::new().height(Length::Fixed(ENTRE_SECCIONES)),
-            self.seccion("Micrófono", &self.entrada),
+            self.seccion("Micrófono", &self.entrada, self.boton.intensidad(1)),
         ];
         control::tarjeta(contenido.into(), ANCHO, MARGEN)
     }
 
     /// Una sección: etiqueta y porcentaje arriba, píldora y botón abajo.
-    fn seccion<'a>(&'a self, titulo: &'a str, canal: &'a Canal) -> PanelElement<'a> {
+    fn seccion<'a>(
+        &'a self, titulo: &'a str, canal: &'a Canal, señalado: f32
+    ) -> PanelElement<'a> {
         let color = if canal.silenciado {
             tema::TEXTO2
         } else {
-            tema::TEXTO
+            tema::texto()
         };
         let cabecera = row![
             text(titulo).size(tema::T_PEQUENO).color(tema::TEXTO2),
@@ -296,12 +320,11 @@ impl Sonido {
         let controles = row![
             control::pildora(ancho, canal.nivel, canal.silenciado),
             Space::new().width(Length::Fixed(HUECO)),
-            control::boton(canal.icono.as_ref(), canal.silenciado),
+            control::boton(canal.icono.as_ref(), canal.silenciado, señalado),
         ]
         .align_y(Vertical::Center);
         column![cabecera, Space::new().height(Length::Fixed(8.0)), controles].into()
     }
-
 }
 
 /// Lanza `wpctl` sin esperarlo.

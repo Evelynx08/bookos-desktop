@@ -1,10 +1,8 @@
 //! La campana de notificaciones.
 //!
-//! **Hoy solo es la campana.** Las notificaciones llegan por D-Bus
-//! (`org.freedesktop.Notifications`) y este shell no habla con ningún servicio
-//! a propósito: es lo que hace que el panel esté pintado en el primer frame.
-//! Meter D-Bus es una decisión aparte, no un rato de trabajo, así que el widget
-//! entra con su sitio hecho y el contador preparado.
+//! El contador viene de fuera: quien atiende `org.freedesktop.Notifications` es
+//! el compositor —el shell no habla D-Bus, para poder estar pintado en el
+//! primer frame— y le pasa aquí cuántas hay sin leer.
 //!
 //! El icono cambia con el estado, que es lo que pide el diseño: campana lisa
 //! sin nada pendiente y campana con aviso cuando hay algo, en el color de
@@ -23,7 +21,7 @@ use crate::widget::Widget;
 const CHAPA: f32 = 14.0;
 
 pub struct Notificaciones {
-    /// Cuántas hay sin leer. Mientras no haya D-Bus se queda en cero.
+    /// Cuántas hay sin leer, tal como las cuenta el compositor.
     pendientes: u32,
     icono: Option<Icono>,
     icono_nombre: &'static str,
@@ -32,9 +30,9 @@ pub struct Notificaciones {
 impl Notificaciones {
     pub fn new() -> Self {
         let mut n = Self {
-            // Escotilla para poder mirar la chapa mientras no haya D-Bus: sin
-            // esto, el único estado que se puede dibujar es "ninguna", y el
-            // contador se daría por bueno sin haberlo visto nunca.
+            // Escotilla para poder mirar la chapa sin provocar notificaciones
+            // de verdad. Sigue valiendo con el servidor puesto: el panel se
+            // pinta antes de que llegue ninguna.
             pendientes: std::env::var("BOOKOS_NOTIF_TEST")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -69,6 +67,19 @@ impl Widget for Notificaciones {
         false
     }
 
+    /// El contador lo pone el compositor, que es quien recibe las
+    /// notificaciones. Cambiarlo puede cambiar también el icono y el ancho del
+    /// widget —la chapa se sale por la derecha—, y por eso repinta el panel
+    /// entero y no solo su hueco.
+    fn notificaciones(&mut self, cuantas: u32) -> bool {
+        if self.pendientes == cuantas {
+            return false;
+        }
+        self.pendientes = cuantas;
+        self.actualizar_icono();
+        true
+    }
+
     /// La chapa se sale por la derecha del icono, así que el widget ocupa un
     /// poco más cuando hay algo pendiente: si no, se comería el hueco del
     /// vecino y el reparto de clics del panel dejaría de cuadrar.
@@ -86,9 +97,9 @@ impl Widget for Notificaciones {
         };
         // Con algo pendiente, el acento; sin nada, el color del texto.
         let color = if self.pendientes > 0 {
-            tema::ACENTO
+            tema::acento()
         } else {
-            TEXT
+            TEXT()
         };
         let campana = icono::ver_teñido(ic, tema::ICONO_PANEL, Some(color));
         if self.pendientes == 0 {
@@ -112,7 +123,7 @@ impl Widget for Notificaciones {
             .height(Length::Fixed(CHAPA))
             .center_y(Length::Fixed(CHAPA))
             .style(|_theme: &iced_widget::Theme| container::Style {
-                background: Some(tema::ROJO.into()),
+                background: Some(tema::rojo().into()),
                 border: Border {
                     radius: (CHAPA / 2.0).into(),
                     ..Default::default()
@@ -128,4 +139,3 @@ impl Widget for Notificaciones {
         stack![campana, chapa].into()
     }
 }
-

@@ -8,6 +8,8 @@
 //! ahorro, verde equilibrado, azul rendimiento— y el símbolo de dentro dice de
 //! dónde come el equipo: rayo cargando, enchufe conectado pero parado.
 
+use std::time::{Duration, Instant};
+
 use iced_widget::{row, text};
 
 use crate::icono::{self, Icono};
@@ -119,7 +121,25 @@ pub struct Bateria {
     minutos: Option<f32>,
     /// El perfil de energía, que decide el color cuando no manda el nivel.
     perfil: Option<String>,
+    /// Cuándo se leyó por última vez cada una de las dos cosas caras. Ver
+    /// [`CADA_PERFIL`] y [`CADA_MINUTOS`].
+    perfil_leido: Instant,
+    minutos_leidos: Instant,
 }
+
+/// Cada cuánto se vuelven a leer las dos fuentes lentas.
+///
+/// **Medido en esta máquina**: `platform_profile` cuesta 0,71 ms y
+/// `current_now` 0,53, contra los 0,02 de `capacity` y `status`. Las dos son
+/// consultas al firmware, no lecturas de un fichero, y se pagaban enteras en
+/// cada evento de `power_supply` —que llegan de varios en varios.
+///
+/// Los intervalos son los de lo que enseñan, no números redondos: el perfil
+/// solo cambia cuando alguien lo cambia a mano, y los minutos restantes ya van
+/// suavizados y redondeados a cinco, así que leerlos más de una vez cada medio
+/// minuto no cambia ni un píxel de lo dibujado.
+const CADA_PERFIL: Duration = Duration::from_secs(5);
+const CADA_MINUTOS: Duration = Duration::from_secs(30);
 
 impl Bateria {
     pub fn new() -> Self {
@@ -129,6 +149,10 @@ impl Bateria {
             icono_nombre: String::new(),
             minutos: None,
             perfil: None,
+            // Restados, para que el primer refresco —el del arranque— lea las
+            // dos: el panel tiene que salir con su color y su tiempo puestos.
+            perfil_leido: Instant::now() - CADA_PERFIL,
+            minutos_leidos: Instant::now() - CADA_MINUTOS,
         };
         b.refrescar();
         b
@@ -166,8 +190,16 @@ impl Bateria {
     /// se puede suponer una cadencia fija cuando cualquier evento de udev
     /// provoca una lectura de más. Sube y baja igual de despacio a propósito —
     /// lo que se quiere es un número estable, no uno que reaccione rápido.
-    fn suavizar(&mut self, fresco: &mut Battery) {
+    fn suavizar(&mut self, fresco: &mut Battery, leido: bool) {
         const PESO: f32 = 0.25;
+        // Sin lectura nueva se conserva la media que había. Sin esto, los
+        // refrescos de entre medias —los que solo miran el porcentaje— dejarían
+        // `minutes` en `None` y la etiqueta perdería el «2:15» hasta la
+        // siguiente lectura cara: un parpadeo cada pocos segundos.
+        if !leido {
+            fresco.minutes = self.minutos.map(|m| (m / 5.0).round() as u32 * 5);
+            return;
+        }
         // Enchufar o desenchufar cambia el signo de lo que se mide: la media
         // anterior ya no vale de nada y se empieza de cero.
         if self.dato.map(|b| b.charging) != Some(fresco.charging) {
@@ -202,7 +234,7 @@ impl Bateria {
     /// aviso y no un estado: ahí el perfil da igual.
     fn color(bat: &Battery, perfil: Option<&str>) -> iced_core::Color {
         if bat.percent <= 15 && !bat.plugged {
-            PELIGRO
+            PELIGRO()
         } else {
             // Cada perfil con su color, que son los del diseño: ahorro
             // amarillo, equilibrado verde y rendimiento azul. `low-power` es
@@ -210,10 +242,10 @@ impl Bateria {
             // power-profiles-daemon; el fichero de sysfs trae uno u otro según
             // el driver de la plataforma.
             match perfil {
-                Some("low-power" | "power-saver" | "quiet") => tema::PERFIL_AHORRO,
-                Some("balanced" | "balanced-performance") => tema::PERFIL_EQUILIBRADO,
-                Some("performance") => tema::PERFIL_RENDIMIENTO,
-                _ => TEXT,
+                Some("low-power" | "power-saver" | "quiet") => tema::perfil_ahorro(),
+                Some("balanced" | "balanced-performance") => tema::perfil_equilibrado(),
+                Some("performance") => tema::perfil_rendimiento(),
+                _ => TEXT(),
             }
         }
     }
@@ -221,11 +253,19 @@ impl Bateria {
     /// El perfil de energía, leído de sysfs.
     ///
     /// Se lee el fichero en vez de preguntar a power-profiles-daemon por D-Bus
-    /// porque esto ocurre en cada refresco del panel: `busctl` es un proceso
-    /// nuevo cada vez, y leer `platform_profile` es un `read` de doce bytes.
-    /// Escribirlo sí necesita el daemon —el fichero es de root—, y eso lo hace
-    /// el emergente de energía.
-    fn perfil() -> Option<String> {
+    /// porque esto ocurre en el refresco del panel: `busctl` es un proceso
+    /// nuevo cada vez. Lo que **no** es cierto es que leerlo sea barato:
+    /// `platform_profile` no es un fichero, es una llamada a la ACPI, y medido
+    /// en esta máquina cuesta **0,71 ms** —treinta veces más que `capacity`—.
+    ///
+    /// Por eso no se lee en cada refresco sino como mucho cada [`CADA_PERFIL`]:
+    /// el perfil solo cambia cuando alguien lo cambia a mano, y los refrescos
+    /// llegan en ráfaga con cada evento de `power_supply`.
+    fn perfil(&mut self) -> Option<String> {
+        if self.perfil_leido.elapsed() < CADA_PERFIL {
+            return self.perfil.clone();
+        }
+        self.perfil_leido = Instant::now();
         std::fs::read_to_string("/sys/firmware/acpi/platform_profile")
             .ok()
             .map(|s| s.trim().to_string())
@@ -261,12 +301,18 @@ impl Widget for Bateria {
     }
 
     fn refrescar(&mut self) -> bool {
-        let mut fresco = Battery::read();
+        // El tiempo restante solo se estima de tanto en tanto: es la parte que
+        // le cuesta medio milisegundo al controlador embebido.
+        let toca_minutos = self.minutos_leidos.elapsed() >= CADA_MINUTOS;
+        if toca_minutos {
+            self.minutos_leidos = Instant::now();
+        }
+        let mut fresco = Battery::read(toca_minutos);
         match fresco.as_mut() {
-            Some(b) => self.suavizar(b),
+            Some(b) => self.suavizar(b, toca_minutos),
             None => self.minutos = None,
         }
-        let perfil = Self::perfil();
+        let perfil = self.perfil();
         if fresco == self.dato && perfil == self.perfil {
             return false;
         }
@@ -293,19 +339,22 @@ impl Widget for Bateria {
         // es el dibujo y el número solo es el dato. Solo bajo mínimos se pinta
         // también el texto, que ahí sí conviene que grite.
         let color = if bat.percent <= 15 && !bat.plugged {
-            PELIGRO
+            PELIGRO()
         } else {
-            TEXT
+            TEXT()
         };
         let etiqueta = Self::etiqueta(bat);
 
-        let mut fila = row![].spacing(5).align_y(iced_core::alignment::Vertical::Center);
+        let mut fila = row![]
+            .spacing(5)
+            .align_y(iced_core::alignment::Vertical::Center);
         if let Some(ic) = &self.icono {
             // Sin teñir: el pictograma ya trae dentro el color del estado, el
             // del borde y el del relleno, que son tres y distintos.
             fila = fila.push(icono::ver(ic, ANCHO_ICONO, ALTO_ICONO));
         }
-        fila.push(text(etiqueta).size(tema::T_CUERPO).color(color)).into()
+        fila.push(text(etiqueta).size(tema::T_CUERPO).color(color))
+            .into()
     }
 }
 
@@ -329,27 +378,30 @@ mod tests {
     fn el_color_es_el_del_perfil() {
         assert_eq!(
             Bateria::color(&bat(80, true, true), Some("low-power")),
-            tema::PERFIL_AHORRO
+            tema::perfil_ahorro()
         );
         assert_eq!(
             Bateria::color(&bat(80, false, true), Some("balanced")),
-            tema::PERFIL_EQUILIBRADO
+            tema::perfil_equilibrado()
         );
         assert_eq!(
             Bateria::color(&bat(80, false, false), Some("performance")),
-            tema::PERFIL_RENDIMIENTO
+            tema::perfil_rendimiento()
         );
-        assert_eq!(Bateria::color(&bat(80, false, false), None), TEXT);
+        assert_eq!(Bateria::color(&bat(80, false, false), None), TEXT());
     }
 
     /// Bajo mínimos y desenchufado el rojo se impone: es un aviso, no un
     /// estado. Enchufado al 10 % no hay nada que avisar.
     #[test]
     fn el_rojo_solo_avisa_sin_corriente() {
-        assert_eq!(Bateria::color(&bat(10, false, false), Some("balanced")), PELIGRO);
+        assert_eq!(
+            Bateria::color(&bat(10, false, false), Some("balanced")),
+            PELIGRO()
+        );
         assert_eq!(
             Bateria::color(&bat(10, false, true), Some("balanced")),
-            tema::PERFIL_EQUILIBRADO
+            tema::perfil_equilibrado()
         );
     }
 
@@ -366,12 +418,17 @@ mod tests {
     /// distingue los dos estados de CA, y se genera con `format!`.
     #[test]
     fn el_pictograma_dibuja_su_simbolo() {
-        let rayo = pictograma(80, Simbolo::Rayo, tema::ACENTO);
+        let rayo = pictograma(80, Simbolo::Rayo, tema::acento());
         assert!(rayo.contains("polygon"), "el rayo es un polígono");
-        let enchufe = pictograma(80, Simbolo::Enchufe, tema::ACENTO);
+        let enchufe = pictograma(80, Simbolo::Enchufe, tema::acento());
         assert!(!enchufe.contains("polygon"));
         // Las cuatro piezas del enchufe más los tres rectángulos del cuerpo.
         assert_eq!(enchufe.matches("<rect").count(), 7);
-        assert_eq!(pictograma(80, Simbolo::Nada, tema::ACENTO).matches("<rect").count(), 3);
+        assert_eq!(
+            pictograma(80, Simbolo::Nada, tema::acento())
+                .matches("<rect")
+                .count(),
+            3
+        );
     }
 }

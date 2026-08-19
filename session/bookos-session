@@ -24,13 +24,22 @@ export QT_QPA_PLATFORM=wayland
 export GDK_BACKEND=wayland,x11
 export MOZ_ENABLE_WAYLAND=1
 
-# El binario: primero el instalado, y si no, el del árbol de desarrollo. Así la
-# misma entrada de sesión sirve para probar sin instalar nada.
+# El binario: primero el instalado, y si no, el del árbol de desarrollo.
+#
+# Entre `release` y `debug` gana **el más reciente**, no `release` por delante
+# como antes. Ese orden fijo era una trampa: `cargo run` y `cargo build`
+# compilan en `debug`, así que quien tocaba el código y se iba al TTY seguía
+# arrancando el `release` de la última vez y probaba una versión vieja sin
+# enterarse. Costó una tarde de "esto no funciona" que sí funcionaba.
 binario=/usr/local/bin/bookos-comp
 if [ ! -x "$binario" ]; then
     raiz="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+    binario=""
     for candidato in "$raiz/target/release/bookos-comp" "$raiz/target/debug/bookos-comp"; do
-        [ -x "$candidato" ] && binario="$candidato" && break
+        [ -x "$candidato" ] || continue
+        if [ -z "$binario" ] || [ "$candidato" -nt "$binario" ]; then
+            binario="$candidato"
+        fi
     done
 fi
 if [ ! -x "$binario" ]; then
@@ -41,4 +50,10 @@ fi
 # El registro va a un fichero y no a la salida estándar porque SDDM se la come:
 # cuando la sesión no arranca, esto es lo único que queda para saber por qué.
 registro="${XDG_RUNTIME_DIR:-/tmp}/bookos-session.log"
-exec "$binario" >"$registro" 2>&1
+# Qué binario y de cuándo, lo primero de todo: es la línea que contesta a "¿por
+# qué no veo el cambio que acabo de hacer?".
+{
+    echo "bookos-session: $binario"
+    echo "compilado: $(date -r "$binario" '+%d/%m %H:%M' 2>/dev/null || echo '?')"
+} >"$registro"
+exec "$binario" >>"$registro" 2>&1

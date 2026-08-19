@@ -23,8 +23,14 @@ impl Red {
 /// desconectado en vez de con el de señal, que sería mentir.
 fn nombre_icono(dato: Option<Network>) -> &'static str {
     match dato {
-        Some(Network { kind: Link::Wifi, up: true }) => "network-wireless-connected-100",
-        Some(Network { kind: Link::Cable, up: true }) => "network-wired-activated",
+        Some(Network {
+            kind: Link::Wifi,
+            up: true,
+        }) => "network-wireless-connected-100",
+        Some(Network {
+            kind: Link::Cable,
+            up: true,
+        }) => "network-wired-activated",
         Some(_) => "network-disconnect",
         None => "network-disconnect",
     }
@@ -58,7 +64,7 @@ impl Widget for Red {
         // Caída se atenúa, como el texto que había antes: no es un fallo, es
         // una cosa menos encendida.
         let color = match self.dato {
-            Some(red) if red.up => tema::TEXTO,
+            Some(red) if red.up => tema::texto(),
             _ => tema::TEXTO2,
         };
         match &self.icono {

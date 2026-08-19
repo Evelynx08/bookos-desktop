@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 
 use iced_widget::{image as iced_image, svg};
 
-/// Un icono ya cargado, listo para dibujar.
+/// Un icono ya cargado, listo para dibujar. Clonarlo es barato —los `Handle` de iced son punteros
+/// contados— y además **conserva el identificador**, que es lo que permite a
+/// iced reutilizar el rasterizado. Ver [`CACHE`].
+#[derive(Clone)]
 pub enum Icono {
     Svg(svg::Handle),
     Raster(iced_image::Handle),
@@ -109,47 +112,107 @@ pub fn ver(icono: &Icono, ancho: f32, alto: f32) -> crate::view::PanelElement<'_
 /// `currentColor` el icono saldría sin pintar: usvg no lo resuelve sin un
 /// contexto de estilo que aquí no hay.
 const PROPIOS: &[(&str, &[u8])] = &[
-    ("volumen-silencio", include_bytes!("../assets/iconos/volumen-silencio.svg")),
-    ("volumen-bajo", include_bytes!("../assets/iconos/volumen-bajo.svg")),
-    ("volumen-medio", include_bytes!("../assets/iconos/volumen-medio.svg")),
-    ("volumen-alto", include_bytes!("../assets/iconos/volumen-alto.svg")),
+    (
+        "volumen-silencio",
+        include_bytes!("../assets/iconos/volumen-silencio.svg"),
+    ),
+    (
+        "volumen-bajo",
+        include_bytes!("../assets/iconos/volumen-bajo.svg"),
+    ),
+    (
+        "volumen-medio",
+        include_bytes!("../assets/iconos/volumen-medio.svg"),
+    ),
+    (
+        "volumen-alto",
+        include_bytes!("../assets/iconos/volumen-alto.svg"),
+    ),
     ("micro", include_bytes!("../assets/iconos/micro.svg")),
     // --- Del sistema de diseño (heroicons 24/outline) --------------------
     // Vienen de BookOS-HIG y sustituyen a los dibujados a mano: el escritorio
     // y sus aplicaciones enseñan así el mismo icono para la misma cosa.
-    ("bateria-0", include_bytes!("../assets/iconos/bateria-0.svg")),
-    ("bateria-50", include_bytes!("../assets/iconos/bateria-50.svg")),
-    ("bateria-100", include_bytes!("../assets/iconos/bateria-100.svg")),
-    ("bateria-carga", include_bytes!("../assets/iconos/bateria-carga.svg")),
+    (
+        "bateria-0",
+        include_bytes!("../assets/iconos/bateria-0.svg"),
+    ),
+    (
+        "bateria-50",
+        include_bytes!("../assets/iconos/bateria-50.svg"),
+    ),
+    (
+        "bateria-100",
+        include_bytes!("../assets/iconos/bateria-100.svg"),
+    ),
+    (
+        "bateria-carga",
+        include_bytes!("../assets/iconos/bateria-carga.svg"),
+    ),
     ("wifi", include_bytes!("../assets/iconos/wifi.svg")),
     ("sin-red", include_bytes!("../assets/iconos/sin-red.svg")),
-    ("notificaciones", include_bytes!("../assets/iconos/notificaciones.svg")),
-    ("notificaciones-aviso", include_bytes!("../assets/iconos/notificaciones-aviso.svg")),
+    (
+        "notificaciones",
+        include_bytes!("../assets/iconos/notificaciones.svg"),
+    ),
+    (
+        "notificaciones-aviso",
+        include_bytes!("../assets/iconos/notificaciones-aviso.svg"),
+    ),
     ("control", include_bytes!("../assets/iconos/control.svg")),
-
     ("brillo", include_bytes!("../assets/iconos/brillo.svg")),
+    // Los dos del buscador: la lupa del campo y la terminal de un comando.
+    ("buscar", include_bytes!("../assets/iconos/buscar.svg")),
+    ("terminal", include_bytes!("../assets/iconos/terminal.svg")),
     ("teclado", include_bytes!("../assets/iconos/teclado.svg")),
     ("touchpad", include_bytes!("../assets/iconos/touchpad.svg")),
     // El logo del sistema, que es lo que abre: el cajón de todo. Va sin teñir
     // —tiene su propia paleta— y por eso el dock lo trata como un icono de
     // aplicación y no como uno de estado.
-    ("launchpad", include_bytes!("../assets/iconos/launchpad.svg")),
+    (
+        "launchpad",
+        include_bytes!("../assets/iconos/launchpad.svg"),
+    ),
     // La alternativa del cohete, por si algún día se prefiere: `dock =
     // launchpad:Aplicaciones:launchpad-cohete, ...`
-    ("launchpad-cohete", include_bytes!("../assets/iconos/launchpad-cohete.svg")),
-    ("bluetooth", include_bytes!("../assets/iconos/bluetooth.svg")),
-    ("bluetooth-apagado", include_bytes!("../assets/iconos/bluetooth-apagado.svg")),
-    ("micro-silencio", include_bytes!("../assets/iconos/micro-silencio.svg")),
+    (
+        "launchpad-cohete",
+        include_bytes!("../assets/iconos/launchpad-cohete.svg"),
+    ),
+    (
+        "bluetooth",
+        include_bytes!("../assets/iconos/bluetooth.svg"),
+    ),
+    (
+        "bluetooth-apagado",
+        include_bytes!("../assets/iconos/bluetooth-apagado.svg"),
+    ),
+    (
+        "micro-silencio",
+        include_bytes!("../assets/iconos/micro-silencio.svg"),
+    ),
     // --- Los de los menús ------------------------------------------------
     ("acerca", include_bytes!("../assets/iconos/acerca.svg")),
-    ("preferencias", include_bytes!("../assets/iconos/preferencias.svg")),
+    (
+        "preferencias",
+        include_bytes!("../assets/iconos/preferencias.svg"),
+    ),
+    (
+        "apariencia",
+        include_bytes!("../assets/iconos/apariencia.svg"),
+    ),
     ("tienda", include_bytes!("../assets/iconos/tienda.svg")),
     ("dormir", include_bytes!("../assets/iconos/dormir.svg")),
-    ("reiniciar", include_bytes!("../assets/iconos/reiniciar.svg")),
+    (
+        "reiniciar",
+        include_bytes!("../assets/iconos/reiniciar.svg"),
+    ),
     ("apagar", include_bytes!("../assets/iconos/apagar.svg")),
     ("bloquear", include_bytes!("../assets/iconos/bloquear.svg")),
     ("salir", include_bytes!("../assets/iconos/salir.svg")),
-    ("ventana-nueva", include_bytes!("../assets/iconos/ventana-nueva.svg")),
+    (
+        "ventana-nueva",
+        include_bytes!("../assets/iconos/ventana-nueva.svg"),
+    ),
     ("fijar", include_bytes!("../assets/iconos/fijar.svg")),
     ("cerrar", include_bytes!("../assets/iconos/cerrar.svg")),
     // --- Los del centro de control ---------------------------------------
@@ -158,38 +221,175 @@ const PROPIOS: &[(&str, &[u8])] = &[
     // El rayo tachado, la balanza y el cohete: en la tarjeta de energía cada
     // perfil se reconoce por su dibujo y no solo por el color, que a un
     // daltónico le deja tres puntos iguales.
-    ("perfil-ahorro", include_bytes!("../assets/iconos/perfil-ahorro.svg")),
-    ("perfil-equilibrado", include_bytes!("../assets/iconos/perfil-equilibrado.svg")),
-    ("perfil-rendimiento", include_bytes!("../assets/iconos/perfil-rendimiento.svg")),
+    (
+        "perfil-ahorro",
+        include_bytes!("../assets/iconos/perfil-ahorro.svg"),
+    ),
+    (
+        "perfil-equilibrado",
+        include_bytes!("../assets/iconos/perfil-equilibrado.svg"),
+    ),
+    (
+        "perfil-rendimiento",
+        include_bytes!("../assets/iconos/perfil-rendimiento.svg"),
+    ),
     ("cpu", include_bytes!("../assets/iconos/cpu.svg")),
     ("ahorro", include_bytes!("../assets/iconos/ahorro.svg")),
     ("mantener", include_bytes!("../assets/iconos/mantener.svg")),
     ("noche", include_bytes!("../assets/iconos/noche.svg")),
-    ("compartir", include_bytes!("../assets/iconos/compartir.svg")),
+    (
+        "compartir",
+        include_bytes!("../assets/iconos/compartir.svg"),
+    ),
     ("captura", include_bytes!("../assets/iconos/captura.svg")),
     ("editar", include_bytes!("../assets/iconos/editar.svg")),
     ("musica", include_bytes!("../assets/iconos/musica.svg")),
     ("anterior", include_bytes!("../assets/iconos/anterior.svg")),
-    ("siguiente", include_bytes!("../assets/iconos/siguiente.svg")),
-    ("reproducir", include_bytes!("../assets/iconos/reproducir.svg")),
+    (
+        "siguiente",
+        include_bytes!("../assets/iconos/siguiente.svg"),
+    ),
+    (
+        "reproducir",
+        include_bytes!("../assets/iconos/reproducir.svg"),
+    ),
     ("pausa", include_bytes!("../assets/iconos/pausa.svg")),
 ];
 
 /// Un icono propio por su nombre. `None` si no existe, que solo puede pasar por
 /// una errata al escribirlo.
+///
+/// `escritorio-N` no está en la tabla: se dibuja al vuelo con el número dentro,
+/// que es lo único que lo distingue del anterior. Ver [`escritorio`].
+/// Va por la misma [`CACHE`] que [`cargar`], y no es una optimización de
+/// adorno: `Handle::from_memory` **estrena identificador en cada llamada**, así
+/// que iced no puede reutilizar nada y resvg vuelve a rasterizar el dibujo en
+/// cada fotograma. Medido en la isla de actividades, con sus ocho pictogramas:
+/// un frame del reproductor pasa de 9 ms a 2, y con la cola abierta de 19 a 5.
 pub fn propio(nombre: &str) -> Option<Icono> {
+    con_cache(nombre, || propio_sin_cache(nombre))
+}
+
+/// Resuelve únicamente el catálogo de BookOS sin tocar la caché compartida.
+/// `cargar` lo necesita para poder completar después la búsqueda en los temas
+/// del sistema antes de decidir si guarda un `None` definitivo.
+fn propio_sin_cache(nombre: &str) -> Option<Icono> {
+    if let Some(n) = nombre.strip_prefix("escritorio-") {
+        return n.parse().ok().map(escritorio);
+    }
     PROPIOS
         .iter()
         .find(|(n, _)| *n == nombre)
         .map(|(_, bytes)| Icono::Svg(svg::Handle::from_memory(*bytes)))
 }
 
+/// Lo que ya hubiera guardado con esa clave, o lo que devuelva `construir`.
+fn con_cache(clave: &str, construir: impl FnOnce() -> Option<Icono>) -> Option<Icono> {
+    let cache = CACHE.get_or_init(Default::default);
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(icono) = cache.get(clave) {
+        return icono.clone();
+    }
+    let icono = construir();
+    cache.insert(clave.to_string(), icono.clone());
+    icono
+}
+
+/// El monitor de heroicons (`16/solid/computer-desktop`) con el número del
+/// escritorio dentro de la pantalla.
+///
+/// El número va **dentro del hueco** que el propio icono deja: su path usa
+/// `fill-rule="evenodd"` y el segundo subpath vacía la pantalla, así que ahí no
+/// hay relleno y el dígito se lee sobre el fondo de la cápsula.
+///
+/// Se construye en memoria en vez de tener cinco ficheros —uno por escritorio—
+/// porque lo único que cambia entre ellos es un dígito, y cinco copias del
+/// mismo monitor se separan a la primera corrección del dibujo.
+pub fn escritorio(numero: u32) -> Icono {
+    let digito = digito(numero);
+    desde_svg(&format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#ffffff">
+  <path fill-rule="evenodd" d="M2 4.25A2.25 2.25 0 0 1 4.25 2h7.5A2.25 2.25 0 0 1 14 4.25v5.5A2.25 2.25 0 0 1 11.75 12h-1.312c.1.128.21.248.328.36a.75.75 0 0 1 .234.545v.345a.75.75 0 0 1-.75.75h-4.5a.75.75 0 0 1-.75-.75v-.345a.75.75 0 0 1 .234-.545c.118-.111.228-.232.328-.36H4.25A2.25 2.25 0 0 1 2 9.75v-5.5Zm2.25-.75a.75.75 0 0 0-.75.75v4.5c0 .414.336.75.75.75h7.5a.75.75 0 0 0 .75-.75v-4.5a.75.75 0 0 0-.75-.75h-7.5Z" clip-rule="evenodd"/>
+  <path d="{digito}" fill="none" stroke="#ffffff" stroke-width="0.9"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>"##
+    ))
+}
+
+/// El trazo de un dígito, centrado en el hueco de la pantalla del monitor.
+///
+/// Dibujado y no escrito con `<text>`: resvg necesita una base de fuentes para
+/// rasterizar texto y la que usa iced por dentro no la tiene, así que el
+/// `<text>` salía **vacío** —comprobado pintando el aviso a escala 8, el
+/// monitor aparecía y el número no—. Con trazo, además, el grosor no depende
+/// de qué fuente haya instalada.
+///
+/// El hueco va de (3,5, 3,5) a (12,5, 9,5) en el viewBox de 16; los dígitos
+/// ocupan la caja (6,6 – 9,4) × (4,4 – 8,5), o sea centrados y con aire por los
+/// cuatro lados. Solo hay hasta el 5 porque `escritorios::MAXIMO` son cinco: un
+/// número mayor deja el monitor sin dígito en vez de dibujar cualquier cosa.
+fn digito(numero: u32) -> &'static str {
+    match numero {
+        1 => "M7.38 5.36 8.13 4.65 8.13 8.26",
+        2 => "M6.9 5.49C6.9 4.3 9.19 4.3 9.19 5.88 9.19 6.94 7.21 7.38 6.86 8.26L9.23 8.26",
+        3 => "M6.94 5.14C7.43 4.34 9.14 4.56 9.14 5.62 9.14 6.24 8.53 6.46 8.09 6.46 8.62 6.46 9.28 6.72 9.28 7.38 9.28 8.57 7.3 8.66 6.9 7.82",
+        4 => "M8.66 8.26 8.66 4.65 6.77 7.25 9.23 7.25",
+        5 => "M9.06 4.74 7.16 4.74 7.03 6.37C7.65 6.02 9.28 6.19 9.28 7.29 9.28 8.52 7.43 8.66 6.94 7.86",
+        _ => "",
+    }
+}
+
+/// Los iconos ya resueltos, por nombre.
+///
+/// **No es solo por ahorrarse la búsqueda.** Un `Handle` de iced lleva dentro un
+/// identificador, y el rasterizado se cachea por ese identificador: devolver un
+/// handle nuevo para el mismo icono obliga a iced a rasterizarlo otra vez.
+/// Medido en release, abrir el conmutador con cinco iconos de 64 px costaba
+/// **46,6 ms cada vez** —no solo la primera—, contra 0,32 ms de repintarlo.
+/// Devolviendo el mismo handle, esos 46 ms se pagan una vez por sesión.
+///
+/// El `None` también se guarda: un icono que no está tampoco lo va a estar
+/// dentro de un segundo, y buscarlo son unos cientos de `stat`.
+static CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, Option<Icono>>>,
+> = std::sync::OnceLock::new();
+
 /// Busca el icono por nombre y lo carga. `None` si no aparece o está roto.
 ///
 /// Primero los propios: un icono de BookOS no debe cambiar de dibujo porque el
 /// usuario instale otro tema.
 pub fn cargar(nombre: &str) -> Option<Icono> {
-    if let Some(icono) = propio(nombre) {
+    let cache = CACHE.get_or_init(Default::default);
+    {
+        // No se conserva el bloqueo mientras se resuelve el icono. La ruta de
+        // resolución consulta primero `propio()`, que comparte esta caché; si
+        // entrase con el mutex cogido intentaría bloquearlo por segunda vez y
+        // congelaría el compositor durante su primer arranque.
+        let mapa = match cache.lock() {
+            Ok(mapa) => mapa,
+            Err(envenenado) => envenenado.into_inner(),
+        };
+        if let Some(guardado) = mapa.get(nombre) {
+            return guardado.clone();
+        }
+    }
+
+    let icono = cargar_sin_cache(nombre);
+
+    // Otro hilo puede haber resuelto la misma clave mientras no teníamos el
+    // mutex. En ese caso se conserva su Handle para que iced siga viendo un
+    // único identificador de textura por icono.
+    let mut mapa = match cache.lock() {
+        Ok(mapa) => mapa,
+        Err(envenenado) => envenenado.into_inner(),
+    };
+    mapa.entry(nombre.to_string())
+        .or_insert_with(|| icono.clone())
+        .clone()
+}
+
+fn cargar_sin_cache(nombre: &str) -> Option<Icono> {
+    if let Some(icono) = propio_sin_cache(nombre) {
         return Some(icono);
     }
     resolve_icon(nombre).and_then(|ruta| load_icon(&ruta))
@@ -366,10 +566,28 @@ fn load_icon(path: &Path) -> Option<Icono> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cada escritorio tiene su icono con su número **dibujado**, no escrito:
+    /// un `<text>` aquí sale vacío porque resvg no tiene fuentes cargadas, y el
+    /// aviso enseñaría un monitor en blanco. Este test es lo que impide volver
+    /// a caer en ello.
+    #[test]
+    fn el_icono_de_escritorio_lleva_su_numero() {
+        for n in 1..=crate::config::MAXIMO_ESCRITORIOS {
+            let trazo = digito(n as u32);
+            assert!(!trazo.is_empty(), "el escritorio {n} se queda sin número");
+            assert!(trazo.starts_with('M'), "el dígito {n} no empieza con un M");
+        }
+        assert!(propio("escritorio-3").is_some());
+        // Y un número fuera de la cuenta deja el monitor sin dígito en vez de
+        // dibujar cualquier cosa.
+        assert!(digito(0).is_empty());
+        assert!(digito(9).is_empty());
+        assert!(propio("escritorio-x").is_none());
+    }
 
     /// Los nombres del dock por defecto tienen que resolverse en una máquina
     /// con Breeze y hicolor instalados. Es el test que habría cazado que
@@ -388,6 +606,19 @@ mod tests {
         ] {
             assert!(resolve_icon(nombre).is_some(), "sin icono para {nombre}");
         }
-        println!("{n} directorios en {indexado:?}; 4 búsquedas en {:?}", t1.elapsed());
+        println!(
+            "{n} directorios en {indexado:?}; 4 búsquedas en {:?}",
+            t1.elapsed()
+        );
+    }
+
+    /// `cargar` consulta primero los iconos propios y ambos caminos comparten
+    /// caché. Esta llamada a un icono externo reproducía el interbloqueo que
+    /// dejaba BookOS detenido antes de su primer fotograma.
+    #[test]
+    fn cargar_un_icono_externo_no_reentra_con_el_mutex_cogido() {
+        assert!(cargar("network-disconnect").is_some());
+        // La segunda consulta recorre el camino caliente de la caché.
+        assert!(cargar("network-disconnect").is_some());
     }
 }

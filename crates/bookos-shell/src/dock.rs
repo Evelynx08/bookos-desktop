@@ -21,8 +21,8 @@ use std::path::PathBuf;
 use iced_core::{Border, Color, Length};
 use iced_widget::{column, container, image as iced_image, row, svg, text, Space};
 
-use crate::tema;
 use crate::icono::{self, Icono};
+use crate::tema;
 use crate::view::{PanelElement, ACENTO, TEXT};
 
 pub const ICON: f32 = 50.0;
@@ -36,19 +36,23 @@ pub const MARGIN: f32 = 12.0;
 ///
 /// 0,30 por lo mismo que el panel: debajo va el cristal esmerilado que dibuja
 /// el compositor, y con 0,78 encima apenas se distinguía del dock opaco.
-const FONDO: Color = Color {
-    a: 0.30,
-    ..tema::CARD
-};
+fn fondo() -> Color {
+    Color {
+        a: 0.30,
+        ..tema::card()
+    }
+}
 
 /// El mismo fondo cuando el dock está pegado al borde. Más cuerpo que el
 /// flotante: apoyado en el borde deja de leerse como algo que va y viene y pasa
 /// a ser parte del marco de la pantalla, y con 0,30 se veía como si estuviese
 /// despegado y transparente a la vez.
-const FONDO_PEGADO: Color = Color {
-    a: 0.55,
-    ..tema::CARD
-};
+fn fondo_pegado() -> Color {
+    Color {
+        a: 0.55,
+        ..tema::card()
+    }
+}
 
 /// Alto de la banda del indicador de ventana abierta, bajo el icono.
 const PUNTO: f32 = 7.0;
@@ -126,7 +130,8 @@ impl DockItem {
 pub struct Dock {
     items: Vec<DockItem>,
     /// Índice del icono bajo el puntero, si lo hay.
-    hover: Option<usize>,
+    /// El icono señalado, con su placa entrando y saliendo.
+    hover: tema::Realce,
     /// Apoyado en el borde inferior. Lo decide el compositor, que es quien sabe
     /// si el dock está fijo o esquivando ventanas.
     pegado: bool,
@@ -152,7 +157,7 @@ impl Dock {
                     self.items[i].anclada = false;
                 } else {
                     self.items.remove(i);
-                    self.hover = None;
+                    self.hover.señalar(None);
                 }
             } else {
                 self.items[i].anclada = true;
@@ -190,7 +195,7 @@ impl Dock {
             .collect();
         Self {
             items,
-            hover: None,
+            hover: tema::Realce::nuevo(),
             pegado: true,
         }
     }
@@ -238,7 +243,7 @@ impl Dock {
         let antes = self.items.len();
         self.items.retain(|i| i.anclada || i.abierta);
         if self.items.len() != antes {
-            self.hover = None;
+            self.hover.señalar(None);
             cambio = true;
         }
         cambio
@@ -281,11 +286,15 @@ impl Dock {
     /// Marca qué icono está señalado. Devuelve `true` si cambió, que es la
     /// señal de que hay que repintar.
     pub fn set_hover(&mut self, hover: Option<usize>) -> bool {
-        if self.hover == hover {
-            return false;
-        }
-        self.hover = hover;
-        true
+        self.hover.señalar(hover)
+    }
+
+    /// ¿Sigue moviéndose la placa de algún icono? Mientras sí, el dock hay que
+    /// repintarlo aunque no llegue ningún evento: es la única superficie del
+    /// shell que se anima sin que nadie la toque después del último movimiento
+    /// del ratón.
+    pub fn animando(&self) -> bool {
+        self.hover.animando()
     }
 
     /// El lanzador que hay bajo `(x, y)`, en las mismas coordenadas que
@@ -319,7 +328,7 @@ impl Dock {
     pub fn view(&self) -> PanelElement<'_> {
         let mut fila = row![].spacing(GAP);
         for (i, item) in self.items.iter().enumerate() {
-            fila = fila.push(icon_view(item, self.hover == Some(i)));
+            fila = fila.push(icon_view(item, self.hover.intensidad(i)));
         }
 
         // Pegado al borde solo se redondea por arriba: unas esquinas curvas
@@ -328,13 +337,13 @@ impl Dock {
         // realmente apoyada.
         let (fondo, radio) = if self.pegado {
             (
-                FONDO_PEGADO,
+                fondo_pegado(),
                 iced_core::border::Radius::default()
                     .top_left(tema::R_TARJETA)
                     .top_right(tema::R_TARJETA),
             )
         } else {
-            (FONDO, tema::R_TARJETA.into())
+            (fondo(), tema::R_TARJETA.into())
         };
         container(fila)
             .padding(PAD)
@@ -366,7 +375,7 @@ impl Dock {
 /// el icono se salga de su slot, y el buffer del dock hoy mide exactamente
 /// `PAD*2 + ICON` de alto, así que lo ampliado quedaría cortado. Reservar ese
 /// hueco cambia la geometría ya calibrada y va aparte.
-fn icon_view(item: &DockItem, señalado: bool) -> PanelElement<'_> {
+fn icon_view(item: &DockItem, señalado: f32) -> PanelElement<'_> {
     let contenido: PanelElement<'_> = match &item.icon {
         Some(Icono::Svg(handle)) => svg(handle.clone())
             .width(Length::Fixed(ICON))
@@ -385,14 +394,20 @@ fn icon_view(item: &DockItem, señalado: bool) -> PanelElement<'_> {
                 .map(|c| c.to_uppercase().to_string())
                 .unwrap_or_default();
             container(
-                container(text(inicial).size(22).color(TEXT))
+                container(text(inicial).size(22).color(TEXT()))
                     .center_x(Length::Fill)
                     .center_y(Length::Fill),
             )
             .width(Length::Fixed(ICON))
             .height(Length::Fixed(ICON))
             .style(|_theme| container::Style {
-                background: Some(Color { a: 0.25, ..ACENTO }.into()),
+                background: Some(
+                    Color {
+                        a: 0.25,
+                        ..ACENTO()
+                    }
+                    .into(),
+                ),
                 border: Border {
                     radius: tema::R_BOTON.into(),
                     ..Default::default()
@@ -403,10 +418,14 @@ fn icon_view(item: &DockItem, señalado: bool) -> PanelElement<'_> {
         }
     };
 
-    let icono: PanelElement<'_> = if señalado {
+    // La placa se desvanece en vez de encenderse de golpe: el dock es lo que
+    // más se recorre con el ratón y el parpadeo de seis placas al cruzarlo era
+    // lo más aparatoso que le quedaba al shell. Por debajo del 1 % de alfa no
+    // se dibuja el contenedor, para no meter una capa por nada.
+    let icono: PanelElement<'_> = if señalado > 0.01 {
         container(contenido)
-            .style(|_theme| container::Style {
-                background: Some(Color { a: 0.18, ..TEXT }.into()),
+            .style(move |_theme| container::Style {
+                background: Some(tema::alfa(TEXT(), 0.18 * señalado).into()),
                 border: Border {
                     radius: tema::R_CONTROL.into(),
                     ..Default::default()
@@ -427,20 +446,24 @@ fn icon_view(item: &DockItem, señalado: bool) -> PanelElement<'_> {
 /// desapareciera, el dock entero cambiaría de alto al abrir una ventana.
 fn punto<'a>(encendida: bool) -> PanelElement<'a> {
     let color = if encendida {
-        Color { a: 0.85, ..TEXT }
+        Color { a: 0.85, ..TEXT() }
     } else {
         Color::TRANSPARENT
     };
     container(
-        container(Space::new().width(Length::Fixed(5.0)).height(Length::Fixed(5.0)))
-            .style(move |_theme| container::Style {
-                background: Some(color.into()),
-                border: Border {
-                    radius: tema::R_PILL.into(),
-                    ..Default::default()
-                },
+        container(
+            Space::new()
+                .width(Length::Fixed(5.0))
+                .height(Length::Fixed(5.0)),
+        )
+        .style(move |_theme| container::Style {
+            background: Some(color.into()),
+            border: Border {
+                radius: tema::R_PILL.into(),
                 ..Default::default()
-            }),
+            },
+            ..Default::default()
+        }),
     )
     .width(Length::Fixed(ICON))
     .height(Length::Fixed(PUNTO))
@@ -473,7 +496,7 @@ mod tests {
             .collect();
         Dock {
             items,
-            hover: None,
+            hover: tema::Realce::nuevo(),
             pegado: true,
         }
     }
@@ -504,7 +527,10 @@ mod tests {
         assert_eq!(d.item_en(PAD + ICON / 2.0, PAD / 2.0), None);
         // Abajo, el icono llega hasta el final de la banda del indicador: ese
         // punto es de la aplicación, no un hueco muerto.
-        assert_eq!(d.item_en(PAD + ICON / 2.0, PAD + ICON + PUNTO / 2.0), Some(0));
+        assert_eq!(
+            d.item_en(PAD + ICON / 2.0, PAD + ICON + PUNTO / 2.0),
+            Some(0)
+        );
         assert_eq!(d.item_en(PAD + ICON / 2.0, PAD + ICON + PUNTO + 1.0), None);
         // Y más allá del último icono, dentro del ancho por el padding derecho.
         let (ancho, _) = d.size();
@@ -565,7 +591,10 @@ mod anclado {
         assert_eq!(dock.items().len(), antes + 1, "la ventana no entró al dock");
         assert!(!dock.esta_anclada("org.bookos.prueba"));
         assert!(
-            !dock.como_configuracion().iter().any(|l| l.contains("prueba")),
+            !dock
+                .como_configuracion()
+                .iter()
+                .any(|l| l.contains("prueba")),
             "lo que no está fijado no se guarda"
         );
 
@@ -575,7 +604,10 @@ mod anclado {
         // Se cierra la ventana: al estar fijada, se queda.
         dock.set_abiertas(&[]);
         assert!(dock.esta_anclada("org.bookos.prueba"), "se fue al cerrarse");
-        assert!(dock.como_configuracion().iter().any(|l| l.contains("prueba")));
+        assert!(dock
+            .como_configuracion()
+            .iter()
+            .any(|l| l.contains("prueba")));
 
         dock.alternar_anclado("org.bookos.prueba", "prueba", "prueba");
         assert_eq!(dock.items().len(), antes, "no volvió a su estado inicial");
@@ -597,7 +629,11 @@ mod anclado {
     fn el_launchpad_no_se_quita() {
         let mut dock = Dock::from_config(&crate::Config::default().dock);
         let antes = dock.items().len();
-        dock.alternar_anclado(crate::config::LAUNCHPAD, crate::config::LAUNCHPAD, "launchpad");
+        dock.alternar_anclado(
+            crate::config::LAUNCHPAD,
+            crate::config::LAUNCHPAD,
+            "launchpad",
+        );
         assert_eq!(dock.items().len(), antes);
     }
 }

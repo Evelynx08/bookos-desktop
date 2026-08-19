@@ -75,12 +75,43 @@ impl Sonando {
         )
     }
 
+    /// Ejecuta una orden sin esperar a que el reproductor responda.
+    ///
+    /// El lockscreen usa este camino: el clic debe volver al compositor de
+    /// inmediato y `busctl` termina por su cuenta. El nombre del bus ya se
+    /// resolvió al leer la tarjeta, así que aquí no se lanza una consulta extra.
+    pub fn ejecutar(&self, que: Orden) -> bool {
+        ejecutar_en(&self.bus, que)
+    }
+
     /// De 0 a 1, para la barra de progreso. `None` si el reproductor no publica
     /// las dos cosas —los navegadores a menudo no dan `Position`—.
     pub fn avance(&self) -> Option<f32> {
         let (p, d) = (self.posicion?, self.duracion?);
         (d > 0).then(|| (p as f32 / d as f32).clamp(0.0, 1.0))
     }
+}
+
+/// La variante para una vista que ya guardó solo el nombre del bus.
+pub fn ejecutar_en(bus: &str, que: Orden) -> bool {
+    let metodo = match que {
+        Orden::Anterior => "Previous",
+        Orden::Siguiente => "Next",
+        Orden::Alternar => "PlayPause",
+    };
+    Command::new("busctl")
+        .args([
+            "--user",
+            "call",
+            bus,
+            "/org/mpris/MediaPlayer2",
+            "org.mpris.MediaPlayer2.Player",
+            metodo,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .is_ok()
 }
 
 /// Los tres botones de la tarjeta.

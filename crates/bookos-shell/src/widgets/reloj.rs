@@ -62,6 +62,9 @@ impl Widget for Reloj {
     }
 
     fn ver(&self) -> PanelElement<'_> {
-        text(self.texto.clone()).size(tema::T_CUERPO).color(TEXT).into()
+        text(self.texto.clone())
+            .size(tema::T_CUERPO)
+            .color(TEXT())
+            .into()
     }
 }

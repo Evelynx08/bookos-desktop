@@ -20,19 +20,23 @@
 //! empieza la pantalla ni cuánto mide, solo su relación con quien lo abrió.
 
 mod acerca;
+mod apagar;
+mod apariencia;
 mod bluetooth;
+mod brillo;
+mod buscador;
 mod calendario;
 mod centro;
-mod brillo;
+pub(crate) mod control;
 mod energia;
+mod escritorios;
+mod launchpad;
 mod lista;
+mod menu;
 mod menu_dock;
 mod notificaciones;
 mod red;
-pub(crate) mod control;
-mod launchpad;
 mod sonido;
-mod menu;
 
 use crate::view::PanelElement;
 use crate::Accion;
@@ -53,6 +57,8 @@ pub enum Ancla {
     SobreElDock { x: f32 },
     /// En el centro de la pantalla. El launchpad.
     Centrada,
+    /// Franja de gestión pegada al borde superior de la pantalla.
+    Arriba,
 }
 
 /// Qué hacer con una tecla que llega a una emergente.
@@ -70,8 +76,24 @@ pub enum Tecla {
 
 pub use menu_dock::Objetivo;
 
+/// Recorta un texto al ancho que hay, con puntos suspensivos.
+///
+/// Vive en las listas de conectividad y se saca aquí porque el toast también lo
+/// necesita: dos recortes distintos en el mismo escritorio cortan por sitios
+/// distintos.
+pub use lista::recortar as recortar_texto;
+
+/// La tarjeta de notificaciones con el silencio que ya hubiera puesto.
+pub(crate) fn notificaciones_con(
+    silencio: Option<(std::time::Instant, Option<std::time::Duration>)>,
+) -> notificaciones::Notificaciones {
+    notificaciones::Notificaciones::con_silencio(silencio)
+}
+
 pub enum Emergente {
     Menu(menu::Menu),
+    Apariencia(apariencia::Apariencia),
+    Apagar(apagar::Apagar),
     Calendario(calendario::Calendario),
     Sonido(sonido::Sonido),
     Brillo(brillo::Brillo),
@@ -83,11 +105,22 @@ pub enum Emergente {
     Red(red::Red),
     Bluetooth(bluetooth::Bluetooth),
     Launchpad(launchpad::Launchpad),
+    Buscador(buscador::Buscador),
+    Escritorios(escritorios::Escritorios),
 }
 
 impl Emergente {
     pub fn menu() -> Self {
         Self::Menu(menu::Menu::new())
+    }
+
+    pub fn apariencia() -> Self {
+        Self::Apariencia(apariencia::Apariencia::new())
+    }
+
+    /// El diálogo del botón de encendido.
+    pub fn apagar() -> Self {
+        Self::Apagar(apagar::Apagar::new())
     }
 
     pub fn calendario() -> Self {
@@ -136,10 +169,29 @@ impl Emergente {
         Self::Launchpad(launchpad::Launchpad::new(pantalla))
     }
 
+    /// El buscador de Meta+Espacio con un tamaño de referencia para clientes
+    /// del shell que no conocen la pantalla. Se conserva para tests y para
+    /// integraciones externas.
+    pub fn buscador() -> Self {
+        Self::buscador_en((1920.0, 1080.0))
+    }
+
+    /// El buscador de Meta+Espacio. `pantalla` está en píxeles lógicos para
+    /// que el ancho sea cómodo tanto en un portátil como en un monitor 4K/8K.
+    pub fn buscador_en(pantalla: (f32, f32)) -> Self {
+        Self::Buscador(buscador::Buscador::new(pantalla))
+    }
+
+    pub fn escritorios(pantalla: (f32, f32), activo: usize, nombres: Vec<String>) -> Self {
+        Self::Escritorios(escritorios::Escritorios::new(pantalla, activo, nombres))
+    }
+
     /// Nombre para las trazas.
     pub fn nombre(&self) -> &'static str {
         match self {
             Self::Menu(_) => "menu",
+            Self::Apariencia(_) => "apariencia",
+            Self::Apagar(_) => "apagar",
             Self::Calendario(_) => "calendario",
             Self::Sonido(_) => "sonido",
             Self::Brillo(_) => "brillo",
@@ -151,6 +203,8 @@ impl Emergente {
             Self::Red(_) => "red",
             Self::Bluetooth(_) => "bluetooth",
             Self::Launchpad(_) => "launchpad",
+            Self::Buscador(_) => "buscador",
+            Self::Escritorios(_) => "escritorios",
         }
     }
 
@@ -158,6 +212,8 @@ impl Emergente {
     pub fn size(&self) -> (f32, f32) {
         match self {
             Self::Menu(m) => m.size(),
+            Self::Apariencia(a) => a.size(),
+            Self::Apagar(a) => a.size(),
             Self::Calendario(c) => c.size(),
             Self::Sonido(s) => s.size(),
             Self::Brillo(b) => b.size(),
@@ -169,12 +225,16 @@ impl Emergente {
             Self::Red(r) => r.size(),
             Self::Bluetooth(b) => b.size(),
             Self::Launchpad(l) => l.size(),
+            Self::Buscador(b) => b.size(),
+            Self::Escritorios(e) => e.size(),
         }
     }
 
     pub fn ancla(&self) -> Ancla {
         match self {
             Self::Menu(m) => m.ancla(),
+            Self::Apariencia(a) => a.ancla(),
+            Self::Apagar(a) => a.ancla(),
             Self::Calendario(c) => c.ancla(),
             Self::Sonido(s) => s.ancla(),
             Self::Brillo(b) => b.ancla(),
@@ -186,6 +246,8 @@ impl Emergente {
             Self::Red(r) => r.ancla(),
             Self::Bluetooth(b) => b.ancla(),
             Self::Launchpad(l) => l.ancla(),
+            Self::Buscador(b) => b.ancla(),
+            Self::Escritorios(e) => e.ancla(),
         }
     }
 
@@ -210,18 +272,33 @@ impl Emergente {
     pub fn animando(&self) -> bool {
         match self {
             Self::Launchpad(l) => l.animando(),
-            _ => false,
+            Self::Buscador(b) => b.animando(),
+            Self::Apariencia(a) => a.animando(),
+            Self::Apagar(a) => a.animando(),
+            Self::Menu(m) => m.animando(),
+            Self::MenuDock(m) => m.animando(),
+            Self::Calendario(c) => c.animando(),
+            Self::Sonido(s) => s.animando(),
+            Self::Energia(e) => e.animando(),
+            Self::Centro(c) => c.animando(),
+            Self::Notificaciones(n) => n.animando(),
+            Self::Red(r) => r.animando(),
+            Self::Bluetooth(b) => b.animando(),
+            Self::Acerca(a) => a.animando(),
+            Self::Escritorios(e) => e.animando(),
+            // El brillo no tiene nada que animar dentro: sus dos píldoras
+            // siguen al dedo y sus botones no se pulsan.
+            Self::Brillo(_) => false,
         }
     }
 
     /// ¿Ocupa la pantalla entera?
     ///
-    /// Solo el launchpad. Trae dos consecuencias: el fondo se desenfoca —sin
-    /// eso el escritorio se lee a través del velo y compite con los iconos— y
-    /// el panel no se dibuja, porque una superficie que tapa la pantalla no
-    /// puede tener una barra por encima.
+    /// El launchpad y la vista general. El panel no se dibuja por encima: son
+    /// modos temporales que gobiernan toda la pantalla aunque su chrome ocupe
+    /// solo la zona con contenido.
     pub fn tapa_la_pantalla(&self) -> bool {
-        matches!(self, Self::Launchpad(_))
+        matches!(self, Self::Launchpad(_) | Self::Escritorios(_))
     }
 
     /// El velo a pantalla completa que va detrás, si la emergente lo quiere.
@@ -229,9 +306,27 @@ impl Emergente {
     pub fn velo(&self) -> Option<iced_core::Color> {
         match self {
             Self::Launchpad(l) => Some(l.velo()),
+            // La vista de escritorios **no** lo lleva: es una franja que se
+            // asoma sobre el escritorio, no algo que haya que atender, y apagar
+            // lo de debajo la convertiría en un diálogo.
+            Self::Buscador(b) => Some(b.velo()),
             Self::Acerca(a) => Some(a.velo()),
+            // Es un diálogo: hay que contestarle antes de seguir, y el velo es
+            // lo que lo dice sin escribirlo.
+            Self::Apagar(a) => Some(a.velo()),
             _ => None,
         }
+    }
+
+    /// ¿Lleva cristal esmerilado debajo?
+    ///
+    /// Solo el buscador. Las tarjetas que cuelgan del panel no lo llevan por lo
+    /// mismo que el panel: salen sobre el fondo del escritorio, que ya es liso,
+    /// y el desenfoque solo se notaría emborronando el borde del fondo. El
+    /// buscador sí flota en mitad de la pantalla, y ahí lo de debajo es
+    /// cualquier cosa.
+    pub fn usa_cristal(&self) -> bool {
+        matches!(self, Self::Buscador(_))
     }
 
     /// El realce de lo señalado: rectángulo **relativo a la emergente** y si
@@ -247,6 +342,8 @@ impl Emergente {
     pub fn view(&self) -> PanelElement<'_> {
         match self {
             Self::Menu(m) => m.view(),
+            Self::Apariencia(a) => a.view(),
+            Self::Apagar(a) => a.view(),
             Self::Calendario(c) => c.view(),
             Self::Sonido(s) => s.view(),
             Self::Brillo(b) => b.view(),
@@ -258,6 +355,8 @@ impl Emergente {
             Self::Red(r) => r.view(),
             Self::Bluetooth(b) => b.view(),
             Self::Launchpad(l) => l.view(),
+            Self::Buscador(b) => b.view(),
+            Self::Escritorios(e) => e.view(),
         }
     }
 
@@ -274,6 +373,8 @@ impl Emergente {
     pub fn puntero(&mut self, punto: Option<(f32, f32)>) -> bool {
         match self {
             Self::Menu(m) => m.puntero(punto),
+            Self::Apariencia(a) => a.puntero(punto),
+            Self::Apagar(a) => a.puntero(punto),
             Self::Calendario(c) => c.puntero(punto),
             Self::Sonido(s) => s.puntero(punto),
             Self::Brillo(b) => b.puntero(punto),
@@ -285,6 +386,8 @@ impl Emergente {
             Self::Red(r) => r.puntero(punto),
             Self::Bluetooth(b) => b.puntero(punto),
             Self::Launchpad(l) => l.puntero(punto),
+            Self::Buscador(b) => b.puntero(punto),
+            Self::Escritorios(e) => e.puntero(punto),
         }
     }
 
@@ -293,6 +396,8 @@ impl Emergente {
     pub fn pulsar(&mut self, x: f32, y: f32) -> Option<Accion> {
         match self {
             Self::Menu(m) => m.pulsar(x, y),
+            Self::Apariencia(a) => a.pulsar(x, y),
+            Self::Apagar(a) => a.pulsar(x, y),
             Self::Calendario(c) => c.pulsar(x, y),
             Self::Sonido(s) => s.pulsar(x, y),
             Self::Brillo(b) => b.pulsar(x, y),
@@ -304,6 +409,8 @@ impl Emergente {
             Self::Red(r) => r.pulsar(x, y),
             Self::Bluetooth(b) => b.pulsar(x, y),
             Self::Launchpad(l) => l.pulsar(x, y),
+            Self::Buscador(b) => b.pulsar(x, y),
+            Self::Escritorios(e) => e.pulsar(x, y),
         }
     }
 
@@ -323,12 +430,16 @@ impl Emergente {
     ///
     /// Solo le importa a lo que se arrastra: hasta el deslizador del volumen,
     /// ninguna emergente necesitaba saber cuándo acababa una pulsación.
-    pub fn soltar(&mut self) -> bool {
+    /// Devuelve si hay que repintar y, si soltar completa una interacción, qué
+    /// hacer: en el launchpad, soltar un icono sin haberlo arrastrado **es** la
+    /// pulsación, y por eso la acción no puede salir de `pulsar`.
+    pub fn soltar(&mut self) -> (bool, Option<Accion>) {
         match self {
-            Self::Sonido(s) => s.soltar(),
-            Self::Brillo(b) => b.soltar(),
-            Self::Centro(c) => c.soltar(),
-            _ => false,
+            Self::Sonido(s) => (s.soltar(), None),
+            Self::Brillo(b) => (b.soltar(), None),
+            Self::Centro(c) => (c.soltar(), None),
+            Self::Launchpad(l) => l.soltar(),
+            _ => (false, None),
         }
     }
 
@@ -340,6 +451,7 @@ impl Emergente {
             Self::Sonido(s) => s.agarrado(),
             Self::Brillo(b) => b.agarrado(),
             Self::Centro(c) => c.agarrado(),
+            Self::Launchpad(l) => l.agarrado(),
             _ => false,
         }
     }
@@ -347,6 +459,8 @@ impl Emergente {
     pub fn tecla(&mut self, tecla: crate::TeclaPulsada) -> Tecla {
         match self {
             Self::Menu(m) => m.tecla(tecla),
+            Self::Apariencia(a) => a.tecla(tecla),
+            Self::Apagar(a) => a.tecla(tecla),
             Self::Calendario(c) => c.tecla(tecla),
             Self::Sonido(s) => s.tecla(tecla),
             Self::Brillo(b) => b.tecla(tecla),
@@ -358,6 +472,22 @@ impl Emergente {
             Self::Red(r) => r.tecla(tecla),
             Self::Bluetooth(b) => b.tecla(tecla),
             Self::Launchpad(l) => l.tecla(tecla),
+            Self::Buscador(b) => b.tecla(tecla),
+            Self::Escritorios(e) => e.tecla(tecla),
+        }
+    }
+
+    pub fn miniaturas_escritorios(&self) -> Vec<iced_core::Rectangle> {
+        match self {
+            Self::Escritorios(e) => e.miniaturas(),
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn actualizar_escritorios(&mut self, activo: usize, nombres: Vec<String>) -> bool {
+        match self {
+            Self::Escritorios(e) => e.actualizar(activo, nombres),
+            _ => false,
         }
     }
 }

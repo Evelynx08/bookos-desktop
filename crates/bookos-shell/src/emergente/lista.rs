@@ -55,9 +55,15 @@ pub struct Entrada {
     pub activa: bool,
 }
 
-/// El interruptor de la cabecera. No es pulsable todavía en todas las
-/// tarjetas; el que lo use conecta su propio rectángulo.
-pub fn interruptor<'a>(encendido: bool) -> PanelElement<'a> {
+/// El interruptor de la cabecera. `encendido` va de 0 a 1: es el recorrido de
+/// la bolita, no un booleano.
+///
+/// El sistema de diseño le da 250 ms con muelle (§2.7, «conmutador»), que es la
+/// duración de [`crate::tema::D_MODAL`]: el estado del interruptor **es** la
+/// decisión que se acaba de tomar y se ve mejor que ninguna otra cosa de la
+/// tarjeta. El que lo use guarda una [`crate::tema::Transicion`] y le pasa aquí
+/// su valor.
+pub fn interruptor<'a>(encendido: f32) -> PanelElement<'a> {
     let bolita = container(Space::new())
         .width(Length::Fixed(INTERRUPTOR_ALTO - 4.0))
         .height(Length::Fixed(INTERRUPTOR_ALTO - 4.0))
@@ -71,27 +77,29 @@ pub fn interruptor<'a>(encendido: bool) -> PanelElement<'a> {
         });
     // La bolita se coloca con un hueco a un lado o al otro en vez de con una
     // posición absoluta: es lo mismo que hace el deslizador del volumen y evita
-    // una capa `stack` solo para mover 18 px.
-    let dentro: PanelElement<'a> = if encendido {
-        row![
-            Space::new().width(Length::Fixed(INTERRUPTOR_ANCHO - INTERRUPTOR_ALTO)),
-            bolita
-        ]
-        .into()
-    } else {
-        row![bolita].into()
-    };
+    // una capa `stack` solo para mover 18 px. Animada, el hueco es el recorrido
+    // entero por la fracción, y con el muelle se pasa un poco del extremo — por
+    // eso se recorta a cero: un hueco negativo no lo acepta el layout.
+    let recorrido = (INTERRUPTOR_ANCHO - INTERRUPTOR_ALTO) * encendido;
+    let dentro: PanelElement<'a> = row![
+        Space::new().width(Length::Fixed(recorrido.max(0.0))),
+        bolita
+    ]
+    .into();
     container(dentro)
         .width(Length::Fixed(INTERRUPTOR_ANCHO))
         .height(Length::Fixed(INTERRUPTOR_ALTO))
         .padding(2)
         .style(move |_theme: &iced_widget::Theme| container::Style {
+            // El fondo cruza del gris al acento con la bolita. El recorte a
+            // [0,1] es por el muelle otra vez: pasarse de 1 en un canal de
+            // color no es un rebote, es un color inventado.
             background: Some(
-                if encendido {
-                    tema::ACENTO
-                } else {
-                    Color { a: 0.20, ..Color::WHITE }
-                }
+                tema::mezclar(
+                    tema::alfa(tema::tinta(), 0.20),
+                    tema::acento(),
+                    encendido.clamp(0.0, 1.0),
+                )
                 .into(),
             ),
             border: Border {
@@ -104,9 +112,9 @@ pub fn interruptor<'a>(encendido: bool) -> PanelElement<'a> {
 }
 
 /// La cabecera: título a la izquierda, interruptor a la derecha.
-pub fn cabecera<'a>(titulo: &str, encendido: Option<bool>) -> PanelElement<'a> {
-    let mut fila = row![text(titulo.to_string()).size(18.0).color(tema::TEXTO)]
-        .align_y(Vertical::Center);
+pub fn cabecera<'a>(titulo: &str, encendido: Option<f32>) -> PanelElement<'a> {
+    let mut fila =
+        row![text(titulo.to_string()).size(18.0).color(tema::texto())].align_y(Vertical::Center);
     if let Some(encendido) = encendido {
         fila = fila
             .push(Space::new().width(Length::Fill))
@@ -140,25 +148,38 @@ pub fn recortar(texto: &str, ancho: f32, tamaño: f32) -> String {
         return texto.to_string();
     }
     // Uno menos para dejarle sitio a los puntos, que ocupan como una letra.
-    texto.chars().take(caben.saturating_sub(1)).collect::<String>() + "…"
+    texto
+        .chars()
+        .take(caben.saturating_sub(1))
+        .collect::<String>()
+        + "…"
 }
 
-/// Una fila de la lista.
-pub fn fila<'a>(entrada: &'a Entrada, señalada: bool) -> PanelElement<'a> {
+/// Una fila de la lista. `señalada` va de 0 a 1: el hover entrando.
+pub fn fila<'a>(entrada: &'a Entrada, señalada: f32) -> PanelElement<'a> {
     // La conectada se marca con **borde** de acento y el texto en acento, no
     // con el fondo relleno: en el diseño el relleno se reserva para lo que se
     // está pulsando, y una fila rellena entera tapaba su propio icono.
-    let (fondo, color, borde) = match (entrada.activa, señalada) {
-        (true, _) => (Color { a: 0.10, ..tema::ACENTO }, tema::ACENTO, tema::ACENTO),
-        (false, true) => (tema::HOVER, tema::TEXTO, Color::TRANSPARENT),
-        (false, false) => (
-            Color { a: 0.04, ..Color::WHITE },
-            tema::TEXTO,
+    let (reposo, realzado, color, borde) = if entrada.activa {
+        (
+            tema::alfa(tema::acento(), 0.10),
+            // La conectada ya lleva acento: su hover sube el mismo relleno en
+            // vez de meter un gris que lo ensuciaría.
+            tema::alfa(tema::acento(), 0.20),
+            tema::acento(),
+            tema::acento(),
+        )
+    } else {
+        (
+            tema::alfa(tema::tinta(), 0.04),
+            tema::hover(),
+            tema::texto(),
             Color::TRANSPARENT,
-        ),
+        )
     };
+    let fondo = tema::mezclar(reposo, realzado, señalada);
     let estado_color = if entrada.activa {
-        Color { a: 0.75, ..tema::ACENTO }
+        tema::alfa(tema::acento(), 0.75)
     } else {
         tema::TEXTO2
     };
@@ -176,8 +197,8 @@ pub fn fila<'a>(entrada: &'a Entrada, señalada: bool) -> PanelElement<'a> {
         Some(ic) => icono::ver_teñido(ic, ICONO, Some(color)),
         None => Space::new().width(Length::Fixed(ICONO)).into(),
     };
-    let mut contenido = row![dibujo, Space::new().width(Length::Fixed(12.0)), textos]
-        .align_y(Vertical::Center);
+    let mut contenido =
+        row![dibujo, Space::new().width(Length::Fixed(12.0)), textos].align_y(Vertical::Center);
     if let Some(derecha) = &entrada.derecha {
         contenido = contenido
             .push(Space::new().width(Length::Fill))
@@ -209,14 +230,14 @@ pub fn vacia<'a>(texto_: &str) -> PanelElement<'a> {
         .into()
 }
 
-/// El pie con dos botones, como en el diseño.
-pub fn pie<'a>(izquierda: &str, derecha: &str, señalado: Option<bool>) -> PanelElement<'a> {
-    let boton = |etiqueta: &str, realzado: bool| -> PanelElement<'a> {
+/// El pie con dos botones, como en el diseño. `realce` señala el 0 o el 1.
+pub fn pie<'a>(izquierda: &str, derecha: &str, realce: &tema::Realce) -> PanelElement<'a> {
+    let boton = |etiqueta: &str, realzado: f32| -> PanelElement<'a> {
         let ancho = (ANCHO - MARGEN * 2.0 - 8.0) / 2.0;
         container(
             text(etiqueta.to_string())
                 .size(tema::T_CUERPO)
-                .color(if realzado { tema::TEXTO } else { tema::TEXTO2 }),
+                .color(tema::mezclar(tema::TEXTO2, tema::texto(), realzado)),
         )
         .width(Length::Fixed(ancho))
         .height(Length::Fixed(PIE_BOTON))
@@ -224,12 +245,7 @@ pub fn pie<'a>(izquierda: &str, derecha: &str, señalado: Option<bool>) -> Panel
         .center_y(Length::Fixed(PIE_BOTON))
         .style(move |_theme: &iced_widget::Theme| container::Style {
             background: Some(
-                if realzado {
-                    tema::HOVER
-                } else {
-                    Color { a: 0.06, ..Color::WHITE }
-                }
-                .into(),
+                tema::mezclar(tema::alfa(tema::tinta(), 0.06), tema::hover(), realzado).into(),
             ),
             border: Border {
                 radius: tema::R_BOTON.into(),
@@ -243,14 +259,14 @@ pub fn pie<'a>(izquierda: &str, derecha: &str, señalado: Option<bool>) -> Panel
         container(Space::new().height(Length::Fixed(1.0)))
             .width(Length::Fixed(ANCHO - MARGEN * 2.0))
             .style(|_theme: &iced_widget::Theme| container::Style {
-                background: Some(tema::DIVISOR.into()),
+                background: Some(tema::divisor().into()),
                 ..Default::default()
             }),
         Space::new().height(Length::Fixed(PIE_AIRE - 1.0)),
         row![
-            boton(izquierda, señalado == Some(false)),
+            boton(izquierda, realce.intensidad(0)),
             Space::new().width(Length::Fixed(8.0)),
-            boton(derecha, señalado == Some(true)),
+            boton(derecha, realce.intensidad(1)),
         ],
     ]
     .into()
@@ -283,7 +299,11 @@ mod tests {
         let corto = recortar(largo, ANCHO_NOMBRE, 14.0);
         assert!(corto.ends_with('…'), "{corto}");
         assert!(corto.chars().count() < largo.chars().count());
-        assert_eq!(recortar("Wifi", ANCHO_NOMBRE, 14.0), "Wifi", "lo que cabe no se toca");
+        assert_eq!(
+            recortar("Wifi", ANCHO_NOMBRE, 14.0),
+            "Wifi",
+            "lo que cabe no se toca"
+        );
     }
 
     #[test]
@@ -295,6 +315,10 @@ mod tests {
             Some(1)
         );
         assert_eq!(fila_en(50.0, 99.0, 100.0, 2), None, "por encima");
-        assert_eq!(fila_en(5.0, 110.0, 100.0, 2), None, "fuera por la izquierda");
+        assert_eq!(
+            fila_en(5.0, 110.0, 100.0, 2),
+            None,
+            "fuera por la izquierda"
+        );
     }
 }

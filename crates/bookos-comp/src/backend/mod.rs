@@ -14,11 +14,16 @@ pub mod udev;
 pub mod winit;
 
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
-use smithay::backend::renderer::element::utils::RescaleRenderElement;
+use smithay::backend::renderer::element::solid::SolidColorRenderElement;
+use smithay::backend::renderer::element::utils::{
+    ConstrainAlign, ConstrainScaleBehavior, RescaleRenderElement,
+};
+use smithay::backend::renderer::element::{Id, Kind};
 use smithay::backend::renderer::element::AsRenderElements;
 use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::desktop::space::{constrain_space_element, ConstrainBehavior, ConstrainReference};
 use smithay::output::Output;
-use smithay::utils::{Logical, Point, Scale};
+use smithay::utils::{Logical, Point, Rectangle, Scale};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 
 use crate::cursor::OverlayElement;
@@ -58,26 +63,200 @@ pub fn escena(
     // el panel encima no está a pantalla completa, está maximizado. El cursor
     // sí sigue delante, que es lo que hace todo el mundo.
     let completa = state.hay_pantalla_completa();
+    let vista_escritorios = state
+        .shell
+        .as_ref()
+        .is_some_and(|s| s.vista_escritorios_abierta());
+    let app_en_foco = state
+        .seat
+        .get_keyboard()
+        .and_then(|k| k.current_focus())
+        .and_then(|surface| state.window_for_surface(&surface))
+        .and_then(|window| crate::handlers::app_id(&window));
     // Retirar el aviso caducado antes de componer: su superficie vive en el
     // compositor y nadie más la suelta. Sin esto el OSD se quedaba en pantalla
     // para siempre —el alfa llegaba a cero, pero el buffer seguía puesto y
     // volvía a verse en cuanto algo cambiaba la escena.
     if let Some(shell) = state.shell.as_mut() {
+        let visible = shell.actividad_app_id().is_some_and(|actividad| {
+            shell.actividad_clase() != Some(bookos_shell::actividad::Clase::Player)
+                || !app_en_foco
+                    .as_deref()
+                    .is_some_and(|foco| bookos_shell::mismo_programa(actividad, foco))
+        });
+        if shell.actividad_visible(visible) {
+            state.needs_redraw = true;
+        }
         if shell.osd_vivo().1 {
             state.needs_redraw = true;
         }
+        // Y lo mismo con el aviso de una notificación: su superficie vive aquí
+        // y nadie más la suelta cuando se le acaba el tiempo.
+        if shell.toast_vivo().1 {
+            state.needs_redraw = true;
+        }
+        shell.animar_toast();
         shell.animar_emergente();
+        shell.animar_dock();
+        shell.animar_conmutador();
+        shell.animar_osd();
+        shell.animar_actividad();
+        if shell.animar_bloqueo() {
+            state.needs_redraw = true;
+        }
     }
+    // El deslizamiento entre escritorios mueve ventanas de verdad dentro del
+    // `Space`, así que tiene que correr **antes** de recoger los elementos de
+    // la escena: hacerlo después dejaría cada frame un paso por detrás.
+    crate::escritorios::animar(state);
+    // Y las que se están yendo al dock: cuando llegan, salen del `Space`.
+    let minimizando = crate::ventanas::animar_minimizados(state);
+    // El commit del shader tiene que cambiar tanto de ida como de vuelta. Antes
+    // solo se incrementaba por `minimizando`; una restaurada ya no estaba en
+    // esa lista y el damage tracker congelaba su primer fotograma junto al
+    // icono, para saltar después directamente a la ventana abierta.
+    let restaurando = state
+        .space
+        .elements()
+        .any(|window| crate::ventanas::encogido(window).is_some());
+    if minimizando || restaurando {
+        state.genio_commit.increment();
+    }
+
+    // Meta+Tab reutiliza directamente las superficies de los clientes. No se
+    // captura ningún bitmap ni se abre un temporizador: Smithay las escala con
+    // la GPU y su damage normal mantiene vivas las miniaturas.
+    //
+    // Van **delante** de la tarjeta del conmutador, no detrás: con las celdas
+    // detrás no podían tener fondo propio —cualquier relleno tapaba la ventana
+    // viva— y una celda sin fondo es un marco vacío flotando.
+    let mostrando_ventanas = state.conmutador_modo
+        == Some(bookos_shell::conmutador::Modo::Ventanas);
+    if mostrando_ventanas {
+        let huecos = state
+            .shell
+            .as_ref()
+            .map(|s| s.conmutador_miniaturas())
+            .unwrap_or_default();
+        for (window, hueco) in state.conmutador_destinos.iter().zip(huecos) {
+            elementos.extend(constrain_space_element::<GlesRenderer, _, OverlayElement>(
+                renderer,
+                window,
+                hueco.loc,
+                1.0,
+                Scale::from(scale),
+                hueco,
+                ConstrainBehavior {
+                    reference: ConstrainReference::Geometry,
+                    behavior: ConstrainScaleBehavior::Fit,
+                    align: ConstrainAlign::CENTER,
+                },
+            ));
+        }
+    }
+
+    // El selector es modal y se mantiene incluso sobre pantalla completa. Va
+    // separado del panel/dock, que sí se ocultan en ese caso.
+    if let Some(elemento) = state
+        .shell
+        .as_ref()
+        .and_then(|shell| shell.conmutador_element(renderer))
+    {
+        elementos.push(OverlayElement::Memory(elemento));
+    }
+
+    // La vista de escritorios compone las mismas superficies Wayland, no
+    // capturas. También las apartadas conservan su buffer vivo, de modo que una
+    // terminal que siga imprimiendo se actualiza dentro de su miniatura sin un
+    // temporizador ni una copia por frame.
+    //
+    // Delante de la franja de la vista por lo mismo que el conmutador: es lo
+    // que permite que cada previa enseñe el fondo de pantalla en vez de ser un
+    // marco transparente.
+    if vista_escritorios {
+        let huecos = state
+            .shell
+            .as_ref()
+            .map(|s| s.escritorios_miniaturas())
+            .unwrap_or_default();
+        let escritorios = crate::escritorios::ventanas_para_vista(state);
+        let (pantalla_w, pantalla_h) = state.pantalla_logica();
+        for (i, (ventanas, hueco)) in escritorios.iter().zip(huecos).enumerate() {
+            let factor = (hueco.size.w as f64 / pantalla_w.max(1.0) as f64)
+                .min(hueco.size.h as f64 / pantalla_h.max(1.0) as f64);
+            // El orden original se conserva: la última ventana del Space es
+            // la que está arriba, y los elementos se entregan de delante atrás.
+            for (window, posicion) in ventanas.iter().rev() {
+                let geo = window.geometry();
+                let destino = Rectangle::new(
+                    (
+                        hueco.loc.x + (posicion.x as f64 * factor).round() as i32,
+                        hueco.loc.y + (posicion.y as f64 * factor).round() as i32,
+                    )
+                        .into(),
+                    (
+                        (geo.size.w as f64 * factor).round().max(1.0) as i32,
+                        (geo.size.h as f64 * factor).round().max(1.0) as i32,
+                    )
+                        .into(),
+                );
+                elementos.extend(constrain_space_element::<GlesRenderer, _, OverlayElement>(
+                    renderer,
+                    window,
+                    destino.loc,
+                    1.0,
+                    Scale::from(scale),
+                    destino,
+                    ConstrainBehavior {
+                        reference: ConstrainReference::Geometry,
+                        behavior: ConstrainScaleBehavior::Fit,
+                        align: ConstrainAlign::CENTER,
+                    },
+                ));
+            }
+            // Y detrás de sus ventanas, el fondo de pantalla: es lo que hace
+            // que un escritorio vacío se vea como un escritorio y no como un
+            // agujero negro en la franja.
+            if let Some(fondo) = state.fondo.as_ref() {
+                if let Some(elemento) = fondo.miniatura(
+                    renderer,
+                    i,
+                    (hueco.loc.x as f64 * scale, hueco.loc.y as f64 * scale),
+                    (hueco.size.w, hueco.size.h),
+                ) {
+                    elementos.push(OverlayElement::Memory(elemento));
+                }
+            }
+        }
+    }
+
     elementos.extend(
         state
             .shell
             .as_ref()
-            .filter(|_| !completa)
+            .filter(|_| !completa || vista_escritorios)
             .map(|shell| shell.elements(renderer))
             .unwrap_or_default()
             .into_iter()
             .map(OverlayElement::Memory),
     );
+
+    // El velo del conmutador va detrás del panel y del dock —que siguen
+    // legibles— y delante de las ventanas del escritorio.
+    if mostrando_ventanas {
+        static VELO_CONMUTADOR: std::sync::OnceLock<Id> = std::sync::OnceLock::new();
+        let (w, h) = output
+            .current_mode()
+            .map(|m| (m.size.w, m.size.h))
+            .unwrap_or((1, 1));
+        elementos.push(OverlayElement::Color(SolidColorRenderElement::new(
+            VELO_CONMUTADOR.get_or_init(Id::new).clone(),
+            Rectangle::new((0, 0).into(), (w, h).into()),
+            0,
+            [0.0, 0.0, 0.0, 0.56],
+            Kind::Unspecified,
+        )));
+    }
     let t_shell = _t.elapsed();
     let _t = std::time::Instant::now();
 
@@ -95,14 +274,14 @@ pub fn escena(
             .map(OverlayElement::Color),
     );
 
-    // El velo del launchpad va detrás del shell y delante de las ventanas: es
+    // El velo de la emergente va detrás del shell y delante de las ventanas: es
     // lo que hace que el escritorio se vea apagado por debajo sin que el shell
     // tenga que rasterizar la pantalla entera en CPU.
     elementos.extend(
         state
             .shell
             .as_ref()
-            .filter(|_| !completa)
+            .filter(|_| !completa || vista_escritorios)
             .and_then(|shell| shell.velo())
             .map(OverlayElement::Color),
     );
@@ -123,7 +302,7 @@ pub fn escena(
         .current_mode()
         .map(|m| (m.size.w, m.size.h))
         .unwrap_or((1, 1));
-    if !completa {
+    if !completa && !vista_escritorios {
         if let (Some(cristal), Some(shell)) = (state.cristal.clone(), state.shell.as_ref()) {
             let zonas = shell.zonas_cristal();
             // El commit **no** sube por frame: el cristal desenfoca el fondo,
@@ -173,11 +352,51 @@ pub fn escena(
             .collect()
     };
     for (window, loc) in ventanas {
-        let (alfa, zoom) = crate::ventanas::animacion(&window);
-        // Al maximizar o encajar, el buffer nuevo entra escalado desde el
-        // tamaño viejo: es la parte de la animación que faltaba, porque
-        // `posicion` solo movía la esquina y el tamaño cambiaba de golpe.
-        let zoom = zoom * crate::ventanas::escala_resize(&window, window.geometry().size);
+        // Una ventana que se va al dock —o que vuelve— manda sobre las demás
+        // animaciones: su recorrido, su tamaño y su desvanecido salen de un
+        // solo sitio, y mezclarlo con el zoom de entrada daría dos escalas
+        // multiplicándose.
+        let encogido = crate::ventanas::encogido(&window);
+        // Con shader, el minimizar es el «magic lamp»: la ventana se congela en
+        // una textura la primera vez y a partir de ahí la dibuja el genio, no
+        // sus superficies. Sin shader se sigue por el camino de abajo, que la
+        // encoge sin deformarla.
+        if let (Some(e), Some(genio)) = (encogido, state.genio.as_ref()) {
+            if !state.capturas.iter().any(|(w, _)| *w == window) {
+                if let Some(captura) = crate::genio::capturar(renderer, &window, scale) {
+                    state.capturas.push((window.clone(), captura));
+                }
+            }
+            if let Some((_, captura)) = state.capturas.iter().find(|(w, _)| *w == window) {
+                elementos.push(OverlayElement::Genio(crate::genio::Elemento::new(
+                    captura,
+                    genio,
+                    state.genio_commit,
+                    e.origen,
+                    e.destino,
+                    crate::ventanas::progreso_encogido(e),
+                    scale,
+                )));
+                continue;
+            }
+        }
+        let (alfa, zoom) = match encogido {
+            Some(e) => {
+                let (_, escala, alfa) = crate::ventanas::encogido_ahora(e);
+                (alfa, escala)
+            }
+            None => {
+                let (alfa, zoom) = crate::ventanas::animacion(&window);
+                // Al maximizar o encajar, el buffer nuevo entra escalado desde
+                // el tamaño viejo: es la parte de la animación que faltaba,
+                // porque `posicion` solo movía la esquina y el tamaño cambiaba
+                // de golpe.
+                (
+                    alfa,
+                    zoom * crate::ventanas::escala_resize(&window, window.geometry().size),
+                )
+            }
+        };
         // Una ventana que aún no tiene sitio no se dibuja. Enseñarla mientras
         // tanto significa un fotograma con el cliente pegado a la esquina
         // superior izquierda antes de saltar al centro, y ese salto se ve.
@@ -186,7 +405,10 @@ pub fn escena(
         }
         // La posición de dibujo descuenta el marco del cliente: `geometry().loc`
         // es el hueco entre el borde del buffer y la ventana visible (sombras).
-        let animada = crate::ventanas::posicion(&window, loc);
+        let animada = match encogido {
+            Some(e) => crate::ventanas::encogido_ahora(e).0,
+            None => crate::ventanas::posicion(&window, loc),
+        };
         let origen = (animada - window.geometry().loc.to_f64()).to_physical_precise_round(scale);
         let superficies = window.render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
             renderer,
@@ -194,6 +416,44 @@ pub fn escena(
             Scale::from(scale),
             alfa,
         );
+
+        // El centro de la ventana, que es desde donde crece el zoom de entrada.
+        // Se calcula antes que nada porque la barra de título comparte esa
+        // animación: escalarla desde su propio centro la separaría de la
+        // ventana a la que va pegada.
+        let geo = window.geometry().size;
+        let centro = Point::<f64, Logical>::from((
+            animada.x + geo.w as f64 / 2.0,
+            animada.y + geo.h as f64 / 2.0,
+        ))
+        .to_physical_precise_round(scale);
+
+        // La barra va **delante de su ventana y detrás de las de encima**, así
+        // que se emite aquí dentro y no con el resto del shell: en
+        // `custom_elements` la barra de una ventana tapada se dibujaría sobre la
+        // que tiene delante.
+        if crate::decoracion::decorada(&window) {
+            let barra = crate::decoracion::estado_de(state, &window);
+            let id = crate::decoracion::id(&window);
+            let origen_barra = Point::<f64, Logical>::from((
+                animada.x,
+                animada.y - crate::decoracion::ALTO as f64,
+            ))
+            .to_physical_precise_round(scale);
+            if let (Some(id), Some(shell)) = (id, state.shell.as_mut()) {
+                if let Some(elemento) =
+                    shell.barra_ventana(renderer, id, geo.w, barra, origen_barra, alfa)
+                {
+                    elementos.push(if zoom == 1.0 {
+                        OverlayElement::Memory(elemento)
+                    } else {
+                        OverlayElement::MemoriaEscalada(RescaleRenderElement::from_element(
+                            elemento, centro, zoom,
+                        ))
+                    });
+                }
+            }
+        }
 
         if zoom == 1.0 {
             elementos.extend(superficies.into_iter().map(OverlayElement::Surface));
@@ -213,12 +473,6 @@ pub fn escena(
         // El zoom crece desde el centro de la ventana: con el origen en la
         // esquina, la ventana se despliega hacia abajo y a la derecha y parece
         // que entre deslizándose en diagonal, no que aparezca.
-        let geo = window.geometry().size;
-        let centro = (
-            animada.x + geo.w as f64 / 2.0,
-            animada.y + geo.h as f64 / 2.0,
-        );
-        let centro = Point::<f64, Logical>::from(centro).to_physical_precise_round(scale);
         elementos.extend(superficies.into_iter().map(|elemento| {
             OverlayElement::Escalada(RescaleRenderElement::from_element(elemento, centro, zoom))
         }));
@@ -228,7 +482,24 @@ pub fn escena(
     // las ventanas, del shell y del cristal.
     if let Some(fondo) = state.fondo.as_ref() {
         let (lw, lh) = state.pantalla_logica();
-        if let Some(elemento) = fondo.elemento(renderer, (lw as i32, lh as i32)) {
+        // Mientras se cambia de escritorio el fondo no se queda quieto: se
+        // agranda un poco y se corre en sentido contrario a la vista. Fuera de
+        // la transición esto devuelve la posición y el tamaño de siempre.
+        // Al cambiar de escritorio el fondo se desliza con las ventanas, a la
+        // misma velocidad: la pantalla entera es una tira que se corre de lado.
+        // Son dos porque el que se va deja el borde al descubierto y detrás
+        // está el del escritorio al que se llega, pegado a él.
+        let (saliente, entrante) = match state.escritorios.tira_fondo() {
+            Some((s, e)) => (s, Some(e)),
+            None => (0, None),
+        };
+        if let Some(x) = entrante {
+            if let Some(elemento) = fondo.elemento_gemelo_en(renderer, (x, 0), (lw as i32, lh as i32))
+            {
+                elementos.push(OverlayElement::Memory(elemento));
+            }
+        }
+        if let Some(elemento) = fondo.elemento_en(renderer, (saliente, 0), (lw as i32, lh as i32)) {
             elementos.push(OverlayElement::Memory(elemento));
         }
     }

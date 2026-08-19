@@ -7,9 +7,10 @@
 mod bateria;
 mod bateria_simple;
 mod bluetooth;
-mod control;
-mod notificaciones;
 mod brillo;
+mod control;
+pub(crate) mod escritorios;
+mod notificaciones;
 mod red;
 mod reloj;
 pub(crate) mod volumen;
@@ -33,6 +34,7 @@ pub fn por_nombre(nombre: &str) -> Option<Box<dyn Widget>> {
         "bluetooth" => Some(Box::new(bluetooth::Bluetooth::new())),
         "notificaciones" => Some(Box::new(notificaciones::Notificaciones::new())),
         "control" => Some(Box::new(control::Control::new())),
+        "escritorios" => Some(Box::new(escritorios::Escritorios::new())),
         _ => None,
     }
 }

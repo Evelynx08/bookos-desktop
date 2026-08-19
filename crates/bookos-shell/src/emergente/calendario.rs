@@ -58,7 +58,7 @@ pub struct Calendario {
     /// El día elegido. Empieza en hoy.
     elegido: Fecha,
     /// Celda bajo el puntero, como índice en la rejilla de 42.
-    señalada: Option<usize>,
+    señalada: tema::Realce,
 }
 
 impl Calendario {
@@ -69,7 +69,7 @@ impl Calendario {
             vista_anio: hoy.anio,
             vista_mes: hoy.mes,
             elegido: hoy,
-            señalada: None,
+            señalada: tema::Realce::nuevo(),
         }
     }
 
@@ -152,12 +152,13 @@ impl Calendario {
     }
 
     pub fn puntero(&mut self, punto: Option<(f32, f32)>) -> bool {
-        let señalada = punto.and_then(|(x, y)| self.celda_en(x, y));
-        if self.señalada == señalada {
-            return false;
-        }
-        self.señalada = señalada;
-        true
+        self.señalada
+            .señalar(punto.and_then(|(x, y)| self.celda_en(x, y)))
+    }
+
+    /// ¿Se mueve algo dentro de la tarjeta?
+    pub fn animando(&self) -> bool {
+        self.señalada.animando()
     }
 
     pub fn pulsar(&mut self, x: f32, y: f32) -> Option<Accion> {
@@ -207,15 +208,12 @@ impl Calendario {
             self.vista_anio
         );
 
-        let cabecera = container(
-            text(titulo)
-                .size(20)
-                .color(tema::TEXTO)
-                .font(iced_core::Font {
-                    weight: iced_core::font::Weight::Bold,
-                    ..iced_core::Font::DEFAULT
-                }),
-        )
+        let cabecera = container(text(titulo).size(20).color(tema::texto()).font(
+            iced_core::Font {
+                weight: iced_core::font::Weight::Bold,
+                ..iced_core::Font::DEFAULT
+            },
+        ))
         .height(Length::Fixed(CABECERA))
         .align_y(Vertical::Center);
 
@@ -242,11 +240,11 @@ impl Calendario {
             .width(Length::Fixed(ANCHO))
             .padding(MARGEN)
             .style(|_theme| container::Style {
-                background: Some(tema::CARD.into()),
+                background: Some(tema::card().into()),
                 border: Border {
                     radius: tema::R_POPOVER.into(),
                     width: 1.0,
-                    color: tema::BORDE,
+                    color: tema::borde(),
                 },
                 ..Default::default()
             })
@@ -257,19 +255,21 @@ impl Calendario {
         let (fecha, del_mes) = self.celda(i);
         let es_hoy = fecha == self.hoy;
         let elegido = fecha == self.elegido;
-        let señalada = self.señalada == Some(i);
+        let señalada = self.señalada.intensidad(i);
 
         // El orden importa: elegido gana a hoy, y hoy gana al hover. Un día que
         // es hoy **y** está elegido se dibuja como elegido, que es lo que dice
-        // dónde está el cursor del usuario.
+        // dónde está el cursor del usuario. El hover es lo único que se anima:
+        // elegir un día es un salto de estado, no un recorrido.
         let (fondo, color) = if elegido {
-            (tema::ACENTO, Color::WHITE)
+            (tema::acento(), tema::sobre_acento())
         } else if es_hoy {
-            (Color { a: 0.14, ..tema::ACENTO }, tema::ACENTO)
-        } else if señalada {
-            (tema::HOVER, tema::TEXTO)
+            (tema::alfa(tema::acento(), 0.14), tema::acento())
         } else {
-            (Color::TRANSPARENT, tema::TEXTO)
+            (
+                tema::mezclar(Color::TRANSPARENT, tema::hover(), señalada),
+                tema::texto(),
+            )
         };
         // Los días de los meses vecinos se ven, pero apagados: dan contexto sin
         // competir con el mes que se está mirando.
@@ -329,9 +329,23 @@ mod tests {
         // lunes 27 de julio y el 1 va en la celda 5.
         c.vista_anio = 2026;
         c.vista_mes = 8;
-        assert_eq!(c.celda(0).0, Fecha { anio: 2026, mes: 7, dia: 27 });
+        assert_eq!(
+            c.celda(0).0,
+            Fecha {
+                anio: 2026,
+                mes: 7,
+                dia: 27
+            }
+        );
         assert!(!c.celda(0).1, "el 27 de julio no es del mes que se mira");
-        assert_eq!(c.celda(5).0, Fecha { anio: 2026, mes: 8, dia: 1 });
+        assert_eq!(
+            c.celda(5).0,
+            Fecha {
+                anio: 2026,
+                mes: 8,
+                dia: 1
+            }
+        );
         assert!(c.celda(5).1);
     }
 
@@ -342,7 +356,14 @@ mod tests {
         // diciembre de 2026.
         c.vista_anio = 2027;
         c.vista_mes = 1;
-        assert_eq!(c.celda(0).0, Fecha { anio: 2026, mes: 12, dia: 28 });
+        assert_eq!(
+            c.celda(0).0,
+            Fecha {
+                anio: 2026,
+                mes: 12,
+                dia: 28
+            }
+        );
         // Y la última celda cae ya en febrero.
         let (ultima, del_mes) = c.celda(41);
         assert_eq!(ultima.mes, 2);
@@ -361,10 +382,34 @@ mod tests {
     #[test]
     fn el_dia_de_la_semana_empieza_en_lunes() {
         // 14 de agosto de 2026 es viernes.
-        assert_eq!(Fecha { anio: 2026, mes: 8, dia: 14 }.dia_semana(), 4);
+        assert_eq!(
+            Fecha {
+                anio: 2026,
+                mes: 8,
+                dia: 14
+            }
+            .dia_semana(),
+            4
+        );
         // 17 de agosto de 2026, lunes.
-        assert_eq!(Fecha { anio: 2026, mes: 8, dia: 17 }.dia_semana(), 0);
+        assert_eq!(
+            Fecha {
+                anio: 2026,
+                mes: 8,
+                dia: 17
+            }
+            .dia_semana(),
+            0
+        );
         // 16 de agosto de 2026, domingo: el último de la semana, no el primero.
-        assert_eq!(Fecha { anio: 2026, mes: 8, dia: 16 }.dia_semana(), 6);
+        assert_eq!(
+            Fecha {
+                anio: 2026,
+                mes: 8,
+                dia: 16
+            }
+            .dia_semana(),
+            6
+        );
     }
 }

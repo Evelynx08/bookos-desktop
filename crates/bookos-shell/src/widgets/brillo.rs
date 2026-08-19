@@ -56,11 +56,17 @@ impl Widget for Brillo {
         let Some(brillo) = self.dato else {
             return crate::widget::vacio();
         };
-        let mut fila = row![].spacing(4).align_y(iced_core::alignment::Vertical::Center);
+        let mut fila = row![]
+            .spacing(4)
+            .align_y(iced_core::alignment::Vertical::Center);
         if let Some(ic) = &self.icono {
-            fila = fila.push(icono::ver_teñido(ic, tema::ICONO_PANEL, Some(TEXT)));
+            fila = fila.push(icono::ver_teñido(ic, tema::ICONO_PANEL, Some(TEXT())));
         }
-        fila.push(text(format!("{brillo}%")).size(tema::T_CUERPO).color(TEXT))
-            .into()
+        fila.push(
+            text(format!("{brillo}%"))
+                .size(tema::T_CUERPO)
+                .color(TEXT()),
+        )
+        .into()
     }
 }

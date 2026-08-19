@@ -17,6 +17,7 @@ use iced_core::Length;
 use iced_widget::{column, Space};
 
 use crate::icono;
+use crate::tema;
 use crate::view::PanelElement;
 use crate::Accion;
 
@@ -33,8 +34,11 @@ pub struct Bluetooth {
     /// no por nombre: dos auriculares del mismo modelo se llaman igual.
     direcciones: Vec<String>,
     encendido: bool,
-    señalada: Option<usize>,
-    pie: Option<bool>,
+    /// El recorrido de la bolita del interruptor, siguiendo a `encendido`.
+    interruptor: tema::Transicion,
+    señalada: tema::Realce,
+    /// El botón del pie bajo el puntero: el 0 es el izquierdo y el 1 el otro.
+    pie: tema::Realce,
     pendiente: Option<Child>,
 }
 
@@ -44,18 +48,22 @@ impl Bluetooth {
             entradas: Vec::new(),
             direcciones: Vec::new(),
             encendido: false,
-            señalada: None,
-            pie: None,
+            interruptor: tema::Transicion::nueva(0.0, tema::D_MODAL, tema::C_MUELLE),
+            señalada: tema::Realce::nuevo(),
+            pie: tema::Realce::nuevo(),
             pendiente: None,
         };
         if let Ok(salida) = Command::new("sh").arg("-c").arg(ORDEN).output() {
             b.aplicar(&String::from_utf8_lossy(&salida.stdout));
         }
+        // Igual que en la tarjeta de red: lo que se lee al abrir no se anima.
+        b.interruptor.fijar(b.encendido as u8 as f32);
         b
     }
 
     fn aplicar(&mut self, salida: &str) {
         self.encendido = salida.contains("Powered: yes");
+        self.interruptor.ir_a(self.encendido as u8 as f32);
         let dispositivos: Vec<_> = interpretar(salida).into_iter().take(MAXIMO).collect();
         self.direcciones = dispositivos.iter().map(|(_, _, mac)| mac.clone()).collect();
         self.entradas = dispositivos
@@ -104,13 +112,17 @@ impl Bluetooth {
     pub fn puntero(&mut self, punto: Option<(f32, f32)>) -> bool {
         let señalada =
             punto.and_then(|(x, y)| lista::fila_en(x, y, self.y_lista(), self.entradas.len()));
-        let pie = punto.and_then(|(x, y)| self.pie_en(x, y));
-        if señalada == self.señalada && pie == self.pie {
-            return false;
-        }
-        self.señalada = señalada;
-        self.pie = pie;
-        true
+        let pie = punto.and_then(|(x, y)| self.pie_en(x, y)).map(usize::from);
+        // Sin cortocircuito: salir de una fila hacia un botón del pie tiene que
+        // apagar la fila **y** encender el botón.
+        let a = self.señalada.señalar(señalada);
+        let b = self.pie.señalar(pie);
+        a || b
+    }
+
+    /// ¿Se mueve algo dentro de la tarjeta?
+    pub fn animando(&self) -> bool {
+        self.señalada.animando() || self.pie.animando() || self.interruptor.animando()
     }
 
     fn pie_en(&self, x: f32, y: f32) -> Option<bool> {
@@ -118,8 +130,7 @@ impl Bluetooth {
         if y < y0 || y > y0 + lista::PIE_BOTON {
             return None;
         }
-        (x > lista::MARGEN && x < lista::ANCHO - lista::MARGEN)
-            .then(|| x > lista::ANCHO / 2.0)
+        (x > lista::MARGEN && x < lista::ANCHO - lista::MARGEN).then(|| x > lista::ANCHO / 2.0)
     }
 
     pub fn pulsar(&mut self, x: f32, y: f32) -> Option<Accion> {
@@ -177,7 +188,7 @@ impl Bluetooth {
     }
 
     pub fn view(&self) -> PanelElement<'_> {
-        let mut contenido = column![lista::cabecera("Bluetooth", Some(self.encendido))];
+        let mut contenido = column![lista::cabecera("Bluetooth", Some(self.interruptor.valor()))];
         if self.entradas.is_empty() {
             contenido = contenido.push(lista::vacia(if self.encendido {
                 "No hay dispositivos emparejados"
@@ -190,12 +201,12 @@ impl Bluetooth {
                     contenido =
                         contenido.push(Space::new().height(Length::Fixed(lista::HUECO_FILA)));
                 }
-                contenido = contenido.push(lista::fila(entrada, self.señalada == Some(i)));
+                contenido = contenido.push(lista::fila(entrada, self.señalada.intensidad(i)));
             }
         }
         contenido = contenido
             .push(Space::new().height(Length::Fixed(10.0)))
-            .push(lista::pie("Detalles", "Configuración", self.pie));
+            .push(lista::pie("Detalles", "Configuración", &self.pie));
         control::tarjeta(contenido.into(), lista::ANCHO, lista::MARGEN)
     }
 }

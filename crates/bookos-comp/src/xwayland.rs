@@ -155,6 +155,9 @@ impl smithay::xwayland::XwmHandler for BookosComp {
     }
 
     fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        if self.shell.as_ref().is_some_and(|s| s.hay_conmutador()) {
+            crate::keybinds::ejecutar(self, crate::keybinds::Accion::ConmutarCancelar);
+        }
         if let Some(elemento) = self.window_de_x11(&window) {
             self.space.unmap_elem(&elemento);
         }
@@ -167,6 +170,10 @@ impl smithay::xwayland::XwmHandler for BookosComp {
     }
 
     fn destroyed_window(&mut self, _xwm: XwmId, _window: X11Surface) {
+        if self.shell.as_ref().is_some_and(|s| s.hay_conmutador()) {
+            crate::keybinds::ejecutar(self, crate::keybinds::Accion::ConmutarCancelar);
+        }
+        crate::escritorios::purgar(self);
         crate::keybinds::refocalizar(self);
         self.needs_redraw = true;
         self.actualizar_dock();
@@ -264,12 +271,12 @@ impl smithay::xwayland::XwmHandler for BookosComp {
             izquierda: matches!(edge, E::Left | E::TopLeft | E::BottomLeft),
             arriba: matches!(edge, E::Top | E::TopLeft | E::TopRight),
         };
-        self.arrastrar_ventana(&elemento, modo);
+        self.arrastrar_ventana(&elemento, modo, true);
     }
 
     fn move_request(&mut self, _xwm: XwmId, window: X11Surface, _button: u32) {
         if let Some(elemento) = self.window_de_x11(&window) {
-            self.arrastrar_ventana(&elemento, crate::ventanas::Modo::Mover);
+            self.arrastrar_ventana(&elemento, crate::ventanas::Modo::Mover, true);
         }
     }
 

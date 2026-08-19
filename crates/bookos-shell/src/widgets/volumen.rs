@@ -46,13 +46,26 @@ impl Volumen {
             icono_nombre: "",
             pendiente: None,
         };
-        // Al arrancar sí se espera: son 21 ms una sola vez, y a cambio el panel
-        // sale con el icono correcto en el primer frame en vez de aparecer
-        // vacío y llenarse solo al primer evento.
-        if let Some((nivel, silenciado)) = consultar("@DEFAULT_AUDIO_SINK@") {
-            v.aplicar(nivel, silenciado);
-        }
+        // Se **lanza** y no se espera: quien la recoge es `esperar_arranque`,
+        // ya con las de los demás widgets corriendo a la vez. Esperarla aquí
+        // ponía en fila los 19 ms de esta con los 19 de bluetooth.
+        v.pendiente = lanzar("@DEFAULT_AUDIO_SINK@");
         v
+    }
+
+    /// Recoge la consulta del arranque, esperándola si hace falta.
+    fn recoger_arranque(&mut self) {
+        let Some(hijo) = self.pendiente.take() else {
+            return;
+        };
+        if let Some((nivel, silenciado)) = hijo
+            .wait_with_output()
+            .ok()
+            .filter(|s| s.status.success())
+            .and_then(|s| interpretar(&String::from_utf8_lossy(&s.stdout)))
+        {
+            self.aplicar(nivel, silenciado);
+        }
     }
 
     /// Guarda lo leído y elige el icono. `true` si cambió algo que se ve.
@@ -118,6 +131,10 @@ impl Widget for Volumen {
         "volumen"
     }
 
+    fn esperar_arranque(&mut self) {
+        self.recoger_arranque();
+    }
+
     fn refrescar(&mut self) -> bool {
         self.releer()
     }
@@ -140,7 +157,11 @@ impl Widget for Volumen {
         };
         // Silenciado en gris: es la misma señal que da el plasmoide, y se
         // distingue del aspa a distancia de un vistazo.
-        let color = if self.silenciado { tema::TEXTO2 } else { TEXT };
+        let color = if self.silenciado {
+            tema::TEXTO2
+        } else {
+            TEXT()
+        };
         icono::ver_teñido(ic, tema::ICONO_PANEL, Some(color))
     }
 }

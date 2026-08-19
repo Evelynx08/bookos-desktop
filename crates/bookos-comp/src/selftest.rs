@@ -413,6 +413,79 @@ fn comprobar_doble_clic(state: &mut BookosComp) {
     tracing::info!("--- fin del autotest de doble clic ---");
 }
 
+/// Comprueba la barra de título que dibujamos: dónde cae, qué botón hay bajo
+/// cada punto y que pulsarlos hace lo que dicen.
+///
+/// El cliente de prueba tiene que entender `xdg-decoration` —konsole sí, GTK
+/// no—; con uno que se decore solo, esto solo puede decir que no lleva barra.
+fn comprobar_decoracion(state: &mut BookosComp) {
+    use bookos_shell::decoracion::Boton;
+
+    tracing::info!("--- barra de título ---");
+    let Some(window) = state.space.elements().next_back().cloned() else {
+        tracing::error!("no hay ninguna ventana: nada que comprobar");
+        return;
+    };
+    if !crate::decoracion::decorada(&window) {
+        tracing::warn!(
+            "el cliente se decora solo; con konsole esta comprobación sí corre"
+        );
+        return;
+    }
+    let Some(rect) = crate::decoracion::barra_rect(state, &window) else {
+        tracing::error!("una ventana decorada sin rectángulo de barra");
+        return;
+    };
+    let panel = state.shell.as_ref().map_or(0, |s| s.panel_height());
+    if rect.loc.y < panel {
+        tracing::error!(?rect, panel, "la barra queda por debajo del panel");
+    } else {
+        tracing::info!(?rect, panel, "la barra cabe bajo el panel");
+    }
+
+    // Cada botón, por su centro. El orden es el de la pantalla: minimizar,
+    // maximizar y cerrar pegado al borde.
+    let medio = rect.loc.y as f64 + rect.size.h as f64 / 2.0;
+    for (i, esperado) in [Boton::Cerrar, Boton::Maximizar, Boton::Minimizar]
+        .into_iter()
+        .enumerate()
+    {
+        let x = rect.loc.x as f64 + rect.size.w as f64 - 6.0 - i as f64 * 26.0 - 12.0;
+        match crate::decoracion::barra_en(state, (x, medio).into()) {
+            Some((_, Some(boton))) if boton == esperado => {
+                tracing::info!(?esperado, x, "el botón está donde se dibuja")
+            }
+            otro => tracing::error!(?esperado, x, ?otro, "el hit-test falla en un botón"),
+        }
+    }
+
+    // Y el maximizar, pulsado de verdad: el mismo camino que sigue un clic.
+    let antes = crate::ventanas::maximizada(&window);
+    let x = rect.loc.x as f64 + rect.size.w as f64 - 6.0 - 26.0 - 12.0;
+    crate::input::set_pointer(state, (x, medio).into(), 700);
+    crate::decoracion::pulsar(state, &window, Boton::Maximizar);
+    match crate::decoracion::soltar(state, (x, medio).into()) {
+        Some((w, boton)) => crate::decoracion::accionar(state, &w, boton),
+        None => tracing::error!("soltar sobre el mismo botón no lo dio por pulsado"),
+    }
+    if crate::ventanas::maximizada(&window) == antes {
+        tracing::error!(maximizada = antes, "el botón de maximizar no hizo nada");
+    } else {
+        tracing::info!(maximizada = !antes, "el botón de maximizar alterna");
+    }
+
+    // Soltar fuera del botón donde se pulsó no dispara nada, que es lo que
+    // permite arrepentirse a mitad de un clic.
+    crate::decoracion::pulsar(state, &window, Boton::Cerrar);
+    let lejos = (rect.loc.x as f64 + 10.0, medio);
+    if crate::decoracion::soltar(state, lejos.into()).is_some() {
+        tracing::error!("soltar fuera del botón lo dio por pulsado");
+    } else {
+        tracing::info!("soltar fuera del botón no dispara nada");
+    }
+    tracing::info!("--- fin del autotest de la barra de título ---");
+}
+
 /// Dos pulsaciones seguidas en el mismo sitio, que es lo que el compositor
 /// reconoce como doble clic. La primera nunca hace nada; la segunda es la que
 /// cuenta.
@@ -633,6 +706,223 @@ fn revisar_x11(state: &mut BookosComp) {
 /// necesita una mano moviendo el ratón con Meta pulsada. Aquí se recorre el
 /// mismo camino que un arrastre real —`empezar_arrastre`, varios movimientos del
 /// puntero, soltar— y se comprueba dónde acabó la ventana.
+/// El conmutador de Alt+Tab, por el camino de verdad: las acciones del atajo.
+///
+/// Lo que se comprueba es lo que se rompe sin avisar: que la lista sale por
+/// **uso reciente** y no en el orden en que se abrieron las ventanas, y que
+/// soltar el modificador enfoca de verdad la elegida.
+fn comprobar_conmutador(state: &mut BookosComp) {
+    comprobar_conmutador_tras(state, 0)
+}
+
+/// Igual, pero esperando a que haya dos aplicaciones.
+///
+/// El segundo cliente se lanza a mano desde fuera y una aplicación de KDE tarda
+/// varios segundos en mapearse: sin esta espera, la prueba se ejecutaba siempre
+/// antes de que llegara y no comprobaba nada.
+fn comprobar_conmutador_tras(state: &mut BookosComp, intento: u32) {
+    use crate::keybinds::{ejecutar, Accion};
+    const INTENTOS: u32 = 8;
+
+    // **Dos ventanas**, no dos aplicaciones: desde que el conmutador va por
+    // ventana, dos terminales bastan — y son justo el caso que estuvo roto.
+    let cuantas = state.space.elements().count();
+    if cuantas < 2 && intento < INTENTOS {
+        let result = state.loop_handle.insert_source(
+            Timer::from_duration(Duration::from_secs(2)),
+            move |_, _, state| {
+                comprobar_conmutador_tras(state, intento + 1);
+                TimeoutAction::Drop
+            },
+        );
+        if let Err(err) = result {
+            tracing::error!("no se pudo reprogramar: {err}");
+        }
+        return;
+    }
+
+    tracing::info!("--- conmutador ---");
+    let ventanas: Vec<_> = state.space.elements().cloned().collect();
+    let ids: Vec<_> = ventanas.iter().filter_map(crate::handlers::app_id).collect();
+    let titulos: Vec<_> = ventanas.iter().filter_map(crate::handlers::titulo).collect();
+    tracing::info!(?ids, ?titulos, "ventanas de partida");
+    if ventanas.len() < 2 {
+        tracing::error!(
+            cuantas = ventanas.len(),
+            "hacen falta dos ventanas; lanza el autotest con dos clientes"
+        );
+        return;
+    }
+
+    ejecutar(
+        state,
+        Accion::Conmutar(bookos_shell::conmutador::Modo::Ventanas, 1),
+    );
+    let abierto = state.shell.as_ref().is_some_and(|s| s.hay_conmutador());
+    tracing::info!(abierto, "Alt+Tab");
+    if !abierto {
+        tracing::error!("el conmutador no se abrió");
+        return;
+    }
+
+    // Soltar el modificador tiene que llevar el foco a la aplicación elegida,
+    // que con un solo Tab es la **anterior** a la de ahora.
+    // Por **identidad de ventana** y no por `app_id`: con dos ventanas del
+    // mismo programa el `app_id` es el mismo y la comprobación no valdría nada.
+    let antes = state.ventana_con_foco();
+    ejecutar(state, Accion::ConmutarFin);
+    let despues = state.ventana_con_foco();
+    tracing::info!(
+        antes = ?antes.as_ref().and_then(crate::handlers::titulo),
+        despues = ?despues.as_ref().and_then(crate::handlers::titulo),
+        "tras soltar"
+    );
+    if antes == despues {
+        tracing::error!("el foco no cambió de ventana");
+    }
+    if state.shell.as_ref().is_some_and(|s| s.hay_conmutador()) {
+        tracing::error!("el conmutador sigue abierto tras soltar");
+    }
+
+    // Y otra vez: tiene que volver a la primera. Ese ida y vuelta es todo el
+    // valor del orden por uso reciente.
+    ejecutar(
+        state,
+        Accion::Conmutar(bookos_shell::conmutador::Modo::Ventanas, 1),
+    );
+    ejecutar(state, Accion::ConmutarFin);
+    let vuelta = state.ventana_con_foco();
+    tracing::info!(vuelta = ?vuelta.as_ref().and_then(crate::handlers::titulo), "segundo Alt+Tab");
+    if vuelta != antes {
+        tracing::error!("no alterna entre las dos últimas ventanas");
+    }
+
+    // Escape lo cierra sin tocar el foco.
+    ejecutar(
+        state,
+        Accion::Conmutar(bookos_shell::conmutador::Modo::Ventanas, 1),
+    );
+    ejecutar(state, Accion::ConmutarCancelar);
+    let tras_escape = state.ventana_con_foco();
+    tracing::info!(
+        tras_escape = ?tras_escape.as_ref().and_then(crate::handlers::titulo),
+        "tras Escape"
+    );
+    if tras_escape != vuelta || state.shell.as_ref().is_some_and(|s| s.hay_conmutador()) {
+        tracing::error!("Escape no dejó las cosas como estaban");
+    }
+}
+
+/// Los escritorios virtuales y su deslizamiento, por el camino de verdad.
+///
+/// Es lo único de los escritorios que se puede comprobar sin un TTY —el gesto
+/// necesita libinput, pero el atajo y el gesto acaban los dos en
+/// `escritorios::cambiar_a`—. Se muestrea la posición de la ventana mientras
+/// dura la transición: si el deslizamiento no ocurre, todas las muestras salen
+/// iguales y se ve en la traza.
+fn comprobar_escritorios(state: &mut BookosComp) {
+    use crate::keybinds::{ejecutar, Accion};
+
+    tracing::info!("--- escritorios ---");
+    let Some(window) = state.space.elements().next_back().cloned() else {
+        tracing::error!("no hay ninguna ventana: nada que comprobar");
+        return;
+    };
+    let Some(antes) = state.space.element_location(&window) else {
+        tracing::error!("la ventana no está mapeada");
+        return;
+    };
+    let cuantas = state.space.elements().count();
+    tracing::info!(escritorio = state.escritorios.activo(), cuantas, ?antes, "de partida");
+
+    ejecutar(state, Accion::EscritorioRelativo(1));
+    muestrear_deslizamiento(state, window, antes, cuantas, 0);
+}
+
+/// Anota dónde está la ventana mientras se desliza, y comprueba el final.
+///
+/// Cada muestra va en su propio temporizador porque la animación avanza al
+/// componer cada frame: en un bucle cerrado no se movería nada y la prueba
+/// mediría su propia impaciencia.
+fn muestrear_deslizamiento(
+    state: &mut BookosComp,
+    window: smithay::desktop::Window,
+    antes: smithay::utils::Point<i32, smithay::utils::Logical>,
+    cuantas: usize,
+    paso: u32,
+) {
+    use crate::keybinds::{ejecutar, Accion};
+    const PASOS: u32 = 9;
+    const ESPERA: Duration = Duration::from_millis(40);
+
+    let x = state.space.element_location(&window).map(|p| p.x);
+    tracing::info!(paso, ?x, deslizando = state.escritorios.deslizando(), "saliendo");
+
+    if paso < PASOS {
+        let result = state
+            .loop_handle
+            .insert_source(Timer::from_duration(ESPERA), move |_, _, state| {
+                muestrear_deslizamiento(state, window.clone(), antes, cuantas, paso + 1);
+                TimeoutAction::Drop
+            });
+        if let Err(err) = result {
+            tracing::error!("no se pudo programar la muestra: {err}");
+        }
+        return;
+    }
+
+    // Terminada la animación: el escritorio nuevo tiene que estar vacío.
+    let vacio = state.space.elements().count();
+    tracing::info!(escritorio = state.escritorios.activo(), quedan = vacio, "tras ir al 2");
+    if vacio != 0 || state.escritorios.deslizando() {
+        tracing::error!(vacio, "el escritorio nuevo debería estar vacío y quieto");
+    }
+
+    ejecutar(state, Accion::EscritorioRelativo(-1));
+    // Y al volver, la ventana tiene que acabar **en su sitio exacto**, no donde
+    // la dejó la animación: es lo que se rompe si el final del deslizamiento no
+    // recoloca y se queda con la última interpolación.
+    let result = state.loop_handle.insert_source(
+        Timer::from_duration(Duration::from_millis(400)),
+        move |_, _, state| {
+            let despues = state.space.element_location(&window);
+            tracing::info!(
+                escritorio = state.escritorios.activo(),
+                vuelven = state.space.elements().count(),
+                ?despues,
+                "de vuelta al 1"
+            );
+            if despues != Some(antes) {
+                tracing::error!(?antes, ?despues, "la ventana no volvió a su sitio");
+            }
+
+            // Y el extremo: a la izquierda del primero no hay nada.
+            ejecutar(state, Accion::EscritorioRelativo(-1));
+            if state.escritorios.activo() != 0 {
+                tracing::error!(
+                    activo = state.escritorios.activo(),
+                    "el primer escritorio no debería tener nada a su izquierda"
+                );
+            }
+
+            // Mostrar escritorio: aparta y devuelve. No anima, así que se puede
+            // comprobar en el sitio.
+            ejecutar(state, Accion::MostrarEscritorio);
+            let despejado = state.space.elements().count();
+            ejecutar(state, Accion::MostrarEscritorio);
+            let recuperadas = state.space.elements().count();
+            tracing::info!(despejado, recuperadas, "mostrar escritorio");
+            if despejado != 0 || recuperadas != cuantas {
+                tracing::error!(despejado, recuperadas, cuantas, "el despejado no cuadra");
+            }
+            TimeoutAction::Drop
+        },
+    );
+    if let Err(err) = result {
+        tracing::error!("no se pudo programar la vuelta: {err}");
+    }
+}
+
 fn comprobar_ventanas(state: &mut BookosComp) {
     use crate::ventanas::Modo;
 
@@ -850,6 +1140,33 @@ fn run(state: &mut BookosComp) {
     comprobar_dock(state);
     if std::env::var_os("BOOKOS_SELFTEST_MENU").is_some() {
         recorrer_menu(state);
+        return;
+    }
+    if std::env::var_os("BOOKOS_SELFTEST_CONMUTADOR").is_some() {
+        comprobar_conmutador(state);
+        return;
+    }
+    if std::env::var_os("BOOKOS_SELFTEST_ESCRITORIOS").is_some() {
+        comprobar_escritorios(state);
+        return;
+    }
+    if std::env::var_os("BOOKOS_SELFTEST_BUSCADOR").is_some() {
+        // Se abre y se le escribe una consulta por el mismo camino que el
+        // teclado real, y se **queda abierto**: es la única forma de mirar el
+        // cristal de debajo, que no existe fuera de una pantalla de verdad.
+        let consulta = std::env::var("BOOKOS_SELFTEST_BUSCADOR").unwrap_or_default();
+        if let Some(shell) = state.shell.as_mut() {
+            shell.alternar_buscador();
+            for c in consulta.chars().filter(|c| *c != '1') {
+                shell.tecla(bookos_shell::TeclaPulsada::Caracter(c));
+            }
+        }
+        state.needs_redraw = true;
+        tracing::info!(consulta, "buscador abierto para mirarlo");
+        return;
+    }
+    if std::env::var_os("BOOKOS_SELFTEST_DECORACION").is_some() {
+        comprobar_decoracion(state);
         return;
     }
     if std::env::var_os("BOOKOS_SELFTEST_VENTANAS").is_some() {

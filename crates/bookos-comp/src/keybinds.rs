@@ -11,6 +11,7 @@
 //! vez el compositor tiene el KMS. El resto de atajos son cosa del escritorio y
 //! llegarán con la configuración, no cableados en el compositor.
 
+use smithay::desktop::Window;
 use smithay::input::keyboard::{keysyms, KeysymHandle, ModifiersState};
 use smithay::utils::{IsAlive, SERIAL_COUNTER};
 
@@ -31,15 +32,23 @@ pub enum Accion {
     Salir,
     /// Meta+Espacio — abrir o cerrar el launchpad.
     Launchpad,
+    /// El buscador de Meta+Espacio: aplicaciones, comandos y estados.
+    Buscador,
+    /// Meta+W — vista general y gestión de escritorios.
+    VistaEscritorios,
     /// Meta+F — maximizar la ventana con foco, o devolverla a su sitio.
     Maximizar,
+    /// Meta+H — mandar la ventana con foco al dock. Vuelve pulsando su icono.
+    Minimizar,
     /// Meta+Alt+B y Meta+Alt+D — alternar si la barra se aparta de las ventanas
     /// o está siempre a la vista.
     AlternarBarra(crate::shell::Barra),
     /// Meta+L — echar la pantalla de bloqueo.
     Bloquear,
-    /// Quitar el bloqueo. Hoy la pide Escape, porque todavía no autentica.
+    /// Quitar el bloqueo. La pide el ayudante de PAM cuando la contraseña vale.
     Desbloquear,
+    /// Apagar, reiniciar o suspender desde el menú de la pantalla de bloqueo.
+    Energia(bookos_shell::bloqueo::Peticion),
     /// Un carácter más en la contraseña del bloqueo.
     BloqueoEscribir(char),
     BloqueoBorrar,
@@ -52,12 +61,162 @@ pub enum Accion {
     /// un cuarto. Es la única forma de llegar a un cuarto sin apuntar a una
     /// esquina con el ratón.
     Encajar(crate::ventanas::Direccion),
-    /// Meta+Tab — pasar el foco a la siguiente ventana.
-    SiguienteVentana,
+    /// Alt+Tab abre aplicaciones; Meta+Tab, ventanas con miniaturas. El entero
+    /// es el sentido: `-1` con Mayús.
+    Conmutar(bookos_shell::conmutador::Modo, i32),
+    /// Soltar el modificador: se va a la aplicación elegida.
+    ConmutarFin,
+    /// Escape con el conmutador abierto: se cierra sin ir a ninguna parte.
+    ConmutarCancelar,
+    /// Ir a un escritorio concreto: Meta+1..5.
+    Escritorio(usize),
+    /// Moverse uno a la izquierda o a la derecha: Meta+Ctrl+flechas y el gesto
+    /// de cuatro dedos a los lados. Va aparte de [`Accion::Escritorio`] porque
+    /// el destino depende de dónde estés, y eso no se sabe al resolver la tecla.
+    EscritorioRelativo(i32),
+    /// Meta+Ctrl+D y el gesto de cuatro dedos abajo: apartar todas las ventanas
+    /// para ver el escritorio, o devolverlas.
+    MostrarEscritorio,
     /// Lo que ha pedido una superficie emergente del shell. Llega por aquí y no
     /// se ejecuta en el sitio porque se decide dentro del filtro de
     /// `kbd.input`, con el estado del compositor ya prestado.
     DelShell(bookos_shell::Accion),
+    /// El diálogo del botón de encendido: dormir, bloquear, salir, reiniciar,
+    /// apagar.
+    DialogoEnergia,
+}
+
+/// El conmutador de aplicaciones: `Alt+Tab` y `Meta+Tab`, con Mayús al revés.
+///
+/// Está aparte de [`resolver`] para poder probarlo: `resolver` necesita un
+/// `KeysymHandle`, que envuelve el estado de xkb y no se construye en un test.
+/// Sin esto, "el atajo no responde" y "la tecla no llega al compositor" son
+/// indistinguibles desde fuera — y anidado dentro de Plasma pasa lo segundo, que
+/// es lo que hay que poder descartar.
+fn conmutador_de(sym: u32, modifiers: &ModifiersState) -> Option<Accion> {
+    if !matches!(sym, keysyms::KEY_Tab | keysyms::KEY_ISO_Left_Tab) {
+        return None;
+    }
+    // Con Ctrl no: `Ctrl+Alt+Tab` es de otra cosa en varios escritorios y no
+    // conviene pisarlo.
+    if modifiers.ctrl || modifiers.alt == modifiers.logo {
+        return None;
+    }
+    // Con Mayús se recorre al revés, como en todas partes. Se mira el
+    // modificador y no el keysym porque xkb ya convierte el tabulador en
+    // `ISO_Left_Tab` al entrar Mayús, y los dos llegan aquí.
+    let modo = if modifiers.alt {
+        bookos_shell::conmutador::Modo::Aplicaciones
+    } else {
+        bookos_shell::conmutador::Modo::Ventanas
+    };
+    Some(Accion::Conmutar(modo, if modifiers.shift { -1 } else { 1 }))
+}
+
+/// Abre el conmutador o avanza en él.
+///
+/// Alt toma la ventana más reciente de cada aplicación; Meta conserva todas
+/// las ventanas. Por eso dos terminales no hacen nada con Alt —solo hay una
+/// aplicación—, pero aparecen separadas y con título propio en Meta.
+///
+/// Solo entran las ventanas **de este escritorio**: las de los demás están
+/// desmapeadas, y saltar a una cambiaría de escritorio sin avisar, que no es lo
+/// que espera quien abre cualquiera de los dos selectores.
+fn conmutar(state: &mut BookosComp, modo: bookos_shell::conmutador::Modo, sentido: i32) {
+    if state.shell.as_ref().is_some_and(|s| s.hay_conmutador()) {
+        if state.conmutador_modo != Some(modo) {
+            state.conmutador_destinos.clear();
+            state.conmutador_modo = None;
+            if let Some(shell) = state.shell.as_mut() {
+                shell.cancelar_conmutador();
+            }
+        } else {
+            if let Some(shell) = state.shell.as_mut() {
+                shell.conmutador_mover(sentido);
+            }
+            state.needs_redraw = true;
+            return;
+        }
+    }
+
+    let ventanas: Vec<Window> = state.space.elements().cloned().collect();
+    let sellos: Vec<_> = ventanas.iter().map(crate::ventanas::enfocada_en).collect();
+    let app_ids: Vec<_> = ventanas
+        .iter()
+        .map(|w| crate::handlers::app_id(w).unwrap_or_default())
+        .collect();
+    // Una celda por ventana en los dos modos. Alt tiene tope —la fila de iconos
+    // se sale de la pantalla pasadas doce— y Meta no, porque su rejilla encoge
+    // las miniaturas hasta que quepan.
+    let orden = match modo {
+        bookos_shell::conmutador::Modo::Aplicaciones => {
+            crate::conmutador::orden(&sellos, bookos_shell::conmutador::MAXIMO)
+        }
+        bookos_shell::conmutador::Modo::Ventanas => crate::conmutador::orden(&sellos, usize::MAX),
+    };
+
+    let entradas: Vec<_> = orden
+        .iter()
+        .map(|i| {
+            let window = &ventanas[*i];
+            let app_id = &app_ids[*i];
+            // El título también en Alt: es lo único que distingue dos ventanas
+            // de la misma aplicación, que ahora tienen celda propia.
+            let titulo = crate::handlers::titulo(window).unwrap_or_default();
+            bookos_shell::entrada_de_ventana(app_id, &titulo)
+        })
+        .collect();
+    state.conmutador_destinos = orden.iter().map(|i| ventanas[*i].clone()).collect();
+
+    let abierto = state
+        .shell
+        .as_mut()
+        .is_some_and(|s| s.abrir_conmutador(modo, entradas));
+    if !abierto {
+        // Nunca en silencio: que este atajo fallara sin decir nada es lo que
+        // hizo que diagnosticarlo costara una tarde.
+        tracing::info!(
+            ventanas = ventanas.len(),
+            celdas = orden.len(),
+            hay_shell = state.shell.is_some(),
+            "el conmutador no se abre"
+        );
+        state.conmutador_destinos.clear();
+        state.conmutador_modo = None;
+        return;
+    }
+    state.conmutador_modo = Some(modo);
+    // El modelo nace señalando la ventana actual (índice 0); esta primera
+    // pulsación aplica el mismo paso que las repeticiones. Hacia atrás cae así
+    // directamente en la última celda.
+    if let Some(shell) = state.shell.as_mut() {
+        shell.conmutador_mover(sentido);
+    }
+    tracing::debug!(celdas = orden.len(), "conmutador abierto");
+    state.needs_redraw = true;
+}
+
+/// Se ha soltado el modificador: a la ventana elegida.
+fn conmutar_fin(state: &mut BookosComp) {
+    state.conmutador_pegado = false;
+    let elegida = state.shell.as_mut().and_then(|s| s.cerrar_conmutador());
+    let destinos = std::mem::take(&mut state.conmutador_destinos);
+    state.conmutador_modo = None;
+    // Repintar pase lo que pase: la tarjeta ya no está y alguien tiene que
+    // borrarla de la pantalla, se haya elegido algo o no.
+    state.needs_redraw = true;
+    let Some(window) = elegida.and_then(|i| destinos.get(i).cloned()) else {
+        return;
+    };
+    // La ventana pudo cerrarse con el conmutador abierto: el `Window` clonado
+    // sigue vivo aquí aunque su cliente se haya ido, así que enfocarlo sin
+    // comprobarlo daría el foco a un fantasma. Antes esto no hacía falta porque
+    // se rebuscaba en el `Space`, que ya solo tiene ventanas vivas.
+    if !window.alive() {
+        tracing::warn!("la ventana elegida se cerró mientras se elegía");
+        return;
+    }
+    state.enfocar(&window);
 }
 
 /// Decide si una tecla es un atajo del compositor.
@@ -81,11 +240,7 @@ pub fn resolver(modifiers: &ModifiersState, handle: &KeysymHandle<'_>) -> Option
     // llega como una F3 normal y hay que reconocerla a mano, mirando el símbolo
     // **sin** modificadores: con Ctrl+Alt aplicados podría no ser ya una F.
     if modifiers.ctrl && modifiers.alt {
-        let base = handle
-            .raw_syms()
-            .first()
-            .map(|s| s.raw())
-            .unwrap_or(sym);
+        let base = handle.raw_syms().first().map(|s| s.raw()).unwrap_or(sym);
         const F1: u32 = keysyms::KEY_F1;
         const F12: u32 = keysyms::KEY_F12;
         if (F1..=F12).contains(&base) {
@@ -96,11 +251,42 @@ pub fn resolver(modifiers: &ModifiersState, handle: &KeysymHandle<'_>) -> Option
         }
     }
 
+    // El botón de encendido y `Meta+Esc`, los dos al mismo diálogo. El segundo
+    // existe porque en un sobremesa el botón está en la caja, debajo de la
+    // mesa, y porque en un portátil puede que logind se quede la tecla antes
+    // de que llegue aquí (`HandlePowerKey`).
+    if sym == XF86_ENCENDIDO || (modifiers.logo && sym == keysyms::KEY_Escape) {
+        return Some(Accion::DialogoEnergia);
+    }
+
     // Las teclas de función no llevan modificador y valen aunque el foco lo
     // tenga una aplicación a pantalla completa: subir el volumen en un vídeo
     // tiene que funcionar sin salir de él.
     if let Some(tecla) = crate::multimedia::resolver(sym) {
         return Some(Accion::Multimedia(tecla));
+    }
+
+    // Alt+Tab, el de toda la vida. Estaba solo en Meta+Tab y eso es pedirle al
+    // usuario que desaprenda el atajo que usa desde hace veinte años: aquí lo
+    // que hay que teclear tiene que ser lo que ya sabe.
+    //
+    // Con Alt pulsada, xkb entrega el tabulador como ISO_Left_Tab en cuanto
+    // entra Mayús, así que se aceptan los dos. Va **antes** que el brazo de
+    // Ctrl+Alt para que no lo intercepte el cambio de VT.
+    if let Some(accion) = conmutador_de(sym, modifiers) {
+        return Some(accion);
+    }
+
+    // Meta+Ctrl, para los escritorios: va antes que Meta a secas por lo mismo
+    // que Meta+Alt —si no, `Meta+Ctrl+Izquierda` encajaría la ventana a medio
+    // lado en vez de cambiar de escritorio—. Son los atajos de KDE.
+    if modifiers.logo && modifiers.ctrl {
+        match sym {
+            keysyms::KEY_Left => return Some(Accion::EscritorioRelativo(-1)),
+            keysyms::KEY_Right => return Some(Accion::EscritorioRelativo(1)),
+            keysyms::KEY_d | keysyms::KEY_D => return Some(Accion::MostrarEscritorio),
+            _ => {}
+        }
     }
 
     // Meta+Alt va antes que Meta a secas: si no, `Meta+Alt+D` entraría por el
@@ -121,12 +307,17 @@ pub fn resolver(modifiers: &ModifiersState, handle: &KeysymHandle<'_>) -> Option
         match sym {
             keysyms::KEY_Return | keysyms::KEY_KP_Enter => return Some(Accion::Terminal),
             keysyms::KEY_q | keysyms::KEY_Q => return Some(Accion::CerrarVentana),
-            // Meta+Espacio abre el launchpad. En Plasma es Meta sola, pero
-            // Meta sola es un modificador: distinguir "la he pulsado y soltado
-            // sin nada más" exige recordar la suelta, y esa heurística es justo
-            // la que deja el menú abriéndose solo al usar cualquier atajo.
-            keysyms::KEY_space => return Some(Accion::Launchpad),
+            // Meta+Espacio abre el **buscador**, que es donde lo tiene KRunner
+            // y donde lo busca cualquiera que venga de Plasma o de macOS. El
+            // launchpad se quedó con Meta sola, que ya funcionaba: son dos
+            // gestos distintos para dos cosas distintas —ver todo lo instalado
+            // frente a escribir lo que quieres.
+            keysyms::KEY_space => return Some(Accion::Buscador),
+            keysyms::KEY_w | keysyms::KEY_W => return Some(Accion::VistaEscritorios),
             keysyms::KEY_f | keysyms::KEY_F => return Some(Accion::Maximizar),
+            // H de *hide*, como en macOS: Meta+M es «minimizar» en Windows pero
+            // aquí Meta+M ya no está libre en cuanto haya un menú.
+            keysyms::KEY_h | keysyms::KEY_H => return Some(Accion::Minimizar),
             keysyms::KEY_l | keysyms::KEY_L => return Some(Accion::Bloquear),
             keysyms::KEY_Left => {
                 return Some(Accion::Encajar(crate::ventanas::Direccion::Izquierda))
@@ -136,11 +327,13 @@ pub fn resolver(modifiers: &ModifiersState, handle: &KeysymHandle<'_>) -> Option
             }
             keysyms::KEY_Up => return Some(Accion::Encajar(crate::ventanas::Direccion::Arriba)),
             keysyms::KEY_Down => return Some(Accion::Encajar(crate::ventanas::Direccion::Abajo)),
-            // Con Meta pulsada, xkb entrega el tabulador como ISO_Left_Tab en
-            // cuanto entra Mayús. Se aceptan los dos porque Meta+Mayús+Tab es el
-            // reflejo de cualquiera que venga de otro escritorio.
-            keysyms::KEY_Tab | keysyms::KEY_ISO_Left_Tab => {
-                return Some(Accion::SiguienteVentana)
+            // Meta+1..5, el atajo directo a cada escritorio. Los keysyms de los
+            // dígitos son consecutivos desde KEY_1, así que la cuenta sale sola
+            // y no hace falta un brazo por escritorio.
+            _ if (keysyms::KEY_1..keysyms::KEY_1 + crate::escritorios::MAXIMO as u32)
+                .contains(&sym) =>
+            {
+                return Some(Accion::Escritorio((sym - keysyms::KEY_1) as usize))
             }
             _ => {}
         }
@@ -170,12 +363,29 @@ pub fn ejecutar(state: &mut BookosComp, accion: Accion) {
             tracing::info!("salida pedida con Ctrl+Alt+Retroceso");
             state.loop_signal.stop();
         }
+        Accion::Escritorio(n) => crate::escritorios::cambiar_a(state, n),
+        Accion::EscritorioRelativo(pasos) => {
+            let destino = crate::escritorios::destino(
+                state.escritorios.activo(),
+                pasos,
+                state.escritorios.cuantos(),
+            );
+            crate::escritorios::cambiar_a(state, destino);
+        }
+        Accion::MostrarEscritorio => crate::escritorios::alternar_despejado(state),
         Accion::Launchpad => {
             if let Some(shell) = state.shell.as_mut() {
                 shell.alternar_launchpad();
             }
             state.needs_redraw = true;
         }
+        Accion::Buscador => {
+            if let Some(shell) = state.shell.as_mut() {
+                shell.alternar_buscador();
+            }
+            state.needs_redraw = true;
+        }
+        Accion::VistaEscritorios => alternar_vista_escritorios(state),
         Accion::AlternarBarra(cual) => {
             let modo = state.shell.as_mut().map(|s| s.alternar_visibilidad(cual));
             if let Some(modo) = modo {
@@ -189,6 +399,7 @@ pub fn ejecutar(state: &mut BookosComp, accion: Accion) {
             }
         }
         Accion::Bloquear => bloquear(state),
+        Accion::DialogoEnergia => alternar_dialogo_energia(state),
         Accion::Desbloquear => {
             state.bloqueo = Default::default();
             if let Some(shell) = state.shell.as_mut() {
@@ -227,6 +438,23 @@ pub fn ejecutar(state: &mut BookosComp, accion: Accion) {
                 state.alternar_maximizada(&window);
             }
         }
+        // Con `-i` para ignorar inhibidores, igual que el menú del panel: desde
+        // la pantalla de bloqueo no hay forma de contestarle a un diálogo de
+        // «hay una aplicación que impide apagar».
+        Accion::Energia(peticion) => {
+            use bookos_shell::bloqueo::Peticion;
+            let orden = match peticion {
+                Peticion::Apagar => "systemctl poweroff -i || systemctl poweroff --force",
+                Peticion::Reiniciar => "systemctl reboot -i || systemctl reboot --force",
+                Peticion::Suspender => "systemctl suspend -i",
+            };
+            lanzar(state, orden);
+        }
+        Accion::Minimizar => {
+            if let Some(window) = state.ventana_con_foco() {
+                crate::ventanas::minimizar(state, window);
+            }
+        }
         Accion::Encajar(hacia) => {
             if let Some(window) = state.ventana_con_foco() {
                 let actual = crate::ventanas::zona_de(&window);
@@ -236,7 +464,20 @@ pub fn ejecutar(state: &mut BookosComp, accion: Accion) {
                 }
             }
         }
-        Accion::SiguienteVentana => state.siguiente_ventana(),
+        Accion::Conmutar(modo, sentido) => conmutar(state, modo, sentido),
+        Accion::ConmutarFin => conmutar_fin(state),
+        Accion::ConmutarCancelar => {
+            state.conmutador_destinos.clear();
+            state.conmutador_modo = None;
+            state.conmutador_pegado = false;
+            if state
+                .shell
+                .as_mut()
+                .is_some_and(|s| s.cancelar_conmutador())
+            {
+                state.needs_redraw = true;
+            }
+        }
         Accion::DelShell(accion) => hacer(state, accion),
     }
 }
@@ -252,6 +493,23 @@ pub fn hacer(state: &mut BookosComp, accion: bookos_shell::Accion) {
             }
             state.needs_redraw = true;
         }
+        bookos_shell::Accion::Escritorio(n) => crate::escritorios::cambiar_a(state, n),
+        bookos_shell::Accion::VistaEscritorios => alternar_vista_escritorios(state),
+        bookos_shell::Accion::CrearEscritorio => {
+            if crate::escritorios::crear(state) {
+                guardar_y_actualizar_escritorios(state);
+            }
+        }
+        bookos_shell::Accion::EliminarEscritorio(i) => {
+            if crate::escritorios::eliminar(state, i) {
+                guardar_y_actualizar_escritorios(state);
+            }
+        }
+        bookos_shell::Accion::RenombrarEscritorio { indice, nombre } => {
+            if crate::escritorios::renombrar(state, indice, &nombre) {
+                guardar_y_actualizar_escritorios(state);
+            }
+        }
         bookos_shell::Accion::Emergente(widget) => {
             if let Some(shell) = state.shell.as_mut() {
                 shell.abrir_de_widget(widget);
@@ -263,6 +521,61 @@ pub fn hacer(state: &mut BookosComp, accion: bookos_shell::Accion) {
                 shell.abrir_acerca();
             }
             state.needs_redraw = true;
+        }
+        bookos_shell::Accion::Apariencia { tema, acento } => {
+            let Some(shell) = state.shell.as_mut() else {
+                return;
+            };
+            if shell.aplicar_apariencia(tema, acento) {
+                // Se guarda **después** de aplicarlo: si escribir falla —disco
+                // lleno, `$HOME` de solo lectura— el escritorio ya ha cambiado
+                // de color y lo que se pierde es que se recuerde, que es el
+                // fallo menos malo de los dos.
+                if let Err(err) = bookos_shell::guardar_apariencia(tema, acento) {
+                    tracing::warn!("no se pudo guardar la apariencia: {err}");
+                }
+            }
+            state.needs_redraw = true;
+        }
+        bookos_shell::Accion::CerrarNotificacion(id) => {
+            let cerrada = state
+                .shell
+                .as_mut()
+                .is_some_and(|s| s.cerrar_notificacion(id));
+            if cerrada {
+                // La aplicación que la mandó espera saber que ya no está: es lo
+                // que le permite no repetirla y limpiar lo suyo.
+                crate::notificaciones::cerrada(
+                    state.bus_notificaciones.as_ref(),
+                    id,
+                    crate::notificaciones::CERRADA_POR_EL_USUARIO,
+                );
+            }
+            state.needs_redraw = true;
+        }
+        bookos_shell::Accion::BorrarNotificaciones => {
+            let ids = state
+                .shell
+                .as_mut()
+                .map(|s| s.borrar_notificaciones())
+                .unwrap_or_default();
+            for id in ids {
+                crate::notificaciones::cerrada(
+                    state.bus_notificaciones.as_ref(),
+                    id,
+                    crate::notificaciones::CERRADA_POR_EL_USUARIO,
+                );
+            }
+            state.needs_redraw = true;
+        }
+        bookos_shell::Accion::Actividad(accion) => {
+            crate::ajustes::accion_actividad(state, &accion);
+            state.needs_redraw = true;
+        }
+        bookos_shell::Accion::Bloquear => bloquear(state),
+        bookos_shell::Accion::CerrarSesion => {
+            tracing::info!("cierre de sesión pedido desde el diálogo de energía");
+            state.loop_signal.stop();
         }
         bookos_shell::Accion::Anclar {
             app_id,
@@ -288,8 +601,21 @@ pub fn hacer(state: &mut BookosComp, accion: bookos_shell::Accion) {
             }
         }
         bookos_shell::Accion::Activar { app_id, exec } => {
+            // El icono funciona como alternador: minimizada vuelve con la
+            // lámpara inversa; abierta se va al dock con la lámpara normal.
+            // Primero las minimizadas para no esconder otra ventana de la misma
+            // aplicación que se haya quedado abierta detrás.
+            if crate::ventanas::hay_minimizada(state, &app_id) {
+                crate::ventanas::restaurar_minimizada(state, &app_id);
+                return;
+            }
+            // Mientras sigue viajando aún figura en el `Space`; una segunda
+            // orden duplicaría su entrada en la lista de minimización.
+            if crate::ventanas::esta_minimizando(state, &app_id) {
+                return;
+            }
             match state.ventana_de_app(&app_id) {
-                Some(window) => state.enfocar(&window),
+                Some(window) => crate::ventanas::minimizar(state, window),
                 // El dock creía que estaba abierta y no la encontramos: pasa si
                 // el cliente declara un `app_id` distinto del de su `.desktop`.
                 // Lanzar es mejor que quedarse quieto — un icono que no responde
@@ -301,6 +627,27 @@ pub fn hacer(state: &mut BookosComp, accion: bookos_shell::Accion) {
             }
         }
     }
+}
+
+fn alternar_vista_escritorios(state: &mut BookosComp) {
+    let activo = state.escritorios.activo();
+    let nombres = state.escritorios.nombres().to_vec();
+    if let Some(shell) = state.shell.as_mut() {
+        shell.alternar_vista_escritorios(activo, nombres);
+    }
+    state.needs_redraw = true;
+}
+
+fn guardar_y_actualizar_escritorios(state: &mut BookosComp) {
+    let activo = state.escritorios.activo();
+    let nombres = state.escritorios.nombres().to_vec();
+    if let Err(err) = bookos_shell::guardar_escritorios(&nombres) {
+        tracing::warn!("no se pudieron guardar los escritorios: {err}");
+    }
+    if let Some(shell) = state.shell.as_mut() {
+        shell.actualizar_vista_escritorios(activo, nombres);
+    }
+    state.needs_redraw = true;
 }
 
 fn cambiar_vt(state: &mut BookosComp, vt: i32) {
@@ -430,7 +777,9 @@ fn cerrar(window: &smithay::desktop::Window) {
 pub fn lanzar(state: &mut BookosComp, cmd: &str) {
     // Los hijos ya terminados se recogen aquí, no con un manejador de SIGCHLD:
     // el bucle es de un solo hilo y esto no necesita señales ni dependencias.
-    state.hijos.retain_mut(|hijo| !matches!(hijo.try_wait(), Ok(Some(_))));
+    state
+        .hijos
+        .retain_mut(|hijo| !matches!(hijo.try_wait(), Ok(Some(_))));
 
     // `sh -c` para que valga cualquier cosa que se escriba en BOOKOS_TERMINAL,
     // con sus argumentos; `exec` evita dejar un shell de más colgando.
@@ -487,13 +836,46 @@ pub fn lanzar(state: &mut BookosComp, cmd: &str) {
 /// una sesión de verdad: se sale con Escape. Mientras siga así no protege
 /// nada, y por eso lo dice el log en voz alta: un bloqueo que parece bloquear
 /// sin bloquear es peor que no tener ninguno.
+/// El keysym de la tecla de encendido. Como los demás `XF86`, a mano: su valor
+/// está fijado desde hace treinta años y no depende de cómo lo llame la versión
+/// de turno de la biblioteca de teclado.
+const XF86_ENCENDIDO: u32 = 0x1008FF2A;
+
+/// Abre el diálogo de energía, o lo cierra si ya estaba: pulsar dos veces el
+/// botón de encendido tiene que dejar el escritorio como estaba, no apilar
+/// diálogos.
+fn alternar_dialogo_energia(state: &mut BookosComp) {
+    let Some(shell) = state.shell.as_mut() else {
+        return;
+    };
+    if shell.emergente_nombre() == Some("apagar") {
+        shell.cerrar_emergente();
+    } else {
+        shell.abrir_de_widget("apagar");
+    }
+    state.needs_redraw = true;
+}
+
 fn bloquear(state: &mut BookosComp) {
     let pantalla = state.pantalla_logica();
     let hora = bookos_shell::Shell::hora_bloqueo();
+    let fecha = bookos_shell::Shell::fecha_bloqueo();
     if let Some(shell) = state.shell.as_mut() {
-        shell.bloquear(hora, pantalla);
+        shell.bloquear(hora, fecha, pantalla);
     }
-    tracing::warn!("bloqueo echado: VISTA PREVIA, todavía no pide contraseña (Escape para salir)");
+    // El bloqueo ya está puesto antes de preguntar por MPRIS: un reproductor
+    // lento nunca puede retrasar la barrera de seguridad ni el primer frame.
+    state.bloqueo_generacion = state.bloqueo_generacion.wrapping_add(1);
+    let generacion = state.bloqueo_generacion;
+    let canal = state.medios_bloqueo.clone();
+    std::thread::Builder::new()
+        .name("bookos-lock-media".into())
+        .spawn(move || {
+            let _ = canal.send((generacion, bookos_shell::medios::Sonando::leer()));
+        })
+        .inspect_err(|err| tracing::warn!("no se pudo consultar MPRIS para el bloqueo: {err}"))
+        .ok();
+    tracing::info!("bloqueo echado");
     state.needs_redraw = true;
 }
 
@@ -521,5 +903,73 @@ pub fn refocalizar(state: &mut BookosComp) {
                 kbd.set_focus(state, None, SERIAL_COUNTER.next_serial());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mods(alt: bool, logo: bool, shift: bool, ctrl: bool) -> ModifiersState {
+        ModifiersState {
+            alt,
+            logo,
+            shift,
+            ctrl,
+            ..Default::default()
+        }
+    }
+
+    /// Alt+Tab y Meta+Tab abren el conmutador, y con Mayús va al revés.
+    ///
+    /// Si esto pasa y el atajo no responde en la máquina, la tecla no está
+    /// llegando: anidado, el compositor de debajo se queda con Alt+Tab.
+    #[test]
+    fn el_tabulador_con_modificador_conmuta() {
+        use bookos_shell::conmutador::Modo;
+        let tab = keysyms::KEY_Tab;
+        assert_eq!(
+            conmutador_de(tab, &mods(true, false, false, false)),
+            Some(Accion::Conmutar(Modo::Aplicaciones, 1)),
+            "Alt+Tab"
+        );
+        assert_eq!(
+            conmutador_de(tab, &mods(false, true, false, false)),
+            Some(Accion::Conmutar(Modo::Ventanas, 1)),
+            "Meta+Tab"
+        );
+        assert_eq!(
+            conmutador_de(tab, &mods(true, false, true, false)),
+            Some(Accion::Conmutar(Modo::Aplicaciones, -1)),
+            "Alt+Mayús+Tab va hacia atrás"
+        );
+        // Y con Mayús, xkb entrega otro keysym: tiene que valer igual.
+        assert_eq!(
+            conmutador_de(keysyms::KEY_ISO_Left_Tab, &mods(true, false, true, false)),
+            Some(Accion::Conmutar(Modo::Aplicaciones, -1)),
+            "ISO_Left_Tab es el mismo gesto"
+        );
+    }
+
+    /// Un tabulador sin modificador es del cliente —se escribe—, y con Ctrl es
+    /// de otra cosa.
+    #[test]
+    fn el_tabulador_solo_no_es_del_compositor() {
+        let tab = keysyms::KEY_Tab;
+        assert_eq!(conmutador_de(tab, &mods(false, false, false, false)), None);
+        assert_eq!(
+            conmutador_de(tab, &mods(true, false, false, true)),
+            None,
+            "Ctrl+Alt+Tab"
+        );
+        assert_eq!(
+            conmutador_de(tab, &mods(true, true, false, false)),
+            None,
+            "Alt+Meta+Tab"
+        );
+        assert_eq!(
+            conmutador_de(keysyms::KEY_a, &mods(true, false, false, false)),
+            None
+        );
     }
 }

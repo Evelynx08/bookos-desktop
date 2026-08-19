@@ -69,6 +69,49 @@ pub trait Widget {
     fn ancho(&self) -> f32 {
         crate::tema::ICONO_PANEL
     }
+
+    /// Qué pasa al pulsar el widget, con `x` relativa a su borde izquierdo.
+    ///
+    /// `None` —lo normal— significa «no respondo por mi cuenta», y entonces el
+    /// panel abre la tarjeta que le corresponda. Lo implementa el indicador de
+    /// escritorios, que no tiene tarjeta: cada punto lleva a un sitio distinto,
+    /// así que la zona no basta y hace falta el punto exacto.
+    fn pulsar(&self, _x: f32) -> Option<crate::Accion> {
+        None
+    }
+
+    /// En qué escritorio virtual está la sesión, y cuántos hay.
+    ///
+    /// Va en el trait —y no en un método del widget concreto con un downcast—
+    /// porque es un dato que el shell **no puede leer**: lo gobierna el
+    /// compositor, igual que las ventanas abiertas del dock. Casi ningún widget
+    /// lo quiere, así que por defecto lo ignora y dice que no hay que repintar.
+    fn escritorios(&mut self, _activo: usize, _cuantos: usize) -> bool {
+        false
+    }
+
+    /// Espera a la consulta que se lanzó al construirse, si la hubo.
+    ///
+    /// Los widgets que dependen de un programa externo —volumen con `wpctl`,
+    /// bluetooth con `bluetoothctl`— lanzan su consulta en el constructor y la
+    /// recogen aquí. Medido: cada una tarda unos 19 ms, y **esperarlas dentro
+    /// del constructor las ponía en fila**: 38 ms antes del primer frame.
+    /// Lanzándolas todas y esperando después, los dos procesos corren a la vez
+    /// y se paga una sola vez.
+    ///
+    /// Se sigue esperando —y no se deja para el primer evento— a propósito: el
+    /// panel tiene que salir con el icono correcto en el primer frame en vez de
+    /// aparecer vacío y llenarse solo.
+    fn esperar_arranque(&mut self) {}
+
+    /// Cuántas notificaciones hay sin leer.
+    ///
+    /// Va en el trait por lo mismo que [`Widget::escritorios`]: es un dato que
+    /// el shell no puede leer por su cuenta —llega por D-Bus, y de eso se
+    /// encarga el compositor— y solo le interesa a un widget.
+    fn notificaciones(&mut self, _cuantas: u32) -> bool {
+        false
+    }
 }
 
 /// Ancho aproximado de un texto del panel, en lógicos, contando caracteres.
@@ -185,10 +228,17 @@ pub struct Panel {
 
 impl Panel {
     pub fn new(centro: Option<Box<dyn Widget>>, derecha: Vec<Box<dyn Widget>>) -> Self {
-        Self {
+        let mut panel = Self {
             centro: centro.map(Ranura::new),
             derecha: derecha.into_iter().map(Ranura::new).collect(),
+        };
+        // Ya están todos construidos, o sea que las consultas que hayan lanzado
+        // están corriendo a la vez: aquí se recogen. Ver
+        // [`Widget::esperar_arranque`].
+        for ranura in panel.ranuras_mut() {
+            ranura.guard("arranque", |w| w.esperar_arranque());
         }
+        panel
     }
 
     /// Relee todos los widgets. `true` si alguno cambió.
@@ -269,6 +319,39 @@ impl Panel {
             x -= ancho + hueco;
         }
         zonas
+    }
+
+    /// Lo que devuelve pulsar el widget `nombre` en la `x` relativa que se le
+    /// da. `None` si ese widget no responde por su cuenta.
+    pub fn pulsar(&mut self, nombre: &str, x: f32) -> Option<crate::Accion> {
+        let ranura = self
+            .ranuras_mut()
+            .find(|r| !r.muerto && r.widget.nombre() == nombre)?;
+        ranura.guard("pulsar", |w| w.pulsar(x)).flatten()
+    }
+
+    /// Reparte el número de notificaciones sin leer. `true` si hay que
+    /// repintar.
+    pub fn notificaciones(&mut self, cuantas: u32) -> bool {
+        let mut cambio = false;
+        for ranura in self.ranuras_mut() {
+            if let Some(si) = ranura.guard("notificaciones", |w| w.notificaciones(cuantas)) {
+                cambio |= si;
+            }
+        }
+        cambio
+    }
+
+    /// Reparte el escritorio activo entre los widgets que lo quieran. `true` si
+    /// alguno pide repintar.
+    pub fn escritorios(&mut self, activo: usize, cuantos: usize) -> bool {
+        let mut cambio = false;
+        for ranura in self.ranuras_mut() {
+            if let Some(si) = ranura.guard("escritorios", |w| w.escritorios(activo, cuantos)) {
+                cambio |= si;
+            }
+        }
+        cambio
     }
 
     pub fn centro(&self) -> Option<PanelElement<'_>> {

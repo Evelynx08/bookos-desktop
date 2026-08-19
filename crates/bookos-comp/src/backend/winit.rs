@@ -18,6 +18,7 @@ use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::EventLoop;
 use smithay::utils::Transform;
 
+use crate::pantallas::{self, Aplicado, Modo, Salida};
 use crate::state::BookosComp;
 
 /// Cadencia del pump de winit **mientras pasa algo**: 8 ms ≈ 120 Hz, que es lo
@@ -59,6 +60,13 @@ pub fn run(
     let (mut backend, mut winit_loop) = winit::init::<GlesRenderer>()
         .map_err(|err| anyhow::anyhow!("no se pudo iniciar el backend winit: {err}"))?;
 
+    // Smithay deja su propio nombre como título de la ventana anidada. Eso
+    // hacía que en el selector de ventanas pareciese una herramienta interna
+    // y, con más de una previsualización abierta, no hubiese forma humana de
+    // reconocer cuál era el escritorio. En una sesión real (backend udev) no
+    // existe esta ventana, así que el cambio solo afecta al modo de desarrollo.
+    backend.window().set_title("BookOS Desktop");
+
     if fullscreen {
         // Previsualizar el DE entero: la ventana anidada ocupa la pantalla y lo
         // que se ve es exactamente lo que verá la sesión real, salvo que debajo
@@ -70,6 +78,17 @@ pub fn run(
     }
 
     let size = backend.window_size();
+    // El refresco del monitor donde está la ventana. Estaba cableado a 60 Hz, y
+    // eso hacía que un panel de 120 se anunciara a la mitad: los clientes que
+    // ajustan su animación al refresco de `wl_output` —Firefox, GTK4— pintaban
+    // a 60 dentro de una ventana que el anfitrión presentaba a 120. Si winit no
+    // sabe en qué monitor está, se queda en 60 000 mHz, que es lo que había.
+    let refresco = backend
+        .window()
+        .current_monitor()
+        .and_then(|m| m.refresh_rate_millihertz())
+        .unwrap_or(60_000) as i32;
+    tracing::info!(hz = refresco as f64 / 1000.0, "refresco del anfitrión");
     // La escala la marca el anfitrión (aquí KWin), salvo que la configuración
     // diga otra cosa. Esa excepción existe para poder **ver** el escritorio a
     // otra escala sin cambiar de monitor ni arrancar en un TTY: es la única
@@ -82,7 +101,7 @@ pub fn run(
         .unwrap_or_else(|| backend.scale_factor());
     let mode = Mode {
         size,
-        refresh: 60_000,
+        refresh: refresco,
     };
     let output = Output::new(
         "winit".to_string(),
@@ -121,6 +140,7 @@ pub fn run(
     crate::backend::watch_hardware(state);
     state.cursor_theme = Some(crate::cursor::CursorTheme::con_tamano(scale, state.cursor_nominal));
     state.cristal = crate::desenfoque::Cristal::new(backend.renderer());
+    state.genio = crate::genio::Genio::new(backend.renderer());
     state.fondo = crate::fondo::Fondo::cargar(state.fondo_config.as_deref());
     // El cristal desenfoca el fondo, así que necesita su propia copia con
     // mipmaps. Se sube aquí, una vez, y no se vuelve a tocar.
@@ -132,6 +152,18 @@ pub fn run(
     // verían dos punteros desalineados.
     backend.window().set_cursor_visible(false);
     crate::selftest::schedule(state);
+    if std::env::var_os("BOOKOS_BLOQUEAR").is_some() {
+        let _ = state.loop_handle.insert_source(
+            smithay::reexports::calloop::timer::Timer::from_duration(
+                std::time::Duration::from_secs(4),
+            ),
+            |_, _, state| {
+                crate::keybinds::ejecutar(state, crate::keybinds::Accion::Bloquear);
+                smithay::reexports::calloop::timer::TimeoutAction::Drop
+            },
+        );
+    }
+    instalar_pantallas(state, &output);
 
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
     // EGL_BUFFER_AGE_EXT no es válido hasta que la superficie ha pasado por un
@@ -147,7 +179,7 @@ pub fn run(
     state
         .loop_handle
         .insert_source(Timer::immediate(), move |_, _, state| {
-            let hubo_eventos = pump(&mut winit_loop, state);
+            let hubo_eventos = pump(&mut winit_loop, state, refresco);
             let toca_dibujar = ultimo_frame.elapsed() >= MIN_FRAME;
             vueltas += 1;
             if state.needs_redraw {
@@ -234,7 +266,7 @@ pub fn run(
 }
 
 /// Vacía la cola de eventos del anfitrión. Devuelve `true` si había alguno.
-fn pump(winit_loop: &mut winit::WinitEventLoop, state: &mut BookosComp) -> bool {
+fn pump(winit_loop: &mut winit::WinitEventLoop, state: &mut BookosComp, refresco: i32) -> bool {
     let mut hubo = false;
     winit_loop.dispatch_new_events(|event| {
         hubo = true;
@@ -250,7 +282,7 @@ fn pump(winit_loop: &mut winit::WinitEventLoop, state: &mut BookosComp) -> bool 
             // reconfiguran aquí y no en el arranque.
             let mode = Mode {
                 size,
-                refresh: 60_000,
+                refresh: refresco,
             };
             if let Some(output) = state.space.outputs().next().cloned() {
                 output.change_current_state(
@@ -358,4 +390,112 @@ fn draw(
 
     state.needs_redraw = false;
     Ok(true)
+}
+
+// ── Pantallas, anidado ───────────────────────────────────────────────────
+
+/// El censo de la única "pantalla" que hay aquí: la ventana del anfitrión.
+///
+/// No es un adorno para que Settings no se caiga: la escala y la rotación se
+/// aplican de verdad y se ven, y es como se prueba la escala fraccional sin
+/// salir a un TTY. Lo que no se puede es cambiar el modo —el tamaño lo decide
+/// el compositor de debajo— ni pedir frecuencia variable.
+fn censo_anidado(output: &Output) -> Vec<Salida> {
+    let modo = output.current_mode().unwrap_or(Mode {
+        size: (0, 0).into(),
+        refresh: 60_000,
+    });
+    let escala = output.current_scale().fractional_scale();
+    let transformacion = pantallas::nombre_transformacion(output.current_transform());
+    let (logico_ancho, logico_alto) = pantallas::tamano_logico(
+        modo.size.w.max(0) as u32,
+        modo.size.h.max(0) as u32,
+        escala,
+        transformacion,
+    );
+    vec![Salida {
+        id: "winit".into(),
+        conector: "winit".into(),
+        fabricante: "BookOS".into(),
+        modelo: "Anidado".into(),
+        serie: String::new(),
+        mm_ancho: 0,
+        mm_alto: 0,
+        activa: true,
+        modos: vec![Modo {
+            ancho: modo.size.w.max(0) as u32,
+            alto: modo.size.h.max(0) as u32,
+            refresco_mhz: modo.refresh.max(0) as u32,
+            preferido: true,
+            actual: true,
+        }],
+        escala,
+        escalas: pantallas::ESCALAS.to_vec(),
+        x: output.current_location().x,
+        y: output.current_location().y,
+        transformacion: transformacion.to_string(),
+        vrr_capaz: false,
+        vrr: false,
+        principal: true,
+        logico_ancho,
+        logico_alto,
+    }]
+}
+
+fn instalar_pantallas(state: &mut BookosComp, output: &Output) {
+    *state
+        .pantallas
+        .compartido
+        .backend
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = "winit";
+    {
+        let output = output.clone();
+        state.censar_pantallas = Some(Box::new(move || censo_anidado(&output)));
+    }
+    {
+        let output = output.clone();
+        state.aplicar_pantallas = Some(Box::new(move |peticion| {
+            let mia = peticion
+                .iter()
+                .find(|p| p.id == "winit")
+                .ok_or_else(|| "la configuración no dice nada de la ventana anidada".to_string())?;
+            if !mia.activa {
+                return Err("no se puede apagar la ventana del compositor anidado".into());
+            }
+            let modo = output
+                .current_mode()
+                .ok_or_else(|| "la ventana anidada todavía no tiene tamaño".to_string())?;
+            if mia.ancho as i32 != modo.size.w || mia.alto as i32 != modo.size.h {
+                return Err(
+                    "anidado, el tamaño lo decide el compositor de debajo: redimensiona la ventana"
+                        .into(),
+                );
+            }
+            // La salida anidada nace en `Flipped180` porque el framebuffer de
+            // GL tiene el eje Y al revés que el de la ventana; componer una
+            // rotación encima de ese volteo no es girar la pantalla, es girar
+            // también el volteo, y sale una imagen en espejo. Rotar es cosa de
+            // la sesión real, y `GetCapabilities` ya lo dice (`rotation` es
+            // false con este backend).
+            let actual = pantallas::nombre_transformacion(output.current_transform());
+            if mia.transformacion != actual {
+                return Err("anidado no se puede rotar la pantalla: pruébalo en la sesión real".into());
+            }
+            output.change_current_state(
+                None,
+                None,
+                Some(Scale::Fractional(mia.escala)),
+                Some((mia.x, mia.y).into()),
+            );
+            Ok(Aplicado {
+                salidas: censo_anidado(&output),
+                mapa: vec![(output.clone(), (mia.x, mia.y).into())],
+                principal: 0,
+            })
+        }));
+    }
+    let salidas = censo_anidado(output);
+    state.pantallas.ultima = pantallas::peticion_de(&salidas);
+    state.pantallas.compartido.publicar(salidas);
 }

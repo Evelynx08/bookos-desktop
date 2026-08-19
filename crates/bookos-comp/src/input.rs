@@ -10,8 +10,9 @@
 //! terminan en el mismo sitio, [`set_pointer`].
 
 use smithay::backend::input::{
-    AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
-    KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
+    AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, GestureBeginEvent,
+    GesturePinchUpdateEvent, GestureSwipeUpdateEvent, InputBackend, InputEvent, KeyState,
+    KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
 };
 use smithay::input::keyboard::{keysyms, FilterResult};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
@@ -19,6 +20,7 @@ use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 
 use bookos_shell::TeclaPulsada;
 
+use crate::gestos::Gesto;
 use crate::state::BookosComp;
 
 /// Botones del ratón, según linux/input-event-codes.h.
@@ -35,6 +37,16 @@ fn modificadores(state: &BookosComp) -> smithay::input::keyboard::ModifiersState
         .get_keyboard()
         .map(|kbd| kbd.modifier_state())
         .unwrap_or_default()
+}
+
+fn modificador_conmutador_suelto(
+    modo: bookos_shell::conmutador::Modo,
+    modifiers: &smithay::input::keyboard::ModifiersState,
+) -> bool {
+    match modo {
+        bookos_shell::conmutador::Modo::Aplicaciones => !modifiers.alt,
+        bookos_shell::conmutador::Modo::Ventanas => !modifiers.logo,
+    }
 }
 
 pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
@@ -64,11 +76,80 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
                     // dejaría la tecla trabada al cliente. Bloqueado, tampoco
                     // la suelta sale de aquí.
                     if !pulsada {
-                        return if bloqueado {
-                            FilterResult::Intercept(None)
-                        } else {
-                            FilterResult::Forward
-                        };
+                        if bloqueado {
+                            return FilterResult::Intercept(None);
+                        }
+                        // Con una excepción: soltar el modificador **resuelve**
+                        // el conmutador de Alt+Tab. Es lo que lo hace el de
+                        // macOS y no una lista que se queda abierta: eliges
+                        // mientras mantienes la tecla y confirmas al soltarla.
+                        //
+                        // La acción **no** se devuelve por `Intercept`, que es
+                        // lo que hacía antes: `Intercept` se queda la tecla y no
+                        // la reenvía (`KeyboardHandle::input` de Smithay), así
+                        // que el cliente al que llegas nunca ve que Alt se ha
+                        // soltado y se le queda trabada para siempre. Se marca
+                        // aquí, se devuelve `Forward` para que la suelta salga
+                        // hacia el cliente que la esperaba, y se resuelve al
+                        // volver de `kbd.input`.
+                        // Smithay actualiza el estado de modificadores antes de
+                        // llamar al filtro. Mirarlo evita depender del keysym
+                        // concreto de Alt/Meta en cada mapa de teclado.
+                        let cerrando = state
+                            .shell
+                            .as_ref()
+                            .is_some_and(|s| s.hay_conmutador())
+                            && !state.conmutador_pegado
+                            && state
+                                .conmutador_modo
+                                .is_some_and(|modo| modificador_conmutador_suelto(modo, modifiers));
+                        if cerrando {
+                            state.conmutador_resolver = true;
+                        }
+                        // Meta a secas: se soltó sin que llegara nada más por el
+                        // medio, así que era la tecla y no un modificador. El
+                        // launchpad se abre al volver de `kbd.input`, igual que
+                        // el conmutador y por lo mismo: la suelta tiene que
+                        // salir hacia el cliente o se le queda trabada.
+                        let meta = matches!(
+                            handle.modified_sym().raw(),
+                            keysyms::KEY_Super_L | keysyms::KEY_Super_R
+                        );
+                        if meta && std::mem::take(&mut state.meta_sola) {
+                            state.abrir_launchpad = true;
+                        }
+                        return FilterResult::Forward;
+                    }
+                    // Cada tecla que llega, con sus modificadores. Es la única
+                    // forma de distinguir "el atajo no funciona" de "la tecla no
+                    // llega": anidado, el compositor de debajo se queda con
+                    // Alt+Tab y aquí no aparece nada.
+                    tracing::debug!(
+                        sym = handle.modified_sym().raw(),
+                        nombre = ?handle.modified_sym().name(),
+                        alt = modifiers.alt,
+                        logo = modifiers.logo,
+                        ctrl = modifiers.ctrl,
+                        shift = modifiers.shift,
+                        "tecla"
+                    );
+                    // Meta empieza a contar como «sola» solo si no hay nada más
+                    // pulsado; cualquier otra tecla la descarta hasta que se
+                    // vuelva a pulsar.
+                    state.meta_sola = matches!(
+                        handle.modified_sym().raw(),
+                        keysyms::KEY_Super_L | keysyms::KEY_Super_R
+                    ) && !modifiers.alt
+                        && !modifiers.ctrl
+                        && !modifiers.shift;
+                    // Escape cancela el conmutador sin ir a ninguna parte, y no
+                    // llega al cliente: es la salida del propio conmutador.
+                    if state.shell.as_ref().is_some_and(|s| s.hay_conmutador())
+                        && handle.modified_sym().raw() == keysyms::KEY_Escape
+                    {
+                        return FilterResult::Intercept(Some(
+                            crate::keybinds::Accion::ConmutarCancelar,
+                        ));
                     }
                     if let Some(accion) = crate::keybinds::resolver(modifiers, &handle) {
                         // Con el bloqueo echado solo valen las salidas de
@@ -80,6 +161,12 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
                         if !bloqueado || accion.es_emergencia() {
                             return FilterResult::Intercept(Some(accion));
                         }
+                        return FilterResult::Intercept(None);
+                    }
+                    if state.shell.as_ref().is_some_and(|s| s.hay_conmutador()) {
+                        // La capa es modal: mientras el usuario mantiene Alt o
+                        // Meta, ninguna tecla suelta debe acabar escribiéndose
+                        // en la ventana que hay debajo.
                         return FilterResult::Intercept(None);
                     }
                     if bloqueado {
@@ -135,6 +222,16 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
             if let Some(Some(accion)) = accion {
                 crate::keybinds::ejecutar(state, accion);
             }
+            // El orden importa y es este: la suelta de Alt ya ha salido hacia el
+            // cliente **antiguo** —que es quien vio la pulsación y la espera— y
+            // el cambio de foco ocurre ahora, así que el `enter` del cliente
+            // nuevo llega con el juego de teclas pulsadas ya sin Alt.
+            if std::mem::take(&mut state.conmutador_resolver) {
+                crate::keybinds::ejecutar(state, crate::keybinds::Accion::ConmutarFin);
+            }
+            if std::mem::take(&mut state.abrir_launchpad) {
+                crate::keybinds::ejecutar(state, crate::keybinds::Accion::Launchpad);
+            }
         }
 
         // libinput: desplazamiento relativo respecto de donde estaba el cursor.
@@ -152,13 +249,57 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
         }
 
         InputEvent::PointerButton { event } => {
-            // Bloqueado, los clics tampoco salen de aquí.
+            // Meta+clic mueve y redimensiona ventanas: si hubo clic, la tecla
+            // era un modificador y no debe abrir nada al soltarla.
+            state.meta_sola = false;
+            // Bloqueado, los clics no salen hacia los clientes: lo único que
+            // atienden es el botón de apagado de la propia pantalla de bloqueo.
             if state.shell.as_ref().is_some_and(|s| s.esta_bloqueado()) {
+                if event.state() == ButtonState::Pressed {
+                    let (x, y) = (state.pointer_location.x, state.pointer_location.y);
+                    let peticion = state
+                        .shell
+                        .as_mut()
+                        .and_then(|shell| shell.bloqueo_pulsado(x, y));
+                    if let Some(peticion) = peticion {
+                        crate::keybinds::ejecutar(
+                            state,
+                            crate::keybinds::Accion::Energia(peticion),
+                        );
+                    }
+                    state.needs_redraw = true;
+                }
                 return;
             }
             let serial = SERIAL_COUNTER.next_serial();
             let button = event.button_code();
             let pulsado = event.state();
+
+            if pulsado == ButtonState::Released && std::mem::take(&mut state.conmutador_clic) {
+                return;
+            }
+            if pulsado == ButtonState::Pressed
+                && state.shell.as_ref().is_some_and(|s| s.hay_conmutador())
+            {
+                state.conmutador_clic = true;
+                let elegida = (button == BTN_LEFT)
+                    .then(|| {
+                        state
+                            .shell
+                            .as_ref()
+                            .and_then(|s| s.conmutador_en(state.pointer_location.x, state.pointer_location.y))
+                    })
+                    .flatten();
+                if let Some(i) = elegida {
+                    if let Some(shell) = state.shell.as_mut() {
+                        shell.conmutador_elegir(i);
+                    }
+                    crate::keybinds::ejecutar(state, crate::keybinds::Accion::ConmutarFin);
+                } else {
+                    crate::keybinds::ejecutar(state, crate::keybinds::Accion::ConmutarCancelar);
+                }
+                return;
+            }
 
             // Soltar cierra el arrastre y encaja la ventana si el cursor estaba
             // en un borde. Que el evento llegue o no al cliente depende de quién
@@ -169,8 +310,16 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
             if pulsado == ButtonState::Released {
                 // El shell primero: si tenía un deslizador agarrado, el soltar
                 // es suyo aunque el puntero esté ya fuera de su superficie.
-                if let Some(shell) = state.shell.as_mut() {
-                    shell.soltar();
+                if let Some(accion) = state.shell.as_mut().and_then(|s| s.soltar()) {
+                    crate::keybinds::hacer(state, accion);
+                }
+                // Un botón de la barra de título se dispara al soltar y sobre
+                // el mismo botón donde se pulsó, como cualquier botón del
+                // sistema: bajar el ratón en la ✕ y salirse antes de soltar no
+                // cierra nada.
+                if let Some((window, boton)) = crate::decoracion::soltar(state, state.pointer_location) {
+                    crate::decoracion::accionar(state, &window, boton);
+                    return;
                 }
                 if state.soltar_arrastre() {
                     return;
@@ -203,6 +352,17 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
             let punto = state.pointer_location;
             // Clic derecho en el dock: menú contextual del icono, como en
             // Plasma. Fijar y cerrar salen de ahí, no del propio clic.
+            // Y en el launchpad: el botón derecho saca las ✕ para quitar
+            // aplicaciones de la rejilla, que es el mismo gesto de «esto tiene
+            // más opciones» que en el dock.
+            if pulsado == ButtonState::Pressed
+                && button == BTN_RIGHT
+                && !modificadores(state).logo
+                && state.shell.as_mut().is_some_and(|s| s.launchpad_menu())
+            {
+                state.needs_redraw = true;
+                return;
+            }
             if pulsado == ButtonState::Pressed
                 && button == BTN_RIGHT
                 && !modificadores(state).logo
@@ -228,6 +388,29 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
                     }
                 }
                 return;
+            }
+
+            // La barra de título que dibujamos nosotros: sus clics no son de
+            // nadie más. Va después del shell —el panel manda sobre la barra de
+            // una ventana que llegue hasta él— y antes del reenvío, porque para
+            // el cliente este clic no existe.
+            if pulsado == ButtonState::Pressed && button == BTN_LEFT {
+                if let Some((window, boton)) = crate::decoracion::barra_en(state, punto) {
+                    state.enfocar(&window);
+                    match boton {
+                        Some(boton) => crate::decoracion::pulsar(state, &window, boton),
+                        // Fuera de los botones, la barra es para agarrar la
+                        // ventana; y dos clics seguidos, para maximizarla.
+                        None if doble_clic_en_barra(state) => {
+                            state.alternar_maximizada(&window);
+                        }
+                        None => {
+                            state.arrastrar_ventana(&window, crate::ventanas::Modo::Mover, false);
+                        }
+                    }
+                    state.needs_redraw = true;
+                    return;
+                }
             }
 
             // Doble clic en la franja de arriba: maximiza y restaura, como en
@@ -291,6 +474,99 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
             pointer.frame(state);
         }
 
+        // --- Gestos de touchpad ---------------------------------------------
+        // Solo llegan desde libinput: winit no los reenvía, así que esto está
+        // muerto en el backend anidado. La lógica vive en `crate::gestos`, que
+        // sí se puede probar sin touchpad.
+        InputEvent::GestureSwipeBegin { event } => {
+            state.gestos.deslizamiento_inicio(event.fingers());
+        }
+
+        InputEvent::GestureSwipeUpdate { event } => {
+            if let Some(gesto) = state
+                .gestos
+                .deslizamiento_avance(event.delta_x(), event.delta_y())
+            {
+                tracing::debug!(?gesto, "gesto de touchpad");
+                match gesto {
+                    Gesto::Escritorio(pasos) => {
+                        let destino = crate::escritorios::destino(
+                            state.escritorios.activo(),
+                            pasos,
+                            state.escritorios.cuantos(),
+                        );
+                        crate::escritorios::cambiar_a(state, destino);
+                    }
+                    Gesto::DespejarEscritorio => crate::escritorios::despejar(state),
+                    // Subir con el escritorio despejado devuelve las ventanas;
+                    // subir estando en una aplicación cualquiera enseña los
+                    // escritorios, que es lo que hace el mismo gesto en macOS.
+                    Gesto::SubirCuatroDedos => {
+                        if state.escritorios.despejado() {
+                            crate::escritorios::recuperar(state);
+                        } else {
+                            crate::keybinds::ejecutar(
+                                state,
+                                crate::keybinds::Accion::VistaEscritorios,
+                            );
+                        }
+                    }
+                    // La exposición es el conmutador de ventanas sin tecla que
+                    // sostener: se abre y se queda, y se cierra al elegir una
+                    // miniatura, con Esc o con el gesto contrario. El `0` es que
+                    // no mueva la selección al abrir —no hay Tab que aplicar—.
+                    Gesto::Exponer => {
+                        if !state.shell.as_ref().is_some_and(|s| s.hay_conmutador()) {
+                            crate::keybinds::ejecutar(
+                                state,
+                                crate::keybinds::Accion::Conmutar(
+                                    bookos_shell::conmutador::Modo::Ventanas,
+                                    0,
+                                ),
+                            );
+                            state.conmutador_pegado =
+                                state.shell.as_ref().is_some_and(|s| s.hay_conmutador());
+                        }
+                    }
+                    Gesto::CerrarExposicion => {
+                        if state.shell.as_ref().is_some_and(|s| s.hay_conmutador()) {
+                            crate::keybinds::ejecutar(
+                                state,
+                                crate::keybinds::Accion::ConmutarCancelar,
+                            );
+                        }
+                    }
+                    // El pellizco no sale de un deslizamiento.
+                    Gesto::AbrirLaunchpad | Gesto::CerrarLaunchpad => {}
+                }
+            }
+        }
+
+        InputEvent::GestureSwipeEnd { .. } => state.gestos.deslizamiento_fin(),
+
+        InputEvent::GesturePinchBegin { event } => {
+            state.gestos.pellizco_inicio(event.fingers());
+        }
+
+        InputEvent::GesturePinchUpdate { event } => {
+            let abierto = state
+                .shell
+                .as_ref()
+                .is_some_and(|s| s.emergente_nombre() == Some("launchpad"));
+            if let Some(gesto) = state.gestos.pellizco_avance(event.scale(), abierto) {
+                tracing::debug!(?gesto, escala = event.scale(), "gesto de touchpad");
+                // Los dos gestos alternan lo mismo; `pellizco_avance` ya se ha
+                // encargado de que solo salga el que corresponde al estado
+                // actual, así que aquí no hay nada que distinguir.
+                if let Some(shell) = state.shell.as_mut() {
+                    shell.alternar_launchpad();
+                }
+                state.needs_redraw = true;
+            }
+        }
+
+        InputEvent::GesturePinchEnd { .. } => state.gestos.pellizco_fin(),
+
         _ => {}
     }
 }
@@ -348,6 +624,29 @@ pub fn set_pointer(state: &mut BookosComp, destino: Point<f64, Logical>, time: u
         return;
     }
 
+    if state.shell.as_ref().is_some_and(|s| s.hay_conmutador()) {
+        let celda = state
+            .shell
+            .as_ref()
+            .and_then(|s| s.conmutador_en(location.x, location.y));
+        if let (Some(i), Some(shell)) = (celda, state.shell.as_mut()) {
+            state.needs_redraw |= shell.conmutador_elegir(i);
+        }
+        // Es una capa modal: lo de debajo no recibe hover mientras elegimos.
+        let pointer = state.pointer.clone();
+        pointer.motion(
+            state,
+            None,
+            &MotionEvent {
+                location,
+                serial: SERIAL_COUNTER.next_serial(),
+                time,
+            },
+        );
+        pointer.frame(state);
+        return;
+    }
+
     if let Some(shell) = state.shell.as_mut() {
         shell.puntero(location.x, location.y);
     }
@@ -362,6 +661,13 @@ pub fn set_pointer(state: &mut BookosComp, destino: Point<f64, Logical>, time: u
         }
     }
     if repintar {
+        state.needs_redraw = true;
+    }
+
+    // El botón de la barra de título bajo el cursor. Repinta solo cuando
+    // cambia: mover el ratón por una barra sin salir del mismo botón no tiene
+    // por qué costar un rasterizado.
+    if crate::decoracion::señalar(state, location) {
         state.needs_redraw = true;
     }
 
@@ -405,16 +711,8 @@ const DOBLE_CLIC_RADIO: f64 = 6.0;
 /// Público para el autotest: es la única forma de probar el gesto sin una mano
 /// dando dos clics seguidos.
 pub fn doble_clic(state: &mut BookosComp) -> bool {
-    let ahora = std::time::Instant::now();
     let punto = state.pointer_location;
-    let previo = state.ultimo_clic.replace((ahora, punto));
-
-    let doble = previo.is_some_and(|(t, p)| {
-        ahora.duration_since(t) <= DOBLE_CLIC
-            && (p.x - punto.x).abs() <= DOBLE_CLIC_RADIO
-            && (p.y - punto.y).abs() <= DOBLE_CLIC_RADIO
-    });
-    if !doble {
+    if !es_doble_clic(state) {
         return false;
     }
 
@@ -433,6 +731,32 @@ pub fn doble_clic(state: &mut BookosComp) -> bool {
     // El tercer clic no vuelve a disparar: se olvida el par ya usado.
     state.ultimo_clic = None;
     state.alternar_maximizada(&window);
+    true
+}
+
+/// ¿Este clic llega lo bastante seguido y lo bastante cerca del anterior?
+///
+/// Apunta el clic actual pase lo que pase: dos clics lentos no son un doble,
+/// pero el segundo sí puede ser el primero de otro par.
+fn es_doble_clic(state: &mut BookosComp) -> bool {
+    let ahora = std::time::Instant::now();
+    let punto = state.pointer_location;
+    let previo = state.ultimo_clic.replace((ahora, punto));
+    previo.is_some_and(|(t, p)| {
+        ahora.duration_since(t) <= DOBLE_CLIC
+            && (p.x - punto.x).abs() <= DOBLE_CLIC_RADIO
+            && (p.y - punto.y).abs() <= DOBLE_CLIC_RADIO
+    })
+}
+
+/// El doble clic sobre **nuestra** barra: no hace falta mirar dónde cae dentro
+/// de la ventana, porque la barra entera es zona de título.
+fn doble_clic_en_barra(state: &mut BookosComp) -> bool {
+    if !es_doble_clic(state) {
+        return false;
+    }
+    // El tercer clic no vuelve a disparar: se olvida el par ya usado.
+    state.ultimo_clic = None;
     true
 }
 
@@ -464,4 +788,28 @@ fn logical_size(state: &BookosComp) -> (i32, i32) {
             )
         })
         .unwrap_or((1, 1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bookos_shell::conmutador::Modo;
+    use smithay::input::keyboard::ModifiersState;
+
+    #[test]
+    fn cada_selector_se_cierra_solo_con_su_modificador() {
+        let alt = ModifiersState {
+            alt: true,
+            ..Default::default()
+        };
+        assert!(!modificador_conmutador_suelto(Modo::Aplicaciones, &alt));
+        assert!(modificador_conmutador_suelto(Modo::Ventanas, &alt));
+
+        let meta = ModifiersState {
+            logo: true,
+            ..Default::default()
+        };
+        assert!(modificador_conmutador_suelto(Modo::Aplicaciones, &meta));
+        assert!(!modificador_conmutador_suelto(Modo::Ventanas, &meta));
+    }
 }

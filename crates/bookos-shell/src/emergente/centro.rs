@@ -56,26 +56,72 @@ const BOTON_PILDORA: f32 = 40.0;
 /// Alto de la tarjeta de medios.
 const MEDIOS: f32 = 132.0;
 
-/// El azul del plasmoide: `#4184FF` encendido, `#AECAFF` apagado.
-const ACENTO: Color = Color {
-    r: 0.255,
-    g: 0.518,
-    b: 1.0,
-    a: 1.0,
-};
-const APAGADO: Color = Color {
+/// El encendido de un conmutador de la estación: el acento del sistema.
+///
+/// Era el `#4184FF` del plasmoide, escrito a pelo. Deja de valer desde que el
+/// acento se elige: con la constante, poner el escritorio en verde dejaba esta
+/// tarjeta —la más azul de todas— en azul, y el apagado `#AECAFF` de al lado,
+/// que sí es un azul deliberado, se leía como el activo de otro tema.
+fn acento_centro() -> Color {
+    tema::acento()
+}
+const APAGADO_OSCURO: Color = Color {
     r: 0.682,
     g: 0.792,
     b: 1.0,
     a: 1.0,
 };
-/// Fondo de las tarjetas interiores: gris oscuro al 80 %.
-const CONTENEDOR: Color = Color {
-    r: 0.16,
-    g: 0.16,
-    b: 0.17,
-    a: 0.80,
-};
+/// El círculo de un conmutador apagado.
+///
+/// En oscuro es el azul claro del plasmoide. En claro ese azul sobre una
+/// tarjeta blanca deja de significar «apagado» —se parece demasiado al
+/// encendido— y pasa a ser el gris `#e5e5ea` del sistema, que es lo que usan
+/// los controles apagados de la paleta clara.
+fn apagado() -> Color {
+    if tema::es_claro() {
+        Color {
+            r: 0.898,
+            g: 0.898,
+            b: 0.918,
+            a: 1.0,
+        }
+    } else {
+        APAGADO_OSCURO
+    }
+}
+
+/// La tinta del icono dentro de un círculo apagado.
+///
+/// Sobre el azul claro va **blanca**, encendida o apagada: con tinta oscura el
+/// botón se leía como deshabilitado, que es justo lo contrario de «apagado pero
+/// disponible». Sobre el gris del tema claro un icono blanco no se vería, y ahí
+/// sí es oscura.
+fn tinta_apagado() -> Color {
+    if tema::es_claro() {
+        tema::texto()
+    } else {
+        Color::WHITE
+    }
+}
+
+/// Fondo de las tarjetas interiores: la superficie del tema al 80 %.
+fn contenedor() -> Color {
+    if tema::es_claro() {
+        Color {
+            r: 0.949,
+            g: 0.949,
+            b: 0.968,
+            a: 0.80,
+        }
+    } else {
+        Color {
+            r: 0.16,
+            g: 0.16,
+            b: 0.17,
+            a: 0.80,
+        }
+    }
+}
 
 /// Un conmutador o una acción de la rejilla.
 struct Baldosa {
@@ -106,7 +152,7 @@ enum Agarre {
 pub struct Centro {
     usuario: Usuario,
     baldosas: Vec<Baldosa>,
-    señalada: Option<usize>,
+    señalada: tema::Realce,
     wifi: bool,
     bluetooth: bool,
     volumen: u8,
@@ -124,9 +170,11 @@ impl Centro {
         let wifi = orden("nmcli radio wifi").contains("enabled");
         let bluetooth = orden("bluetoothctl show").contains("Powered: yes");
         let mut c = Self {
-            usuario: Usuario::leer(),
+            // El centro de control no ve la configuración: la foto de `panel.conf`
+            // la resuelve el bloqueo, y aquí basta con las de siempre.
+            usuario: Usuario::leer(None),
             baldosas: Vec::new(),
-            señalada: None,
+            señalada: tema::Realce::nuevo(),
             wifi,
             bluetooth,
             // El nivel de partida se lee de golpe: `wpctl` cuesta 21 ms
@@ -260,11 +308,12 @@ impl Centro {
             }
         }
         let señalada = punto.and_then(|(x, y)| self.baldosa_en(x, y));
-        if señalada == self.señalada {
-            return false;
-        }
-        self.señalada = señalada;
-        true
+        self.señalada.señalar(señalada)
+    }
+
+    /// ¿Se mueve algo dentro de la tarjeta?
+    pub fn animando(&self) -> bool {
+        self.señalada.animando()
     }
 
     pub fn agarrado(&self) -> bool {
@@ -294,7 +343,10 @@ impl Centro {
             return None;
         }
         if let Some(orden) = self.medio_en(x, y) {
-            return self.sonando.as_ref().map(|s| Accion::Lanzar(s.orden(orden)));
+            return self
+                .sonando
+                .as_ref()
+                .map(|s| Accion::Lanzar(s.orden(orden)));
         }
         if let Some(bluetooth) = self.conexion_en(x, y) {
             // El círculo enciende y apaga la radio; el resto de la tarjeta abre
@@ -471,7 +523,7 @@ impl Centro {
             .center_y(Length::Fixed(AVATAR))
             .clip(true)
             .style(|_theme: &iced_widget::Theme| container::Style {
-                background: Some(ACENTO.into()),
+                background: Some(acento_centro().into()),
                 border: Border {
                     radius: (AVATAR / 2.0).into(),
                     ..Default::default()
@@ -483,7 +535,7 @@ impl Centro {
                 column![
                     text(self.usuario.nombre.clone())
                         .size(15.0)
-                        .color(tema::TEXTO),
+                        .color(tema::texto()),
                     text(format!("@{}", self.usuario.cuenta))
                         .size(11.0)
                         .color(tema::TEXTO2),
@@ -500,7 +552,7 @@ impl Centro {
         .padding([0, 8])
         .center_y(Length::Fixed(CABECERA))
         .style(|_theme: &iced_widget::Theme| container::Style {
-            background: Some(CONTENEDOR.into()),
+            background: Some(contenedor().into()),
             border: Border {
                 radius: (CABECERA / 2.0).into(),
                 ..Default::default()
@@ -511,11 +563,11 @@ impl Centro {
         row![
             pildora,
             Space::new().width(Length::Fixed(8.0)),
-            Self::circulo("editar", BOTON_CABECERA, CONTENEDOR, tema::TEXTO),
+            Self::circulo("editar", BOTON_CABECERA, contenedor(), tema::texto()),
             Space::new().width(Length::Fixed(8.0)),
-            Self::circulo("apagar", BOTON_CABECERA, CONTENEDOR, tema::TEXTO),
+            Self::circulo("apagar", BOTON_CABECERA, contenedor(), tema::texto()),
             Space::new().width(Length::Fixed(8.0)),
-            Self::circulo("preferencias", BOTON_CABECERA, CONTENEDOR, tema::TEXTO),
+            Self::circulo("preferencias", BOTON_CABECERA, contenedor(), tema::texto()),
         ]
         .align_y(Vertical::Center)
         .into()
@@ -534,19 +586,31 @@ impl Centro {
                 },
             )
         } else {
-            ("Wi-Fi", self.wifi, if self.wifi { "wifi" } else { "sin-red" })
+            (
+                "Wi-Fi",
+                self.wifi,
+                if self.wifi { "wifi" } else { "sin-red" },
+            )
         };
         container(
             row![
                 Self::circulo(
                     icono,
                     ICONO_CONEXION,
-                    if encendido { ACENTO } else { APAGADO },
-                    Color::WHITE,
+                    if encendido {
+                        acento_centro()
+                    } else {
+                        apagado()
+                    },
+                    if encendido {
+                        tema::sobre_acento()
+                    } else {
+                        tinta_apagado()
+                    },
                 ),
                 Space::new().width(Length::Fixed(10.0)),
                 column![
-                    text(nombre).size(15.0).color(tema::TEXTO),
+                    text(nombre).size(15.0).color(tema::texto()),
                     text(if encendido { "Activado" } else { "Desactivado" })
                         .size(11.0)
                         .color(tema::TEXTO2),
@@ -559,7 +623,7 @@ impl Centro {
         .padding([0, 8])
         .center_y(Length::Fixed(CONEXION))
         .style(|_theme: &iced_widget::Theme| container::Style {
-            background: Some(CONTENEDOR.into()),
+            background: Some(contenedor().into()),
             border: Border {
                 radius: tema::R_TARJETA.into(),
                 ..Default::default()
@@ -571,17 +635,24 @@ impl Centro {
 
     fn baldosa(&self, i: usize) -> PanelElement<'_> {
         let baldosa = &self.baldosas[i];
-        // El icono va **siempre en blanco**, encendida o apagada: lo que
-        // cambia es el círculo de detrás, de acento a azul claro. Con la tinta
-        // oscura sobre el azul claro el botón se leía como deshabilitado, que
-        // es justo lo contrario de "apagado pero disponible".
-        let fondo = match (baldosa.activa, self.señalada == Some(i)) {
-            (true, false) => ACENTO,
-            (true, true) => Color { a: 0.85, ..ACENTO },
-            (false, false) => APAGADO,
-            (false, true) => Color { a: 0.85, ..APAGADO },
+        // Lo que cambia entre encendida y apagada es el círculo de detrás, no
+        // el icono: acento contra el apagado del tema. La tinta la decide
+        // [`tinta_apagado`], que es donde está escrito por qué sobre el azul
+        // claro sigue siendo blanca.
+        // Señalada, el círculo se aclara hasta el 85 % de alfa. Interpolado y
+        // no conmutado: la rejilla tiene ocho baldosas juntas y el salto de
+        // opacidad se lee como un parpadeo al cruzarla con el ratón.
+        let base = if baldosa.activa {
+            acento_centro()
+        } else {
+            apagado()
         };
-        let tinta = Color::WHITE;
+        let fondo = tema::alfa(base, base.a - 0.15 * base.a * self.señalada.intensidad(i));
+        let tinta = if baldosa.activa {
+            tema::sobre_acento()
+        } else {
+            tinta_apagado()
+        };
         let celda = (ANCHO - (MARGEN + REJILLA_MARGEN) * 2.0) / COLUMNAS as f32;
         container(Self::circulo(baldosa.icono, BOTON, fondo, tinta))
             .width(Length::Fixed(celda))
@@ -607,7 +678,7 @@ impl Centro {
         row![
             control::pildora(self.ancho_pildora(), nivel, false),
             Space::new().width(Length::Fixed(10.0)),
-            Self::circulo(icono, BOTON_PILDORA, APAGADO, Color::WHITE),
+            Self::circulo(icono, BOTON_PILDORA, apagado(), tinta_apagado()),
         ]
         .align_y(Vertical::Center)
         .into()
@@ -621,7 +692,7 @@ impl Centro {
                 .width(Length::Fixed(ancho_barra * avance))
                 .height(Length::Fixed(4.0))
                 .style(|_theme: &iced_widget::Theme| container::Style {
-                    background: Some(Color::WHITE.into()),
+                    background: Some(tema::texto().into()),
                     border: Border {
                         radius: 2.0.into(),
                         ..Default::default()
@@ -632,7 +703,13 @@ impl Centro {
         .width(Length::Fixed(ancho_barra))
         .height(Length::Fixed(4.0))
         .style(|_theme: &iced_widget::Theme| container::Style {
-            background: Some(Color { a: 0.20, ..Color::WHITE }.into()),
+            background: Some(
+                Color {
+                    a: 0.20,
+                    ..tema::tinta()
+                }
+                .into(),
+            ),
             border: Border {
                 radius: 2.0.into(),
                 ..Default::default()
@@ -642,7 +719,7 @@ impl Centro {
 
         let boton = |nombre: &str| -> PanelElement<'static> {
             match icono::propio(nombre) {
-                Some(ic) => icono::ver_teñido_propio(&ic, 24.0, Color::WHITE),
+                Some(ic) => icono::ver_teñido_propio(&ic, 24.0, tema::texto()),
                 None => Space::new().width(Length::Fixed(24.0)).into(),
             }
         };
@@ -661,7 +738,7 @@ impl Centro {
         let contenido = column![
             cabecera,
             Space::new().height(Length::Fixed(4.0)),
-            text(sonando.titulo.clone()).size(15.0).color(tema::TEXTO),
+            text(sonando.titulo.clone()).size(15.0).color(tema::texto()),
             text(sonando.artista.clone()).size(11.0).color(tema::TEXTO2),
             Space::new().height(Length::Fixed(6.0)),
             barra,
@@ -701,7 +778,7 @@ impl Centro {
             .height(Length::Fixed(MEDIOS))
             .padding([8, 12])
             .style(|_theme: &iced_widget::Theme| container::Style {
-                background: Some(CONTENEDOR.into()),
+                background: Some(contenedor().into()),
                 border: Border {
                     radius: tema::R_TARJETA.into(),
                     ..Default::default()
@@ -719,7 +796,7 @@ impl Centro {
             .padding([0, REJILLA_MARGEN as u16])
             .center_y(Length::Fixed(alto))
             .style(|_theme: &iced_widget::Theme| container::Style {
-                background: Some(CONTENEDOR.into()),
+                background: Some(contenedor().into()),
                 border: Border {
                     radius: tema::R_TARJETA.into(),
                     ..Default::default()
@@ -875,9 +952,16 @@ mod tests {
         let y0 = c.y_rejilla() + REJILLA_MARGEN;
         let ancho_celda = (ANCHO - x0 * 2.0) / COLUMNAS as f32;
         assert_eq!(c.baldosa_en(x0 + 5.0, y0 + 5.0), Some(0));
-        assert_eq!(c.baldosa_en(x0 + ancho_celda * 3.0 + 5.0, y0 + 5.0), Some(3));
+        assert_eq!(
+            c.baldosa_en(x0 + ancho_celda * 3.0 + 5.0, y0 + 5.0),
+            Some(3)
+        );
         assert_eq!(c.baldosa_en(x0 + 5.0, y0 + BOTON + 12.0), Some(4));
-        assert_eq!(c.baldosa_en(2.0, y0 + 5.0), None, "el margen no es de nadie");
+        assert_eq!(
+            c.baldosa_en(2.0, y0 + 5.0),
+            None,
+            "el margen no es de nadie"
+        );
     }
 
     /// Los dos deslizadores no se pisan: agarrar el de abajo no mueve el de

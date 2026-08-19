@@ -14,7 +14,7 @@
 //! compositor tendría que purgarse en `toplevel_destroyed`, y ese es justo el
 //! sitio donde se olvida y queda una fuga que solo se nota tras horas de sesión.
 //!
-//! ## Por qué no hay animación de salida
+//! ## Minimizar sí se anima, cerrar no
 //!
 //! Cuando llega `toplevel_destroyed` la `wl_surface` ya no existe y con ella se
 //! ha ido el buffer: no queda nada que dibujar, así que una animación de cierre
@@ -22,6 +22,11 @@
 //! Eso es trabajo del renderer (un paso a framebuffer offscreen por ventana) y
 //! no se hace aquí. Las ventanas entran animadas y desaparecen de golpe, y es
 //! preferible eso a fingir una animación con un rectángulo vacío.
+//!
+//! Minimizar es otra cosa: la ventana **sigue viva** con su buffer, solo deja
+//! de estar en el `Space`. Por eso sí se puede animar de verdad —se encoge
+//! hacia su icono del dock— y por eso el desmapeo espera a que la animación
+//! termine.
 
 use std::cell::Cell;
 use std::time::{Duration, Instant};
@@ -87,12 +92,237 @@ pub struct Estado {
     restaurar: Cell<Option<Rectangle<i32, Logical>>>,
     /// En qué zona está encajada, si lo está.
     zona: Cell<Option<Zona>>,
+    /// Cuándo se enfocó por última vez, para el orden del conmutador.
+    ///
+    /// No vale el orden del `Space`: `escritorios::animar` desmapea y vuelve a
+    /// mapear las ventanas al cambiar de escritorio, y eso las manda al final
+    /// como si acabaran de usarse. Con un sello propio el orden sobrevive a
+    /// cualquier recolocación.
+    enfocada: Cell<Option<Instant>>,
+    /// El encogido hacia el dock —o el crecimiento desde él— en marcha.
+    ///
+    /// Guarda a qué rectángulo va (el icono del dock), desde qué geometría
+    /// salió y cuándo empezó. Es lo que dibuja el minimizar: la ventana sigue
+    /// viva y con su buffer mientras dura, y solo al terminar se saca del
+    /// `Space`.
+    encogido: Cell<Option<Encogido>>,
     /// Está a pantalla completa: tapa también el panel y el dock.
     ///
     /// Va aparte de `zona` y no como una `Zona` más porque no es una forma de
     /// repartir el área útil, sino de dejar de respetarla: mientras esté
     /// puesto, el shell no se dibuja.
     completa: Cell<bool>,
+}
+
+/// Un minimizar o un restaurar a medio camino.
+#[derive(Debug, Clone, Copy)]
+pub struct Encogido {
+    /// La geometría de la que sale la ventana.
+    pub origen: Rectangle<i32, Logical>,
+    /// El icono del dock al que va —o del que viene—.
+    pub destino: Rectangle<i32, Logical>,
+    pub desde: Instant,
+    /// `true` minimiza y `false` restaura, que es la misma animación al revés.
+    pub hacia_el_dock: bool,
+}
+
+/// Lo que tarda una ventana en irse al dock o en volver.
+///
+/// La "transición de página completa" del sistema, la misma que el cambio de
+/// escritorio: es un recorrido largo de un extremo a otro de la pantalla, y con
+/// los 250 ms del pop de modal la ventana llegaba antes de que el ojo la
+/// siguiera.
+const ENCOGIDO: Duration = tema::D_PAGINA;
+
+/// Empieza el encogido hacia el dock, o el crecimiento de vuelta.
+pub fn encoger(window: &Window, origen: Rectangle<i32, Logical>, destino: Rectangle<i32, Logical>, hacia_el_dock: bool) {
+    estado(window).encogido.set(Some(Encogido {
+        origen,
+        destino,
+        desde: Instant::now(),
+        hacia_el_dock,
+    }));
+}
+
+/// El encogido en marcha, o `None` si ya terminó.
+pub fn encogido(window: &Window) -> Option<Encogido> {
+    let e = estado(window).encogido.get()?;
+    if e.desde.elapsed() >= ENCOGIDO {
+        estado(window).encogido.set(None);
+        return None;
+    }
+    Some(e)
+}
+
+/// Cuánto lleva recorrido el encogido, de 0 (en su sitio) a 1 (en el dock).
+///
+/// Va con la curva de entrada y no lineal, que es la misma que usa el resto del
+/// recorrido: el shader del genio recibe esto y no el tiempo crudo.
+pub fn progreso_encogido(e: Encogido) -> f32 {
+    avance_encogido(tema::fraccion(e.desde.elapsed(), ENCOGIDO), e.hacia_el_dock)
+}
+
+fn avance_encogido(t: f32, hacia_el_dock: bool) -> f32 {
+    tema::C_ENTRADA.eval(if hacia_el_dock { t } else { 1.0 - t })
+}
+
+/// Dónde y a qué tamaño se dibuja una ventana que va —o viene— del dock.
+///
+/// Devuelve la esquina en lógicos, el factor de escala y el alfa. La escala sale
+/// del **ancho**: encoger a la vez por los dos ejes con proporciones distintas
+/// deforma el buffer, y lo que se busca es que la ventana se vaya achicando
+/// hacia su icono, no que se aplaste.
+pub fn encogido_ahora(e: Encogido) -> (Point<f64, Logical>, f64, f32) {
+    // De ida el tiempo corre hacia delante y de vuelta hacia atrás: es la misma
+    // curva recorrida al revés, y por eso no hay dos animaciones que mantener.
+    let s = avance_encogido(
+        tema::fraccion(e.desde.elapsed(), ENCOGIDO),
+        e.hacia_el_dock,
+    ) as f64;
+    let escala = 1.0 + (e.destino.size.w as f64 / e.origen.size.w.max(1) as f64 - 1.0) * s;
+    let centro_x = e.origen.loc.x as f64 + e.origen.size.w as f64 / 2.0;
+    let centro_y = e.origen.loc.y as f64 + e.origen.size.h as f64 / 2.0;
+    let destino_x = e.destino.loc.x as f64 + e.destino.size.w as f64 / 2.0;
+    let destino_y = e.destino.loc.y as f64 + e.destino.size.h as f64 / 2.0;
+    let x = centro_x + (destino_x - centro_x) * s - e.origen.size.w as f64 * escala / 2.0;
+    let y = centro_y + (destino_y - centro_y) * s - e.origen.size.h as f64 * escala / 2.0;
+    // El alfa se va al final, no linealmente: si se apaga desde el principio, la
+    // ventana desaparece a mitad de camino y el recorrido no se ve.
+    let alfa = (1.0 - s * s) as f32;
+    ((x, y).into(), escala, alfa.clamp(0.0, 1.0))
+}
+
+/// Minimiza la ventana: la manda encogiéndose a su icono del dock.
+///
+/// El desmapeo **no** ocurre aquí sino cuando la animación termina, en
+/// [`animar_minimizados`]: si se sacara ya del `Space` no habría nada que
+/// dibujar y el encogido no se vería.
+pub fn minimizar(state: &mut BookosComp, window: Window) {
+    let Some(origen) = state.space.element_geometry(&window) else {
+        return;
+    };
+    let app_id = crate::handlers::app_id(&window).unwrap_or_default();
+    let destino = destino_dock(state, &app_id, origen);
+    encoger(&window, origen, destino, true);
+    state.minimizando.push((window, origen.loc));
+    // El foco pasa a la de debajo: dejárselo a una ventana que se está yendo al
+    // dock significa escribir a ciegas en ella.
+    let siguiente = state
+        .space
+        .elements()
+        .rev()
+        .find(|w| *w != &state.minimizando.last().expect("recién metida").0)
+        .cloned();
+    match siguiente {
+        Some(w) => state.enfocar(&w),
+        None => {
+            if let Some(kbd) = state.seat.get_keyboard() {
+                kbd.set_focus(state, None, SERIAL_COUNTER.next_serial());
+            }
+        }
+    }
+    state.needs_redraw = true;
+}
+
+/// ¿Tiene esta aplicación alguna ventana minimizada?
+pub fn hay_minimizada(state: &BookosComp, app_id: &str) -> bool {
+    state.minimizadas.iter().any(|(w, _)| {
+        crate::handlers::app_id(w).is_some_and(|suyo| bookos_shell::mismo_programa(app_id, &suyo))
+    })
+}
+
+/// ¿Esta aplicación ya está recorriendo la lámpara hacia el dock?
+///
+/// Durante esos 280 ms la ventana aún pertenece al `Space`, así que buscarla
+/// como una ventana abierta también la encuentra. Ignorar un segundo clic evita
+/// insertar dos veces la misma ventana en `minimizando`.
+pub fn esta_minimizando(state: &BookosComp, app_id: &str) -> bool {
+    state.minimizando.iter().any(|(w, _)| {
+        crate::handlers::app_id(w).is_some_and(|suyo| bookos_shell::mismo_programa(app_id, &suyo))
+    })
+}
+
+/// Devuelve al escritorio la última ventana minimizada de una aplicación.
+///
+/// La última y no la primera porque el icono del dock se pulsa para recuperar
+/// «lo que acabo de guardar», que es lo que espera cualquiera con tres ventanas
+/// del mismo programa escondidas.
+pub fn restaurar_minimizada(state: &mut BookosComp, app_id: &str) -> bool {
+    let Some(i) = state.minimizadas.iter().rposition(|(w, _)| {
+        crate::handlers::app_id(w).is_some_and(|suyo| bookos_shell::mismo_programa(app_id, &suyo))
+    }) else {
+        return false;
+    };
+    let (window, posicion) = state.minimizadas.remove(i);
+    state.capturas.retain(|(w, _)| *w != window);
+    state.space.map_element(window.clone(), posicion, true);
+    let origen = state
+        .space
+        .element_geometry(&window)
+        .unwrap_or(Rectangle::new(posicion, (1, 1).into()));
+    let destino = destino_dock(state, app_id, origen);
+    encoger(&window, origen, destino, false);
+    state.enfocar(&window);
+    state.needs_redraw = true;
+    true
+}
+
+/// A qué rectángulo se encoge una ventana de esta aplicación.
+///
+/// Su icono del dock si lo tiene, y si no el borde de abajo justo debajo de
+/// ella: una ventana sin icono no puede irse a ninguna parte concreta, y bajarla
+/// en vertical al menos dice hacia dónde se fue.
+fn destino_dock(
+    state: &BookosComp,
+    app_id: &str,
+    origen: Rectangle<i32, Logical>,
+) -> Rectangle<i32, Logical> {
+    let icono = state.shell.as_ref().and_then(|s| s.icono_dock(app_id));
+    match icono {
+        Some((x, y, w, h)) => Rectangle::new(
+            (x.round() as i32, y.round() as i32).into(),
+            (w.round().max(1.0) as i32, h.round().max(1.0) as i32).into(),
+        ),
+        None => {
+            let (_, alto) = state.pantalla_logica();
+            Rectangle::new(
+                (origen.loc.x + origen.size.w / 2 - 24, alto as i32).into(),
+                (48, 48).into(),
+            )
+        }
+    }
+}
+
+/// Termina los minimizados que han llegado al dock: los saca del `Space`.
+///
+/// Devuelve `true` mientras quede alguno moviéndose, que es lo que mantiene el
+/// bucle dibujando hasta el final de la animación.
+pub fn animar_minimizados(state: &mut BookosComp) -> bool {
+    if state.minimizando.is_empty() {
+        return false;
+    }
+    let mut sigue = false;
+    let pendientes = std::mem::take(&mut state.minimizando);
+    for (window, posicion) in pendientes {
+        if encogido(&window).is_some() {
+            state.minimizando.push((window, posicion));
+            sigue = true;
+            continue;
+        }
+        state.space.unmap_elem(&window);
+        // La textura congelada ya no hace falta: son varios megas de GPU por
+        // ventana y quedarse con ellos «por si vuelve» es una fuga con nombre
+        // bonito. Al restaurar se captura otra vez, que cuesta un frame.
+        state.capturas.retain(|(w, _)| *w != window);
+        state.minimizadas.push((window, posicion));
+    }
+    state.needs_redraw = true;
+    sigue
+}
+
+/// Cuándo se enfocó por última vez. `None` = nunca ha tenido el foco.
+pub fn enfocada_en(window: &Window) -> Option<Instant> {
+    estado(window).enfocada.get()
 }
 
 /// El estado de una ventana, creándolo la primera vez.
@@ -133,6 +363,10 @@ pub fn tomar_restaurar(window: &Window) -> Option<Rectangle<i32, Logical>> {
 pub fn animando(window: &Window) -> bool {
     let estado = estado(window);
     estado
+        .encogido
+        .get()
+        .is_some_and(|e| e.desde.elapsed() < ENCOGIDO)
+        || estado
         .nacida
         .get()
         .is_some_and(|t| t.elapsed() < ENTRADA_ZOOM)
@@ -517,7 +751,7 @@ impl Arrastre {
             )
         };
         // Premultiplicado, que es lo que espera el renderer.
-        let acento = tema::ACENTO;
+        let acento = tema::acento();
         let color = |a: f32| {
             let a = a * alfa;
             [acento.r * a, acento.g * a, acento.b * a, a]
@@ -726,7 +960,7 @@ impl BookosComp {
             .filter(|w| *w != window && colocada(w))
             .filter_map(|w| self.space.element_location(w))
             .collect();
-        let sitio = hueco(tam, self.work_area(), &ocupadas);
+        let sitio = hueco(tam, crate::decoracion::area_util(self, window), &ocupadas);
         tracing::debug!(?sitio, ?tam, otras = ocupadas.len(), "ventana colocada");
         // Un cliente X11 tiene que enterarse de dónde lo hemos puesto: sus
         // menús y diálogos se posicionan en coordenadas absolutas de la
@@ -736,6 +970,18 @@ impl BookosComp {
         }
         self.space.map_element(window.clone(), sitio, true);
         nace(window);
+        // Abrir recorre la misma lámpara que minimizar, en sentido inverso.
+        // Se arranca después de mapear porque el renderer necesita una ventana
+        // viva para congelar su primer buffer. Si la aplicación aún no tiene
+        // icono, `destino_dock` usa el borde inferior bajo ella como origen
+        // estable y evita que aparezca desde una esquina arbitraria.
+        let origen = self
+            .space
+            .element_geometry(window)
+            .unwrap_or(Rectangle::new(sitio, tam));
+        let app_id = crate::handlers::app_id(window).unwrap_or_default();
+        let destino = destino_dock(self, &app_id, origen);
+        encoger(window, origen, destino, false);
         self.revisar_barras();
         // Una ventana que aparece se lleva el foco: es lo que espera cualquiera
         // al abrir un programa, y sin esto habría que pulsarla para escribir.
@@ -750,6 +996,9 @@ impl BookosComp {
     /// dibujan como si tuvieran el foco a la vez.
     pub fn enfocar(&mut self, window: &Window) {
         self.space.raise_element(window, true);
+        // El sello de uso reciente se pone aquí y no al abrir la ventana: lo que
+        // importa para Alt+Tab es a qué has ido, no qué has lanzado.
+        estado(window).enfocada.set(Some(Instant::now()));
 
         // El servidor X lleva su propio orden de apilado, y no se entera de que
         // el `Space` ha subido nada. Sin decírselo, dos ventanas X11 se tapan
@@ -827,13 +1076,18 @@ impl BookosComp {
     /// desencadenó ya ocurrió.
     pub fn arrastrar_toplevel(&mut self, toplevel: &ToplevelSurface, modo: Modo) {
         if let Some(window) = self.window_de_toplevel(toplevel) {
-            self.arrastrar_ventana(&window, modo);
+            self.arrastrar_ventana(&window, modo, true);
         }
     }
 
     /// El mismo arrastre, con la ventana ya resuelta. Lo usan tanto xdg-shell
     /// como X11, que llegan por caminos distintos al mismo sitio.
-    pub fn arrastrar_ventana(&mut self, window: &Window, modo: Modo) {
+    ///
+    /// `del_cliente` dice quién lo pidió, y decide si al soltar el botón el
+    /// evento llega al cliente: si lo pidió él, ya vio la pulsación y necesita
+    /// ver también la suelta. Arrastrando de **nuestra** barra de título el
+    /// clic no ha existido para él.
+    pub fn arrastrar_ventana(&mut self, window: &Window, modo: Modo, del_cliente: bool) {
         let Some(loc) = self.space.element_location(window) else {
             return;
         };
@@ -846,7 +1100,7 @@ impl BookosComp {
             zona: None,
             previa_desde: None,
             previa_nacida: None,
-            del_cliente: true,
+            del_cliente,
         });
     }
 
@@ -916,7 +1170,7 @@ impl BookosComp {
         let Some(arrastre) = self.arrastre.clone() else {
             return false;
         };
-        let area = self.work_area();
+        let area = crate::decoracion::area_util(self, &arrastre.window);
         let destino = arrastre.geometria(self.pointer_location, area);
         // Sin animación: durante un arrastre la ventana tiene que ir pegada al
         // cursor. Interpolar aquí se siente como arrastrar algo con retardo.
@@ -935,7 +1189,10 @@ impl BookosComp {
             }
         }
         if arrastre.modo == Modo::Mover {
-            self.actualizar_previa(zona_en(self.pointer_location, area));
+            // La previa se dibuja sobre el área del escritorio: es dónde va a
+            // quedar la ventana **con** su barra, y descontarla dos veces
+            // dejaría el rectángulo por debajo de la ventana que anuncia.
+            self.actualizar_previa(zona_en(self.pointer_location, self.work_area()));
         }
         self.needs_redraw = true;
         true
@@ -995,7 +1252,10 @@ impl BookosComp {
 
     /// Pone la ventana en una zona de la pantalla, animando el recorrido.
     pub fn encajar(&mut self, window: &Window, zona: Zona) {
-        let destino = zona.rect(self.work_area());
+        // El área es la de esta ventana, no la del escritorio: una decorada
+        // maximizada tiene que dejar arriba el hueco de su propia barra, o la
+        // barra acaba debajo del panel.
+        let destino = zona.rect(crate::decoracion::area_util(self, window));
         let actual = self
             .space
             .element_location(window)
@@ -1051,7 +1311,7 @@ impl BookosComp {
         // creció— y devolver la ventana a un sitio inalcanzable es peor que no
         // devolverla del todo.
         let previa = Rectangle::new(
-            confinar(previa.loc, previa.size, self.work_area()),
+            confinar(previa.loc, previa.size, crate::decoracion::area_util(self, window)),
             previa.size,
         );
         estado(window).zona.set(None);
@@ -1117,8 +1377,9 @@ impl BookosComp {
         } else {
             // Sin nada guardado se vuelve al área útil: perder el sitio de
             // antes es malo, pero dejar la ventana tapando el panel es peor.
-            let previa = tomar_restaurar(window).unwrap_or_else(|| Zona::Maxima.rect(self.work_area()));
-            Rectangle::new(confinar(previa.loc, previa.size, self.work_area()), previa.size)
+            let area = crate::decoracion::area_util(self, window);
+            let previa = tomar_restaurar(window).unwrap_or_else(|| Zona::Maxima.rect(area));
+            Rectangle::new(confinar(previa.loc, previa.size, area), previa.size)
         };
 
         estado(window).completa.set(activar);
@@ -1171,6 +1432,32 @@ impl BookosComp {
         }
     }
 
+    /// Baja la ventana lo justo para que su barra de título quepa.
+    ///
+    /// Hace falta porque el modo de decoración llega **después** de que la
+    /// ventana esté colocada: el cliente crea su `xdg_toplevel`, lo mapeamos, y
+    /// solo entonces pide (o acepta) que la decoremos. Sin esto, la barra de la
+    /// primera ventana de cada sesión aparecía metida bajo el panel.
+    pub fn recolocar_por_barra(&mut self, window: &Window) {
+        if !colocada(window) || encajada(window) || completa(window) {
+            return;
+        }
+        let Some(loc) = self.space.element_location(window) else {
+            return;
+        };
+        let area = crate::decoracion::area_util(self, window);
+        let destino = confinar(loc, window.geometry().size, area);
+        if destino == loc {
+            return;
+        }
+        mover_desde(window, Rectangle::new(loc, window.geometry().size));
+        if let Some(x11) = window.x11_surface() {
+            let _ = x11.configure(Rectangle::new(destino, window.geometry().size));
+        }
+        self.space.map_element(window.clone(), destino, false);
+        self.revisar_barras();
+    }
+
     /// Mira si alguna ventana llega a donde están las barras y se lo dice al
     /// shell, para que se aparten o vuelvan.
     ///
@@ -1215,22 +1502,6 @@ impl BookosComp {
         self.space.elements().any(completa)
     }
 
-    /// Pasa el foco a la siguiente ventana, en orden de apilado.
-    ///
-    /// Rotar hacia el fondo y no llevar un historial de uso es deliberado: el
-    /// orden "última usada" necesita recordar el orden anterior y, con dos
-    /// ventanas —que es el caso normal—, las dos reglas dan lo mismo.
-    pub fn siguiente_ventana(&mut self) {
-        let foco = self.ventana_con_foco();
-        let ventanas: Vec<Window> = self.space.elements().cloned().collect();
-        let siguiente = match foco {
-            Some(actual) => ventanas.iter().find(|w| **w != actual).cloned(),
-            None => ventanas.last().cloned(),
-        };
-        if let Some(window) = siguiente {
-            self.enfocar(&window);
-        }
-    }
 }
 
 /// En qué zona está encajada, si lo está.
@@ -1467,6 +1738,20 @@ mod tests {
         // cuando acaba la animación.
         let zoom = tema::C_MUELLE.eval(1.0);
         assert_eq!(ZOOM_INICIAL + (1.0 - ZOOM_INICIAL) * zoom as f64, 1.0);
+    }
+
+    #[test]
+    fn abrir_recorre_magic_lamp_exactamente_al_reves() {
+        for i in 0..=100 {
+            let t = i as f32 / 100.0;
+            let ida = avance_encogido(t, true);
+            let vuelta = avance_encogido(1.0 - t, false);
+            assert!((ida - vuelta).abs() < 1e-5, "los recorridos divergen en t={t}");
+        }
+        assert_eq!(avance_encogido(0.0, true), 0.0);
+        assert_eq!(avance_encogido(1.0, true), 1.0);
+        assert_eq!(avance_encogido(0.0, false), 1.0);
+        assert_eq!(avance_encogido(1.0, false), 0.0);
     }
 
     #[test]

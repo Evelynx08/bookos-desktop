@@ -11,16 +11,88 @@
 //! radios (§2.3) y la de movimiento (§2.7), las dos cerradas: cada duración va
 //! con **su** curva y no son intercambiables.
 //!
-//! Desviaciones conscientes, que las hay y conviene tenerlas juntas:
+//! ## Los dos temas
 //!
-//! - **No hay tema claro.** El sistema define los dos; aquí no hay Plasma de
-//!   quien heredar la preferencia, así que hasta que exista un ajuste propio
-//!   la paleta clara sería código que nadie ejecuta.
+//! Los colores que cambian entre claro y oscuro son **funciones**, no
+//! constantes: `tema::texto()`, `tema::card()`. Lo que no cambia —los radios,
+//! las curvas, los tamaños de letra y el gris secundario, que el sistema de
+//! diseño fija igual en los dos— sigue siendo `const`, y así el compilador
+//! separa una cosa de la otra sin tener que recordarlo.
 //!
-//! Los valores del tema claro, para cuando llegue: bg `#f2f2f7`, card `#fff`,
-//! texto `#000`, acento `#007AFF`.
+//! Cuál está puesto lo dice un entero global. Es un dato del proceso y no un
+//! parámetro que se arrastre por las cincuenta funciones de dibujo: el shell
+//! entero se pinta con el mismo tema y cambiarlo repinta todo, así que pasarlo
+//! de mano en mano sería ceremonia sin nadie a quien servir.
+//!
+//! ## El acento se elige
+//!
+//! El sistema de diseño fija un acento —el azul— y aquí hay diez, uno a la vez,
+//! el que diga `acento` en `panel.conf` o la tarjeta de Apariencia. Sigue
+//! siendo un solo color de acción, que es lo que el documento pide; lo que
+//! cambia es que ya no está clavado en el código. La tabla y el criterio con
+//! el que se eligió cada par claro/oscuro están en [`Acento`].
+//!
+//! Lo que **no** se deriva del acento son los colores de estado: el verde de
+//! «conectado» y el rojo de «batería baja» significan eso y no el gusto de
+//! nadie.
+//!
+//! Desviaciones conscientes:
+//!
+//! - **El acento azul del tema claro es el `#007AFF` del sistema de diseño**,
+//!   no el `#5C95FF` de la paleta de BookOS: ese está elegido para vibrar sobre
+//!   negro y sobre una tarjeta blanca se queda en un azul lavado que no llega
+//!   al contraste de un texto de acción.
+//! - **Los colores de estado sí cambian**, aunque la paleta de BookOS no traiga
+//!   variante clara: los suyos están elegidos para brillar sobre negro y como
+//!   texto sobre una tarjeta blanca no se leen. En claro se usan los de la
+//!   sección 2.1 del sistema de diseño.
+
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use iced_core::Color;
+
+/// Cuál de los dos temas se está pintando.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tema {
+    #[default]
+    Oscuro,
+    Claro,
+}
+
+static ACTUAL: AtomicU8 = AtomicU8::new(0);
+
+/// Pone el tema del proceso. Quien lo llame tiene que repintar: los colores ya
+/// dibujados no se enteran.
+pub fn aplicar(tema: Tema) {
+    ACTUAL.store(matches!(tema, Tema::Claro) as u8, Ordering::Relaxed);
+}
+
+pub fn actual() -> Tema {
+    if ACTUAL.load(Ordering::Relaxed) == 1 {
+        Tema::Claro
+    } else {
+        Tema::Oscuro
+    }
+}
+
+pub fn es_claro() -> bool {
+    actual() == Tema::Claro
+}
+
+/// Declara un color del tema como función, con su valor en cada uno.
+///
+/// Existe para que la paleta se lea como una tabla de dos columnas —que es como
+/// viene en el sistema de diseño— en vez de como veinte `if` iguales.
+macro_rules! tokens {
+    ($($(#[$att:meta])* $nombre:ident: claro $claro:expr, oscuro $oscuro:expr;)*) => {
+        $(
+            $(#[$att])*
+            pub fn $nombre() -> Color {
+                if es_claro() { $claro } else { $oscuro }
+            }
+        )*
+    };
+}
 
 /// De `#rrggbb` a color. En tiempo de compilación, para poder escribir los
 /// tokens con el mismo hex que el sistema de diseño y no con decimales que ya
@@ -40,35 +112,233 @@ const fn hexa(v: u32, a: f32) -> Color {
 
 // --- Colores ---------------------------------------------------------------
 
-/// Fondo del escritorio y de las superficies a pantalla completa.
-pub const BG: Color = hex(0x000000);
-/// Tarjetas y popups.
-pub const CARD: Color = hex(0x1c1c1e);
-pub const TEXTO: Color = hex(0xffffff);
-/// Texto secundario. Es el mismo en claro y en oscuro.
-pub const TEXTO2: Color = hex(0x8e8e93);
-/// El acento del sistema, de la paleta de BookOS (`Accent / UI`).
-///
-/// Antes era el `#0a84ff` de iOS, que es de donde salió el primer boceto. La
-/// paleta oficial usa `#5C95FF`, más claro y menos saturado: sobre negro no
-/// vibra tanto y es el que llevan los emergentes del diseño.
-pub const ACENTO: Color = hex(0x5c95ff);
+tokens! {
+    /// Fondo del escritorio y de las superficies a pantalla completa.
+    bg: claro hex(0xf2f2f7), oscuro hex(0x000000);
+    /// Tarjetas y popups.
+    card: claro hex(0xffffff), oscuro hex(0x1c1c1e);
+    texto: claro hex(0x000000), oscuro hex(0xffffff);
+}
+
+// --- El acento -------------------------------------------------------------
+//
+// El sistema de diseño fija **un** acento, el azul, y dice además que es el
+// único color que significa «esto se toca». Los diez de aquí no lo contradicen:
+// siguen siendo un solo acento a la vez, el que el usuario elija en Apariencia.
+// La tabla es una extensión declarada en este fichero —el documento no la
+// trae— y por eso cada par se elige con el mismo criterio que ya se le aplicó
+// al azul: el de claro tiene que leerse sobre la tarjeta blanca, el de oscuro
+// tiene que no vibrar sobre el negro.
+//
+// Los que ya existían como token de estado —rojo, naranja, amarillo, verde— son
+// literalmente los mismos valores: dos amarillos casi iguales en el mismo
+// escritorio es lo que hace que se note cosido a mano.
+
+/// El color de acento elegido. Es una tabla cerrada y no un `#rrggbb` libre:
+/// un acento arbitrario se sale del contraste que el resto de la paleta da por
+/// hecho —el texto blanco encima, el `hover` con alfa— y no hay dónde
+/// comprobarlo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Acento {
+    #[default]
+    Azul,
+    Indigo,
+    Morado,
+    Rosa,
+    Rojo,
+    Naranja,
+    Amarillo,
+    Verde,
+    Turquesa,
+    Grafito,
+}
+
+impl Acento {
+    /// Todos, en el orden en que se pintan en la rejilla de Apariencia: el
+    /// círculo cromático, que es el orden en que se buscan con el ojo.
+    pub const TODOS: [Acento; 10] = [
+        Acento::Azul,
+        Acento::Indigo,
+        Acento::Morado,
+        Acento::Rosa,
+        Acento::Rojo,
+        Acento::Naranja,
+        Acento::Amarillo,
+        Acento::Verde,
+        Acento::Turquesa,
+        Acento::Grafito,
+    ];
+
+    /// Su nombre en la configuración y en la interfaz. Sin tildes ni mayúsculas
+    /// para que sea también lo que se escribe en `panel.conf`.
+    pub fn nombre(self) -> &'static str {
+        match self {
+            Acento::Azul => "azul",
+            Acento::Indigo => "indigo",
+            Acento::Morado => "morado",
+            Acento::Rosa => "rosa",
+            Acento::Rojo => "rojo",
+            Acento::Naranja => "naranja",
+            Acento::Amarillo => "amarillo",
+            Acento::Verde => "verde",
+            Acento::Turquesa => "turquesa",
+            Acento::Grafito => "grafito",
+        }
+    }
+
+    pub fn desde_nombre(nombre: &str) -> Option<Acento> {
+        Acento::TODOS
+            .into_iter()
+            .find(|a| a.nombre() == nombre.trim())
+    }
+
+    /// Su color en el tema que esté puesto.
+    pub fn color(self) -> Color {
+        let (claro, oscuro) = match self {
+            // El par calibrado del que salen todos los demás: ver el histórico
+            // de este fichero.
+            Acento::Azul => (0x007aff, 0x5c95ff),
+            Acento::Indigo => (0x5856d6, 0x7d7aff),
+            Acento::Morado => (0xaf52de, 0xc979f0),
+            Acento::Rosa => (0xff2d55, 0xff6482),
+            // Los cuatro siguientes son los tokens de estado, sin retocar.
+            Acento::Rojo => (0xff3b30, 0xff4a4a),
+            Acento::Naranja => (0xff9500, 0xf8a13a),
+            Acento::Amarillo => (0xffcc00, 0xf8db36),
+            Acento::Verde => (0x34c759, 0x65ff8c),
+            Acento::Turquesa => (0x009ba8, 0x40cbd4),
+            // El acento de quien no quiere acento. No es `TEXTO2`: ese es el
+            // gris del texto secundario y usarlo aquí haría que un botón
+            // primario se leyera como deshabilitado.
+            Acento::Grafito => (0x6e6e73, 0xa1a1a6),
+        };
+        hex(if es_claro() { claro } else { oscuro })
+    }
+}
+
+static ACENTO: AtomicU8 = AtomicU8::new(0);
+
+/// Pone el acento del proceso. Como con el tema, quien lo llame tiene que
+/// repintar: lo ya dibujado no se entera.
+pub fn aplicar_acento(acento: Acento) {
+    ACENTO.store(
+        Acento::TODOS.iter().position(|a| *a == acento).unwrap_or(0) as u8,
+        Ordering::Relaxed,
+    );
+}
+
+pub fn acento_actual() -> Acento {
+    let i = ACENTO.load(Ordering::Relaxed) as usize;
+    Acento::TODOS.get(i).copied().unwrap_or_default()
+}
+
+/// El acento del sistema, el único color que significa «esto se toca».
+pub fn acento() -> Color {
+    acento_actual().color()
+}
+
 /// El acento apagado: el relleno de un conmutador que está, pero no encendido.
-pub const ACENTO_SUAVE: Color = hex(0xc8daff);
-/// El azul del texto y de los enlaces.
-pub const ENLACE: Color = hex(0x77a2ff);
+///
+/// Se deriva y no se escribe a mano porque hay diez acentos y diez parejas
+/// escritas a ojo se separan a la primera corrección. Las fracciones son las
+/// que más se acercan a los dos valores que ya estaban calibrados para el
+/// azul: `#b8d3ff` en claro y `#c8daff` en oscuro. No los clavan —los de antes
+/// se eligieron a ojo y no son una mezcla lineal: en claro el verde queda 4
+/// niveles de 255 por encima— pero por debajo de esa distancia no hay color
+/// que se vea distinto.
+pub fn acento_suave() -> Color {
+    mezclar(acento(), Color::WHITE, if es_claro() { 0.70 } else { 0.66 })
+}
+
+/// El color del texto y de los enlaces: el acento corrido hacia donde se lee.
+///
+/// En claro se oscurece un 13 % —un texto fino en `#007aff` sobre blanco se
+/// queda corto de contraste—; en oscuro se aclara un 17 %. Igual que arriba,
+/// son las fracciones que devuelven los `#0a6ede` y `#77a2ff` que estaban
+/// escritos a mano cuando el único acento era el azul.
+pub fn enlace() -> Color {
+    if es_claro() {
+        mezclar(acento(), Color::BLACK, 0.13)
+    } else {
+        mezclar(acento(), Color::WHITE, 0.17)
+    }
+}
+
+/// La tinta que se lee encima del acento.
+///
+/// Con el acento azul esto es blanco siempre y por eso el shell lo tenía
+/// escrito así. Con la paleta abierta deja de serlo: el amarillo `#ffcc00`
+/// tiene luminancia 0,66 y el texto blanco encima desaparece. Donde el fondo es
+/// el acento se pregunta aquí, no se asume.
+pub fn sobre_acento() -> Color {
+    tinta_sobre(acento())
+}
+
+/// Interpola dos colores. `t = 0` da `a`, `t = 1` da `b`.
+///
+/// En sRGB directo, sin linealizar: es lo que hace `color-mix` de CSS por
+/// defecto y lo que esperan los valores calibrados a ojo de los que sale la
+/// tabla de arriba. Linealizar aquí daría mezclas más claras que las que el
+/// sistema de diseño tiene escritas.
+pub fn mezclar(a: Color, b: Color, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    let m = |x: f32, y: f32| x + (y - x) * t;
+    Color {
+        r: m(a.r, b.r),
+        g: m(a.g, b.g),
+        b: m(a.b, b.b),
+        a: m(a.a, b.a),
+    }
+}
+
+/// El mismo color con otro alfa. Se escribía a mano —`Color { a: 0.12, ..c }`—
+/// en cincuenta sitios.
+pub fn alfa(c: Color, a: f32) -> Color {
+    Color { a, ..c }
+}
+
+/// Texto secundario. Es el mismo en claro y en oscuro —lo fija así el sistema
+/// de diseño— y por eso sigue siendo constante.
+pub const TEXTO2: Color = hex(0x8e8e93);
+
+/// El color de la tinta, para rellenos y bordes con muy poco alfa.
+///
+/// Es lo que había escrito como `Color { a: 0.12, ..Color::WHITE }` por todo el
+/// shell: un velo del color del texto sobre la superficie. En claro ese blanco
+/// desaparece contra la tarjeta, y por eso el alfa se aplica sobre esto y no
+/// sobre un blanco fijo. Cuando lo que hay debajo es el acento —un botón azul,
+/// una fila señalada— la tinta sí es blanca siempre, y ahí se escribe
+/// `Color::WHITE` a propósito.
+pub fn tinta() -> Color {
+    texto()
+}
 
 // Estado, de la sección `Status / Feedback` de la paleta.
-pub const VERDE: Color = hex(0x65ff8c);
-pub const ROJO: Color = hex(0xff4a4a);
-pub const AMARILLO: Color = hex(0xf8db36);
+//
+// Los de BookOS están elegidos para brillar sobre negro y en claro se caen: el
+// amarillo `#F8DB36` como texto sobre una tarjeta blanca no se lee —medido en
+// el «78 %» de la tarjeta de batería—, así que en claro se usan los de la
+// sección 2.1 del sistema de diseño, que sí tienen variante para fondo claro.
+tokens! {
+    verde: claro hex(0x34c759), oscuro hex(0x65ff8c);
+    rojo: claro hex(0xff3b30), oscuro hex(0xff4a4a);
+    /// El ámbar de aviso. En claro es el `warning` naranja del sistema y no un
+    /// amarillo más oscuro: el amarillo puro no llega al contraste ni bajándolo.
+    amarillo: claro hex(0xff9500), oscuro hex(0xf8db36);
+}
 
 /// Los tres perfiles de energía, con el color que les da el diseño. Se usan en
 /// el widget de la batería y en su tarjeta, y tienen que ser los mismos en los
 /// dos sitios: es lo único que dice de un vistazo en qué perfil va el equipo.
-pub const PERFIL_AHORRO: Color = AMARILLO;
-pub const PERFIL_EQUILIBRADO: Color = VERDE;
-pub const PERFIL_RENDIMIENTO: Color = ACENTO;
+pub fn perfil_ahorro() -> Color {
+    amarillo()
+}
+pub fn perfil_equilibrado() -> Color {
+    verde()
+}
+pub fn perfil_rendimiento() -> Color {
+    acento()
+}
 
 /// Blanco o negro, el que se lea sobre `fondo`.
 ///
@@ -96,24 +366,30 @@ pub fn tinta_sobre(fondo: Color) -> Color {
     }
 }
 
-/// Línea de separación de 1 px.
-pub const DIVISOR: Color = hexa(0xffffff, 0.08);
-/// Relleno de lo que está bajo el puntero.
-pub const HOVER: Color = hexa(0xffffff, 0.06);
-/// El canal vacío de un deslizador. Es el `trough` de los plasmoides: blanco
-/// al 14 % sobre oscuro, que se ve sin competir con la parte llena.
-pub const SURCO: Color = hexa(0xffffff, 0.14);
-/// Borde de un popup.
-pub const BORDE: Color = hexa(0xffffff, 0.09);
+// Los cuatro rellenos de encima de una superficie son el **mismo color de la
+// tinta** con muy poco alfa: blanco sobre oscuro, negro sobre claro. Por eso no
+// hay un valor claro inventado para cada uno, solo cambia de qué lado tira.
+tokens! {
+    /// Línea de separación de 1 px.
+    divisor: claro hexa(0x000000, 0.08), oscuro hexa(0xffffff, 0.08);
+    /// Relleno de lo que está bajo el puntero.
+    hover: claro hexa(0x000000, 0.04), oscuro hexa(0xffffff, 0.06);
+    /// El canal vacío de un deslizador. Es el `trough` de los plasmoides, que se
+    /// ve sin competir con la parte llena.
+    surco: claro hexa(0x000000, 0.12), oscuro hexa(0xffffff, 0.14);
+    /// Borde de un popup.
+    borde: claro hexa(0x000000, 0.10), oscuro hexa(0xffffff, 0.09);
 
-/// Fondo del panel. Es el `BG` del sistema con transparencia: el panel se
-/// apoya sobre el escritorio y taparlo del todo lo despega de él.
-///
-/// 0,55. Estuvo en 0,35 mientras el compositor dibujaba un cristal esmerilado
-/// debajo —con más opacidad el desenfoque quedaba tapado y solo costaba GPU—.
-/// Ese cristal ya no está, y sin él un 35 % deja el texto blanco del panel
-/// sobre lo que haya en el escritorio: encima de un fondo claro no se leería.
-pub const PANEL: Color = hexa(0x000000, 0.55);
+    /// Fondo del panel. Es el `bg` del sistema con transparencia: el panel se
+    /// apoya sobre el escritorio y taparlo del todo lo despega de él.
+    ///
+    /// 0,55. Estuvo en 0,35 mientras el compositor dibujaba un cristal
+    /// esmerilado debajo —con más opacidad el desenfoque quedaba tapado y solo
+    /// costaba GPU—. Ese cristal ya no está, y sin él un 35 % deja el texto del
+    /// panel sobre lo que haya en el escritorio: no se leería. En claro tira a
+    /// blanco por lo mismo, que es lo que hace legible la tinta negra.
+    panel: claro hexa(0xffffff, 0.72), oscuro hexa(0x000000, 0.55);
+}
 
 // --- Radios ----------------------------------------------------------------
 //
@@ -125,6 +401,11 @@ pub const PANEL: Color = hexa(0x000000, 0.55);
 
 /// Tarjeta agrupadora. Es el radio del dock, que es una tarjeta flotante.
 pub const R_TARJETA: f32 = 22.0;
+/// Diálogos y superficies modales centradas.
+///
+/// El buscador es un diálogo de teclado, no una tarjeta anclada al panel: el
+/// HIG le da el radio mayor para que se lea como una superficie temporal.
+pub const R_DIALOGO: f32 = 26.0;
 pub const R_POPOVER: f32 = 18.0;
 /// Controles: conmutadores, campos, botones de diálogo.
 pub const R_CONTROL: f32 = 14.0;
@@ -260,9 +541,288 @@ pub fn fraccion(pasado: Duration, total: Duration) -> f32 {
     (pasado.as_secs_f32() / total.as_secs_f32()).clamp(0.0, 1.0)
 }
 
+/// Un número que va hacia otro con su curva y su duración.
+///
+/// Es lo mínimo que hace falta para animar dentro de un buffer del shell: el
+/// que dibuja pregunta [`Transicion::valor`] en cada frame y quien manda el
+/// bucle pregunta [`Transicion::animando`] para saber si tiene que pedir otro.
+/// No hay reloj propio ni hilo: el tiempo lo pone el `Instant` de la última
+/// vez que cambió el destino, así que una transición parada no cuesta nada.
+///
+/// **Al redirigirla a medio camino, el origen pasa a ser el valor de ahora** y
+/// no el de partida. Sin eso, sacar el ratón de un botón antes de que acabe de
+/// encenderse lo hacía saltar al principio de la curva: es el mismo fallo que
+/// ya estaba corregido en la animación de las barras del compositor.
+#[derive(Debug, Clone, Copy)]
+pub struct Transicion {
+    origen: f32,
+    destino: f32,
+    inicio: std::time::Instant,
+    duracion: Duration,
+    curva: Curva,
+}
+
+impl Transicion {
+    /// Quieta en `valor`, sin animación pendiente.
+    pub fn nueva(valor: f32, duracion: Duration, curva: Curva) -> Self {
+        Self {
+            origen: valor,
+            destino: valor,
+            // Restarle la duración la deja terminada: recién creada no está
+            // animando, que es lo que quiere quien la construye al arrancar.
+            inicio: std::time::Instant::now() - duracion,
+            duracion,
+            curva,
+        }
+    }
+
+    /// El valor de ahora mismo.
+    pub fn valor(&self) -> f32 {
+        let t = self
+            .curva
+            .eval(fraccion(self.inicio.elapsed(), self.duracion));
+        self.origen + (self.destino - self.origen) * t
+    }
+
+    /// Le pone otro destino. `true` si eso cambia algo y hay que repintar.
+    pub fn ir_a(&mut self, destino: f32) -> bool {
+        if self.destino == destino {
+            return false;
+        }
+        self.origen = self.valor();
+        self.destino = destino;
+        self.inicio = std::time::Instant::now();
+        true
+    }
+
+    /// La planta en `valor` sin animar. Para cuando el cambio no es del
+    /// usuario: al abrirse una tarjeta, sus conmutadores no tienen que hacer el
+    /// recorrido desde cero delante de él.
+    pub fn fijar(&mut self, valor: f32) {
+        self.origen = valor;
+        self.destino = valor;
+        self.inicio = std::time::Instant::now() - self.duracion;
+    }
+
+    /// ¿Se sigue moviendo? Mientras sí, hay que pedir otro fotograma.
+    pub fn animando(&self) -> bool {
+        self.origen != self.destino && self.inicio.elapsed() < self.duracion
+    }
+
+    pub fn destino(&self) -> f32 {
+        self.destino
+    }
+}
+
+/// El realce que se pasea por una lista: qué fila está señalada y cuánto le
+/// queda a la que se acaba de dejar.
+///
+/// Una [`Transicion`] por fila sería lo obvio y es justo lo que no hace falta:
+/// solo hay dos filas moviéndose a la vez —la que entra y la que sale— y las
+/// listas del shell se reconstruyen enteras en cada `view`, así que guardar
+/// estado por fila obligaría a mantenerlo alineado con una lista que cambia
+/// (las redes a la vista aparecen y desaparecen solas). Con dos índices y un
+/// instante, el estado no depende de cuántas filas haya.
+#[derive(Debug, Clone, Copy)]
+pub struct Realce {
+    actual: Option<usize>,
+    previa: Option<usize>,
+    desde: std::time::Instant,
+}
+
+impl Default for Realce {
+    fn default() -> Self {
+        Self::nuevo()
+    }
+}
+
+impl Realce {
+    pub fn nuevo() -> Self {
+        Self {
+            actual: None,
+            previa: None,
+            desde: std::time::Instant::now() - D_HOVER,
+        }
+    }
+
+    /// Señala otra fila. `true` si hay que repintar.
+    pub fn señalar(&mut self, i: Option<usize>) -> bool {
+        if self.actual == i {
+            return false;
+        }
+        // La que se va **es la que estaba**, no la que hubiera antes: pasar el
+        // ratón deprisa por tres filas tiene que apagar la de en medio, no
+        // dejarla encendida hasta que se acabe su curva.
+        self.previa = self.actual;
+        self.actual = i;
+        self.desde = std::time::Instant::now();
+        true
+    }
+
+    /// Cuánto realce le toca a la fila `i`, entre 0 y 1.
+    pub fn intensidad(&self, i: usize) -> f32 {
+        let t = C_SUAVE.eval(fraccion(self.desde.elapsed(), D_HOVER));
+        if self.actual == Some(i) {
+            t
+        } else if self.previa == Some(i) {
+            1.0 - t
+        } else {
+            0.0
+        }
+    }
+
+    /// Da la animación por terminada, dejando la fila señalada ya al máximo.
+    ///
+    /// Es para el estado inicial: una tarjeta que se abre con un color ya
+    /// elegido tiene que enseñarlo marcado, no marcándose.
+    pub fn terminar(&mut self) {
+        self.previa = self.actual;
+        self.desde = std::time::Instant::now() - D_HOVER;
+    }
+
+    /// Qué fila está señalada ahora. Para el hit-test, que no anima.
+    pub fn actual(&self) -> Option<usize> {
+        self.actual
+    }
+
+    pub fn animando(&self) -> bool {
+        self.actual != self.previa && self.desde.elapsed() < D_HOVER
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// El tema conmuta de verdad y la tinta lo sigue.
+    ///
+    /// Deja el tema **como estaba** al terminar: es un global del proceso y los
+    /// tests del mismo binario corren en hilos a la vez.
+    #[test]
+    fn el_tema_claro_invierte_la_tinta() {
+        let antes = actual();
+        aplicar(Tema::Claro);
+        assert!(es_claro());
+        assert_eq!(texto(), hex(0x000000), "en claro la tinta es negra");
+        assert_eq!(card(), hex(0xffffff));
+        aplicar(Tema::Oscuro);
+        assert_eq!(texto(), hex(0xffffff));
+        assert_eq!(bg(), hex(0x000000));
+        // Lo que el sistema de diseño fija igual en los dos no se mueve.
+        aplicar(Tema::Claro);
+        assert_eq!(TEXTO2, hex(0x8e8e93));
+        aplicar(antes);
+    }
+
+    /// Las fórmulas de `acento_suave` y `enlace` tienen que devolver, con el
+    /// azul, los mismos colores que estaban escritos a mano antes de que
+    /// hubiera diez acentos. Si esto se va, la paleta entera se desplaza.
+    #[test]
+    fn las_derivaciones_del_acento_reproducen_el_azul_calibrado() {
+        let antes = (actual(), acento_actual());
+        aplicar_acento(Acento::Azul);
+
+        let cerca = |a: Color, b: Color, que: &str| {
+            for (x, y) in [(a.r, b.r), (a.g, b.g), (a.b, b.b)] {
+                // 12/255. Los valores de antes se eligieron a ojo y no son
+                // mezclas lineales: `#0a6ede` tiene 10 de rojo donde el azul
+                // del que sale tiene 0, y oscurecer no sube un canal. Lo que
+                // este test protege es que la fórmula no se desvíe de lo
+                // calibrado, no un redondeo; 10 niveles en el rojo de un azul
+                // no se distinguen.
+                assert!((x - y).abs() < 12.0 / 255.0, "{que}: {a:?} vs {b:?}");
+            }
+        };
+
+        aplicar(Tema::Claro);
+        assert_eq!(acento(), hex(0x007aff));
+        cerca(acento_suave(), hex(0xb8d3ff), "acento_suave claro");
+        cerca(enlace(), hex(0x0a6ede), "enlace claro");
+        assert_eq!(sobre_acento(), Color::WHITE, "el azul lleva tinta blanca");
+
+        aplicar(Tema::Oscuro);
+        assert_eq!(acento(), hex(0x5c95ff));
+        cerca(acento_suave(), hex(0xc8daff), "acento_suave oscuro");
+        cerca(enlace(), hex(0x77a2ff), "enlace oscuro");
+
+        aplicar(antes.0);
+        aplicar_acento(antes.1);
+    }
+
+    /// El motivo de que `sobre_acento` exista: con el amarillo puesto, el
+    /// blanco de siempre deja de leerse.
+    #[test]
+    fn el_amarillo_pide_tinta_negra() {
+        let antes = (actual(), acento_actual());
+        aplicar(Tema::Oscuro);
+        aplicar_acento(Acento::Amarillo);
+        assert_eq!(sobre_acento(), Color::BLACK);
+        aplicar_acento(Acento::Azul);
+        assert_eq!(sobre_acento(), Color::WHITE);
+        aplicar(antes.0);
+        aplicar_acento(antes.1);
+    }
+
+    #[test]
+    fn los_nombres_de_los_acentos_van_y_vuelven() {
+        for a in Acento::TODOS {
+            assert_eq!(Acento::desde_nombre(a.nombre()), Some(a));
+        }
+        assert_eq!(Acento::desde_nombre("fucsia"), None);
+    }
+
+    /// Redirigir a medio camino no puede dar un salto: es lo que se ve al
+    /// sacar el ratón de un botón antes de que acabe de encenderse.
+    #[test]
+    fn una_transicion_redirigida_arranca_donde_estaba() {
+        let mut t = Transicion::nueva(0.0, Duration::from_millis(100), C_SUAVE);
+        assert_eq!(t.valor(), 0.0);
+        assert!(!t.animando(), "recién creada no anima");
+
+        assert!(t.ir_a(1.0));
+        assert!(t.animando());
+        assert!(!t.ir_a(1.0), "el mismo destino no reinicia nada");
+        std::thread::sleep(Duration::from_millis(50));
+        let a_medias = t.valor();
+        assert!(a_medias > 0.0 && a_medias < 1.0, "{a_medias}");
+
+        t.ir_a(0.0);
+        // El primer valor tras redirigir es el que había, no el 1,0 del destino
+        // anterior ni el 0,0 del nuevo.
+        assert!(
+            (t.valor() - a_medias).abs() < 0.05,
+            "{} vs {a_medias}",
+            t.valor()
+        );
+
+        t.fijar(1.0);
+        assert_eq!(t.valor(), 1.0);
+        assert!(!t.animando());
+    }
+
+    /// Pasar el ratón deprisa por tres filas apaga la de en medio; si no, se
+    /// quedan dos encendidas a la vez.
+    #[test]
+    fn el_realce_solo_deja_dos_filas_a_la_vez() {
+        let mut r = Realce::nuevo();
+        assert!(r.señalar(Some(0)));
+        assert!(!r.señalar(Some(0)));
+        r.señalar(Some(1));
+        r.señalar(Some(2));
+        assert_eq!(r.actual(), Some(2));
+        assert_eq!(
+            r.intensidad(0),
+            0.0,
+            "la de hace dos saltos ya está apagada"
+        );
+        assert!(r.intensidad(1) > 0.0, "la anterior se está yendo");
+        assert!(r.animando());
+
+        std::thread::sleep(D_HOVER);
+        assert_eq!(r.intensidad(2), 1.0);
+        assert_eq!(r.intensidad(1), 0.0);
+        assert!(!r.animando());
+    }
 
     #[test]
     fn los_radios_estan_en_la_tabla_cerrada() {

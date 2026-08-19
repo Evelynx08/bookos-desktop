@@ -5,8 +5,24 @@
 //! ```text
 //! # Los widgets del panel, por zona.
 //! centro = reloj
-//! derecha = red, brillo, bateria
+//! derecha = escritorios, red, brillo, bateria
 //! escala = 1.75
+//! tema = oscuro
+//! acento = azul
+//! avatar = ~/Imágenes/yo.png
+//! bloqueo_animaciones = si
+//! bloqueo_fecha = si
+//! bloqueo_medios = si
+//! bloqueo_reloj_y = 0.08
+//! bloqueo_acceso_y = 0.36
+//! bloqueo_medios_y = 0.68
+//! bloqueo_reloj_tamano = 120
+//! bloqueo_avatar_tamano = 112
+//! actividades = si
+//! actividades_animaciones = si
+//! temporizador_siempre_visible = no
+//! escritorios = 2
+//! nombres_escritorios = Escritorio 1, Escritorio 2
 //! dock = konsole:Terminal:utilities-terminal, firefox:Navegador:firefox
 //!
 //! # Cursor y entrada. Las velocidades van en la escala de libinput: [-1, 1].
@@ -49,6 +65,74 @@ pub struct Config {
     pub fondo: Option<String>,
     /// Distribución de teclado (`es`, `us`, `fr`…). `None` = la del sistema.
     pub teclado: Option<String>,
+    /// Cuántos escritorios virtuales hay.
+    ///
+    /// Dos de serie y un máximo de cinco, que es lo que cabe en la vista
+    /// general sin convertir las previsualizaciones en sellos.
+    pub escritorios: usize,
+    /// Nombres editables de los escritorios, en el mismo orden.
+    pub nombres_escritorios: Vec<String>,
+    /// Claro u oscuro. Lo aplica quien crea el shell, porque el tema es del
+    /// proceso entero y no de una superficie.
+    pub tema: crate::tema::Tema,
+    /// El color de acento, de la tabla cerrada de [`crate::tema::Acento`].
+    pub acento: crate::tema::Acento,
+    /// Foto de perfil para el bloqueo. `None` = la del sistema (`~/.face` o
+    /// AccountsService), y si tampoco hay, las iniciales.
+    pub avatar: Option<String>,
+    /// Composición visual del bloqueo. Vive en la configuración compartida
+    /// para que BookOS Settings pueda editarla sin conocer el código de iced.
+    pub bloqueo: Bloqueo,
+    /// Isla de tareas vivas; estas claves quedan preparadas para BookOS
+    /// Settings y permiten desactivar movimiento sin apagar la función.
+    pub actividades: Actividades,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Actividades {
+    pub habilitadas: bool,
+    pub animaciones: bool,
+    pub temporizador_siempre: bool,
+}
+
+impl Default for Actividades {
+    fn default() -> Self {
+        Self { habilitadas: true, animaciones: true, temporizador_siempre: false }
+    }
+}
+
+/// Opciones de la pantalla de bloqueo.
+///
+/// Las posiciones son fracciones del alto lógico de la salida. De ese modo un
+/// valor guardado sirve igual en 1920×1080, 2880×1800 y con escala fraccional:
+/// la densidad cambia los píxeles físicos, no la composición que ve el usuario.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Bloqueo {
+    pub animaciones: bool,
+    pub fecha: bool,
+    pub medios: bool,
+    pub reloj_y: f32,
+    pub acceso_y: f32,
+    pub medios_y: f32,
+    pub reloj_tamano: f32,
+    pub avatar_tamano: f32,
+}
+
+impl Default for Bloqueo {
+    fn default() -> Self {
+        Self {
+            animaciones: true,
+            fecha: true,
+            medios: true,
+            // La referencia: reloj en el primer tercio, identidad en el centro
+            // y la tarjeta de lo que suena por debajo del acceso.
+            reloj_y: 0.08,
+            acceso_y: 0.36,
+            medios_y: 0.68,
+            reloj_tamano: 144.0,
+            avatar_tamano: 132.0,
+        }
+    }
 }
 
 /// Lo que se le pide a libinput sobre los dispositivos de entrada.
@@ -83,6 +167,14 @@ impl Default for Entrada {
     }
 }
 
+/// Cuántos escritorios virtuales caben como mucho.
+///
+/// Cinco es lo que entra en la vista general sin convertir las
+/// previsualizaciones en sellos, y es también hasta dónde llegan los iconos
+/// numerados del aviso. El compositor tiene el mismo tope y por eso este valor
+/// no puede subir aquí sin subir allí.
+pub const MAXIMO_ESCRITORIOS: usize = 5;
+
 /// El `exec` reservado que abre el launchpad en vez de lanzar un programa.
 ///
 /// Es una palabra y no un binario porque el launchpad no es un programa: vive
@@ -111,6 +203,10 @@ impl Default for Config {
             // —batería, conexiones— antes que lo que se toca, y el reloj el
             // último, pegado a la esquina.
             derecha: vec![
+                // El primero de la fila: es el único que dice *dónde estás* y
+                // no *qué tienes*, así que va aparte de los estados, pegado al
+                // borde izquierdo del grupo.
+                "escritorios".into(),
                 "bateria".into(),
                 "bluetooth".into(),
                 "red".into(),
@@ -149,6 +245,13 @@ impl Default for Config {
             entrada: Entrada::default(),
             fondo: None,
             teclado: None,
+            escritorios: 2,
+            nombres_escritorios: vec!["Escritorio 1".into(), "Escritorio 2".into()],
+            tema: crate::tema::Tema::Oscuro,
+            acento: crate::tema::Acento::Azul,
+            avatar: None,
+            bloqueo: Bloqueo::default(),
+            actividades: Actividades::default(),
         }
     }
 }
@@ -193,6 +296,83 @@ impl Config {
                 // Un valor absurdo se descarta en vez de aplicarse: una escala
                 // de 0 deja la pantalla en 0x0 píxeles lógicos y el escritorio
                 // no vuelve a arrancar hasta editar el fichero a ciegas.
+                "escritorios" => match valor.trim().parse::<usize>() {
+                    Ok(v) => config.escritorios = v.clamp(1, MAXIMO_ESCRITORIOS),
+                    Err(_) => tracing::warn!(valor, "«escritorios» no es un número"),
+                },
+                "nombres_escritorios" => config.nombres_escritorios = items(),
+                // Sin comprobar que exista: el fichero puede llegar después que
+                // la configuración —un montaje de red, por ejemplo— y descartar
+                // la ruta aquí obligaría a editar el fichero otra vez.
+                "avatar" => config.avatar = Some(valor.trim().to_string()),
+                "bloqueo_animaciones" => {
+                    if let Some(v) = booleano(valor, ruta, n + 1) {
+                        config.bloqueo.animaciones = v;
+                    }
+                }
+                "actividades" => {
+                    if let Some(v) = booleano(valor, ruta, n + 1) {
+                        config.actividades.habilitadas = v;
+                    }
+                }
+                "actividades_animaciones" => {
+                    if let Some(v) = booleano(valor, ruta, n + 1) {
+                        config.actividades.animaciones = v;
+                    }
+                }
+                "temporizador_siempre_visible" => {
+                    if let Some(v) = booleano(valor, ruta, n + 1) {
+                        config.actividades.temporizador_siempre = v;
+                    }
+                }
+                "bloqueo_fecha" => {
+                    if let Some(v) = booleano(valor, ruta, n + 1) {
+                        config.bloqueo.fecha = v;
+                    }
+                }
+                "bloqueo_medios" => {
+                    if let Some(v) = booleano(valor, ruta, n + 1) {
+                        config.bloqueo.medios = v;
+                    }
+                }
+                "bloqueo_reloj_y" => {
+                    if let Some(v) = decimal(valor, 0.02..=0.40, ruta, n + 1) {
+                        config.bloqueo.reloj_y = v as f32;
+                    }
+                }
+                "bloqueo_acceso_y" => {
+                    if let Some(v) = decimal(valor, 0.18..=0.72, ruta, n + 1) {
+                        config.bloqueo.acceso_y = v as f32;
+                    }
+                }
+                "bloqueo_medios_y" => {
+                    if let Some(v) = decimal(valor, 0.42..=0.88, ruta, n + 1) {
+                        config.bloqueo.medios_y = v as f32;
+                    }
+                }
+                "bloqueo_reloj_tamano" => {
+                    if let Some(v) = decimal(valor, 72.0..=220.0, ruta, n + 1) {
+                        config.bloqueo.reloj_tamano = v as f32;
+                    }
+                }
+                "bloqueo_avatar_tamano" => {
+                    if let Some(v) = decimal(valor, 64.0..=220.0, ruta, n + 1) {
+                        config.bloqueo.avatar_tamano = v as f32;
+                    }
+                }
+                // Cualquier otra cosa se queda en oscuro y se avisa: un tema
+                // mal escrito no puede dejar el escritorio a medio pintar.
+                "tema" => match valor.trim() {
+                    "claro" => config.tema = crate::tema::Tema::Claro,
+                    "oscuro" => config.tema = crate::tema::Tema::Oscuro,
+                    otro => tracing::warn!(otro, "«tema» solo entiende claro u oscuro"),
+                },
+                // Un nombre que no está en la tabla se ignora en vez de
+                // dejar el escritorio con un acento a medias.
+                "acento" => match crate::tema::Acento::desde_nombre(valor) {
+                    Some(a) => config.acento = a,
+                    None => tracing::warn!(valor = valor.trim(), "acento desconocido"),
+                },
                 "escala" => match valor.trim().replace(',', ".").parse::<f64>() {
                     Ok(v) if (0.5..=4.0).contains(&v) => config.escala = Some(v),
                     _ => tracing::warn!(
@@ -240,6 +420,13 @@ impl Config {
                 otro => tracing::warn!(?ruta, linea = n + 1, clave = otro, "clave desconocida"),
             }
         }
+        config.nombres_escritorios.truncate(config.escritorios);
+        while config.nombres_escritorios.len() < config.escritorios {
+            config.nombres_escritorios.push(format!(
+                "Escritorio {}",
+                config.nombres_escritorios.len() + 1
+            ));
+        }
         config
     }
 }
@@ -256,6 +443,28 @@ fn velocidad(valor: &str, ruta: &std::path::Path, linea: usize) -> Option<f64> {
                 linea,
                 valor = valor.trim(),
                 "velocidad fuera de [-1 - 1]; se ignora"
+            );
+            None
+        }
+    }
+}
+
+fn decimal(
+    valor: &str,
+    rango: std::ops::RangeInclusive<f64>,
+    ruta: &std::path::Path,
+    linea: usize,
+) -> Option<f64> {
+    match valor.trim().replace(',', ".").parse::<f64>() {
+        Ok(v) if rango.contains(&v) => Some(v),
+        _ => {
+            tracing::warn!(
+                ?ruta,
+                linea,
+                valor = valor.trim(),
+                minimo = *rango.start(),
+                maximo = *rango.end(),
+                "valor fuera de rango; se ignora"
             );
             None
         }
@@ -290,11 +499,46 @@ fn lanzador(spec: &str) -> Option<Lanzador> {
 }
 
 /// Reescribe la clave `dock` del fichero, dejando lo demás como está.
-///
-/// Se hace a mano y no serializando la `Config` entera porque el fichero es del
-/// usuario: lleva sus comentarios y su orden, y volcarlo desde el código los
-/// borraría. Se sustituye la línea si existe y se añade al final si no.
 pub fn guardar_dock(anclados: &[String]) -> std::io::Result<()> {
+    escribir_claves(&[("dock", anclados.join(", "))])
+}
+
+/// Persiste la cantidad y los nombres sin reescribir el resto del fichero.
+pub fn guardar_escritorios(nombres: &[String]) -> std::io::Result<()> {
+    // La coma separa los nombres en el fichero, así que un nombre con coma
+    // partiría la lista en dos escritorios al releerla.
+    let nombres: Vec<_> = nombres
+        .iter()
+        .map(|n| n.replace([',', '\n', '\r'], " "))
+        .collect();
+    escribir_claves(&[
+        ("escritorios", nombres.len().to_string()),
+        ("nombres_escritorios", nombres.join(", ")),
+    ])
+}
+
+/// Persiste el tema y el acento que se acaban de elegir en Apariencia.
+pub fn guardar_apariencia(
+    tema: crate::tema::Tema,
+    acento: crate::tema::Acento,
+) -> std::io::Result<()> {
+    let tema = match tema {
+        crate::tema::Tema::Claro => "claro",
+        crate::tema::Tema::Oscuro => "oscuro",
+    };
+    escribir_claves(&[
+        ("tema", tema.to_string()),
+        ("acento", acento.nombre().to_string()),
+    ])
+}
+
+/// Reescribe esas claves del fichero y deja lo demás como está.
+///
+/// A mano y no serializando la `Config` entera porque el fichero es del
+/// usuario: lleva sus comentarios y su orden, y volcarlo desde el código los
+/// borraría. La clave que ya estaba se sustituye en su sitio; la que no,
+/// se añade al final.
+fn escribir_claves(valores: &[(&str, String)]) -> std::io::Result<()> {
     let Some(ruta) = ruta() else {
         return Ok(());
     };
@@ -302,23 +546,141 @@ pub fn guardar_dock(anclados: &[String]) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     let anterior = std::fs::read_to_string(&ruta).unwrap_or_default();
-    let linea = format!("dock = {}", anclados.join(", "));
-    let mut salida = String::with_capacity(anterior.len() + linea.len());
-    let mut sustituida = false;
-    for l in anterior.lines() {
-        if l.trim_start().starts_with("dock") && l.contains('=') && !sustituida {
-            salida.push_str(&linea);
-            sustituida = true;
+    let mut vistos = vec![false; valores.len()];
+    let mut salida = String::new();
+    for linea in anterior.lines() {
+        let clave = linea.split_once('=').map(|(k, _)| k.trim());
+        if let Some(i) = valores.iter().position(|(k, _)| Some(*k) == clave) {
+            // Repetida en el fichero: la primera se sustituye y las demás se
+            // caen, que es lo que hace la lectura —se queda con la última— al
+            // revés, pero deja el fichero sin claves duplicadas.
+            if !vistos[i] {
+                salida.push_str(&format!("{} = {}", valores[i].0, valores[i].1));
+                vistos[i] = true;
+            } else {
+                continue;
+            }
         } else {
-            salida.push_str(l);
+            salida.push_str(linea);
         }
         salida.push('\n');
     }
-    if !sustituida {
-        salida.push_str(&linea);
-        salida.push('\n');
+    for (i, (clave, valor)) in valores.iter().enumerate() {
+        if !vistos[i] {
+            salida.push_str(&format!("{clave} = {valor}\n"));
+        }
     }
-    std::fs::write(&ruta, salida)
+    std::fs::write(ruta, salida)
+}
+
+/// El launchpad guardado, en `~/.config/bookos/launchpad.conf`.
+///
+/// Un fichero aparte y no una clave de `panel.conf` porque esto **lo escribe el
+/// escritorio**, no el usuario: cada vez que se arrastra un icono se reescribe
+/// entero, y mezclarlo con la configuración escrita a mano acabaría pisando los
+/// comentarios de alguien.
+///
+/// Una carpeta por línea, `nombre[:color] = exec1, exec2, …`, más la lista de
+/// las aplicaciones que se han quitado de la rejilla:
+///
+/// ```text
+/// Utilidades:verde = konsole, kate, kcalc
+/// Internet = firefox, thunderbird
+/// ocultas = xterm, gnome-tetravex
+/// ```
+///
+/// El color es uno de la tabla de [`crate::tema::Acento`]; sin él, la carpeta
+/// va en gris. [`CLAVE_OCULTAS`] es una clave reservada: una carpeta no puede
+/// llamarse así.
+///
+/// Las aplicaciones se identifican por su `exec` porque es lo que ya usa el
+/// dock en `panel.conf`: dos formas de nombrar la misma aplicación en el mismo
+/// escritorio se separan a la primera.
+pub const CLAVE_OCULTAS: &str = "ocultas";
+
+/// Lo que hay en `launchpad.conf`.
+#[derive(Default)]
+pub struct Launchpad {
+    /// Nombre, color —si lo tiene— y aplicaciones de cada carpeta.
+    pub carpetas: Vec<(String, Option<String>, Vec<String>)>,
+    /// Las que el usuario ha quitado de la rejilla.
+    pub ocultas: Vec<String>,
+}
+
+pub fn cargar_launchpad() -> Launchpad {
+    let Some(ruta) = ruta_launchpad() else {
+        return Launchpad::default();
+    };
+    let Ok(texto) = std::fs::read_to_string(&ruta) else {
+        return Launchpad::default();
+    };
+    interpretar_launchpad(&texto)
+}
+
+fn interpretar_launchpad(texto: &str) -> Launchpad {
+    let mut salida = Launchpad::default();
+    for linea in texto
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    {
+        let Some((clave, valores)) = linea.split_once('=') else {
+            continue;
+        };
+        let valores: Vec<String> = valores
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        // Una carpeta vacía no se enseña: sería un icono que al abrirse no
+        // tiene nada dentro.
+        if valores.is_empty() {
+            continue;
+        }
+        let clave = clave.trim();
+        if clave == CLAVE_OCULTAS {
+            salida.ocultas = valores;
+            continue;
+        }
+        let (nombre, color) = match clave.split_once(':') {
+            Some((n, c)) => (n.trim(), Some(c.trim().to_string())),
+            None => (clave, None),
+        };
+        salida.carpetas.push((nombre.to_string(), color, valores));
+    }
+    salida
+}
+
+/// Reescribe el fichero entero. Lo llama el launchpad al cambiar algo.
+pub fn guardar_launchpad(datos: &Launchpad) -> std::io::Result<()> {
+    let Some(ruta) = ruta_launchpad() else {
+        return Ok(());
+    };
+    if let Some(dir) = ruta.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut salida = String::from(
+        "# El launchpad: carpetas y aplicaciones quitadas de la rejilla.\n         # Lo escribe el escritorio; se puede editar a mano.\n         # Una carpeta por línea: nombre[:color] = exec1, exec2, …\n",
+    );
+    for (nombre, color, apps) in &datos.carpetas {
+        // Ni `=`, ni `,`, ni `:` en el nombre: los tres partirían la línea al
+        // volver a leerla. Se sustituyen en vez de perder la carpeta entera.
+        let nombre = nombre.replace(['=', ',', ':', '\n', '\r'], " ");
+        let nombre = nombre.trim();
+        match color {
+            Some(color) => salida.push_str(&format!("{nombre}:{color} = {}\n", apps.join(", "))),
+            None => salida.push_str(&format!("{nombre} = {}\n", apps.join(", "))),
+        }
+    }
+    if !datos.ocultas.is_empty() {
+        salida.push_str(&format!("{CLAVE_OCULTAS} = {}\n", datos.ocultas.join(", ")));
+    }
+    std::fs::write(ruta, salida)
+}
+
+fn ruta_launchpad() -> Option<PathBuf> {
+    Some(ruta()?.with_file_name("launchpad.conf"))
 }
 
 fn ruta() -> Option<PathBuf> {
@@ -344,6 +706,17 @@ mod tests {
         assert!(c.entrada.toque_para_clic);
         assert!(c.entrada.scroll_natural);
         assert_eq!(c.escala, None);
+        assert_eq!(c.escritorios, 2);
+        assert_eq!(c.nombres_escritorios, ["Escritorio 1", "Escritorio 2"]);
+    }
+
+    #[test]
+    fn escritorios_se_acotan_y_los_nombres_se_completan() {
+        let c = parsear("escritorios = 9\nnombres_escritorios = Trabajo, Juegos\n");
+        assert_eq!(c.escritorios, 5);
+        assert_eq!(c.nombres_escritorios.len(), 5);
+        assert_eq!(&c.nombres_escritorios[..2], ["Trabajo", "Juegos"]);
+        assert_eq!(parsear("escritorios = 0").escritorios, 1);
     }
 
     #[test]
@@ -386,6 +759,71 @@ mod tests {
         // hardware: en ambos casos vale más quedarse con el de serie.
         assert_eq!(parsear("cursor = 4").cursor, 24);
         assert_eq!(parsear("cursor = 500").cursor, 24);
+    }
+
+    #[test]
+    fn la_composicion_del_bloqueo_es_configurable_y_segura() {
+        let c = parsear(
+            "bloqueo_animaciones = no\n\
+             bloqueo_fecha = no\n\
+             bloqueo_medios = sí\n\
+             bloqueo_reloj_y = 0.12\n\
+             bloqueo_acceso_y = 0.42\n\
+             bloqueo_medios_y = 0.73\n\
+             bloqueo_reloj_tamano = 168\n\
+             bloqueo_avatar_tamano = 150\n",
+        );
+        assert!(!c.bloqueo.animaciones);
+        assert!(!c.bloqueo.fecha);
+        assert!(c.bloqueo.medios);
+        assert_eq!(c.bloqueo.reloj_y, 0.12);
+        assert_eq!(c.bloqueo.acceso_y, 0.42);
+        assert_eq!(c.bloqueo.medios_y, 0.73);
+        assert_eq!(c.bloqueo.reloj_tamano, 168.0);
+        assert_eq!(c.bloqueo.avatar_tamano, 150.0);
+
+        // Una posición fuera de pantalla no pisa el valor utilizable de serie.
+        assert_eq!(parsear("bloqueo_acceso_y = 4").bloqueo.acceso_y, 0.36);
+    }
+
+    #[test]
+    fn las_actividades_y_su_movimiento_se_pueden_desactivar() {
+        let c = parsear(
+            "actividades = no\n\
+             actividades_animaciones = no\n\
+             temporizador_siempre_visible = sí\n",
+        );
+        assert!(!c.actividades.habilitadas);
+        assert!(!c.actividades.animaciones);
+        assert!(c.actividades.temporizador_siempre);
+    }
+
+    #[test]
+    fn el_launchpad_va_y_vuelve() {
+        let texto = "# comentario\n\
+                     Utilidades:verde = konsole, kate , kcalc\n\
+                     \n\
+                     Vacia = \n\
+                     Internet = firefox\n\
+                     ocultas = xterm\n";
+        let datos = interpretar_launchpad(texto);
+        assert_eq!(datos.carpetas.len(), 2, "la vacía no cuenta");
+        assert_eq!(datos.carpetas[0].0, "Utilidades");
+        assert_eq!(datos.carpetas[0].1.as_deref(), Some("verde"), "el color");
+        assert_eq!(datos.carpetas[0].2, ["konsole", "kate", "kcalc"]);
+        assert_eq!(datos.carpetas[1].1, None, "sin color va en gris");
+        assert_eq!(datos.ocultas, ["xterm"]);
+    }
+
+    #[test]
+    fn el_acento_sale_de_la_tabla_y_lo_demas_se_ignora() {
+        assert_eq!(
+            parsear("acento = morado").acento,
+            crate::tema::Acento::Morado
+        );
+        // Un acento inventado deja el de serie: el escritorio tiene que
+        // arrancar con un color, no con ninguno.
+        assert_eq!(parsear("acento = fucsia").acento, crate::tema::Acento::Azul);
     }
 
     #[test]

@@ -42,3 +42,21 @@ xcursor = "0.3"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+# El servidor de notificaciones (`org.freedesktop.Notifications`), que es
+# D-Bus y no hay forma de que no lo sea: es la única interfaz que las
+# aplicaciones conocen para avisar de algo.
+#
+# Se usa la **API bloqueante** desde un hilo aparte, no la asíncrona: meter un
+# ejecutor async en el proceso obligaría a casarlo con `calloop`, que es quien
+# manda aquí, y el hilo con un canal hacia el bucle hace lo mismo sin que el
+# bucle de frames se entere de que existe. Por eso tampoco se activa `tokio`.
+zbus = { version = "5", default-features = false, features = [
+    "async-io",
+    "blocking-api",
+] }
+# Solo para derivar los tipos que viajan por D-Bus en `pantallas.rs`. No es una
+# dependencia nueva de verdad: `serde` y su `derive` ya entraban en el árbol con
+# `zvariant`, que es quien serializa los mensajes del bus.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"

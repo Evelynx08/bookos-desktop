@@ -5,7 +5,7 @@
 //! aquí para que una sola sea la buena: tres copias de un deslizador acaban
 //! con tres radios distintos y tres zonas agarrables que no coinciden.
 
-use iced_core::{Border, Color, Length};
+use iced_core::{Border, Length};
 use iced_widget::{container, Space};
 
 use crate::icono::Icono;
@@ -29,7 +29,11 @@ pub const MARGEN_AGARRE: f32 = 6.0;
 /// La píldora: el canal lleno hasta `nivel` (de 0 a 100) sobre el surco.
 pub fn pildora<'a>(ancho: f32, nivel: u8, apagado: bool) -> PanelElement<'a> {
     let lleno = ancho * (nivel.min(100) as f32 / 100.0);
-    let color = if apagado { tema::TEXTO2 } else { tema::ACENTO };
+    let color = if apagado {
+        tema::TEXTO2
+    } else {
+        tema::acento()
+    };
     let barra = container(Space::new())
         .width(Length::Fixed(lleno))
         .height(Length::Fixed(PILDORA))
@@ -45,7 +49,7 @@ pub fn pildora<'a>(ancho: f32, nivel: u8, apagado: bool) -> PanelElement<'a> {
         .width(Length::Fixed(ancho))
         .height(Length::Fixed(PILDORA))
         .style(|_| container::Style {
-            background: Some(tema::SURCO.into()),
+            background: Some(tema::surco().into()),
             border: Border {
                 radius: (PILDORA / 2.0).into(),
                 ..Default::default()
@@ -58,13 +62,18 @@ pub fn pildora<'a>(ancho: f32, nivel: u8, apagado: bool) -> PanelElement<'a> {
 /// El botón redondo con un icono dentro.
 ///
 /// `apagado` lo deja en gris con el icono en texto secundario; encendido va en
-/// el acento con el icono en blanco.
-pub fn boton<'a>(icono: Option<&'a Icono>, apagado: bool) -> PanelElement<'a> {
+/// el acento con el icono en la tinta que se lea encima. `señalado`, de 0 a 1,
+/// es el puntero por encima: aclara el fondo sin cambiar de estado, que es lo
+/// que distingue «se puede pulsar» de «está pulsado».
+pub fn boton<'a>(icono: Option<&'a Icono>, apagado: bool, señalado: f32) -> PanelElement<'a> {
     let (fondo, tinta) = if apagado {
-        (tema::HOVER, tema::TEXTO2)
+        (tema::hover(), tema::TEXTO2)
     } else {
-        (tema::ACENTO, Color::WHITE)
+        (tema::acento(), tema::sobre_acento())
     };
+    // Hacia la tinta y no hacia el blanco: sobre el tema claro, aclarar con
+    // blanco un botón que ya es casi blanco no se ve.
+    let fondo = tema::mezclar(fondo, tema::alfa(tema::tinta(), 0.22), 0.5 * señalado);
     let dentro = match icono {
         Some(ic) => crate::icono::ver_teñido(ic, 19.0, Some(tinta)),
         None => crate::widget::vacio(),
@@ -99,7 +108,7 @@ pub fn tarjeta<'a>(contenido: PanelElement<'a>, ancho: f32, margen: f32) -> Pane
         .padding(margen)
         .width(Length::Fixed(ancho))
         .style(|_| container::Style {
-            background: Some(tema::CARD.into()),
+            background: Some(tema::card().into()),
             border: Border {
                 radius: tema::R_TARJETA.into(),
                 ..Default::default()

@@ -67,11 +67,11 @@ impl BateriaSimple {
     /// El color: solo habla cuando hay algo que decir.
     fn color(bat: &Battery) -> iced_core::Color {
         if bat.charging {
-            OK
+            OK()
         } else if bat.percent <= 15 {
-            PELIGRO
+            PELIGRO()
         } else {
-            TEXT
+            TEXT()
         }
     }
 
@@ -117,7 +117,9 @@ impl Widget for BateriaSimple {
     }
 
     fn refrescar(&mut self) -> bool {
-        let mut fresco = Battery::read();
+        // Sin tiempo restante: este widget solo enseña el porcentaje, y
+        // estimarlo costaría 0,53 ms por refresco para tirarlo.
+        let mut fresco = Battery::read(false);
         match fresco.as_mut() {
             Some(b) => self.suavizar(b),
             None => self.minutos = None,
@@ -128,7 +130,9 @@ impl Widget for BateriaSimple {
         self.dato = fresco;
         let nombre = self.dato.as_ref().map(Self::nombre_icono).unwrap_or("");
         if nombre != self.icono_nombre {
-            self.icono = (!nombre.is_empty()).then(|| icono::propio(nombre)).flatten();
+            self.icono = (!nombre.is_empty())
+                .then(|| icono::propio(nombre))
+                .flatten();
             self.icono_nombre = nombre;
         }
         true
@@ -152,12 +156,8 @@ impl Widget for BateriaSimple {
         if let Some(ic) = &self.icono {
             fila = fila.push(icono::ver_teñido(ic, tema::ICONO_PANEL, Some(color)));
         }
-        fila.push(
-            text(Self::etiqueta(bat))
-                .size(tema::T_CUERPO)
-                .color(color),
-        )
-        .into()
+        fila.push(text(Self::etiqueta(bat)).size(tema::T_CUERPO).color(color))
+            .into()
     }
 }
 
@@ -187,8 +187,8 @@ mod tests {
     /// siempre no grita nunca.
     #[test]
     fn el_color_solo_habla_cuando_hace_falta() {
-        assert_eq!(BateriaSimple::color(&bat(70, false)), TEXT);
-        assert_eq!(BateriaSimple::color(&bat(10, false)), PELIGRO);
-        assert_eq!(BateriaSimple::color(&bat(10, true)), OK);
+        assert_eq!(BateriaSimple::color(&bat(70, false)), TEXT());
+        assert_eq!(BateriaSimple::color(&bat(10, false)), PELIGRO());
+        assert_eq!(BateriaSimple::color(&bat(10, true)), OK());
     }
 }

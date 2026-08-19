@@ -21,6 +21,7 @@ use iced_core::Length;
 use iced_widget::{column, Space};
 
 use crate::icono;
+use crate::tema;
 use crate::view::PanelElement;
 use crate::Accion;
 
@@ -35,9 +36,11 @@ const MAXIMO: usize = 4;
 pub struct Red {
     entradas: Vec<Entrada>,
     encendida: bool,
-    señalada: Option<usize>,
-    /// El botón del pie bajo el puntero: `false` el izquierdo, `true` el otro.
-    pie: Option<bool>,
+    /// El recorrido de la bolita del interruptor, siguiendo a `encendida`.
+    interruptor: tema::Transicion,
+    señalada: tema::Realce,
+    /// El botón del pie bajo el puntero: el 0 es el izquierdo y el 1 el otro.
+    pie: tema::Realce,
     pendiente: Option<Child>,
 }
 
@@ -46,16 +49,20 @@ impl Red {
         let mut r = Self {
             entradas: Vec::new(),
             encendida: true,
-            señalada: None,
-            pie: None,
+            interruptor: tema::Transicion::nueva(1.0, tema::D_MODAL, tema::C_MUELLE),
+            señalada: tema::Realce::nuevo(),
+            pie: tema::Realce::nuevo(),
             pendiente: None,
         };
         // La primera lista se pide de golpe: al abrir el emergente hay que
         // enseñar algo, y aquí sí se puede esperar unos milisegundos porque
         // ocurre una vez, no en cada refresco del panel.
-        if let Some(salida) = Command::new("sh").arg("-c").arg(ORDEN).output().ok() {
+        if let Ok(salida) = Command::new("sh").arg("-c").arg(ORDEN).output() {
             r.aplicar(&String::from_utf8_lossy(&salida.stdout));
         }
+        // La primera lectura no se anima: la tarjeta se abre con el interruptor
+        // ya en su sitio, no poniéndose delante del usuario.
+        r.interruptor.fijar(r.encendida as u8 as f32);
         r
     }
 
@@ -69,13 +76,18 @@ impl Red {
                 } else {
                     "sin-red"
                 }),
-                estado: if activa { "Conectado".into() } else { String::new() },
+                estado: if activa {
+                    "Conectado".into()
+                } else {
+                    String::new()
+                },
                 derecha: Some(format!("{señal}%")),
                 nombre,
                 activa,
             })
             .collect();
         self.encendida = salida.contains("enabled");
+        self.interruptor.ir_a(self.encendida as u8 as f32);
     }
 
     /// El alto reservado. El `MARGEN` final es el de abajo de la tarjeta:
@@ -104,13 +116,17 @@ impl Red {
     pub fn puntero(&mut self, punto: Option<(f32, f32)>) -> bool {
         let señalada =
             punto.and_then(|(x, y)| lista::fila_en(x, y, self.y_lista(), self.entradas.len()));
-        let pie = punto.and_then(|(x, y)| self.pie_en(x, y));
-        if señalada == self.señalada && pie == self.pie {
-            return false;
-        }
-        self.señalada = señalada;
-        self.pie = pie;
-        true
+        let pie = punto.and_then(|(x, y)| self.pie_en(x, y)).map(usize::from);
+        // Los dos `señalar`, sin `||`: con el cortocircuito, salir de una fila
+        // hacia un botón del pie apaga la fila y deja el botón sin encender.
+        let a = self.señalada.señalar(señalada);
+        let b = self.pie.señalar(pie);
+        a || b
+    }
+
+    /// ¿Se mueve algo dentro de la tarjeta?
+    pub fn animando(&self) -> bool {
+        self.señalada.animando() || self.pie.animando() || self.interruptor.animando()
     }
 
     /// Sobre qué botón del pie cae el punto.
@@ -183,7 +199,7 @@ impl Red {
     }
 
     pub fn view(&self) -> PanelElement<'_> {
-        let mut contenido = column![lista::cabecera("Wi-Fi", Some(self.encendida))];
+        let mut contenido = column![lista::cabecera("Wi-Fi", Some(self.interruptor.valor()))];
         if self.entradas.is_empty() {
             contenido = contenido.push(lista::vacia("No hay redes a la vista"));
         } else {
@@ -192,12 +208,12 @@ impl Red {
                     contenido =
                         contenido.push(Space::new().height(Length::Fixed(lista::HUECO_FILA)));
                 }
-                contenido = contenido.push(lista::fila(entrada, self.señalada == Some(i)));
+                contenido = contenido.push(lista::fila(entrada, self.señalada.intensidad(i)));
             }
         }
         contenido = contenido
             .push(Space::new().height(Length::Fixed(10.0)))
-            .push(lista::pie("Detalles", "Configuración", self.pie));
+            .push(lista::pie("Detalles", "Configuración", &self.pie));
         control::tarjeta(contenido.into(), lista::ANCHO, lista::MARGEN)
     }
 }

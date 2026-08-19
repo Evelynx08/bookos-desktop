@@ -243,7 +243,10 @@ mod tests {
     fn los_codigos_de_campo_no_llegan_al_programa() {
         assert_eq!(limpiar_exec("firefox %u"), "firefox");
         assert_eq!(limpiar_exec("kate %F"), "kate");
-        assert_eq!(limpiar_exec("env FOO=1 app -x %U --flag"), "env FOO=1 app -x  --flag");
+        assert_eq!(
+            limpiar_exec("env FOO=1 app -x %U --flag"),
+            "env FOO=1 app -x  --flag"
+        );
         // `%%` sí es un porcentaje de verdad.
         assert_eq!(limpiar_exec("cosa --al 50%%"), "cosa --al 50%");
     }
