@@ -43,6 +43,8 @@ pub enum Accion {
     /// Meta+Alt+B y Meta+Alt+D — alternar si la barra se aparta de las ventanas
     /// o está siempre a la vista.
     AlternarBarra(crate::shell::Barra),
+    /// Impr, o Meta+Mayús+S — abrir la capa de captura de pantalla.
+    Captura,
     /// Meta+L — echar la pantalla de bloqueo.
     Bloquear,
     /// Quitar el bloqueo. La pide el ayudante de PAM cuando la contraseña vale.
@@ -84,6 +86,10 @@ pub enum Accion {
     /// El diálogo del botón de encendido: dormir, bloquear, salir, reiniciar,
     /// apagar.
     DialogoEnergia,
+    /// Fn+F4 / XF86Display — selector rápido de proyección.
+    Proyeccion,
+    /// Meta+Alt+F — poner o quitar el panel de diagnóstico de fotogramas.
+    Diagnostico,
 }
 
 /// El conmutador de aplicaciones: `Alt+Tab` y `Meta+Tab`, con Mayús al revés.
@@ -111,6 +117,21 @@ fn conmutador_de(sym: u32, modifiers: &ModifiersState) -> Option<Accion> {
         bookos_shell::conmutador::Modo::Ventanas
     };
     Some(Accion::Conmutar(modo, if modifiers.shift { -1 } else { 1 }))
+}
+
+/// Teclas que el firmware puede usar para el selector de pantallas.
+///
+/// La mayoría de portátiles emite `KEY_SWITCHVIDEOMODE` (227), que XKB
+/// convierte en `XF86Display`. Otros emiten el más reciente
+/// `KEY_DISPLAYTOGGLE` (431). Miramos también el código físico XKB (evdev + 8)
+/// porque un mapa de teclado sin las reglas `inet` deja ambos como `NoSymbol`.
+fn es_tecla_de_pantalla(sym: u32, codigo_xkb: u32) -> bool {
+    const XF86_DISPLAY_TOGGLE: u32 = 0x1008_11AF;
+    const SWITCH_VIDEO_MODE_XKB: u32 = 227 + 8;
+    const DISPLAY_TOGGLE_XKB: u32 = 431 + 8;
+
+    matches!(sym, keysyms::KEY_XF86Display | XF86_DISPLAY_TOGGLE)
+        || matches!(codigo_xkb, SWITCH_VIDEO_MODE_XKB | DISPLAY_TOGGLE_XKB)
 }
 
 /// Abre el conmutador o avanza en él.
@@ -223,7 +244,11 @@ fn conmutar_fin(state: &mut BookosComp) {
 ///
 /// Se llama **solo con la pulsación**, no con la suelta: interceptar también la
 /// suelta dejaría al cliente con la tecla marcada como pulsada para siempre.
-pub fn resolver(modifiers: &ModifiersState, handle: &KeysymHandle<'_>) -> Option<Accion> {
+pub fn resolver(
+    modifiers: &ModifiersState,
+    handle: &KeysymHandle<'_>,
+    codigo_xkb: u32,
+) -> Option<Accion> {
     let sym = handle.modified_sym().raw();
 
     // Ctrl+Alt+Fn. Con la configuración de xkb por defecto la propia capa de
@@ -258,6 +283,14 @@ pub fn resolver(modifiers: &ModifiersState, handle: &KeysymHandle<'_>) -> Option
     if sym == XF86_ENCENDIDO || (modifiers.logo && sym == keysyms::KEY_Escape) {
         return Some(Accion::DialogoEnergia);
     }
+    if es_tecla_de_pantalla(sym, codigo_xkb)
+        || handle
+            .raw_syms()
+            .iter()
+            .any(|raw| es_tecla_de_pantalla(raw.raw(), codigo_xkb))
+    {
+        return Some(Accion::Proyeccion);
+    }
 
     // Las teclas de función no llevan modificador y valen aunque el foco lo
     // tenga una aplicación a pantalla completa: subir el volumen en un vídeo
@@ -289,6 +322,36 @@ pub fn resolver(modifiers: &ModifiersState, handle: &KeysymHandle<'_>) -> Option
         }
     }
 
+    // Impr, en sus varias formas. Va fuera de los brazos de Meta porque no
+    // lleva ninguno.
+    //
+    // Son tres keysyms y no uno porque **Fn no llega hasta aquí**: la resuelve
+    // el firmware del teclado, así que `Fn+Impr` puede aparecer como `Print` a
+    // secas —lo normal en un portátil donde Impr comparte tecla— o como
+    // `Sys_Req`, que es lo que da xkb cuando la combinación lleva Alt. El
+    // tercero es el de los terminales 3270 y no cuesta nada.
+    //
+    // Si en alguna máquina Fn+Impr manda otra cosa, la traza de más abajo lo
+    // dice: no hay forma de saberlo desde el código y adivinar no vale.
+    if matches!(
+        sym,
+        keysyms::KEY_Print | keysyms::KEY_Sys_Req | keysyms::KEY_3270_PrintScreen
+    ) {
+        return Some(Accion::Captura);
+    }
+    // Las teclas sin nombre imprimible que no ha reclamado nadie: se apuntan a
+    // nivel de traza para poder averiguar qué manda una tecla rara —Fn+algo—
+    // sin tener que instalar herramientas.
+    if sym >= 0xff00 && !modifiers.logo && !modifiers.ctrl && !modifiers.alt {
+        tracing::trace!(keysym = format_args!("{sym:#06x}"), "tecla especial sin atajo");
+    }
+    // Y Meta+Mayús+S, que es lo que tienen en los dedos los que vienen de
+    // Windows o de GNOME. Antes que el brazo de Meta a secas por lo mismo que
+    // Meta+Alt: si no, entraría por él y no llegaría aquí.
+    if modifiers.logo && modifiers.shift && matches!(sym, keysyms::KEY_s | keysyms::KEY_S) {
+        return Some(Accion::Captura);
+    }
+
     // Meta+Alt va antes que Meta a secas: si no, `Meta+Alt+D` entraría por el
     // brazo de Meta y no llegaría nunca aquí.
     if modifiers.logo && modifiers.alt {
@@ -299,6 +362,9 @@ pub fn resolver(modifiers: &ModifiersState, handle: &KeysymHandle<'_>) -> Option
             keysyms::KEY_d | keysyms::KEY_D => {
                 return Some(Accion::AlternarBarra(crate::shell::Barra::Dock))
             }
+            // F de fotogramas. Va en el brazo de Meta+Alt, así que no le quita
+            // nada a Meta+F, que sigue maximizando.
+            keysyms::KEY_f | keysyms::KEY_F => return Some(Accion::Diagnostico),
             _ => {}
         }
     }
@@ -319,6 +385,10 @@ pub fn resolver(modifiers: &ModifiersState, handle: &KeysymHandle<'_>) -> Option
             // aquí Meta+M ya no está libre en cuanto haya un menú.
             keysyms::KEY_h | keysyms::KEY_H => return Some(Accion::Minimizar),
             keysyms::KEY_l | keysyms::KEY_L => return Some(Accion::Bloquear),
+            // Alternativa deliberada para equipos cuyo firmware se queda Fn
+            // antes de crear un evento de teclado. No sustituye Fn+F4: permite
+            // abrir el mismo selector con un atajo que siempre llega.
+            keysyms::KEY_p | keysyms::KEY_P => return Some(Accion::Proyeccion),
             keysyms::KEY_Left => {
                 return Some(Accion::Encajar(crate::ventanas::Direccion::Izquierda))
             }
@@ -363,14 +433,14 @@ pub fn ejecutar(state: &mut BookosComp, accion: Accion) {
             tracing::info!("salida pedida con Ctrl+Alt+Retroceso");
             state.loop_signal.stop();
         }
-        Accion::Escritorio(n) => crate::escritorios::cambiar_a(state, n),
+        Accion::Escritorio(n) => crate::escritorios::cambiar_aqui(state, n),
         Accion::EscritorioRelativo(pasos) => {
             let destino = crate::escritorios::destino(
-                state.escritorios.activo(),
+                crate::escritorios::activo_aqui(state),
                 pasos,
                 state.escritorios.cuantos(),
             );
-            crate::escritorios::cambiar_a(state, destino);
+            crate::escritorios::cambiar_aqui(state, destino);
         }
         Accion::MostrarEscritorio => crate::escritorios::alternar_despejado(state),
         Accion::Launchpad => {
@@ -398,8 +468,29 @@ pub fn ejecutar(state: &mut BookosComp, accion: Accion) {
                 state.needs_redraw = true;
             }
         }
+        Accion::Captura => {
+            if let Some(shell) = state.shell.as_mut() {
+                // Pulsar otra vez con la capa abierta la cierra, como cualquier
+                // otro conmutador del escritorio.
+                if shell.hay_captura() {
+                    shell.cerrar_captura();
+                } else {
+                    shell.abrir_captura();
+                }
+            }
+            state.needs_redraw = true;
+        }
         Accion::Bloquear => bloquear(state),
         Accion::DialogoEnergia => alternar_dialogo_energia(state),
+        Accion::Diagnostico => diagnostico(state),
+        Accion::Proyeccion => {
+            let conectadas = state.pantallas.compartido.salidas().len();
+            tracing::info!(conectadas, "selector de proyección abierto");
+            if let Some(shell) = state.shell.as_mut() {
+                shell.alternar_proyeccion(conectadas);
+            }
+            state.needs_redraw = true;
+        }
         Accion::Desbloquear => {
             state.bloqueo = Default::default();
             if let Some(shell) = state.shell.as_mut() {
@@ -493,7 +584,7 @@ pub fn hacer(state: &mut BookosComp, accion: bookos_shell::Accion) {
             }
             state.needs_redraw = true;
         }
-        bookos_shell::Accion::Escritorio(n) => crate::escritorios::cambiar_a(state, n),
+        bookos_shell::Accion::Escritorio(n) => crate::escritorios::cambiar_aqui(state, n),
         bookos_shell::Accion::VistaEscritorios => alternar_vista_escritorios(state),
         bookos_shell::Accion::CrearEscritorio => {
             if crate::escritorios::crear(state) {
@@ -516,25 +607,110 @@ pub fn hacer(state: &mut BookosComp, accion: bookos_shell::Accion) {
             }
             state.needs_redraw = true;
         }
+        bookos_shell::Accion::Proyeccion(modo) => {
+            if let Some(shell) = state.shell.as_mut() { shell.cerrar_emergente(); }
+            if let Err(err) = crate::pantallas::aplicar_modo_rapido(state, modo) {
+                tracing::warn!("no se pudo aplicar el modo de proyección: {err}");
+                if let Some(shell) = state.shell.as_mut() {
+                    shell.mostrar_osd("pantalla", None, Some(err));
+                }
+            }
+            state.needs_redraw = true;
+        }
+        bookos_shell::Accion::Compartir { sesion, pantalla } => {
+            crate::portal::responder(state, sesion, pantalla);
+        }
         bookos_shell::Accion::Acerca => {
             if let Some(shell) = state.shell.as_mut() {
                 shell.abrir_acerca();
             }
             state.needs_redraw = true;
         }
-        bookos_shell::Accion::Apariencia { tema, acento } => {
+        bookos_shell::Accion::Apariencia { modo, acento } => {
+            // La tarjeta manda lo **elegido**; qué tema toca con «automático»
+            // depende de la hora y lo resuelve el compositor, que es quien
+            // lleva el reloj y el temporizador del cambio.
+            state.modo_tema = modo;
+            bookos_shell::tema::aplicar_modo(modo);
+            let tema = state.tema_que_toca();
+            // Si el tema cambia de verdad, el fondo se va con él: la pareja
+            // clara y la oscura son imágenes distintas, y quedarse con la
+            // oscura sobre un escritorio claro es justo lo que no se quiere.
+            // Se mira **antes** de aplicar, que es cuando `tema::actual()`
+            // todavía dice el de ahora.
+            let cambia_el_tema = bookos_shell::tema::actual() != tema;
             let Some(shell) = state.shell.as_mut() else {
                 return;
             };
             if shell.aplicar_apariencia(tema, acento) {
+                // Solo si la imagen depende del tema: con un `fondo` fijo y sin
+                // pareja, recargar decodificaría 20 MB para poner lo mismo.
+                if cambia_el_tema && state.fondo_config.depende_del_tema() {
+                    state.recargar_fondo = true;
+                }
                 // Se guarda **después** de aplicarlo: si escribir falla —disco
                 // lleno, `$HOME` de solo lectura— el escritorio ya ha cambiado
                 // de color y lo que se pierde es que se recuerde, que es el
                 // fallo menos malo de los dos.
-                if let Err(err) = bookos_shell::guardar_apariencia(tema, acento) {
+                if let Err(err) = bookos_shell::guardar_apariencia(modo, acento) {
                     tracing::warn!("no se pudo guardar la apariencia: {err}");
                 }
             }
+            // Elegir «automático» —o cambiar de hora— reprograma el despertar
+            // del próximo cambio; elegir uno fijo lo cancela.
+            crate::apariencia::programar_cambio(state);
+            state.needs_redraw = true;
+        }
+        bookos_shell::Accion::Capturar { x, y, ancho, alto, guardar } => {
+            // La capa se cierra **antes** de capturar: si no, el velo y la
+            // barra de modos saldrían en la foto.
+            if let Some(shell) = state.shell.as_mut() {
+                shell.cerrar_captura();
+            }
+            state.captura_pedida = Some(crate::state::CapturaPedida {
+                x,
+                y,
+                ancho,
+                alto,
+                guardar,
+            });
+            state.needs_redraw = true;
+        }
+        bookos_shell::Accion::Fondo { claro, oscuro } => {
+            // Las dos rutas de golpe: es lo que hace que el cambio de tema
+            // pueda llevarse el fondo con él. `fondo` a secas se borra, o
+            // seguiría mandando sobre la pareja al reiniciar la sesión.
+            state.fondo_config = crate::fondo::Eleccion {
+                ambos: None,
+                claro: Some(claro.to_string_lossy().into_owned()),
+                oscuro: Some(oscuro.to_string_lossy().into_owned()),
+            };
+            bookos_shell::fondos::poner_elegida(bookos_shell::fondos::familia_de(&claro));
+            state.recargar_fondo = true;
+            // Se guarda después de aplicarlo, igual que la apariencia: si el
+            // disco falla, lo que se pierde es que se recuerde, no el cambio.
+            if let Err(err) = bookos_shell::guardar_fondo(&claro, &oscuro) {
+                tracing::warn!("no se pudo guardar el fondo: {err}");
+            }
+            state.needs_redraw = true;
+        }
+        bookos_shell::Accion::AlternarEfectos => {
+            let Some(shell) = state.shell.as_mut() else {
+                return;
+            };
+            let elegido = shell.alternar_efectos();
+            // Se guarda después de aplicarlo, igual que la apariencia: si el
+            // disco falla, lo que se pierde es que se recuerde, no el cambio.
+            if let Err(err) = bookos_shell::guardar_efectos(elegido) {
+                tracing::warn!("no se pudieron guardar los efectos: {err}");
+            }
+            tracing::info!(
+                reducidos = bookos_shell::tema::efectos_reducidos(),
+                "efectos visuales"
+            );
+            // No hace falta repintar el panel ni el dock: su buffer lleva su
+            // color y el cristal es un elemento aparte de la escena. Basta con
+            // componer otra vez sin él.
             state.needs_redraw = true;
         }
         bookos_shell::Accion::CerrarNotificacion(id) => {
@@ -630,7 +806,7 @@ pub fn hacer(state: &mut BookosComp, accion: bookos_shell::Accion) {
 }
 
 fn alternar_vista_escritorios(state: &mut BookosComp) {
-    let activo = state.escritorios.activo();
+    let activo = crate::escritorios::activo_aqui(state);
     let nombres = state.escritorios.nombres().to_vec();
     if let Some(shell) = state.shell.as_mut() {
         shell.alternar_vista_escritorios(activo, nombres);
@@ -639,7 +815,7 @@ fn alternar_vista_escritorios(state: &mut BookosComp) {
 }
 
 fn guardar_y_actualizar_escritorios(state: &mut BookosComp) {
-    let activo = state.escritorios.activo();
+    let activo = crate::escritorios::activo_aqui(state);
     let nombres = state.escritorios.nombres().to_vec();
     if let Err(err) = bookos_shell::guardar_escritorios(&nombres) {
         tracing::warn!("no se pudieron guardar los escritorios: {err}");
@@ -736,6 +912,48 @@ fn recoger_comprobacion(state: &mut BookosComp) {
     );
     if let Err(err) = result {
         tracing::error!("no se pudo programar la recogida del bloqueo: {err}");
+    }
+}
+
+/// Pone o quita el panel de diagnóstico, y con él su despertar por segundo.
+///
+/// El temporizador es la única fuente de sondeo que hay en el compositor y
+/// existe **solo mientras el panel está a la vista**: sin él los números se
+/// congelarían en cuanto el escritorio se quedara quieto, que es justo cuando
+/// hace falta ver que están a cero. Al quitarlo se suelta.
+fn diagnostico(state: &mut BookosComp) {
+    let puesto = state
+        .shell
+        .as_mut()
+        .map(|shell| shell.alternar_diagnostico())
+        .unwrap_or(false);
+    state.needs_redraw = true;
+    if let Some(token) = state.tick_diagnostico.take() {
+        state.loop_handle.remove(token);
+    }
+    if !puesto {
+        tracing::info!("panel de diagnóstico quitado");
+        return;
+    }
+    tracing::info!("panel de diagnóstico puesto (Meta+Alt+F)");
+    let timer = smithay::reexports::calloop::timer::Timer::from_duration(
+        std::time::Duration::from_secs(1),
+    );
+    // El callback no hace nada por sí mismo: basta con que el bucle dé una
+    // vuelta para que `post_dispatch` cierre la ventana de medida y le pase los
+    // números al panel, que solo repinta si cambiaron.
+    let r = state.loop_handle.insert_source(timer, |_, _, state| {
+        if state.shell.as_ref().is_some_and(|s| s.diagnostico_visible()) {
+            smithay::reexports::calloop::timer::TimeoutAction::ToDuration(
+                std::time::Duration::from_secs(1),
+            )
+        } else {
+            smithay::reexports::calloop::timer::TimeoutAction::Drop
+        }
+    });
+    match r {
+        Ok(token) => state.tick_diagnostico = Some(token),
+        Err(err) => tracing::error!("no se pudo programar el tick del diagnóstico: {err}"),
     }
 }
 
@@ -971,5 +1189,14 @@ mod tests {
             conmutador_de(keysyms::KEY_a, &mods(true, false, false, false)),
             None
         );
+    }
+
+    #[test]
+    fn reconoce_las_variantes_de_la_tecla_de_pantalla() {
+        assert!(es_tecla_de_pantalla(keysyms::KEY_XF86Display, 0));
+        assert!(es_tecla_de_pantalla(0x1008_11AF, 0));
+        assert!(es_tecla_de_pantalla(0, 227 + 8));
+        assert!(es_tecla_de_pantalla(0, 431 + 8));
+        assert!(!es_tecla_de_pantalla(keysyms::KEY_F4, 62));
     }
 }

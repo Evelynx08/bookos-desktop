@@ -30,10 +30,15 @@ use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode};
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
+use smithay::backend::renderer::element::default_primary_scanout_output_compare;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{all_gpus, primary_gpu, UdevBackend, UdevEvent};
-use smithay::desktop::utils::surface_primary_scanout_output;
+use smithay::desktop::utils::{
+    surface_presentation_feedback_flags_from_states, surface_primary_scanout_output,
+    update_surface_primary_scanout_output, OutputPresentationFeedback,
+};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::EventLoop;
@@ -41,7 +46,8 @@ use smithay::reexports::drm::control::{connector, crtc, Device as _, ModeTypeFla
 use smithay::reexports::drm::control::property::Value as PropValue;
 use smithay::reexports::input::{AccelProfile, ClickMethod, Device as InputDevice, Libinput};
 use smithay::reexports::rustix::fs::OFlags;
-use smithay::utils::DeviceFd;
+use smithay::utils::{DeviceFd, Physical, Point};
+use smithay::wayland::presentation::Refresh;
 
 use crate::cursor::OverlayElement;
 use crate::pantallas::{self, Aplicado, Modo, Peticion, Salida};
@@ -51,26 +57,45 @@ type Alloc = GbmAllocator<DrmDeviceFd>;
 /// El exportador convierte los buffers GBM en framebuffers de DRM. No vale el
 /// `GbmDevice` pelado: hace falta este envoltorio.
 type Exporter = GbmFramebufferExporter<DrmDeviceFd>;
-type Manager = DrmOutputManager<Alloc, Exporter, (), DrmDeviceFd>;
-type Surface = DrmOutput<Alloc, Exporter, (), DrmDeviceFd>;
+type Manager = DrmOutputManager<Alloc, Exporter, OutputPresentationFeedback, DrmDeviceFd>;
+type Surface = DrmOutput<Alloc, Exporter, OutputPresentationFeedback, DrmDeviceFd>;
 
 /// Lo que el backend necesita y el estado del compositor no debe conocer.
+struct SalidaKms {
+    output: Output,
+    surface: Surface,
+    conector: connector::Handle,
+    id: String,
+    en_vuelo: bool,
+    pendiente: bool,
+}
+
 struct Udev {
     manager: Manager,
     renderer: GlesRenderer,
-    output: Output,
-    surface: Surface,
-    /// El conector encendido y su identificador estable. Se guardan porque el
-    /// censo y el aplicador tienen que saber **cuál** de las pantallas
-    /// enumeradas es la que se está dibujando, y el `Output` de Smithay solo
-    /// lleva el nombre del conector, que no es estable entre arranques.
-    conector: connector::Handle,
-    id: String,
-    /// Hay un frame en el aire esperando su vblank. Encolar otro antes de que
-    /// llegue agota los buffers del swapchain.
-    en_vuelo: bool,
+    display_handle: smithay::reexports::wayland_server::DisplayHandle,
+    /// Una escena KMS independiente por salida activa. Cada una conserva su
+    /// swapchain, damage tracker y reloj de presentación por vblank.
+    salidas: Vec<SalidaKms>,
+    principal_id: String,
     /// La sesión está en segundo plano (has cambiado de TTY): no se dibuja.
     activa: bool,
+}
+
+impl Udev {
+    /// Hay una salida con damage apuntado que todavía no se ha podido dibujar
+    /// porque tenía un frame en el aire.
+    ///
+    /// Sin mirar esto, ese damage se perdía: `dibujar_todas` limpia
+    /// `needs_redraw` aunque la salida se saltara por `en_vuelo`, y el vblank
+    /// solo redibujaba si `needs_redraw` seguía puesto. O sea que **todo commit
+    /// de un cliente que llegue mientras hay un frame en vuelo —el caso normal
+    /// escribiendo en un navegador— se quedaba sin pintar y sin frame callback**
+    /// hasta que otro evento cualquiera despertara el bucle. De ahí el segundo
+    /// largo de retraso al teclear.
+    fn hay_pendiente(&self) -> bool {
+        self.salidas.iter().any(|s| s.pendiente && !s.en_vuelo)
+    }
 }
 
 pub fn run(
@@ -122,6 +147,15 @@ pub fn run(
     let mut renderer = unsafe { GlesRenderer::new(context)? };
 
     let render_formats = renderer.egl_context().dmabuf_render_formats().clone();
+
+    // El global que hace que los clientes entreguen descriptores de la GPU en
+    // vez de píxeles. Ver `backend::anunciar_dmabuf`.
+    crate::backend::anunciar_dmabuf(
+        state,
+        &display,
+        renderer.egl_context().dmabuf_texture_formats().clone(),
+    );
+
     let allocator = GbmAllocator::new(
         gbm.clone(),
         GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
@@ -140,15 +174,23 @@ pub fn run(
         render_formats,
     );
 
-    let (output, surface, conector, id_salida) = crear_salida(&mut manager, &mut renderer, state)?;
+    let salidas = crear_salidas(&mut manager, &mut renderer, state)?;
+    let guardadas = pantallas::cargar();
+    let principal = guardadas.iter().find(|p| p.activa && p.principal)
+        .and_then(|p| salidas.iter().find(|s| s.id == p.id))
+        .or_else(|| salidas
+        .iter()
+        .find(|s| s.output.current_location() == (0, 0).into()))
+        .unwrap_or(&salidas[0]);
+    let principal_id = principal.id.clone();
 
-    let escala = output.current_scale().fractional_scale();
+    let escala = principal.output.current_scale().fractional_scale();
     // La escala puede venir de `pantallas.conf` y no de `panel.conf`, así que
     // hay que reponerla aquí: el resto del compositor la lee de este campo
     // cuando la pantalla cambia de tamaño, y si no, volvería a la de la
     // configuración vieja.
     state.escala_forzada = Some(escala);
-    let modo = output.current_mode().map(|m| m.size).unwrap_or_default();
+    let modo = principal.output.current_mode().map(|m| m.size).unwrap_or_default();
     state.shell = Some(crate::shell::ShellHost::new(
         modo.w.max(1) as u32,
         modo.h.max(1) as u32,
@@ -162,26 +204,32 @@ pub fn run(
     // antes del primer frame, para que salga pintado con el resto del panel y
     // no aparezca un instante después.
     crate::escritorios::avisar_al_panel(state);
-    state.cursor_theme = Some(crate::cursor::CursorTheme::con_tamano(escala, state.cursor_nominal));
+    let escala_cursor = salidas.iter()
+        .map(|s| s.output.current_scale().fractional_scale())
+        .max_by(f64::total_cmp).unwrap_or(escala);
+    state.cursor_theme = Some(crate::cursor::CursorTheme::con_tamano(
+        escala_cursor, state.cursor_nominal));
     state.cristal = crate::desenfoque::Cristal::new(&mut renderer);
     state.genio = crate::genio::Genio::new(&mut renderer);
-    state.fondo = crate::fondo::Fondo::cargar(state.fondo_config.as_deref());
+    state.fondo = crate::fondo::Fondo::cargar(&state.fondo_config);
     // El cristal desenfoca el fondo, así que necesita su propia copia con
     // mipmaps. Se sube aquí, una vez, y no se vuelve a tocar.
     if let (Some(fondo), Some(cristal)) = (state.fondo.as_ref(), state.cristal.as_ref()) {
         let (rgba, tam) = fondo.rgba();
         cristal.borrow_mut().preparar(&mut renderer, rgba, tam);
     }
-    state.space.map_output(&output, (0, 0));
+    for salida in &salidas {
+        state
+            .space
+            .map_output(&salida.output, salida.output.current_location());
+    }
 
     let udev = Rc::new(RefCell::new(Udev {
         manager,
         renderer,
-        output,
-        surface,
-        conector,
-        id: id_salida,
-        en_vuelo: false,
+        display_handle: state.display_handle.clone(),
+        salidas,
+        principal_id,
         activa: true,
     }));
 
@@ -275,20 +323,61 @@ pub fn run(
         let udev = udev.clone();
         event_loop
             .handle()
-            .insert_source(drm_notifier, move |event, _, state| match event {
-                DrmEvent::VBlank(_crtc) => {
+            .insert_source(drm_notifier, move |event, metadata, state| match event {
+                DrmEvent::VBlank(crtc) => {
                     let mut u = udev.borrow_mut();
                     // Cerrar el frame anterior antes de plantearse otro: si no,
                     // el swapchain se queda sin buffers libres.
-                    if let Err(err) = u.surface.frame_submitted() {
-                        tracing::warn!("frame_submitted: {err}");
+                    if let Some(salida) = u.salidas.iter_mut().find(|s| s.surface.crtc() == crtc) {
+                        match salida.surface.frame_submitted() {
+                            Ok(Some(mut feedback)) => {
+                                if let Some(metadata) = *metadata {
+                                    let mhz = salida.output.current_mode()
+                                        .map(|m| m.refresh.max(1) as u64).unwrap_or(60_000);
+                                    let periodo = Duration::from_nanos(
+                                        1_000_000_000_000u64 / mhz);
+                                    let refresh = if salida.surface
+                                        .with_compositor(|c| c.vrr_enabled()) {
+                                        Refresh::variable(periodo)
+                                    } else {
+                                        Refresh::fixed(periodo)
+                                    };
+                                    let tiempo = match metadata.time {
+                                        smithay::backend::drm::DrmEventTime::Monotonic(t) =>
+                                            smithay::utils::Time::<smithay::utils::Monotonic>::from(t),
+                                        // Un driver que da el flip en el reloj
+                                        // de pared. Se **traslada** al
+                                        // monotónico en vez de tirarlo: antes
+                                        // aquí se ponía el instante en que el
+                                        // bucle atendía el evento, que no es
+                                        // cuando la pantalla enseñó el
+                                        // fotograma, y esa diferencia es jitter
+                                        // que el cliente se come al ajustar su
+                                        // ritmo. El desfase entre los dos
+                                        // relojes se mide ahora, que es lo más
+                                        // cerca del vblank que se puede estar.
+                                        smithay::backend::drm::DrmEventTime::Realtime(t) =>
+                                            trasladar_a_monotonico(t),
+                                    };
+                                    feedback.presented(
+                                        tiempo, refresh, metadata.sequence as u64,
+                                        smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::Vsync,
+                                    );
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(err) => tracing::warn!(?crtc, "frame_submitted: {err}"),
+                        }
+                        salida.en_vuelo = false;
+                        // Contado aquí y no al encolar: esto es lo que el
+                        // hardware ha enseñado de verdad.
+                        state.metricas.presentado(&salida.output.name());
                     }
-                    u.en_vuelo = false;
                     // Igual que en winit: una animación en marcha pide el
                     // siguiente fotograma aunque nadie haya marcado nada, porque
                     // su paso se calcula al componer.
-                    if state.needs_redraw || state.hay_animacion() {
-                        dibujar(state, &mut u);
+                    if state.needs_redraw || state.hay_animacion() || u.hay_pendiente() {
+                        dibujar_todas(state, &mut u);
                     }
                 }
                 DrmEvent::Error(err) => tracing::error!("error de DRM: {err}"),
@@ -312,7 +401,7 @@ pub fn run(
                         libinput.suspend();
                         u.manager.pause();
                         u.activa = false;
-                        u.en_vuelo = false;
+                        for salida in &mut u.salidas { salida.en_vuelo = false; }
                     }
                     SessionEvent::ActivateSession => {
                         tracing::info!("sesión reactivada");
@@ -326,9 +415,9 @@ pub fn run(
                         if let Err(err) = u.manager.activate(false) {
                             tracing::warn!("activate: {err}");
                         }
-                        u.surface.reset_buffers();
+                        for salida in &u.salidas { salida.surface.reset_buffers(); }
                         state.needs_redraw = true;
-                        dibujar(state, &mut u);
+                        dibujar_todas(state, &mut u);
                     }
                 }
             })
@@ -336,11 +425,14 @@ pub fn run(
     }
 
     crate::backend::schedule_panel_tick(state);
+    // El despertar del tema automático, si está puesto. Con un modo fijo no
+    // deja ningún temporizador. Ver `crate::apariencia`.
+    crate::apariencia::programar_cambio(state);
     crate::backend::watch_hardware(state);
 
     // Primer frame: deja el escritorio pintado antes de que arranque nada más,
     // que es lo que evita el parpadeo al iniciar sesión.
-    dibujar(state, &mut udev.borrow_mut());
+    dibujar_todas(state, &mut udev.borrow_mut());
 
     tracing::info!(socket = ?state.socket_name, "compositor listo (sesión real)");
 
@@ -358,9 +450,10 @@ pub fn run(
         // Si hay trabajo pendiente y no hay frame en el aire, se dibuja al
         // cerrar la vuelta del bucle. El resto del tiempo el proceso duerme en
         // epoll: no hay sondeo de ningún tipo.
-        if state.needs_redraw || state.hay_animacion() {
+        let pendiente = udev_loop.try_borrow().is_ok_and(|u| u.hay_pendiente());
+        if state.needs_redraw || state.hay_animacion() || pendiente {
             match udev_loop.try_borrow_mut() {
-                Ok(mut u) => dibujar(state, &mut u),
+                Ok(mut u) => dibujar_todas(state, &mut u),
                 // No debería pasar: este callback corre entre vueltas del
                 // bucle, con todos los callbacks de las fuentes ya cerrados.
                 // Pero si pasara, descartar el frame en silencio dejaría la
@@ -398,145 +491,110 @@ fn elegir_gpu(session: &LibSeatSession) -> anyhow::Result<DrmNode> {
     Ok(DrmNode::from_path(path)?)
 }
 
-/// Enciende el primer conector conectado, con lo que diga la configuración
-/// guardada o, si no hay nada guardado para él, con su modo preferido.
-///
-/// **Solo se enciende uno.** El resto de conectores se enumeran en el censo
-/// —Settings los ve, con sus modos y su EDID— pero no se les asigna un crtc:
-/// para eso hace falta una `DrmOutput` por salida y componer la escena varias
-/// veces por frame, y eso es un cambio de otra magnitud. Ver `censar`.
-fn crear_salida(
+/// Enciende todas las salidas configuradas, asignando un CRTC distinto a cada
+/// conector. Un monitor desconocido se añade a la derecha; uno conocido
+/// recupera modo, escala, posición, rotación y VRR por su identificador EDID.
+fn crear_salidas(
     manager: &mut Manager,
     renderer: &mut GlesRenderer,
     state: &mut BookosComp,
-) -> anyhow::Result<(Output, Surface, connector::Handle, String)> {
+) -> anyhow::Result<Vec<SalidaKms>> {
     let recursos = manager.device().resource_handles()?;
     let guardadas = pantallas::cargar();
+    let activos = recursos.connectors().iter().filter_map(|handle| {
+        let con = manager.device().get_connector(*handle, true).ok()?;
+        if con.state() != connector::State::Connected { return None; }
+        let id = identificador(manager.device(), &con);
+        (!guardadas.iter().any(|g| g.id == id && !g.activa)).then_some(*handle)
+    }).collect::<Vec<_>>();
+    let opciones = activos.iter().map(|handle| {
+        manager.device().get_connector(*handle, true).ok()
+            .map(|con| crtcs_compatibles(manager, &recursos, &con))
+            .unwrap_or_default()
+    }).collect::<Vec<_>>();
+    let asignados = asignar_crtcs(&opciones)
+        .ok_or_else(|| anyhow::anyhow!("no existe una asignación de CRTC para las pantallas activas"))?;
+    let mut salidas = Vec::new();
+    let mut siguiente_x = 0;
 
-    let (conector, crtc, modo, guardada) = recursos
-        .connectors()
-        .iter()
-        .filter_map(|handle| manager.device().get_connector(*handle, true).ok())
-        .filter(|con| con.state() == connector::State::Connected)
-        .find_map(|con| {
-            let id = identificador(manager.device(), &con);
-            // Lo guardado manda sobre el modo preferido, pero solo si el modo
-            // sigue existiendo: un monitor puede perder modos al cambiar de
-            // cable, y aplicar uno que ya no está deja la pantalla apagada.
-            let guardada = guardadas
-                .iter()
-                .find(|g| g.id == id && g.activa)
-                .and_then(|g| {
-                    let existe = con.modes().iter().any(|m| {
-                        let (w, h) = m.size();
-                        w as u32 == g.ancho && h as u32 == g.alto
-                            && m.vrefresh() * 1000 == g.refresco_mhz
-                    });
-                    existe.then(|| g.clone())
-                });
-            let modo = guardada
-                .as_ref()
-                .and_then(|g| {
-                    con.modes().iter().find(|m| {
-                        let (w, h) = m.size();
-                        w as u32 == g.ancho && h as u32 == g.alto
-                            && m.vrefresh() * 1000 == g.refresco_mhz
-                    })
-                })
-                // El modo preferido es el que anuncia el panel como nativo.
-                .or_else(|| {
-                    con.modes()
-                        .iter()
-                        .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
-                })
-                .or_else(|| con.modes().first())
-                .copied()?;
-            let crtc = primer_crtc(manager, &recursos, &con)?;
-            Some((con, crtc, modo, guardada))
-        })
-        .ok_or_else(|| anyhow::anyhow!("no hay ninguna pantalla conectada"))?;
+    for handle in recursos.connectors() {
+        let Ok(conector) = manager.device().get_connector(*handle, true) else { continue };
+        if conector.state() != connector::State::Connected { continue; }
+        let id = identificador(manager.device(), &conector);
+        let guardada = guardadas.iter().find(|g| g.id == id).cloned();
+        if guardada.as_ref().is_some_and(|g| !g.activa) { continue; }
+        let Some(indice) = activos.iter().position(|h| *h == conector.handle()) else { continue };
+        let crtc = asignados[indice];
+        let modo = guardada.as_ref().and_then(|g| {
+            conector.modes().iter().find(|m| {
+                let (w, h) = m.size();
+                w as u32 == g.ancho && h as u32 == g.alto
+                    && m.vrefresh() * 1000 == g.refresco_mhz
+            })
+        }).or_else(|| conector.modes().iter().find(|m| {
+            m.mode_type().contains(ModeTypeFlags::PREFERRED)
+        })).or_else(|| conector.modes().first()).copied();
+        let Some(modo) = modo else { continue };
 
-    let nombre = format!("{:?}-{}", conector.interface(), conector.interface_id());
-    let id = identificador(manager.device(), &conector);
-    let (mm_w, mm_h) = conector.size().unwrap_or((0, 0));
-    let (w, h) = modo.size();
-    let (fabricante, modelo_edid, _serie) = datos_edid(manager.device(), &conector);
-    tracing::info!(
-        pantalla = %nombre,
-        id = %id,
-        modo = %format!("{}x{}@{}", w, h, modo.vrefresh()),
-        restaurada = guardada.is_some(),
-        "encendiendo salida"
-    );
-
-    let output = Output::new(
-        nombre,
-        PhysicalProperties {
+        let nombre = format!("{:?}-{}", conector.interface(), conector.interface_id());
+        let (mm_w, mm_h) = conector.size().unwrap_or((0, 0));
+        let (w, h) = modo.size();
+        let (fabricante, modelo_edid, _) = datos_edid(manager.device(), &conector);
+        let escala = guardada.as_ref().map(|g| g.escala)
+            .or_else(|| state.config.as_ref().and_then(|c| c.escala))
+            .unwrap_or_else(|| super::escala_sugerida(
+                (w as i32, h as i32), (mm_w as i32, mm_h as i32)));
+        let transformacion = guardada.as_ref()
+            .and_then(|g| pantallas::transformacion(&g.transformacion))
+            .unwrap_or(smithay::utils::Transform::Normal);
+        let posicion = guardada.as_ref().map_or((siguiente_x, 0).into(), |g| (g.x, g.y).into());
+        let output = Output::new(nombre.clone(), PhysicalProperties {
             size: (mm_w as i32, mm_h as i32).into(),
             subpixel: Subpixel::Unknown,
-            // Lo que dice el EDID, no "BookOS": es lo que los clientes enseñan
-            // cuando preguntan en qué pantalla están.
             make: if fabricante.is_empty() { "BookOS".into() } else { fabricante },
             model: if modelo_edid.is_empty() { "KMS".into() } else { modelo_edid },
-        },
-    );
-    let output_mode = OutputMode {
-        size: (w as i32, h as i32).into(),
-        refresh: (modo.vrefresh() * 1000) as i32,
-    };
-    output.create_global::<BookosComp>(&state.display_handle);
-
-    // La escala la manda lo guardado; si no, la configuración; si tampoco, se
-    // deduce del tamaño físico que anuncia el panel. Estaba cableada a 1,0, y
-    // en un portátil de 242 DPI eso significaba un panel de 32 px físicos y
-    // texto ilegible: el escritorio solo se podía usar anidado.
-    let escala = guardada
-        .as_ref()
-        .map(|g| g.escala)
-        .or_else(|| state.config.as_ref().and_then(|c| c.escala))
-        .unwrap_or_else(|| super::escala_sugerida((w as i32, h as i32), (mm_w as i32, mm_h as i32)));
-    let transformacion = guardada
-        .as_ref()
-        .and_then(|g| pantallas::transformacion(&g.transformacion))
-        .unwrap_or(smithay::utils::Transform::Normal);
-    let posicion: smithay::utils::Point<i32, smithay::utils::Logical> =
-        guardada.as_ref().map_or((0, 0).into(), |g| (g.x, g.y).into());
-    tracing::info!(
-        escala,
-        automatica = guardada.is_none() && state.config.as_ref().and_then(|c| c.escala).is_none(),
-        logico = %format!("{}x{}", (w as f64 / escala) as i32, (h as f64 / escala) as i32),
-        "escala de la pantalla"
-    );
-    output.change_current_state(
-        Some(output_mode),
-        Some(transformacion),
-        Some(Scale::Fractional(escala)),
-        Some(posicion),
-    );
-    output.set_preferred(output_mode);
-
-    let surface = manager
-        .initialize_output(
-            crtc,
-            modo,
-            &[conector.handle()],
-            &output,
-            None,
-            renderer,
+        });
+        let output_mode = OutputMode {
+            size: (w as i32, h as i32).into(),
+            refresh: (modo.vrefresh() * 1000) as i32,
+        };
+        output.create_global::<BookosComp>(&state.display_handle);
+        output.change_current_state(
+            Some(output_mode), Some(transformacion),
+            Some(Scale::Fractional(escala)), Some(posicion),
+        );
+        output.set_preferred(output_mode);
+        let surface = match manager.initialize_output(
+            crtc, modo, &[conector.handle()], &output, None, renderer,
             &DrmOutputRenderElements::<GlesRenderer, OverlayElement>::default(),
-        )
-        .map_err(|err| anyhow::anyhow!("no se pudo inicializar la salida: {err}"))?;
-
-    // La frecuencia variable no se hereda: si la configuración guardada la
-    // pedía, se pide aquí, y si el panel no puede se sigue sin ella.
-    if guardada.as_ref().is_some_and(|g| g.vrr) {
-        let r = surface.with_compositor(|c| c.use_vrr(true));
-        if let Err(err) = r {
-            tracing::warn!("no se pudo activar la frecuencia variable: {err}");
+        ) {
+            Ok(surface) => surface,
+            Err(err) => {
+                tracing::warn!(pantalla = %nombre, "no se pudo inicializar la salida: {err}");
+                continue;
+            }
+        };
+        if guardada.as_ref().is_some_and(|g| g.vrr) {
+            if let Err(err) = surface.with_compositor(|c| c.use_vrr(true)) {
+                tracing::warn!(pantalla = %nombre, "no se pudo activar VRR: {err}");
+            }
         }
+        let (lw, _) = pantallas::tamano_logico(w as u32, h as u32, escala,
+            pantallas::nombre_transformacion(transformacion));
+        siguiente_x = posicion.x + lw;
+        tracing::info!(pantalla = %nombre, %id, crtc = ?crtc,
+            modo = %format!("{}x{}@{}", w, h, modo.vrefresh()),
+            escala, x = posicion.x, y = posicion.y, "salida multipantalla activa");
+        salidas.push(SalidaKms {
+            output, surface, conector: conector.handle(), id,
+            en_vuelo: false, pendiente: true,
+        });
     }
 
-    Ok((output, surface, conector.handle(), id))
+    if salidas.is_empty() {
+        return Err(anyhow::anyhow!("no hay ninguna pantalla conectada utilizable"));
+    }
+    Ok(salidas)
 }
 
 // ── Censo de pantallas ───────────────────────────────────────────────────
@@ -685,33 +743,26 @@ fn modos_de(con: &connector::Info, actual: Option<&smithay::reexports::drm::cont
 
 /// El censo de todo lo que hay enchufado.
 ///
-/// La única salida con `activa = true` es la que tiene crtc. Las demás se
-/// enumeran enteras —modos, EDID, tamaño físico— para que Settings pueda
-/// enseñarlas y avisar de que todavía no se pueden encender, en vez de hacer
-/// como que no existen.
+/// Censo de conectores y de sus escenas KMS activas.
 fn censar(u: &Udev) -> Vec<Salida> {
     let device = u.manager.device();
     let Ok(recursos) = device.resource_handles() else {
         return Vec::new();
     };
-    let escala = u.output.current_scale().fractional_scale();
-    let transformacion = pantallas::nombre_transformacion(u.output.current_transform());
-    let posicion = u.output.current_location();
-    let modo_actual = u.surface.with_compositor(|c| c.pending_mode());
-    let vrr = u.surface.with_compositor(|c| c.vrr_enabled());
-
     recursos
         .connectors()
         .iter()
         .filter_map(|handle| device.get_connector(*handle, true).ok())
         .filter(|con| con.state() == connector::State::Connected)
         .map(|con| {
-            let encendida = con.handle() == u.conector;
+            let activa = u.salidas.iter().find(|s| s.conector == con.handle());
+            let encendida = activa.is_some();
             let (fabricante, modelo, serie) = datos_edid(device, &con);
             let (mm_w, mm_h) = con.size().unwrap_or((0, 0));
-            let modos = modos_de(&con, encendida.then_some(&modo_actual));
-            let escala = if encendida {
-                escala
+            let modo_actual = activa.map(|s| s.surface.with_compositor(|c| c.pending_mode()));
+            let modos = modos_de(&con, modo_actual.as_ref());
+            let escala = if let Some(salida) = activa {
+                salida.output.current_scale().fractional_scale()
             } else {
                 // Todavía no está encendida: se enseña lo que se le pondría.
                 let preferido = modos.iter().find(|m| m.preferido).or_else(|| modos.first());
@@ -728,7 +779,11 @@ fn censar(u: &Udev) -> Vec<Salida> {
                 .or_else(|| modos.iter().find(|m| m.preferido))
                 .or_else(|| modos.first())
                 .map_or((0, 0), |m| (m.ancho, m.alto));
-            let transformacion = if encendida { transformacion } else { "normal" };
+            let transformacion = activa.map_or("normal", |s| {
+                pantallas::nombre_transformacion(s.output.current_transform())
+            });
+            let posicion = activa.map(|s| s.output.current_location()).unwrap_or_default();
+            let vrr = activa.is_some_and(|s| s.surface.with_compositor(|c| c.vrr_enabled()));
             let (logico_ancho, logico_alto) =
                 pantallas::tamano_logico(ancho, alto, escala, transformacion);
             Salida {
@@ -743,12 +798,12 @@ fn censar(u: &Udev) -> Vec<Salida> {
                 modos,
                 escala,
                 escalas: pantallas::ESCALAS.to_vec(),
-                x: if encendida { posicion.x } else { 0 },
-                y: if encendida { posicion.y } else { 0 },
+                x: posicion.x,
+                y: posicion.y,
                 transformacion: transformacion.to_string(),
                 vrr_capaz: vrr_capaz(device, &con),
                 vrr: encendida && vrr,
-                principal: encendida,
+                principal: activa.is_some_and(|s| s.id == u.principal_id),
                 logico_ancho,
                 logico_alto,
             }
@@ -761,121 +816,228 @@ fn censar(u: &Udev) -> Vec<Salida> {
 /// Devuelve el censo releído, no lo que se pidió: si el driver acabó en otro
 /// sitio, lo que gana es lo que hay.
 fn aplicar_en_kms(u: &mut Udev, peticion: &[Peticion]) -> Result<Aplicado, String> {
-    let mia = peticion
-        .iter()
-        .find(|p| p.id == u.id)
-        .ok_or_else(|| format!("la configuración no dice nada de «{}»", u.id))?;
-
-    if !mia.activa {
-        return Err(
-            "este backend enciende una sola pantalla: apagarla dejaría la sesión sin ninguna".into(),
-        );
-    }
-    if let Some(otra) = peticion.iter().find(|p| p.id != u.id && p.activa) {
-        return Err(format!(
-            "«{}» no se puede encender todavía: el compositor solo maneja una salida",
-            otra.id
-        ));
-    }
-
-    let transformacion = pantallas::transformacion(&mia.transformacion)
-        .ok_or_else(|| format!("rotación «{}» desconocida", mia.transformacion))?;
-
-    // El modo de DRM que corresponde a lo pedido. Se busca en el conector y no
-    // se construye a mano: un `Mode` inventado no lleva los tiempos reales y el
-    // modeset lo rechaza.
-    let device = u.manager.device();
-    let con = device
-        .get_connector(u.conector, true)
-        .map_err(|err| format!("no se pudo leer el conector: {err}"))?;
-    let modo_drm = con
-        .modes()
-        .iter()
-        .find(|m| {
+    let recursos = u.manager.device().resource_handles()
+        .map_err(|err| format!("no se pudieron enumerar los recursos DRM: {err}"))?;
+    // Preflight completo antes de soltar una salida viva. Los modos y la
+    // asignación de CRTC se comprueban primero para que una petición inválida
+    // no deje la sesión negra a mitad de la reconstrucción.
+    let mut opciones_crtc = Vec::new();
+    for pedido in peticion.iter().filter(|p| p.activa) {
+        let conector = recursos.connectors().iter()
+            .filter_map(|h| u.manager.device().get_connector(*h, true).ok())
+            .find(|c| c.state() == connector::State::Connected
+                && identificador(u.manager.device(), c) == pedido.id)
+            .ok_or_else(|| format!("la pantalla «{}» ya no está conectada", pedido.id))?;
+        if !conector.modes().iter().any(|m| {
             let (w, h) = m.size();
-            w as u32 == mia.ancho && h as u32 == mia.alto && m.vrefresh() * 1000 == mia.refresco_mhz
-        })
-        .copied()
-        .ok_or_else(|| {
-            format!(
-                "el conector no tiene el modo {}x{}@{}",
-                mia.ancho, mia.alto, mia.refresco_mhz
-            )
-        })?;
-
-    let modo_previo = u.surface.with_compositor(|c| c.pending_mode());
-    let cambia_modo = modo_previo.size() != modo_drm.size()
-        || modo_previo.vrefresh() != modo_drm.vrefresh();
-    if cambia_modo {
-        let Udev { surface, renderer, .. } = u;
-        surface
-            .use_mode(
-                modo_drm,
-                renderer,
-                &DrmOutputRenderElements::<GlesRenderer, OverlayElement>::default(),
-            )
-            .map_err(|err| format!("el hardware rechazó el modo: {err}"))?;
-    }
-
-    // El `DrmCompositor` toma la escala y la rotación del `Output` en cada
-    // frame (`OutputModeSource::Auto`), así que cambiarlas aquí basta: no hace
-    // falta ningún modeset para rotar ni para reescalar.
-    let output_mode = OutputMode {
-        size: (mia.ancho as i32, mia.alto as i32).into(),
-        refresh: mia.refresco_mhz as i32,
-    };
-    u.output.change_current_state(
-        Some(output_mode),
-        Some(transformacion),
-        Some(Scale::Fractional(mia.escala)),
-        Some((mia.x, mia.y).into()),
-    );
-
-    if u.surface.with_compositor(|c| c.vrr_enabled()) != mia.vrr {
-        let r = u.surface.with_compositor(|c| c.use_vrr(mia.vrr));
-        if let Err(err) = r {
-            // No es motivo para tirar el resto de la configuración: el modo y
-            // la escala ya están puestos y se ven.
-            tracing::warn!(vrr = mia.vrr, "no se pudo cambiar la frecuencia variable: {err}");
+            w as u32 == pedido.ancho && h as u32 == pedido.alto
+                && m.vrefresh() * 1000 == pedido.refresco_mhz
+        }) {
+            return Err(format!("«{}» no tiene el modo {}x{}@{}",
+                pedido.id, pedido.ancho, pedido.alto, pedido.refresco_mhz));
         }
+        opciones_crtc.push(crtcs_compatibles(&u.manager, &recursos, &conector));
+    }
+    let asignados = asignar_crtcs(&opciones_crtc)
+        .ok_or_else(|| "no existe una asignación de CRTC compatible para esta combinación".to_string())?;
+
+    // Se reconstruyen únicamente las superficies KMS, no el compositor ni la
+    // sesión. Soltar `DrmOutput` libera su CRTC y permite encender/apagar o
+    // cambiar el cable en caliente sin reiniciar BookOS.
+    u.salidas.clear();
+    for (pedido, crtc) in peticion.iter().filter(|p| p.activa).zip(asignados) {
+        let conector = recursos.connectors().iter()
+            .filter_map(|h| u.manager.device().get_connector(*h, true).ok())
+            .find(|c| c.state() == connector::State::Connected
+                && identificador(u.manager.device(), c) == pedido.id)
+            .ok_or_else(|| format!("la pantalla «{}» ya no está conectada", pedido.id))?;
+        let modo = conector.modes().iter().find(|m| {
+            let (w, h) = m.size();
+            w as u32 == pedido.ancho && h as u32 == pedido.alto
+                && m.vrefresh() * 1000 == pedido.refresco_mhz
+        }).copied().ok_or_else(|| format!(
+            "«{}» no tiene el modo {}x{}@{}",
+            pedido.id, pedido.ancho, pedido.alto, pedido.refresco_mhz))?;
+        let transformacion = pantallas::transformacion(&pedido.transformacion)
+            .ok_or_else(|| format!("rotación «{}» desconocida", pedido.transformacion))?;
+        let nombre = format!("{:?}-{}", conector.interface(), conector.interface_id());
+        let (mm_w, mm_h) = conector.size().unwrap_or((0, 0));
+        let (fabricante, modelo, _) = datos_edid(u.manager.device(), &conector);
+        let output = Output::new(nombre, PhysicalProperties {
+            size: (mm_w as i32, mm_h as i32).into(),
+            subpixel: Subpixel::Unknown,
+            make: if fabricante.is_empty() { "BookOS".into() } else { fabricante },
+            model: if modelo.is_empty() { "KMS".into() } else { modelo },
+        });
+        let output_mode = OutputMode {
+            size: (pedido.ancho as i32, pedido.alto as i32).into(),
+            refresh: pedido.refresco_mhz as i32,
+        };
+        output.create_global::<BookosComp>(&u.display_handle);
+        output.change_current_state(
+            Some(output_mode), Some(transformacion),
+            Some(Scale::Fractional(pedido.escala)), Some((pedido.x, pedido.y).into()),
+        );
+        output.set_preferred(output_mode);
+        let surface = u.manager.initialize_output(
+            crtc, modo, &[conector.handle()], &output, None, &mut u.renderer,
+            &DrmOutputRenderElements::<GlesRenderer, OverlayElement>::default(),
+        ).map_err(|err| format!("KMS rechazó «{}»: {err}", pedido.id))?;
+        if pedido.vrr {
+            surface.with_compositor(|c| c.use_vrr(true))
+                .map_err(|err| format!("no se pudo activar VRR en «{}»: {err}", pedido.id))?;
+        }
+        u.salidas.push(SalidaKms {
+            output, surface, conector: conector.handle(), id: pedido.id.clone(),
+            en_vuelo: false, pendiente: true,
+        });
     }
 
-    if cambia_modo {
-        // Los buffers del swapchain tienen el tamaño del modo anterior.
-        u.surface.reset_buffers();
-    }
-
-    Ok(Aplicado {
-        salidas: censar(u),
-        mapa: vec![(u.output.clone(), (mia.x, mia.y).into())],
-        principal: 0,
-    })
+    let principal = peticion.iter().find(|p| p.activa && p.principal)
+        .and_then(|p| u.salidas.iter().position(|s| s.id == p.id)).unwrap_or(0);
+    u.principal_id = u.salidas[principal].id.clone();
+    let salidas = censar(u);
+    let mapa = u.salidas.iter().map(|s| {
+        (s.output.clone(), s.output.current_location())
+    }).collect::<Vec<_>>();
+    Ok(Aplicado { salidas, mapa, principal })
 }
 
-/// Un crtc capaz de manejar este conector.
-fn primer_crtc(
+fn crtcs_compatibles(
     manager: &Manager,
     recursos: &smithay::reexports::drm::control::ResourceHandles,
     con: &connector::Info,
-) -> Option<crtc::Handle> {
+) -> Vec<crtc::Handle> {
     con.encoders()
         .iter()
         .filter_map(|enc| manager.device().get_encoder(*enc).ok())
-        .find_map(|enc| recursos.filter_crtcs(enc.possible_crtcs()).first().copied())
+        .flat_map(|enc| recursos.filter_crtcs(enc.possible_crtcs()))
+        .fold(Vec::new(), |mut lista, crtc| {
+            if !lista.contains(&crtc) { lista.push(crtc); }
+            lista
+        })
 }
 
-/// Dibuja un frame y lo encola para escaneo.
-fn dibujar(state: &mut BookosComp, u: &mut Udev) {
-    if !u.activa || u.en_vuelo {
+/// Emparejamiento con retroceso: elegir siempre el primer CRTC compatible
+/// falla si A admite 0/1 y B solo 0. Hay muy pocos CRTCs (normalmente 2–4), así
+/// que probar las combinaciones es más seguro y despreciable en coste.
+fn asignar_crtcs(opciones: &[Vec<crtc::Handle>]) -> Option<Vec<crtc::Handle>> {
+    fn buscar(
+        i: usize,
+        opciones: &[Vec<crtc::Handle>],
+        usados: &mut Vec<crtc::Handle>,
+        resultado: &mut Vec<crtc::Handle>,
+    ) -> bool {
+        if i == opciones.len() { return true; }
+        for crtc in opciones[i].iter().copied() {
+            if usados.contains(&crtc) { continue; }
+            usados.push(crtc);
+            resultado.push(crtc);
+            if buscar(i + 1, opciones, usados, resultado) { return true; }
+            resultado.pop();
+            usados.pop();
+        }
+        false
+    }
+    let mut usados = Vec::new();
+    let mut resultado = Vec::with_capacity(opciones.len());
+    buscar(0, opciones, &mut usados, &mut resultado).then_some(resultado)
+}
+
+/// Dibuja cada salida que esté libre. Los vblank son independientes: una
+/// pantalla a 144 Hz no espera a otra de 60 Hz y cada swapchain conserva su
+/// propio daño.
+fn dibujar_todas(state: &mut BookosComp, u: &mut Udev) {
+    if !u.activa { return; }
+    // Antes de mirar nada: lo que se mueve solo avanza **una vez** por vuelta,
+    // no una por salida. Ver `backend::avanzar_animaciones`.
+    crate::backend::avanzar_animaciones(state);
+    let animando = state.hay_animacion();
+    let Udev { renderer, salidas, .. } = u;
+    // Antes de componer nada: si el tema cambió, el fondo y el cristal tienen
+    // que ser ya los nuevos en este mismo fotograma.
+    crate::backend::recargar_fondo(state, renderer);
+    if state.needs_redraw || animando {
+        for salida in salidas.iter_mut() { salida.pendiente = true; }
+    }
+    for salida in salidas {
+        dibujar_salida(state, renderer, salida, animando);
+    }
+    state.needs_redraw = false;
+}
+
+fn dibujar_salida(
+    state: &mut BookosComp,
+    renderer: &mut GlesRenderer,
+    salida: &mut SalidaKms,
+    animando: bool,
+) {
+    if salida.en_vuelo {
+        // Hay trabajo y el hardware todavía no ha enseñado el fotograma
+        // anterior: se apunta y se dibuja en el vblank. Contarlo es lo que
+        // distingue «el compositor va justo» de «el compositor va sobrado».
+        if salida.pendiente || animando {
+            state.metricas.aplazado(&salida.output.name());
+        }
         return;
     }
+    if !salida.pendiente && !animando {
+        return;
+    }
+    // El nombre se pide aquí y no arriba porque `name()` clona la cadena, y con
+    // dos monitores esta función se llama también para el que no tiene nada que
+    // dibujar.
+    let nombre = salida.output.name();
 
-    let elementos = crate::backend::escena(state, &mut u.renderer, &u.output);
+    let escala = salida.output.current_scale().fractional_scale();
+    let modo_actual = salida.output.current_mode();
+    if let Some(modo) = modo_actual {
+        state.metricas.modo(
+            &nombre,
+            modo.size.w,
+            modo.size.h,
+            escala,
+            // `refresh` viene en mHz.
+            modo.refresh as f32 / 1000.0,
+            salida.surface.with_compositor(|c| c.vrr_enabled()),
+        );
+    }
+    // Un refresco, para el umbral de los frame callbacks (ver `enviar_frames`).
+    // Sin modo —no debería pasar con la salida encendida— se usan 60 Hz, que
+    // solo decide cada cuánto arranca una superficie todavía sin salida
+    // asignada, no el ritmo de dibujo.
+    let periodo = modo_actual
+        .filter(|m| m.refresh > 0)
+        .map(|m| Duration::from_nanos(1_000_000_000_000u64 / m.refresh as u64))
+        .unwrap_or(Duration::from_millis(16));
+
+    let cronometro = std::time::Instant::now();
+    let elementos = crate::backend::escena(state, renderer, &salida.output);
+    let origen: Point<i32, Physical> = salida.output.current_location().to_f64()
+        .to_physical_precise_round(escala);
+    // `escena` trabaja en el escritorio lógico global. KMS espera coordenadas
+    // físicas locales al CRTC; trasladar al final conserva ventanas que cruzan
+    // dos salidas incluso cuando cada una usa una escala distinta.
+    let elementos = elementos.into_iter().map(|elemento| {
+        RelocateRenderElement::from_element(
+            elemento, (-origen.x, -origen.y), Relocate::Relative)
+    }).collect::<Vec<_>>();
+
+    let t_escena = cronometro.elapsed();
+    let cronometro = std::time::Instant::now();
 
     // `FrameFlags::DEFAULT` deja que el compositor use los planos: es lo que
     // habilita el direct scanout y el cursor por hardware.
-    let resultado = u.surface.render_frame(
-        &mut u.renderer,
+    //
+    // **Sin `SKIP_CURSOR_ONLY_UPDATES`**, aunque suene a que ahorraría trabajo
+    // en el caso más común —mover el ratón—. Lo que hace ese flag es marcar el
+    // plano del cursor como `skip` y devolver el fotograma como vacío; aquí eso
+    // significa salir sin `queue_frame`, o sea que el movimiento **nunca llega
+    // a KMS** y el puntero se queda clavado hasta que otra cosa dañe la
+    // pantalla. En Smithay existe para VRR, donde un movimiento de ratón no
+    // debe forzar un flip antes de tiempo, no como optimización general.
+    let resultado = salida.surface.render_frame(
+        renderer,
         &elementos,
         [0.05, 0.05, 0.06, 1.0],
         FrameFlags::DEFAULT,
@@ -885,6 +1047,11 @@ fn dibujar(state: &mut BookosComp, u: &mut Udev) {
         Ok(r) => r,
         Err(err) => {
             tracing::error!("fallo al dibujar: {err}");
+            // El pendiente se suelta aunque el fotograma se pierda: si se
+            // dejara puesto, `hay_pendiente` haría que el bucle volviera a
+            // intentarlo sin descanso y un fallo persistente del driver
+            // pasaría de una pantalla congelada a un núcleo al 100 %.
+            salida.pendiente = false;
             return;
         }
     };
@@ -892,48 +1059,109 @@ fn dibujar(state: &mut BookosComp, u: &mut Udev) {
     if resultado.is_empty {
         // Nada cambió: no se toca la pantalla. Este es el caso normal en un
         // escritorio en reposo.
-        state.needs_redraw = false;
-        state.frames.skipped += 1;
+        state.metricas.saltado(&nombre);
+        salida.pendiente = false;
+        // Los frame callbacks salen igual. Un cliente puede pedir el callback
+        // sin dañar nada —Firefox lo hace para engancharse al vsync— y si aquí
+        // se vuelve sin contestarle se queda esperando un frame que nadie le va
+        // a dar: deja de dibujar del todo hasta que otro evento mueva la
+        // pantalla.
+        enviar_frames(state, &salida.output, periodo);
         return;
     }
 
-    match u.surface.queue_frame(()) {
+    let mut feedback = OutputPresentationFeedback::new(&salida.output);
+    for window in state.space.elements() {
+        window.with_surfaces(|surface, data| {
+            update_surface_primary_scanout_output(
+                surface, &salida.output, data, &resultado.states,
+                default_primary_scanout_output_compare,
+            );
+        });
+        window.take_presentation_feedback(
+            &mut feedback,
+            surface_primary_scanout_output,
+            |surface, _| surface_presentation_feedback_flags_from_states(
+                surface, &resultado.states),
+        );
+    }
+
+    match salida.surface.queue_frame(feedback) {
         Ok(()) => {
-            u.en_vuelo = true;
-            state.frames.submitted += 1;
+            salida.en_vuelo = true;
+            salida.pendiente = false;
         }
         Err(err) => tracing::error!("queue_frame: {err}"),
     }
-    state.needs_redraw = false;
-
+    // El coste se apunta con el encolado dentro: `queue_frame` es donde se
+    // paga el atómico de KMS, y dejarlo fuera escondería justo la parte que se
+    // come el plazo cuando el driver va apretado.
+    state.metricas.dibujado(&nombre, t_escena, cronometro.elapsed());
     // Los frame callbacks salen después de encolar: es la señal de "puedes
     // dibujar el siguiente".
+    enviar_frames(state, &salida.output, periodo);
+    // Las capturas van al final, con la escena ya presentada, y componen su
+    // propio buffer. Ver `backend::servir_capturas`.
+    crate::backend::servir_capturas(state, renderer, &salida.output);
+    crate::backend::servir_captura_propia(state, renderer, &salida.output);
+}
+
+/// Pasa un instante del reloj de pared al monotónico, midiendo ahora el desfase
+/// entre los dos.
+///
+/// Hace falta para los drivers que anuncian los page-flip en `CLOCK_REALTIME`.
+/// `wp_presentation` se anunció con el reloj monotónico (`PresentationState::
+/// new(&dh, 1)`), así que entregarle otra cosa sería mentirle al cliente.
+fn trasladar_a_monotonico(
+    t: std::time::SystemTime,
+) -> smithay::utils::Time<smithay::utils::Monotonic> {
+    use smithay::reexports::rustix::time::{clock_gettime, ClockId};
+    let ts = clock_gettime(ClockId::Monotonic);
+    let mono = Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32);
+    // Cuánto hace del flip. `unwrap_or_default` cubre la marca posterior a
+    // "ahora" —relojes reajustados entre medias—: ahí lo más cercano a la
+    // verdad es "acaba de pasar", no un instante en el futuro.
+    let antiguedad = t.elapsed().unwrap_or_default();
+    smithay::utils::Time::<smithay::utils::Monotonic>::from(mono.saturating_sub(antiguedad))
+}
+
+/// Contesta a los frame callbacks de todo lo que se enseña en esta salida.
+///
+/// El `throttle` **no es `None`**, y ese detalle decide si una ventana nueva
+/// llega a pintar. Con `None`, Smithay solo contesta a las superficies cuya
+/// salida de scanout principal es esta —`frame_overdue` se queda en `false`
+/// para siempre, ver `SurfaceFrameThrottlingState::update`—, y esa salida solo
+/// se asigna en el camino de fotograma **no vacío**, recorriendo
+/// `resultado.states`. O sea que una superficie que todavía no ha aparecido en
+/// ningún `states` —la pestaña que acabas de abrir, el primer fotograma de una
+/// ventana— no recibe callback **nunca** y se queda esperando a que otra cosa
+/// mueva la pantalla. Es el «abro una pestaña y se queda pillada».
+///
+/// Con un periodo de refresco como umbral, esas superficies reciben un
+/// callback por vuelta de vblank y arrancan, mientras que las que están de
+/// verdad ocultas tras otra ventana siguen limitadas a uno por refresco en vez
+/// de correr en vacío, que es lo que pasaría con `Some(Duration::ZERO)`.
+fn enviar_frames(state: &mut BookosComp, output: &Output, periodo: Duration) {
     let tiempo = state.start_time.elapsed();
     for window in state.space.elements() {
-        window.send_frame(
-            &u.output,
-            tiempo,
-            Some(Duration::ZERO),
-            surface_primary_scanout_output,
-        );
+        window.send_frame(output, tiempo, Some(periodo), surface_primary_scanout_output);
     }
     if state
         .shell
         .as_ref()
         .is_some_and(|s| s.vista_escritorios_abierta())
     {
-        let activo = state.escritorios.activo();
-        for (i, ventanas) in crate::escritorios::ventanas_para_vista(state).iter().enumerate() {
+        let salida_vista = crate::escritorios::salida_para_vista(state);
+        let activo = state.escritorios.activo_en(&salida_vista);
+        for (i, ventanas) in crate::escritorios::ventanas_para_vista(state, &salida_vista)
+            .iter()
+            .enumerate()
+        {
             if i == activo {
                 continue;
             }
             for (window, _) in ventanas {
-                window.send_frame(
-                    &u.output,
-                    tiempo,
-                    Some(Duration::ZERO),
-                    surface_primary_scanout_output,
-                );
+                window.send_frame(output, tiempo, Some(periodo), surface_primary_scanout_output);
             }
         }
     }

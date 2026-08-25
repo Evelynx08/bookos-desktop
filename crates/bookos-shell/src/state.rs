@@ -363,9 +363,23 @@ fn bisiesto(anio: i32) -> bool {
 }
 
 #[cfg(unix)]
-fn local_hm(unix_secs: i64) -> (u8, u8) {
+pub(crate) fn local_hm(unix_secs: i64) -> (u8, u8) {
     let tm = local_tm(unix_secs);
     (tm.0, tm.1)
+}
+
+/// La hora local de ahora mismo, en `(hora, minuto)`.
+///
+/// La usa el tema automático para saber si toca claro u oscuro. Va aquí, con
+/// el resto del calendario, porque es donde vive la única llamada a
+/// `localtime_r` del proyecto y no tiene sentido tener dos.
+pub fn hora_local_ahora() -> (u8, u8) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    local_hm(secs)
 }
 
 /// `(hora, minuto, años desde 1900, mes desde 0, día del mes)` en local.

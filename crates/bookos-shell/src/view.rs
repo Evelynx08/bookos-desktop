@@ -39,10 +39,10 @@ pub type PanelElement<'a> = Element<'a, (), Theme, Renderer>;
 
 /// Separación entre los estados de la derecha.
 ///
-/// 20 y no los 14 de antes: con los widgets nuevos —bluetooth, notificaciones,
-/// centro de control— la fila pasó de cinco iconos a ocho y se leía como una
-/// tira continua en vez de como estados sueltos.
-pub const HUECO: f32 = 20.0;
+/// 16 deja respirar cada estado sin que la fila derecha parezca demasiado
+/// dispersa. El hit-test reparte la mitad del hueco a cada vecino, así que
+/// reducirlo no crea franjas muertas entre iconos.
+pub const HUECO: f32 = 16.0;
 /// Margen izquierdo y derecho del panel.
 pub const MARGEN_PANEL: f32 = 12.0;
 /// Lado del logo, en lógicos. 20 sobre un panel de 32 deja 6 de aire arriba y

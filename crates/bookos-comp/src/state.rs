@@ -12,7 +12,7 @@
 
 use std::ffi::OsString;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use smithay::desktop::{Space, Window};
 use smithay::input::pointer::PointerHandle;
@@ -24,6 +24,8 @@ use smithay::reexports::wayland_server::{Display, DisplayHandle};
 use smithay::wayland::compositor::{CompositorClientState, CompositorState};
 use smithay::wayland::fractional_scale::FractionalScaleManagerState;
 use smithay::wayland::output::OutputManagerState;
+use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
+use smithay::wayland::presentation::PresentationState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::selection::primary_selection::PrimarySelectionState;
 use smithay::wayland::selection::wlr_data_control::DataControlState;
@@ -45,6 +47,49 @@ pub struct Bloqueo {
     pub fallo: bool,
 }
 
+/// Un gesto en curso sobre el escritorio.
+pub enum ArrastreEscritorio {
+    /// La banda elástica, desde ese punto lógico. `previa` es la selección que
+    /// había al empezar: con Ctrl la banda **suma** a lo que ya estaba
+    /// marcado, y sin él va vacía.
+    Banda {
+        origen: smithay::utils::Point<f64, smithay::utils::Logical>,
+        previa: Vec<bool>,
+    },
+    /// Iconos agarrados. Hasta que el ratón no se aleja del umbral no se mueve
+    /// nada: sin eso, un clic con la mano poco firme recolocaría el icono.
+    Iconos {
+        origen: smithay::utils::Point<f64, smithay::utils::Logical>,
+        movido: bool,
+    },
+}
+
+/// El permiso de compartir pantalla que la tarjeta tiene abierto.
+///
+/// Los dos emisarios van al hilo del portal, que está esperándolos: primero la
+/// respuesta del usuario y, si es que sí, el identificador del nodo que dará
+/// PipeWire. **Soltar este `Consentimiento` sin contestar es la negativa**, así
+/// que no hay camino por el que el portal se quede colgado.
+pub struct Consentimiento {
+    pub sesion: u32,
+    pub respuesta: crate::portal::Emisario<(u32, u32)>,
+    pub nodo: crate::portal::Emisario<u32>,
+    /// Las salidas que se le enseñaron, en el mismo orden que las celdas de la
+    /// tarjeta: la respuesta viene como índice de esta lista.
+    pub salidas: Vec<smithay::output::Output>,
+}
+
+/// Un rectángulo de la pantalla que hay que fotografiar, en lógicos.
+#[derive(Debug, Clone, Copy)]
+pub struct CapturaPedida {
+    pub x: i32,
+    pub y: i32,
+    pub ancho: i32,
+    pub alto: i32,
+    /// A un fichero. Con `false` va al portapapeles.
+    pub guardar: bool,
+}
+
 pub struct BookosComp {
     pub display_handle: DisplayHandle,
     pub loop_handle: LoopHandle<'static, BookosComp>,
@@ -60,7 +105,13 @@ pub struct BookosComp {
     /// Cuándo llegó el último evento de entrada. Decide si el backend anidado
     /// sondea rápido o se relaja.
     pub last_input: Option<Instant>,
-    pub frames: FrameStats,
+    /// El ritmo de dibujo: qué cuesta cada fotograma y cuántos se pierden.
+    pub metricas: crate::metricas::Metricas,
+    /// Un despertar por segundo mientras el panel de diagnóstico esté puesto.
+    /// Es la única fuente de sondeo del compositor y existe solo mientras se
+    /// está mirando: sin esto los números se congelarían con el escritorio
+    /// quieto, que es justo cuando hace falta ver que están a cero.
+    pub tick_diagnostico: Option<smithay::reexports::calloop::RegistrationToken>,
 
     pub space: Space<Window>,
     pub seat: Seat<Self>,
@@ -163,9 +214,38 @@ pub struct BookosComp {
     /// el backend de sesión real; anidado se queda en `None` porque ahí la
     /// entrada la da el compositor de debajo.
     pub aplicar_touchpad: Option<Box<dyn Fn(bool)>>,
-    /// Ruta del fondo que pide la configuración, copiada por lo mismo que la
-    /// escala: la `Config` se la lleva el shell al construirse.
-    pub fondo_config: Option<String>,
+    /// Rutas del fondo que pide la configuración: la de siempre y, si las hay,
+    /// una por tema. Copiadas por lo mismo que la escala: la `Config` se la
+    /// lleva el shell al construirse.
+    ///
+    /// Se guardan las **tres** y se elige al recargar, no al arrancar, porque
+    /// el tema cambia en caliente y el fondo tiene que irse con él.
+    pub fondo_config: crate::fondo::Eleccion,
+    /// Hay que volver a cargar el fondo, porque cambió el tema o la
+    /// configuración.
+    ///
+    /// Es una marca y no una llamada directa por lo mismo que `needs_redraw`:
+    /// decodificar la imagen y subirla —la del fondo y la mipmapeada del
+    /// cristal— necesita el `GlesRenderer`, que vive dentro del backend y no
+    /// se ve desde aquí. El backend la consulta en su punto de dibujo, donde
+    /// sí lo tiene.
+    pub recargar_fondo: bool,
+    /// El fondo que se está yendo y cuándo empezó a irse, mientras dura el
+    /// fundido con el que entra. `None` fuera de la transición.
+    ///
+    /// Son otros veinte megas de textura viva durante esos milisegundos, y por
+    /// eso se suelta en cuanto acaba en vez de guardarse por si acaso.
+    pub fondo_saliente: Option<(crate::fondo::Fondo, Instant)>,
+    /// Lo que el usuario eligió en Apariencia: claro, oscuro o que siga la hora.
+    ///
+    /// El tema **efectivo** vive en `bookos_shell::tema`, que es global del
+    /// proceso; esto es lo otro, lo elegido, y de los dos sale el que se pinta.
+    pub modo_tema: bookos_shell::tema::ModoTema,
+    /// Las dos horas del modo automático.
+    pub horas_tema: (bookos_shell::tema::HoraDelDia, bookos_shell::tema::HoraDelDia),
+    /// El despertar del próximo cambio automático. `None` con un modo fijo: sin
+    /// nada que esperar no se deja ningún temporizador puesto.
+    pub tick_tema: Option<smithay::reexports::calloop::RegistrationToken>,
     /// Tamaño lógico del cursor. Copia de la configuración por lo mismo que
     /// `escala_forzada`: el tema se vuelve a cargar cada vez que cambia la
     /// escala, y para entonces la `Config` ya se la llevó el shell.
@@ -179,6 +259,11 @@ pub struct BookosComp {
     /// cliente: si no, la terminal que arrastras cree que estás seleccionando
     /// texto.
     pub arrastre: Option<crate::ventanas::Arrastre>,
+    /// Lo que se está arrastrando **sobre el escritorio**: la banda elástica o
+    /// un puñado de iconos. Va aparte de `arrastre`, que es de ventanas: aquí
+    /// no hay ningún cliente de por medio y el gesto no puede acabar encajando
+    /// nada contra un borde.
+    pub arrastre_escritorio: Option<ArrastreEscritorio>,
 
     /// Cómo saltar a otro terminal virtual. Lo rellena el backend de sesión
     /// real; anidado se queda en `None` porque el TTY no es nuestro.
@@ -247,6 +332,63 @@ pub struct BookosComp {
     /// tamaño lógico". Sin viewporter, la escala fraccional no sirve de nada.
     #[allow(dead_code)]
     pub fractional_scale_state: FractionalScaleManagerState,
+    /// `wp_presentation`: los clientes reciben el vblank real y la frecuencia
+    /// de la salida, necesario para animar a 120/144 Hz sin asumir 60 Hz.
+    pub _presentation_state: PresentationState,
+    /// `zwp_linux_dmabuf_v1`: el cliente dibuja en la GPU y nos pasa el
+    /// **descriptor** del buffer, no sus píxeles.
+    ///
+    /// Sin este global, Mesa no encuentra forma de hacer EGL acelerado sobre
+    /// Wayland y todo cliente cae a software: el navegador rasteriza por CPU y
+    /// entrega el resultado por `wl_shm`, que aquí obliga a una copia CPU→GPU
+    /// por ventana y por fotograma. Y como un buffer de memoria compartida
+    /// nunca se puede exportar a un plano DRM, el direct scanout que promete
+    /// la cabecera de `backend::udev` no podía ocurrir para ningún cliente.
+    /// `zwlr_screencopy_v1`: copiar una salida a un buffer del cliente. Es lo
+    /// que da capturas de pantalla y compartir pantalla. Ver [`crate::captura`].
+    #[allow(dead_code)]
+    pub captura_state: crate::captura::CapturaState,
+    /// Las copias pedidas y todavía sin servir. Se sirven tras el próximo
+    /// fotograma de su salida, que es de donde sale la imagen.
+    pub capturas_pantalla: Vec<crate::captura::Pendiente>,
+    /// Una captura pedida desde la capa del escritorio y todavía sin hacer.
+    ///
+    /// Se sirve al componer el siguiente fotograma, igual que las de
+    /// `zwlr_screencopy`: la capa acaba de cerrarse y hay que dejar que el
+    /// escritorio se dibuje sin ella antes de fotografiarlo.
+    pub captura_pedida: Option<CapturaPedida>,
+    /// El portal de escritorio (`org.freedesktop.impl.portal.*`). Nadie la lee:
+    /// se guarda porque al soltarla se cierra el bus y se pierde el nombre, y
+    /// entonces `xdg-desktop-portal` dejaría de encontrar el backend. Ver
+    /// [`crate::portal`].
+    #[allow(dead_code)]
+    pub bus_portal: Option<zbus::blocking::Connection>,
+    /// Las pantallas que se están compartiendo ahora mismo, y el hilo de
+    /// PipeWire que las sirve. Ver [`crate::emision`].
+    pub emisiones: crate::emision::Emisiones,
+    /// El permiso de compartir pantalla que está en la tarjeta ahora mismo.
+    ///
+    /// Vive aquí y no en el shell porque el que espera es el hilo del portal:
+    /// pase lo que pase con la tarjeta —se contesta, se cierra con un clic
+    /// fuera, o el shell se cae— hay que mandarle **una** respuesta, y este es
+    /// el sitio desde el que se ve todo eso.
+    pub consentimiento: Option<Consentimiento>,
+    /// Quién espera la ruta del PNG de la captura en curso, si la pidió el
+    /// portal en vez de la tecla Impr.
+    pub captura_portal: Option<crate::portal::Emisario<std::path::PathBuf>>,
+    pub dmabuf_state: DmabufState,
+    /// El global vivo. Al soltarlo desaparece y los clientes vuelven a SHM, así
+    /// que hay que guardarlo aunque nadie lo lea. `None` hasta que el backend
+    /// arranca: los formatos salen del contexto EGL, que todavía no existe.
+    #[allow(dead_code)]
+    pub dmabuf_global: Option<DmabufGlobal>,
+    /// La conexión EGL del backend, solo para **validar** una importación.
+    ///
+    /// El `GlesRenderer` vive dentro del backend y el estado no lo ve; sacarlo
+    /// hasta aquí sería repartir de nuevo la propiedad del renderer para
+    /// contestar sí o no a una pregunta que `EGLDisplay` ya sabe contestar:
+    /// si sabe hacer la `EGLImage`, el import del fotograma también podrá.
+    pub egl_display: Option<smithay::backend::egl::EGLDisplay>,
     #[allow(dead_code)]
     pub viewporter_state: ViewporterState,
     /// `wp_cursor_shape_v1`: el cliente dice **qué forma** quiere —"texto",
@@ -335,6 +477,12 @@ impl BookosComp {
             .is_some_and(|q| q <= bookos_shell::toast::SALIDA);
         osd_saliendo
             || toast_saliendo
+            // El fundido entre dos fondos: sin esto el bucle se dormiría a
+            // mitad y el fondo nuevo se quedaría a medio aparecer.
+            || self.fondo_saliente.is_some()
+            // El recuadro de la captura se mueve con el ratón: sin esto el
+            // bucle se dormiría a mitad del arrastre.
+            || self.shell.as_ref().is_some_and(|s| s.captura_animando())
             || self
                 .shell
                 .as_ref()
@@ -369,6 +517,14 @@ impl BookosComp {
         let data_control_state =
             DataControlState::new::<Self, _>(&dh, Some(&primary_selection_state), |_| true);
         let fractional_scale_state = FractionalScaleManagerState::new::<Self>(&dh);
+        // Linux CLOCK_MONOTONIC. DRM usa este mismo reloj cuando el driver
+        // anuncia timestamps monotónicos para los page-flips.
+        let presentation_state = PresentationState::new::<Self>(&dh, 1);
+        // El global se crea en el backend, cuando ya hay contexto EGL del que
+        // sacar los formatos: anunciar una lista vacía sería peor que no
+        // anunciar nada.
+        let dmabuf_state = DmabufState::new();
+        let captura_state = crate::captura::CapturaState::new(&dh);
         let viewporter_state = ViewporterState::new::<Self>(&dh);
         let cursor_shape_state =
             smithay::wayland::cursor_shape::CursorShapeManagerState::new::<Self>(&dh);
@@ -422,6 +578,19 @@ impl BookosComp {
         let pantallas = crate::pantallas::Estado::default();
         let bus_ajustes = crate::ajustes::arrancar(ajustes, pantallas.compartido.clone());
 
+        // El portal de escritorio, por el mismo camino: su hilo pide, este
+        // bucle decide. Ver la cabecera de `crate::portal`.
+        let (portal, fuente_portal) = smithay::reexports::calloop::channel::channel();
+        loop_handle
+            .insert_source(fuente_portal, |evento, _, state| {
+                use smithay::reexports::calloop::channel::Event;
+                if let Event::Msg(aviso) = evento {
+                    crate::portal::recibir(state, aviso);
+                }
+            })
+            .map_err(|err| anyhow::anyhow!("insert_source(portal): {err}"))?;
+        let bus_portal = crate::portal::arrancar(portal);
+
         // MPRIS puede lanzar varios procesos `busctl`; se consulta después de
         // que el bloqueo ya esté visible y en un hilo corto. El resultado
         // vuelve por calloop, igual que las notificaciones, sin bloquear frames.
@@ -442,7 +611,13 @@ impl BookosComp {
 
         let entrada = std::mem::take(&mut config.entrada);
         let cursor_nominal = config.cursor;
-        let fondo_config = config.fondo.clone();
+        let modo_tema = config.modo_tema;
+        let horas_tema = (config.tema_claro_desde, config.tema_oscuro_desde);
+        let fondo_config = crate::fondo::Eleccion {
+            ambos: config.fondo.clone(),
+            claro: config.fondo_claro.clone(),
+            oscuro: config.fondo_oscuro.clone(),
+        };
 
         Ok(Self {
             display_handle: dh,
@@ -453,7 +628,8 @@ impl BookosComp {
             needs_redraw: true,
             bloqueo: Bloqueo::default(),
             last_input: None,
-            frames: FrameStats::default(),
+            metricas: crate::metricas::Metricas::new(),
+            tick_diagnostico: None,
             space: Space::default(),
             seat,
             pointer,
@@ -489,7 +665,13 @@ impl BookosComp {
             aplicar_touchpad: None,
             cursor_nominal,
             fondo_config,
+            recargar_fondo: false,
+            fondo_saliente: None,
+            modo_tema,
+            horas_tema,
+            tick_tema: None,
             arrastre: None,
+            arrastre_escritorio: None,
             ultimo_clic: None,
             cambiar_vt: None,
             hijos: Vec::new(),
@@ -512,6 +694,17 @@ impl BookosComp {
             medios_bloqueo,
             bloqueo_generacion: 0,
             fractional_scale_state,
+            _presentation_state: presentation_state,
+            captura_state,
+            capturas_pantalla: Vec::new(),
+            captura_pedida: None,
+            bus_portal,
+            emisiones: crate::emision::Emisiones::new(),
+            consentimiento: None,
+            captura_portal: None,
+            dmabuf_state,
+            dmabuf_global: None,
+            egl_display: None,
             viewporter_state,
             cursor_shape_state,
             xwayland_shell_state,
@@ -606,7 +799,20 @@ impl BookosComp {
     }
 
     /// Todo lo que hay que hacer justo antes de volver a dormir en `epoll`.
+    /// Si el próximo dibujo va a componer **además** en un buffer aparte.
+    ///
+    /// Lo hacen las copias de `zwlr_screencopy`, la captura de la tecla Impr y
+    /// las pantallas compartidas: las tres recomponen la escena en su propio
+    /// offscreen después de presentar. Ver [`crate::backend::servir_capturas`].
+    pub fn hay_offscreen_pendiente(&self) -> bool {
+        !self.capturas_pantalla.is_empty() || self.captura_pedida.is_some() || self.emisiones.hay()
+    }
+
     pub fn post_dispatch(&mut self) {
+        // Si la tarjeta del permiso se cerró sin contestar —un clic fuera—, el
+        // hilo del portal sigue bloqueado. Se le manda la negativa.
+        crate::portal::denegar_si_se_cerro(self);
+
         // Una emergente entrando pide fotogramas aunque no pase nada más. Es la
         // única vez que este compositor dibuja sin que haya ocurrido un evento,
         // y dura lo que dura la animación: 280 ms.
@@ -619,6 +825,12 @@ impl BookosComp {
         } else if let Some(shell) = self.shell.as_mut() {
             // Ya no se mueve nada: se sueltan los buffers de lo que se cerró.
             shell.fin_animacion();
+            // `fin_animacion` puede abrir la tarjeta que quedó en cola al
+            // cambiar de widget. Esa entrada necesita su primer frame ahora;
+            // sin marcarlo, el bucle dormiría justo después de crearla.
+            if shell.animando() {
+                self.needs_redraw = true;
+            }
         }
         // Y lo mismo con las ventanas: una que está apareciendo o llegando a su
         // sitio pide fotogramas aunque el cliente no haga commit. `any` corta en
@@ -629,63 +841,24 @@ impl BookosComp {
         {
             self.needs_redraw = true;
         }
-        self.frames.maybe_report();
+        // Cierra la ventana de medida si toca y se la pasa al panel, que solo
+        // repinta si los números cambiaron.
+        if self.metricas.toca_cerrar() {
+            let vivas: Vec<String> = self.space.outputs().map(|o| o.name()).collect();
+            self.metricas.retener(&vivas);
+            if self.metricas.cerrar_ventana() {
+                let datos = self.metricas.datos().clone();
+                if self
+                    .shell
+                    .as_mut()
+                    .is_some_and(|s| s.diagnostico_datos(datos))
+                {
+                    self.needs_redraw = true;
+                }
+            }
+        }
         self.space.refresh();
         self.display_handle.flush_clients().ok();
-    }
-}
-
-/// Contadores del bucle de dibujo.
-///
-/// Existen para poder demostrar —y no solo afirmar— que el compositor está
-/// quieto cuando la pantalla está quieta. `submitted` es lo que llega a la
-/// pantalla; `skipped` son las veces que se evaluó el damage y no había nada
-/// que cambiar. En un escritorio en reposo, `submitted` debe tender a cero.
-#[derive(Default)]
-pub struct FrameStats {
-    pub submitted: u64,
-    pub skipped: u64,
-    /// Cuánto se ha tardado dibujando, en total y en el peor caso.
-    ///
-    /// La media sola engaña: un escritorio que dibuja a 2 ms de media pero se
-    /// va a 40 en un fotograma de cada diez se ve peor que uno constante a 8, y
-    /// es exactamente lo que se percibe como que "va a tirones".
-    tiempo: Duration,
-    peor: Duration,
-    last_report: Option<Instant>,
-}
-
-impl FrameStats {
-    /// Vuelca un resumen como mucho una vez cada 5 s, y solo si hubo actividad.
-    /// Apunta lo que ha costado un fotograma.
-    pub fn dibujado(&mut self, cuanto: Duration) {
-        self.tiempo += cuanto;
-        self.peor = self.peor.max(cuanto);
-    }
-
-    pub fn maybe_report(&mut self) {
-        const EVERY: Duration = Duration::from_secs(5);
-        let now = Instant::now();
-        let last = *self.last_report.get_or_insert(now);
-        if now.duration_since(last) < EVERY {
-            return;
-        }
-        let secs = now.duration_since(last).as_secs_f64();
-        if self.submitted > 0 || self.skipped > 0 {
-            let n = (self.submitted + self.skipped).max(1) as f64;
-            tracing::info!(
-                fps_reales = format_args!("{:.1}", self.submitted as f64 / secs),
-                saltados = format_args!("{:.1}/s", self.skipped as f64 / secs),
-                media_ms = format_args!("{:.2}", self.tiempo.as_secs_f64() * 1000.0 / n),
-                peor_ms = format_args!("{:.2}", self.peor.as_secs_f64() * 1000.0),
-                "ritmo de dibujo"
-            );
-        }
-        self.submitted = 0;
-        self.skipped = 0;
-        self.tiempo = Duration::ZERO;
-        self.peor = Duration::ZERO;
-        self.last_report = Some(now);
     }
 }
 

@@ -226,6 +226,119 @@ fn comprobar_encierro(state: &mut BookosComp) {
     tracing::info!("--- fin ---");
 }
 
+/// Recorre entero el permiso de compartir pantalla, sin D-Bus de por medio.
+///
+/// Es la mitad que no se puede provocar desde un script: `Start` bloquea al
+/// hilo del portal hasta que alguien pulsa en la tarjeta, y pulsar en la
+/// tarjeta pide un ratón dentro del compositor anidado. Aquí se sintetiza el
+/// mismo [`crate::portal::Aviso`] que mandaría el hilo y se contesta con la
+/// misma tecla que el usuario, así que lo único que queda sin ejercitar es el
+/// empaquetado D-Bus —que sí se puede mirar desde fuera con `busctl`—.
+///
+/// Se ejecuta con `BOOKOS_SELFTEST_COMPARTIR=1`.
+fn comprobar_compartir(state: &mut BookosComp) {
+    tracing::info!("--- permiso de compartir pantalla ---");
+
+    let (respuesta, espera) = crate::portal::promesa();
+    let (nodo, espera_nodo) = crate::portal::promesa();
+    crate::portal::recibir(
+        state,
+        crate::portal::Aviso::Consentir {
+            sesion: 1,
+            app: "Autotest".into(),
+            respuesta,
+            nodo,
+        },
+    );
+
+    let abierta = state.shell.as_ref().and_then(|s| s.emergente_nombre());
+    if abierta != Some("compartir") {
+        tracing::error!(?abierta, "la tarjeta del permiso no se abrió");
+        return;
+    }
+    tracing::info!("la tarjeta se abrió");
+
+    // Intro acepta la pantalla resaltada, que es la primera.
+    let accion = state
+        .shell
+        .as_mut()
+        .and_then(|s| s.tecla(bookos_shell::TeclaPulsada::Intro).1);
+    match accion {
+        Some(accion) => crate::keybinds::hacer(state, accion),
+        None => {
+            tracing::error!("Intro no produjo ninguna acción");
+            return;
+        }
+    }
+
+    // Ya está contestado: `responder` corre en este mismo hilo, así que el
+    // buzón tiene el valor sin necesidad de esperar a nada.
+    match futuro_ya_resuelto(espera) {
+        Some((ancho, alto)) => tracing::info!(ancho, alto, "permiso concedido"),
+        None => {
+            tracing::error!("el permiso salió denegado");
+            return;
+        }
+    }
+    if !state.emisiones.hay() {
+        tracing::error!("no quedó ninguna emisión viva");
+        return;
+    }
+
+    // `BOOKOS_SELFTEST_COMPARTIR=queda` deja la emisión viva y mueve el puntero
+    // sin parar: es la única forma de enchufar un consumidor de verdad
+    // (`gst-launch-1.0 pipewiresrc`) y mirar los píxeles, porque sin daño en la
+    // pantalla no sale ni un fotograma, que es justo el diseño.
+    let queda = std::env::var("BOOKOS_SELFTEST_COMPARTIR").is_ok_and(|v| v == "queda");
+
+    // El identificador del nodo lo asigna PipeWire en su propio hilo, así que
+    // no está en esta misma vuelta del bucle. Se mira un segundo después, que
+    // es también tiempo de sobra para que hayan salido varios fotogramas.
+    // El `Timer` quiere un `FnMut` y leer la promesa la consume, así que va en
+    // un `Option` que se vacía la primera vez. El temporizador se suelta acto
+    // seguido, así que no hay una segunda.
+    let mut espera_nodo = Some(espera_nodo);
+    let result = state.loop_handle.insert_source(
+        Timer::from_duration(Duration::from_secs(1)),
+        move |_, _, state: &mut BookosComp| {
+            match espera_nodo.take().and_then(futuro_ya_resuelto) {
+                Some(id) => tracing::info!(node_id = id, "nodo de PipeWire vivo"),
+                None => tracing::error!("PipeWire no dio identificador de nodo"),
+            }
+            if queda {
+                tracing::info!("la emisión se queda; muevo el puntero para dar daño");
+                programar_paso(state, 0);
+                return TimeoutAction::Drop;
+            }
+            state.emisiones.quitar(1);
+            tracing::info!("--- fin ---");
+            TimeoutAction::Drop
+        },
+    );
+    if let Err(err) = result {
+        tracing::error!("no se pudo programar la comprobación del nodo: {err}");
+    }
+    // Sin esto el escritorio está quieto y no sale ni un fotograma: la emisión
+    // va pegada al dibujo, no a un temporizador.
+    state.needs_redraw = true;
+}
+
+/// Lee una [`crate::portal::Promesa`] que ya tiene que estar resuelta.
+///
+/// El autotest corre en el hilo del bucle y no puede `.await`ear nada, pero
+/// tampoco lo necesita: cuando llega aquí, quien tenía que contestar ya lo ha
+/// hecho. Un `poll` con un waker que no hace nada lo saca sin bloquear, y si
+/// sale `Pending` es que el fallo es justo que nadie contestó.
+fn futuro_ya_resuelto<T>(promesa: crate::portal::Promesa<T>) -> Option<T> {
+    use std::task::{Context, Poll};
+    let waker = std::task::Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    match std::pin::pin!(promesa).poll(&mut cx) {
+        Poll::Ready(v) => v,
+        Poll::Pending => None,
+    }
+}
+
 /// Comprueba que el panel y el dock se apartan de las ventanas y vuelven.
 ///
 /// Es lo que hacen Meta+Alt+B y Meta+Alt+D. Se prueba aquí y no con un test
@@ -550,6 +663,320 @@ fn comprobar_cursor(state: &mut BookosComp) {
     }
 }
 
+/// Cuánto se espera, desde que arranca el fundido, a que haya terminado.
+///
+/// El fundido dura `tema::D_PAGINA`; el margen de más cubre que la muestra se
+/// tome unos milisegundos tarde y que el último fotograma tenga que llegar.
+const FUNDIDO_MARGEN: Duration = Duration::from_millis(500);
+
+/// La capa de captura, por el camino de verdad: se abre con el atajo, se marca
+/// un recuadro arrastrando y se comprueba que el PNG acaba en el disco con las
+/// medidas que se pidieron.
+fn comprobar_captura(state: &mut BookosComp) {
+    use crate::keybinds::{ejecutar, Accion};
+
+    tracing::info!("--- captura de pantalla ---");
+    ejecutar(state, Accion::Captura);
+    if !state.shell.as_ref().is_some_and(|s| s.hay_captura()) {
+        tracing::error!("el atajo no abrió la capa de captura");
+        return;
+    }
+    tracing::info!("capa abierta");
+
+    // Un recuadro a mano, por el mismo camino que el ratón: pulsar, mover y
+    // soltar. Las coordenadas son lógicas de la pantalla.
+    let (x0, y0, x1, y1) = (200.0, 150.0, 600.0, 450.0);
+    let accion = state.shell.as_mut().and_then(|s| {
+        s.captura_pulsar(x0, y0);
+        s.captura_puntero(x1, y1);
+        s.captura_soltar()
+    });
+    let Some(accion) = accion else {
+        tracing::error!("soltar el arrastre no pidió ninguna captura");
+        return;
+    };
+    tracing::info!(?accion, "recuadro marcado");
+    // El destino por defecto es el portapapeles, así que esta primera va ahí.
+    // La del fichero se pide después, con la misma región: son dos caminos
+    // distintos y hay que pasar por los dos.
+    let region = match accion {
+        bookos_shell::Accion::Capturar { x, y, ancho, alto, .. } => (x, y, ancho, alto),
+        _ => {
+            tracing::error!("el arrastre pidió algo que no era una captura");
+            return;
+        }
+    };
+    ejecutar(state, Accion::DelShell(accion));
+    if state.shell.as_ref().is_some_and(|s| s.hay_captura()) {
+        tracing::error!("la capa sigue abierta: saldría en la propia foto");
+    }
+    if state.captura_pedida.is_none() {
+        tracing::error!("no quedó ninguna captura pedida");
+        return;
+    }
+
+    // La foto se hace al componer el siguiente fotograma.
+    let _ = state.loop_handle.insert_source(
+        Timer::from_duration(Duration::from_millis(400)),
+        move |_, _, state: &mut BookosComp| {
+            if state.captura_pedida.is_some() {
+                tracing::error!("la captura se quedó pendiente");
+                return TimeoutAction::Drop;
+            }
+            // Que el compositor sea el dueño del portapapeles y ofrezca una
+            // imagen. Que los bytes lleguen de verdad no se puede comprobar
+            // desde dentro —ver `captura::el_portapapeles_tiene_imagen`—: eso
+            // pide un cliente que pegue.
+            if crate::captura::el_portapapeles_tiene_imagen(state) {
+                tracing::info!("el portapapeles ofrece la captura como image/png");
+            } else {
+                tracing::error!("el portapapeles no ofrece la captura");
+            }
+
+            // Y ahora la misma región al fichero, que es el otro camino.
+            let (x, y, ancho, alto) = region;
+            crate::keybinds::ejecutar(
+                state,
+                crate::keybinds::Accion::DelShell(bookos_shell::Accion::Capturar {
+                    x,
+                    y,
+                    ancho,
+                    alto,
+                    guardar: true,
+                }),
+            );
+            let _ = state.loop_handle.insert_source(
+                Timer::from_duration(Duration::from_millis(400)),
+                |_, _, state: &mut BookosComp| {
+                    if state.captura_pedida.is_some() {
+                        tracing::error!("la captura a fichero se quedó pendiente");
+                        return TimeoutAction::Drop;
+                    }
+                    match bookos_shell::captura::ultima_guardada() {
+                        Some(ruta) => match std::fs::metadata(&ruta) {
+                            Ok(m) if m.len() > 0 => {
+                                tracing::info!(?ruta, bytes = m.len(), "captura guardada")
+                            }
+                            _ => tracing::error!(?ruta, "el fichero está vacío o no está"),
+                        },
+                        None => tracing::error!("no se guardó ninguna captura"),
+                    }
+                    tracing::info!("--- fin del autotest de captura ---");
+                    TimeoutAction::Drop
+                },
+            );
+            TimeoutAction::Drop
+        },
+    );
+}
+
+/// Cambiar de tema tiene que llevarse el fondo con él.
+///
+/// No se puede comprobar desde el shell: el fondo lo carga el compositor y la
+/// recarga pasa por el backend, que es quien tiene el `GlesRenderer`. Aquí se
+/// pulsa por el camino de verdad —la misma `Accion` que manda la tarjeta de
+/// apariencia— y se mira qué fichero acabó puesto.
+fn comprobar_apariencia(state: &mut BookosComp) {
+    use crate::keybinds::hacer;
+    use bookos_shell::tema::{actual, Tema};
+
+    tracing::info!("--- apariencia ---");
+    // Lo que había, para dejarlo como estaba: este autotest va por el camino de
+    // verdad y ese camino **escribe en `panel.conf`**. Sin devolverlo, correr
+    // la batería de pruebas le cambiaba el tema al usuario.
+    let modo_original = bookos_shell::tema::modo_actual();
+    let acento_original = bookos_shell::tema::acento_actual();
+    let antes_tema = actual();
+    let antes = state.fondo.as_ref().map(|f| f.ruta().to_path_buf());
+    tracing::info!(?antes_tema, ?antes, "de partida");
+
+    // El modo contrario y **fijo**: lo que se comprueba es que cambiar de tema
+    // se lleva el fondo, no la política del automático, que tiene sus propios
+    // tests en `tema::tema_automatico`.
+    let otro = match antes_tema {
+        Tema::Claro => bookos_shell::tema::ModoTema::Oscuro,
+        Tema::Oscuro => bookos_shell::tema::ModoTema::Claro,
+    };
+    hacer(
+        state,
+        bookos_shell::Accion::Apariencia {
+            modo: otro,
+            acento: bookos_shell::tema::acento_actual(),
+        },
+    );
+    if !state.recargar_fondo {
+        tracing::error!("el cambio de tema no pidió recargar el fondo");
+    }
+
+    // El fundido: se muestrea a los 120 ms, a mitad de los 280 que dura, y ahí
+    // tienen que estar **los dos** fondos vivos. Sin esto solo se sabría que la
+    // imagen acabó cambiando, que es justo lo que ya se comprobaba antes de que
+    // hubiera transición ninguna.
+    let _ = state.loop_handle.insert_source(
+        Timer::from_duration(Duration::from_millis(120)),
+        move |_, _, state: &mut BookosComp| {
+            let Some((saliente, desde)) = state.fondo_saliente.as_ref() else {
+                tracing::error!("a los 120 ms ya no hay fundido: el cambio fue un corte");
+                return TimeoutAction::Drop;
+            };
+            tracing::info!(
+                ms = desde.elapsed().as_millis(),
+                saliente = ?saliente.ruta().file_name(),
+                entrante = ?state.fondo.as_ref().and_then(|f| f.ruta().file_name()),
+                "a mitad del fundido hay dos fondos"
+            );
+            // Y que termine y suelte los veinte megas del saliente: dejarlo
+            // vivo sería una fuga por cada cambio de tema. Se cuenta desde
+            // **aquí** y no desde la acción: el fundido no arranca hasta que la
+            // imagen nueva está decodificada, que son otros ciento veinte
+            // milisegundos, y contarlo desde antes daba por perdido un fundido
+            // que solo iba por la mitad.
+            let queda = FUNDIDO_MARGEN.saturating_sub(desde.elapsed());
+            let _ = state.loop_handle.insert_source(
+                Timer::from_duration(queda),
+                move |_, _, state: &mut BookosComp| {
+                    if state.fondo_saliente.is_some() {
+                        tracing::error!("el fondo saliente sigue vivo pasado el fundido");
+                    } else {
+                        tracing::info!("el fundido terminó y soltó el fondo anterior");
+                    }
+                    // El selector va **detrás** y no en paralelo: cambia el
+                    // fondo otra vez, y con los dos a la vez el segundo fundido
+                    // estaría a medias cuando se comprueba el primero.
+                    comprobar_selector_de_fondo(state, modo_original, acento_original);
+                    TimeoutAction::Drop
+                },
+            );
+            TimeoutAction::Drop
+        },
+    );
+
+    // La recarga ocurre al componer el siguiente fotograma, no aquí: hay que
+    // dejar pasar uno antes de mirar.
+    let _ = state.loop_handle.insert_source(
+        Timer::from_duration(Duration::from_millis(300)),
+        move |_, _, state: &mut BookosComp| {
+            let despues = state.fondo.as_ref().map(|f| f.ruta().to_path_buf());
+            tracing::info!(tema = ?actual(), ?despues, "tras cambiar de tema");
+            if state.recargar_fondo {
+                tracing::error!("la recarga del fondo se quedó pendiente");
+            }
+
+            match (&antes, &despues) {
+                (Some(a), Some(d)) if a == d => tracing::error!(
+                    ?a,
+                    "el fondo no cambió con el tema: sigue siendo el mismo fichero"
+                ),
+                (Some(_), Some(d)) => {
+                    tracing::info!(?d, "el fondo se fue con el tema, correcto")
+                }
+                // Sin fondos instalados no hay nada que comprobar, y decirlo es
+                // mejor que dar por bueno un `None` que no prueba nada.
+                _ => tracing::warn!("no hay fondo cargado: no se puede comprobar"),
+            }
+            tracing::info!("--- fin del autotest de apariencia ---");
+            TimeoutAction::Drop
+        },
+    );
+}
+
+/// El selector de fondo de la tarjeta de Apariencia, por el camino de verdad:
+/// se abre la tarjeta, se pulsa una miniatura y se mira qué imagen acabó
+/// puesta.
+fn comprobar_selector_de_fondo(
+    state: &mut BookosComp,
+    modo_original: bookos_shell::tema::ModoTema,
+    acento_original: bookos_shell::tema::Acento,
+) {
+    tracing::info!("--- selector de fondo ---");
+    let familias = bookos_shell::fondos::instaladas(bookos_shell::tema::es_claro());
+    if familias.len() < 2 {
+        tracing::warn!(
+            cuantas = familias.len(),
+            "hacen falta dos familias instaladas para comprobar el cambio"
+        );
+        return;
+    }
+    let antes = state.fondo.as_ref().map(|f| f.ruta().to_path_buf());
+    // Lo que había, para devolverlo: elegir un fondo escribe `fondo_claro` y
+    // `fondo_oscuro` en `panel.conf`.
+    let fondo_original = state.fondo_config.clone();
+    // Una que **no** sea la puesta, o pulsarla no cambiaría nada y el test
+    // daría por bueno que no pasa nada.
+    let puesta = bookos_shell::fondos::elegida();
+    let Some(otra) = familias
+        .iter()
+        .find(|f| Some(f.nombre.as_str()) != puesta.as_deref())
+    else {
+        tracing::error!("no hay ninguna familia distinta de la puesta");
+        return;
+    };
+    tracing::info!(?antes, puesta = ?puesta, elegimos = %otra.nombre, "de partida");
+
+    crate::keybinds::hacer(
+        state,
+        bookos_shell::Accion::Fondo {
+            claro: otra.claro.clone(),
+            oscuro: otra.oscuro.clone(),
+        },
+    );
+    let esperada = otra.claro.clone();
+    let esperada_oscura = otra.oscuro.clone();
+    let _ = state.loop_handle.insert_source(
+        Timer::from_duration(Duration::from_millis(300)),
+        move |_, _, state: &mut BookosComp| {
+            let despues = state.fondo.as_ref().map(|f| f.ruta().to_path_buf());
+            tracing::info!(?despues, "tras elegir");
+            let bien = despues.as_deref() == Some(esperada.as_path())
+                || despues.as_deref() == Some(esperada_oscura.as_path());
+            if bien {
+                tracing::info!("el fondo elegido está puesto, correcto");
+            } else {
+                tracing::error!(?despues, ?esperada, "el fondo elegido no se aplicó");
+            }
+            restaurar_apariencia(state, modo_original, acento_original, &fondo_original);
+            tracing::info!("--- fin del autotest del selector ---");
+            TimeoutAction::Drop
+        },
+    );
+}
+
+/// Devuelve la apariencia y el fondo a lo que había antes del autotest, en el
+/// disco además de en la pantalla.
+///
+/// Va por el mismo camino que el usuario para que lo guardado sea lo original,
+/// no una mezcla: el autotest usó `Accion::Apariencia` y `Accion::Fondo`, y las
+/// dos escriben. Sin esto, pasar las pruebas le dejaba al usuario otro tema y
+/// otro fondo puestos.
+fn restaurar_apariencia(
+    state: &mut BookosComp,
+    modo: bookos_shell::tema::ModoTema,
+    acento: bookos_shell::tema::Acento,
+    fondo: &crate::fondo::Eleccion,
+) {
+    use crate::keybinds::hacer;
+    match (fondo.claro.as_deref(), fondo.oscuro.as_deref()) {
+        (Some(claro), Some(oscuro)) => hacer(
+            state,
+            bookos_shell::Accion::Fondo {
+                claro: claro.into(),
+                oscuro: oscuro.into(),
+            },
+        ),
+        // No había pareja elegida: se quitan las dos claves para dejar el
+        // fichero como estaba, sin ninguna.
+        _ => {
+            state.fondo_config = fondo.clone();
+            state.recargar_fondo = true;
+            if let Err(err) = bookos_shell::olvidar_fondo() {
+                tracing::warn!("no se pudo devolver el fondo: {err}");
+            }
+        }
+    }
+    hacer(state, bookos_shell::Accion::Apariencia { modo, acento });
+    tracing::info!(?modo, "apariencia devuelta a como estaba");
+}
+
 /// Comprueba la pantalla completa: la ventana ocupa la pantalla entera —panel
 /// incluido— y al salir vuelve exactamente a donde estaba.
 ///
@@ -833,7 +1260,7 @@ fn comprobar_escritorios(state: &mut BookosComp) {
         return;
     };
     let cuantas = state.space.elements().count();
-    tracing::info!(escritorio = state.escritorios.activo(), cuantas, ?antes, "de partida");
+    tracing::info!(escritorio = crate::escritorios::activo_aqui(state), cuantas, ?antes, "de partida");
 
     ejecutar(state, Accion::EscritorioRelativo(1));
     muestrear_deslizamiento(state, window, antes, cuantas, 0);
@@ -873,7 +1300,7 @@ fn muestrear_deslizamiento(
 
     // Terminada la animación: el escritorio nuevo tiene que estar vacío.
     let vacio = state.space.elements().count();
-    tracing::info!(escritorio = state.escritorios.activo(), quedan = vacio, "tras ir al 2");
+    tracing::info!(escritorio = crate::escritorios::activo_aqui(state), quedan = vacio, "tras ir al 2");
     if vacio != 0 || state.escritorios.deslizando() {
         tracing::error!(vacio, "el escritorio nuevo debería estar vacío y quieto");
     }
@@ -887,7 +1314,7 @@ fn muestrear_deslizamiento(
         move |_, _, state| {
             let despues = state.space.element_location(&window);
             tracing::info!(
-                escritorio = state.escritorios.activo(),
+                escritorio = crate::escritorios::activo_aqui(state),
                 vuelven = state.space.elements().count(),
                 ?despues,
                 "de vuelta al 1"
@@ -898,9 +1325,9 @@ fn muestrear_deslizamiento(
 
             // Y el extremo: a la izquierda del primero no hay nada.
             ejecutar(state, Accion::EscritorioRelativo(-1));
-            if state.escritorios.activo() != 0 {
+            if crate::escritorios::activo_aqui(state) != 0 {
                 tracing::error!(
-                    activo = state.escritorios.activo(),
+                    activo = crate::escritorios::activo_aqui(state),
                     "el primer escritorio no debería tener nada a su izquierda"
                 );
             }
@@ -1177,6 +1604,10 @@ fn run(state: &mut BookosComp) {
         comprobar_encierro(state);
         return;
     }
+    if std::env::var_os("BOOKOS_SELFTEST_COMPARTIR").is_some() {
+        comprobar_compartir(state);
+        return;
+    }
     if std::env::var_os("BOOKOS_SELFTEST_OSD").is_some() {
         // El aviso que sale al tocar el volumen, por el mismo camino que la
         // tecla de función: `multimedia::ejecutar` es quien lo pide.
@@ -1211,6 +1642,14 @@ fn run(state: &mut BookosComp) {
                 TimeoutAction::Drop
             },
         );
+        return;
+    }
+    if std::env::var_os("BOOKOS_SELFTEST_CAPTURA").is_some() {
+        comprobar_captura(state);
+        return;
+    }
+    if std::env::var_os("BOOKOS_SELFTEST_APARIENCIA").is_some() {
+        comprobar_apariencia(state);
         return;
     }
     if std::env::var_os("BOOKOS_SELFTEST_WIDGETS").is_some() {
@@ -1452,7 +1891,8 @@ fn muestrear_resize(state: &mut BookosComp, window: smithay::desktop::Window, i:
     let escala = crate::ventanas::escala_resize(&window, window.geometry().size);
     tracing::info!(
         i,
-        escala = format_args!("{escala:.3}"),
+        escala_x = format_args!("{:.3}", escala.x),
+        escala_y = format_args!("{:.3}", escala.y),
         tam = ?window.geometry().size,
         "escala del redimensionado"
     );

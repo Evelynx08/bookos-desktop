@@ -144,6 +144,9 @@ pub struct ShellHost {
     /// al abrirla y se destruye al cerrarla: a diferencia del panel y del dock,
     /// su tamaño lo decide su contenido y cambia de una a otra.
     emergente: Option<Surface>,
+    /// Página anterior del Launchpad mientras cruza con la nueva. Ambos
+    /// buffers están ya rasterizados; la GPU solo cambia posición y alfa.
+    pagina_anterior: Option<(Surface, std::time::Instant, f32)>,
     /// El realce de lo señalado dentro de la emergente. Va aparte porque mover
     /// el ratón por el launchpad repintaría el buffer entero: medido, 23 ms
     /// cada celda que se cruza. Como superficie propia solo cambia su posición.
@@ -154,6 +157,9 @@ pub struct ShellHost {
     /// termine la animación de salida. Sin esto desaparecía de golpe, que es lo
     /// que hace que un escritorio parezca hecho a trozos.
     cerrando_en: Option<std::time::Instant>,
+    /// Tarjeta solicitada mientras otra está saliendo. Se abre al terminar la
+    /// salida para que nunca se mezclen dos contenidos en el mismo buffer.
+    emergente_pendiente: Option<&'static str>,
     /// De dónde venía el realce y cuándo empezó a moverse, para que se deslice
     /// entre celdas en vez de saltar.
     realce_desde: Option<(Point<f64, Physical>, std::time::Instant)>,
@@ -166,8 +172,13 @@ pub struct ShellHost {
     /// La superficie del bloqueo, cuando está echado. Ocupa la pantalla entera
     /// y va por delante de todo lo demás.
     bloqueo: Option<Surface>,
+    /// La capa de captura de pantalla, mientras se elige qué capturar. Ocupa la
+    /// pantalla entera, como el bloqueo. Ver [`bookos_shell::captura`].
+    captura: Option<Surface>,
     /// La del aviso de volumen y brillo, mientras dura.
     osd: Option<Surface>,
+    /// El panel de diagnóstico, mientras esté puesto.
+    diagnostico: Option<Surface>,
     /// El aviso de la última notificación, mientras dura.
     toast: Option<Surface>,
     /// Isla superior de música, temporizador o grabación.
@@ -179,6 +190,13 @@ pub struct ShellHost {
     barras: std::collections::HashMap<u64, Surface>,
     /// La del conmutador de Alt+Tab, mientras el modificador siga pulsado.
     conmutador: Option<Surface>,
+    /// Una superficie por icono del escritorio. Van detrás de las ventanas, así
+    /// que se emiten aparte del resto del shell — ver
+    /// [`ShellHost::elementos_escritorio`].
+    escritorio: Vec<Surface>,
+    /// La banda elástica mientras se arrastra sobre el escritorio, en píxeles
+    /// **lógicos** y ya normalizada: `(x, y, ancho, alto)`.
+    banda: Option<(f64, f64, f64, f64)>,
     /// Cuando el shell hace panic se desactiva para siempre. Reintentar cada
     /// frame solo llenaría el log y repetiría el fallo.
     dead: bool,
@@ -255,23 +273,30 @@ impl ShellHost {
             dock: Surface::new(shell.dock_buffer_size(), shell.dock_logical_size()),
             shell,
             emergente: None,
+            pagina_anterior: None,
             realce: None,
             abierta_en: None,
             cerrando_en: None,
+            emergente_pendiente: None,
             realce_desde: None,
             screen: (width as i32, height as i32),
             panel_barra: EstadoBarra::new(),
             dock_barra: EstadoBarra::new(),
             bloqueo: None,
+            captura: None,
             osd: None,
+            diagnostico: None,
             toast: None,
             actividad: None,
             actividad_visible: true,
             conmutador: None,
             barras: std::collections::HashMap::new(),
+            escritorio: Vec::new(),
+            banda: None,
             dead: false,
         };
         host.place_dock();
+        host.escritorio_recolocar();
         host
     }
 
@@ -290,8 +315,8 @@ impl ShellHost {
             barra.escondida = false;
         }
         let modo = barra.modo;
-        // El dock cambia de sitio con el modo: pegado si es fijo, flotando si
-        // esquiva.
+        // El modo cambia cuándo se aparta, no su lenguaje visual: el dock se
+        // mantiene flotante en ambos casos.
         if cual == Barra::Dock {
             self.place_dock();
         }
@@ -444,25 +469,269 @@ impl ShellHost {
     }
 
     fn place_dock(&mut self) {
-        let pegado = self.dock_barra.modo == Visibilidad::Siempre;
-        if self.guard("dock pegado", |host| host.shell.dock_pegado(pegado)) == Some(true) {
+        // Siempre flotante. Antes el modo fijo lo pegaba al canto inferior,
+        // eliminaba sus esquinas de abajo y parecía una barra del sistema en
+        // vez de un dock. La visibilidad solo decide si puede apartarse.
+        if self.guard("dock flotante", |host| host.shell.dock_pegado(false)) == Some(true) {
             self.guard("pintar dock", |host| {
                 let buffer = &mut host.dock.buffer;
                 paint(buffer, |buf| host.shell.draw_dock(buf));
             });
         }
         let (dw, dh) = self.shell.dock_buffer_size();
-        // Fijo, pegado al borde; esquivando ventanas, flotando sobre él. No es
-        // un capricho: un dock que se aparta tiene que verse como algo que va
-        // y viene, y uno que está siempre es parte del marco de la pantalla.
-        let margin = if self.dock_barra.modo == Visibilidad::Siempre {
-            0.0
-        } else {
-            bookos_shell::DOCK_MARGIN as f64 * self.shell.scale() as f64
-        };
+        let margin = bookos_shell::DOCK_MARGIN as f64 * self.shell.scale() as f64;
         let x = ((self.screen.0 - dw as i32) as f64 / 2.0).max(0.0);
         let y = (self.screen.1 - dh as i32) as f64 - margin;
         self.dock.location = (x, y.max(0.0)).into();
+    }
+
+    // --- Iconos del escritorio ---------------------------------------------
+
+    /// Rehace la rejilla del escritorio y repinta todas sus celdas.
+    ///
+    /// Se llama al arrancar y al cambiar la pantalla de tamaño o de escala, no
+    /// en cada frame: rasterizar una celda cuesta lo suyo y aquí se rasterizan
+    /// todas.
+    pub fn escritorio_recolocar(&mut self) {
+        if self.dead {
+            return;
+        }
+        let escala = self.shell.scale() as f64;
+        let logica = (
+            self.screen.0 as f32 / escala as f32,
+            self.screen.1 as f32 / escala as f32,
+        );
+        let escala_f32 = self.shell.scale();
+        self.guard("recolocar el escritorio", |host| {
+            host.shell.escritorio_pantalla(logica, escala_f32);
+            let cuantos = host.shell.escritorio().cuantos();
+            let buffer = host.shell.escritorio_buffer_size();
+            let (lw, lh) = host.shell.escritorio_logical_size();
+            host.escritorio = (0..cuantos)
+                .map(|_| Surface::new(buffer, (lw as i32, lh as i32)))
+                .collect();
+            for i in 0..cuantos {
+                host.pintar_celda(i);
+            }
+            host.escritorio_colocar();
+        });
+    }
+
+    /// Pone cada superficie donde diga la rejilla. Es lo único que hace falta
+    /// mientras se arrastra: los buffers ya están pintados y solo cambian de
+    /// sitio, que es trabajo de la GPU.
+    fn escritorio_colocar(&mut self) {
+        let escala = self.shell.scale() as f64;
+        for i in 0..self.escritorio.len() {
+            let Some((x, y, _, _)) = self.shell.escritorio().rect(i) else {
+                continue;
+            };
+            self.escritorio[i].location = (x as f64 * escala, y as f64 * escala).into();
+        }
+    }
+
+    fn pintar_celda(&mut self, i: usize) {
+        let Self {
+            escritorio, shell, ..
+        } = self;
+        if let Some(surface) = escritorio.get_mut(i) {
+            paint(&mut surface.buffer, |buf| shell.draw_escritorio(i, buf));
+        }
+    }
+
+    /// Cambia la selección y repinta **solo** las celdas que cambiaron de
+    /// estado. Es lo que hace que barrer con la banda no cueste la pantalla
+    /// entera: por cada movimiento del ratón se rasterizan las una o dos celdas
+    /// que el borde acaba de cruzar.
+    fn escritorio_cambiar(
+        &mut self,
+        f: impl FnOnce(&mut bookos_shell::escritorio::Escritorio) -> bool,
+    ) -> bool {
+        if self.dead {
+            return false;
+        }
+        self.guard("selección del escritorio", |host| {
+            let antes = host.shell.escritorio().seleccion();
+            if !f(host.shell.escritorio_mut()) {
+                return false;
+            }
+            let despues = host.shell.escritorio().seleccion();
+            for i in 0..despues.len() {
+                if antes.get(i) != despues.get(i) {
+                    host.pintar_celda(i);
+                }
+            }
+            true
+        })
+        .unwrap_or(false)
+    }
+
+    /// Qué icono hay en un punto lógico.
+    pub fn escritorio_en(&self, x: f64, y: f64) -> Option<usize> {
+        if self.dead {
+            return None;
+        }
+        self.shell.escritorio().en(x as f32, y as f32)
+    }
+
+    pub fn escritorio_seleccionar(&mut self, i: Option<usize>, aditivo: bool) -> bool {
+        self.escritorio_cambiar(|e| e.seleccionar(i, aditivo))
+    }
+
+    pub fn escritorio_seleccion(&self) -> Vec<bool> {
+        if self.dead {
+            return Vec::new();
+        }
+        self.shell.escritorio().seleccion()
+    }
+
+    /// Pone la banda elástica —en lógicos y ya normalizada— y marca lo que
+    /// cruza. `previa` es la selección de antes de empezar a arrastrar.
+    ///
+    /// No dice si hay que repintar porque la respuesta es siempre que sí: la
+    /// banda cambia de tamaño con cada movimiento, y es parte de la escena
+    /// aunque no toque ningún icono.
+    pub fn escritorio_banda(&mut self, rect: (f64, f64, f64, f64), previa: &[bool]) {
+        self.banda = Some(rect);
+        let rect = (rect.0 as f32, rect.1 as f32, rect.2 as f32, rect.3 as f32);
+        self.escritorio_cambiar(|e| e.banda(rect, previa));
+    }
+
+    pub fn escritorio_quitar_banda(&mut self) -> bool {
+        self.banda.take().is_some()
+    }
+
+    /// Corre los iconos seleccionados mientras se arrastran.
+    pub fn escritorio_arrastrar(&mut self, delta: (f64, f64)) {
+        if self.dead {
+            return;
+        }
+        self.guard("arrastrar iconos", |host| {
+            host.shell
+                .escritorio_mut()
+                .arrastrar((delta.0 as f32, delta.1 as f32));
+            host.escritorio_colocar();
+        });
+    }
+
+    pub fn escritorio_arrastrando(&self) -> bool {
+        !self.dead && self.shell.escritorio().arrastrando()
+    }
+
+    /// Deja los iconos en su celda nueva y guarda las posiciones.
+    pub fn escritorio_soltar(&mut self) -> bool {
+        if self.dead {
+            return false;
+        }
+        self.guard("soltar iconos", |host| {
+            let movidos = host.shell.escritorio_mut().soltar();
+            host.escritorio_colocar();
+            movidos
+        })
+        .unwrap_or(false)
+    }
+
+    pub fn escritorio_abrir(&self, i: usize) -> Option<Accion> {
+        if self.dead {
+            return None;
+        }
+        self.shell.escritorio().abrir(i)
+    }
+
+    /// Los iconos del escritorio, para dibujarlos **detrás de las ventanas** y
+    /// delante del fondo. Por eso no salen por [`ShellHost::elements`], que es
+    /// lo que va por encima de todo.
+    pub fn elementos_escritorio<R>(
+        &self,
+        renderer: &mut R,
+    ) -> Vec<MemoryRenderBufferRenderElement<R>>
+    where
+        R: Renderer + ImportMem,
+        R::TextureId: Send + Clone + 'static,
+    {
+        if self.dead {
+            return Vec::new();
+        }
+        self.escritorio
+            .iter()
+            .filter_map(|surface| {
+                MemoryRenderBufferRenderElement::from_buffer(
+                    renderer,
+                    surface.location,
+                    &surface.buffer,
+                    None,
+                    Some(surface.src),
+                    Some(surface.logical),
+                    Kind::Unspecified,
+                )
+                .inspect_err(|_| tracing::warn!("no se pudo subir un icono del escritorio"))
+                .ok()
+            })
+            .collect()
+    }
+
+    /// La banda elástica: relleno y cuatro filos.
+    ///
+    /// Cinco rectángulos de color y no un buffer propio, por lo mismo que el
+    /// velo del launchpad: la banda cambia de tamaño en **cada** movimiento del
+    /// ratón, y rasterizarla en CPU sería repintar un buffer de medio millón de
+    /// píxeles por evento. Así solo cambia la geometría que se le pasa a la GPU.
+    pub fn banda_elementos(
+        &self,
+    ) -> Vec<smithay::backend::renderer::element::solid::SolidColorRenderElement> {
+        use smithay::backend::renderer::element::solid::SolidColorRenderElement;
+        use smithay::backend::renderer::element::Id;
+
+        let Some((x, y, w, h)) = self.banda else {
+            return Vec::new();
+        };
+        if self.dead || w < 1.0 || h < 1.0 {
+            return Vec::new();
+        }
+        // Los identificadores tienen que ser los mismos en cada frame: uno
+        // nuevo por frame le diría al damage tracker que cambia toda la
+        // pantalla, no solo donde estuvo la banda.
+        static IDS: std::sync::OnceLock<[Id; 5]> = std::sync::OnceLock::new();
+        let ids = IDS.get_or_init(|| std::array::from_fn(|_| Id::new()));
+
+        let escala = self.shell.scale() as f64;
+        let acento = bookos_shell::tema::acento();
+        let fisico = |v: f64| (v * escala).round() as i32;
+        let (x, y, w, h) = (fisico(x), fisico(y), fisico(w), fisico(h));
+        // Un píxel lógico de filo: a escala 2 son dos físicos, que es lo que
+        // hace que el borde se vea igual de fino en cualquier pantalla.
+        let filo = escala.round().max(1.0) as i32;
+        let rectangulos = [
+            (Rectangle::new((x, y).into(), (w, h).into()), 0.14),
+            (Rectangle::new((x, y).into(), (w, filo).into()), 0.9),
+            (
+                Rectangle::new((x, y + h - filo).into(), (w, filo).into()),
+                0.9,
+            ),
+            (Rectangle::new((x, y).into(), (filo, h).into()), 0.9),
+            (
+                Rectangle::new((x + w - filo, y).into(), (filo, h).into()),
+                0.9,
+            ),
+        ];
+        ids.iter()
+            .zip(rectangulos)
+            .map(|(id, (rect, alfa))| {
+                SolidColorRenderElement::new(
+                    id.clone(),
+                    rect,
+                    0,
+                    // Premultiplicado, que es lo que espera el renderer.
+                    [
+                        acento.r * alfa,
+                        acento.g * alfa,
+                        acento.b * alfa,
+                        alfa,
+                    ],
+                    Kind::Unspecified,
+                )
+            })
+            .collect()
     }
 
     /// Cuánto falta para que algún widget tenga algo nuevo que enseñar.
@@ -490,6 +759,39 @@ impl ShellHost {
         } else {
             self.shell.panel_height()
         }
+    }
+
+    /// El rectángulo lógico de la pantalla principal, que es donde vive **todo**
+    /// el shell: panel, dock, emergentes, bloqueo, OSD y avisos.
+    ///
+    /// Su origen es (0,0) porque `pantallas::normalizar` lleva ahí el de la
+    /// principal, y por eso una pantalla colocada a la izquierda o arriba usa
+    /// coordenadas negativas. Quien pregunte por un punto tiene que acotarlo
+    /// contra esto antes de creerse nada: los puntos que llegan son del
+    /// escritorio entero, no de este monitor.
+    pub fn area_principal(&self) -> (f64, f64) {
+        let escala = self.shell.scale() as f64;
+        (self.screen.0 as f64 / escala, self.screen.1 as f64 / escala)
+    }
+
+    /// La escala de la pantalla principal. **No** es la de la salida bajo el
+    /// puntero: lo que se mide contra las superficies del shell tiene que ir en
+    /// la escala en la que están dibujadas, y están dibujadas en la principal.
+    pub fn escala_principal(&self) -> f64 {
+        self.shell.scale() as f64
+    }
+
+    /// ¿Llega el escritorio hasta este punto lógico **global**? Es
+    /// [`Self::en_la_principal`] con nombre de lo que pregunta quien la usa: el
+    /// escritorio ocupa la principal entera, iconos y hueco vacío incluidos.
+    pub fn escritorio_alcanza(&self, x: f64, y: f64) -> bool {
+        !self.dead && self.en_la_principal(x, y)
+    }
+
+    /// ¿Cae este punto lógico **global** dentro de la pantalla principal?
+    fn en_la_principal(&self, x: f64, y: f64) -> bool {
+        let (w, h) = self.area_principal();
+        x >= 0.0 && y >= 0.0 && x < w && y < h
     }
 
     /// El dock en coordenadas **lógicas**: `(x, y, ancho, alto)`.
@@ -625,6 +927,16 @@ impl ShellHost {
         if self.dead {
             return false;
         }
+        // Lo primero, y no un detalle: el shell **solo existe en la principal**,
+        // pero el punto que llega es del escritorio entero. Sin acotar aquí, en
+        // una pantalla colocada a la izquierda —x negativa— la franja `y < 32`
+        // caía dentro del panel y se tragaba los clics, y peor: con cualquier
+        // emergente abierta se devolvía `true` para **toda** la pantalla
+        // secundaria, así que el ratón dejaba de funcionar ahí hasta cerrarla.
+        // El síntoma era «el ratón se vuelve raro en el monitor de al lado».
+        if !self.en_la_principal(x, y) {
+            return false;
+        }
         // El aviso de una notificación se dibuja encima de las ventanas, así
         // que también gana el hit-test mientras está: si no, pulsarlo escribiría
         // en lo que tenga debajo.
@@ -729,7 +1041,7 @@ impl ShellHost {
     /// launchpad a pantalla completa son varios megas que no tiene sentido
     /// guardar mientras está cerrado.
     fn sincronizar_emergente(&mut self) {
-        let Some(((w, h), ancla)) = self.shell.emergente_geometria() else {
+        let Some(((w, h), ancla, alto_colocacion)) = self.shell.emergente_geometria() else {
             // Cerrándose: las superficies se quedan hasta que acabe la salida.
             if self.cerrando_en.is_none() {
                 self.emergente = None;
@@ -759,7 +1071,10 @@ impl ShellHost {
                 .is_some_and(|s| s.logical != (w, h).into());
         if rehacer {
             self.emergente = Some(Surface::new(buffer, (w, h)));
-            self.colocar_emergente(ancla, (w, h));
+            // Se coloca por el alto **estable** cuando la emergente tiene uno:
+            // el buscador cambia de alto con cada tecla, y usar el de ahora lo
+            // hacía saltar media fila mientras escribes.
+            self.colocar_emergente(ancla, (w, alto_colocacion.unwrap_or(h)));
             if nueva {
                 self.abierta_en = Some(std::time::Instant::now());
             }
@@ -881,18 +1196,52 @@ impl ShellHost {
                     .clamp(SEPARACION, (ancho - w as f64 - SEPARACION).max(SEPARACION));
                 (izq, dy - h as f64 - SEPARACION)
             }
-            Ancla::Centrada => (
-                (self.screen.0 as f64 / escala - w as f64) / 2.0,
-                (self.screen.1 as f64 / escala - h as f64) / 2.0,
-            ),
+            // Centrada en el **área útil**, no en la pantalla: el panel come
+            // 32 px arriba y el dock unos 78 abajo, así que centrar contra el
+            // rectángulo entero deja la tarjeta por debajo del centro que se
+            // percibe. Con algo más alto que el área útil —el launchpad— la
+            // cuenta sale negativa y el recorte de abajo la deja en su sitio.
+            Ancla::Centrada => {
+                let arriba = self.shell.panel_height() as f64;
+                let (_, dock_y, _, _) = self.dock_rect();
+                let util = (dock_y - SEPARACION - arriba).max(1.0);
+                (
+                    (self.screen.0 as f64 / escala - w as f64) / 2.0,
+                    arriba + (util - h as f64) / 2.0,
+                )
+            }
             Ancla::Arriba => (0.0, 0.0),
         };
         // Sin esto, una emergente anclada cerca del borde derecho se saldría de
         // la pantalla y se vería cortada.
-        let max_x = (self.screen.0 as f64 / escala - w as f64).max(0.0);
-        let max_y = (self.screen.1 as f64 / escala - h as f64).max(0.0);
+        //
+        // El recorte de las tarjetas que flotan deja el mismo aire que hay
+        // contra el panel, no cero: el calendario cuelga del reloj, que está en
+        // la esquina, y pegado al borde exacto se leía como cortado —su sombra
+        // cae fuera del buffer y desaparece justo en el lado que toca—. Con
+        // margen se ve entero y flotando, que es lo que es.
+        //
+        // Las que **no** flotan no lo llevan: el launchpad y la franja de
+        // escritorios se pegan al borde a propósito, y darles 8 px los
+        // descolocaría.
+        let margen = match ancla {
+            Ancla::Arriba => 0.0,
+            _ if self.shell.emergente_tapa_la_pantalla() => 0.0,
+            _ => SEPARACION,
+        };
+        let ancho = self.screen.0 as f64 / escala;
+        let alto = self.screen.1 as f64 / escala;
+        // Si con margen no cabe, se recorta sin él antes que dejar el mínimo
+        // por encima del máximo, que en `clamp` es un pánico.
+        let hueco = |disponible: f64, tamano: f64| {
+            let max = disponible - tamano - margen;
+            if max >= margen { (margen, max) } else { (0.0, (disponible - tamano).max(0.0)) }
+        };
+        let (min_x, max_x) = hueco(ancho, w as f64);
+        let (min_y, max_y) = hueco(alto, h as f64);
         if let Some(surface) = self.emergente.as_mut() {
-            surface.location = (x.clamp(0.0, max_x) * escala, y.clamp(0.0, max_y) * escala).into();
+            surface.location =
+                (x.clamp(min_x, max_x) * escala, y.clamp(min_y, max_y) * escala).into();
         }
     }
 
@@ -920,6 +1269,7 @@ impl ShellHost {
         // flotando en el escritorio para siempre.
         self.realce = None;
         self.realce_desde = None;
+        self.pagina_anterior = None;
         self.cerrando_en = Some(std::time::Instant::now());
         true
     }
@@ -927,7 +1277,22 @@ impl ShellHost {
     /// Se llama cuando ya no hay animación en curso: suelta lo que quedaba.
     pub fn fin_animacion(&mut self) {
         self.realce_desde = None;
+        if self
+            .pagina_anterior
+            .as_ref()
+            .is_some_and(|(_, t, _)| t.elapsed() >= bookos_shell::tema::D_PAGINA)
+        {
+            self.pagina_anterior = None;
+        }
         self.recoger_cerrada();
+        if self.emergente.is_none() {
+            if let Some(nombre) = self.emergente_pendiente.take() {
+                self.guard("abrir siguiente tarjeta", |host| {
+                    host.shell.abrir_emergente_nombre(nombre)
+                });
+                self.sincronizar_emergente();
+            }
+        }
     }
 
     /// Suelta lo que quede de una emergente que ya terminó de irse.
@@ -972,12 +1337,46 @@ impl ShellHost {
         self.sincronizar_emergente();
     }
 
+    /// Abre el permiso de compartir pantalla que pide el portal.
+    ///
+    /// Cierra lo que hubiera abierto: es un diálogo y tiene que verse.
+    pub fn abrir_compartir(
+        &mut self,
+        sesion: u32,
+        app: String,
+        pantallas: Vec<bookos_shell::PantallaCompartible>,
+    ) {
+        if self.dead {
+            return;
+        }
+        self.guard("permiso de compartir pantalla", |host| {
+            host.shell
+                .abrir(bookos_shell::Emergente::compartir(sesion, app, pantallas));
+        });
+        self.sincronizar_emergente();
+    }
+
     pub fn abrir_acerca(&mut self) {
         if self.dead {
             return;
         }
         self.guard("acerca", |host| {
             host.shell.abrir(bookos_shell::Emergente::acerca());
+        });
+        self.sincronizar_emergente();
+    }
+
+    pub fn alternar_proyeccion(&mut self, conectadas: usize) {
+        if self.dead {
+            return;
+        }
+        if self.shell.emergente_nombre() == Some("proyeccion") {
+            self.cerrar_emergente();
+            return;
+        }
+        self.guard("selector de proyección", |host| {
+            host.shell
+                .abrir(bookos_shell::Emergente::proyeccion(conectadas));
         });
         self.sincronizar_emergente();
     }
@@ -1157,11 +1556,35 @@ impl ShellHost {
             })
             .unwrap_or(false);
         if repintar {
+            let delta = if dx.abs() >= dy.abs() { dx } else { dy };
+            let hacia = if delta >= 0.0 { 1.0 } else { -1.0 };
+            if self.shell.emergente_nombre() == Some("launchpad") {
+                if let Some(anterior) = self.emergente.take() {
+                    self.pagina_anterior = Some((anterior, std::time::Instant::now(), hacia));
+                }
+            }
             self.sincronizar_emergente();
+            // La superficie nueva es otra página de la misma emergente: no
+            // debe sumar el zoom de apertura al deslizamiento lateral.
+            self.abierta_en = None;
         }
         // Consumido aunque no haya cambiado de página: el gesto es del
         // launchpad de principio a fin.
         true
+    }
+
+    /// Botón derecho dentro del Launchpad: entra o sale de edición.
+    pub fn editar_launchpad(&mut self) -> bool {
+        if self.dead {
+            return false;
+        }
+        let cambio = self
+            .guard("editar launchpad", |host| host.shell.launchpad_editar())
+            .unwrap_or(false);
+        if cambio {
+            self.sincronizar_emergente();
+        }
+        cambio
     }
 
     /// Qué hacer al pulsar en un punto lógico. `None` si ahí no hay nada.
@@ -1199,6 +1622,19 @@ impl ShellHost {
         // launchpad se dibuja **encima** del panel, y ahí arriba lo que hay es
         // launchpad, no widgets.
         if y < self.shell.panel_height() as f64 && !self.shell.emergente_tapa_la_pantalla() {
+            let objetivo = self.shell.objetivo_emergente_panel(x as f32);
+            let abierta = self.shell.emergente_nombre();
+            if let (Some(abierta), Some((widget, nombre_objetivo))) = (abierta, objetivo) {
+                if abierta == nombre_objetivo {
+                    // Segundo clic en el mismo widget: cerrar con la animación
+                    // del host, no destruyendo el buffer de golpe en el shell.
+                    self.cerrar_emergente();
+                    return None;
+                }
+                self.emergente_pendiente = Some(widget);
+                self.cerrar_emergente();
+                return None;
+            }
             let accion = self
                 .guard("pulsar panel", |host| {
                     host.shell.panel_pulsado(x as f32, y as f32)
@@ -1259,6 +1695,11 @@ impl ShellHost {
                 paint(buffer, |buf| host.shell.draw_panel(buf));
                 let buffer = &mut host.dock.buffer;
                 paint(buffer, |buf| host.shell.draw_dock(buf));
+                // Y los iconos del escritorio, que llevan el acento en la
+                // pastilla del nombre y en el realce de lo seleccionado.
+                for i in 0..host.escritorio.len() {
+                    host.pintar_celda(i);
+                }
             })
             .is_some();
         // La emergente va aparte: su superficie se rehace, no se repinta en un
@@ -1292,7 +1733,9 @@ impl ShellHost {
     }
 
     pub fn aplicar_actividades_config(&mut self, config: bookos_shell::ConfigActividades) -> bool {
-        if self.dead { return false; }
+        if self.dead {
+            return false;
+        }
         self.guard("ajustes de actividades", |host| {
             host.shell.aplicar_actividades_config(config)
         });
@@ -1315,26 +1758,30 @@ impl ShellHost {
     // --- Actividades vivas -------------------------------------------------
 
     pub fn publicar_actividad(&mut self, estado: bookos_shell::actividad::Estado) {
-        self.guard("publicar actividad", |host| host.shell.publicar_actividad(estado));
+        self.guard("publicar actividad", |host| {
+            host.shell.publicar_actividad(estado)
+        });
         self.actividad_visible = true;
         self.pintar_actividad();
     }
 
     pub fn cerrar_actividad(&mut self, app_id: &str) -> bool {
-        let cerrada = self
-            .guard("cerrar actividad", |host| host.shell.cerrar_actividad(app_id))
-            == Some(true);
-        if cerrada { self.pintar_actividad(); }
+        let cerrada = self.guard("cerrar actividad", |host| {
+            host.shell.cerrar_actividad(app_id)
+        }) == Some(true);
+        if cerrada {
+            self.pintar_actividad();
+        }
         cerrada
     }
 
     pub fn abrir_actividad_previsualizacion(&mut self, app_id: &str) -> bool {
-        let abierta = self
-            .guard("abrir actividad de previsualización", |host| {
-                host.shell.abrir_actividad_previsualizacion(app_id)
-            })
-            == Some(true);
-        if abierta { self.pintar_actividad(); }
+        let abierta = self.guard("abrir actividad de previsualización", |host| {
+            host.shell.abrir_actividad_previsualizacion(app_id)
+        }) == Some(true);
+        if abierta {
+            self.pintar_actividad();
+        }
         abierta
     }
 
@@ -1347,7 +1794,9 @@ impl ShellHost {
     }
 
     pub fn actividad_visible(&mut self, visible: bool) -> bool {
-        if self.actividad_visible == visible { return false; }
+        if self.actividad_visible == visible {
+            return false;
+        }
         self.actividad_visible = visible;
         true
     }
@@ -1357,33 +1806,41 @@ impl ShellHost {
             self.actividad = None;
             return;
         };
-        let Some((lw, lh)) = self.shell.actividad_logical_size() else { return; };
-        let rehacer = self.actividad.as_ref().is_none_or(|s| {
-            s.src.size.w != w as f64 || s.src.size.h != h as f64
-        });
+        let Some((lw, lh)) = self.shell.actividad_logical_size() else {
+            return;
+        };
+        let rehacer = self
+            .actividad
+            .as_ref()
+            .is_none_or(|s| s.src.size.w != w as f64 || s.src.size.h != h as f64);
         if rehacer {
             self.actividad = Some(Surface::new((w, h), (lw as i32, lh as i32)));
         }
         let escala = self.shell.scale() as f64;
-        let arriba = self.shell.panel_height() as f64
-            + bookos_shell::actividad::SEPARACION_PANEL as f64;
+        let arriba =
+            self.shell.panel_height() as f64 + bookos_shell::actividad::SEPARACION_PANEL as f64;
         if let Some(s) = self.actividad.as_mut() {
             s.location = (
                 (self.screen.0 as f64 - w as f64) / 2.0,
                 (arriba - bookos_shell::actividad::MARGEN_SOMBRA as f64) * escala,
-            ).into();
+            )
+                .into();
             let shell = &mut self.shell;
             paint(&mut s.buffer, |buf| shell.draw_actividad(buf));
         }
     }
 
     pub fn animar_actividad(&mut self) {
-        if self.dead || !self.actividad_visible || !self.shell.actividad_needs_paint() { return; }
+        if self.dead || !self.actividad_visible || !self.shell.actividad_needs_paint() {
+            return;
+        }
         self.pintar_actividad();
     }
 
     fn actividad_rect(&self) -> Option<(f64, f64, f64, f64)> {
-        if !self.actividad_visible { return None; }
+        if !self.actividad_visible {
+            return None;
+        }
         let s = self.actividad.as_ref()?;
         let escala = self.shell.scale() as f64;
         let sombra = bookos_shell::actividad::MARGEN_SOMBRA as f64;
@@ -1679,6 +2136,75 @@ impl ShellHost {
         self.osd = Some(surface);
     }
 
+    /// Cambia la preferencia de efectos y devuelve la elegida, para guardarla.
+    pub fn alternar_efectos(&mut self) -> bookos_shell::Efectos {
+        self.shell.alternar_efectos()
+    }
+
+    /// Recalcula el modo de efectos —lo elegido y lo que impone la batería— y
+    /// devuelve si cambió. No pasa por `guard`: no dibuja nada, solo lee sysfs
+    /// y mueve un booleano.
+    pub fn revisar_efectos(&self) -> bool {
+        !self.dead && self.shell.revisar_efectos()
+    }
+
+    // --- Panel de diagnóstico -----------------------------------------------
+
+    /// Pone o quita el panel. Devuelve si quedó puesto, que es lo que el
+    /// compositor necesita para programar o soltar su despertar por segundo.
+    pub fn alternar_diagnostico(&mut self) -> bool {
+        let puesto = self.guard("diagnóstico", |host| host.shell.alternar_diagnostico())
+            == Some(true);
+        if puesto {
+            self.pintar_diagnostico();
+        } else {
+            self.diagnostico = None;
+        }
+        puesto
+    }
+
+    pub fn diagnostico_visible(&self) -> bool {
+        self.diagnostico.is_some()
+    }
+
+    /// Entrega la medida de la última ventana. Devuelve si hay que repintar.
+    pub fn diagnostico_datos(&mut self, datos: bookos_shell::diagnostico::Datos) -> bool {
+        if self.dead || self.diagnostico.is_none() {
+            return false;
+        }
+        let cambio = self.guard("datos del diagnóstico", |host| {
+            host.shell.diagnostico_datos(datos)
+        }) == Some(true);
+        if cambio {
+            self.pintar_diagnostico();
+        }
+        cambio
+    }
+
+    fn pintar_diagnostico(&mut self) {
+        let Some((w, h)) = self.shell.diagnostico_buffer_size() else {
+            self.diagnostico = None;
+            return;
+        };
+        let Some((lw, lh)) = self.shell.diagnostico_logical_size() else {
+            return;
+        };
+        let mut surface = Surface::new((w, h), (lw as i32, lh as i32));
+        // Arriba a la derecha, justo debajo del panel: es la esquina que menos
+        // tapa mientras se prueba algo, y no se solapa con el OSD ni con los
+        // avisos, que salen abajo y arriba a la derecha respectivamente. El
+        // toast se le puede poner encima; se acepta, es una herramienta.
+        let escala = self.shell.scale() as f64;
+        let margen = 12.0 * escala;
+        surface.location = (
+            self.screen.0 as f64 - w as f64 - margen,
+            bookos_shell::PANEL_HEIGHT as f64 * escala + margen,
+        )
+            .into();
+        paint(&mut surface.buffer, |buf| self.shell.draw_diagnostico(buf));
+        self.diagnostico = Some(surface);
+    }
+
     // --- Conmutador de aplicaciones ----------------------------------------
 
     pub fn hay_conmutador(&self) -> bool {
@@ -1853,6 +2379,128 @@ impl ShellHost {
             let mut surface = Surface::new((w, h), logico);
             paint(&mut surface.buffer, |buf| self.shell.draw_bloqueo(buf));
             self.bloqueo = Some(surface);
+        }
+    }
+
+    /// Abre la capa de captura de pantalla y la deja pintada.
+    ///
+    /// La superficie se crea aquí y no en `refresh` por lo mismo que la del
+    /// bloqueo: tiene que estar puesta en el primer fotograma, o al pulsar Impr
+    /// se vería el escritorio sin velo durante un frame.
+    pub fn abrir_captura(&mut self) {
+        if self.dead {
+            return;
+        }
+        let escala = self.shell.scale();
+        let pantalla = (
+            self.screen.0 as f32 / escala,
+            self.screen.1 as f32 / escala,
+        );
+        self.guard("abrir captura", |host| {
+            host.shell.abrir_captura(pantalla);
+        });
+        if let Some((w, h)) = self.shell.captura_buffer_size() {
+            let logico = (
+                (w as f32 / escala).round() as i32,
+                (h as f32 / escala).round() as i32,
+            );
+            let mut surface = Surface::new((w, h), logico);
+            paint(&mut surface.buffer, |buf| self.shell.draw_captura(buf));
+            self.captura = Some(surface);
+        }
+    }
+
+    pub fn cerrar_captura(&mut self) -> bool {
+        let habia = self
+            .guard("cerrar captura", |host| host.shell.cerrar_captura())
+            .unwrap_or(false);
+        self.captura = None;
+        habia
+    }
+
+    pub fn hay_captura(&self) -> bool {
+        !self.dead && self.captura.is_some()
+    }
+
+    pub fn captura_animando(&self) -> bool {
+        !self.dead && self.shell.captura_animando()
+    }
+
+    /// Repinta la capa si lo pide. Devuelve `true` si se repintó.
+    fn repintar_captura(&mut self) -> bool {
+        if !self.shell.captura_needs_paint() {
+            return false;
+        }
+        self.guard("pintar captura", |host| {
+            let Some(surface) = host.captura.as_mut() else {
+                return;
+            };
+            let buffer = &mut surface.buffer;
+            paint(buffer, |buf| host.shell.draw_captura(buf));
+        });
+        true
+    }
+
+    /// Mueve el puntero sobre la capa, en lógicos de la pantalla.
+    pub fn captura_puntero(&mut self, x: f64, y: f64) -> bool {
+        if !self.hay_captura() {
+            return false;
+        }
+        let movido = self
+            .guard("puntero de la captura", |host| {
+                host.shell.captura_puntero(x as f32, y as f32)
+            })
+            .unwrap_or(false);
+        if movido {
+            self.repintar_captura();
+        }
+        movido
+    }
+
+    pub fn captura_pulsar(&mut self, x: f64, y: f64) -> Option<bookos_shell::Accion> {
+        if !self.hay_captura() {
+            return None;
+        }
+        let accion = self
+            .guard("clic en la captura", |host| {
+                host.shell.captura_pulsar(x as f32, y as f32)
+            })
+            .flatten();
+        self.repintar_captura();
+        accion
+    }
+
+    pub fn captura_soltar(&mut self) -> Option<bookos_shell::Accion> {
+        if !self.hay_captura() {
+            return None;
+        }
+        let accion = self
+            .guard("soltar en la captura", |host| host.shell.captura_soltar())
+            .flatten();
+        self.repintar_captura();
+        accion
+    }
+
+    /// Una tecla para la capa. Devuelve `(consumida, acción)`.
+    pub fn captura_tecla(
+        &mut self,
+        tecla: bookos_shell::TeclaPulsada,
+    ) -> (bool, Option<bookos_shell::Accion>) {
+        if !self.hay_captura() {
+            return (false, None);
+        }
+        let resultado = self
+            .guard("tecla de la captura", |host| host.shell.captura_tecla(tecla))
+            .unwrap_or(bookos_shell::Tecla::Ignorada);
+        self.repintar_captura();
+        match resultado {
+            bookos_shell::Tecla::Cerrar => {
+                self.cerrar_captura();
+                (true, None)
+            }
+            bookos_shell::Tecla::Hacer(accion) => (true, Some(accion)),
+            bookos_shell::Tecla::Consumida => (true, None),
+            bookos_shell::Tecla::Ignorada => (false, None),
         }
     }
 
@@ -2050,6 +2698,7 @@ impl ShellHost {
             );
             host.place_dock();
         });
+        self.escritorio_recolocar();
     }
 
     /// Relee los datos y repinta lo que haya cambiado. Devuelve `true` si hay
@@ -2058,7 +2707,7 @@ impl ShellHost {
         if self.dead {
             return false;
         }
-        self.guard("refresh", |host| {
+        let dirty = self.guard("refresh", |host| {
             let mut dirty = false;
             if host.shell.refresh() {
                 let buffer = &mut host.panel.buffer;
@@ -2074,7 +2723,30 @@ impl ShellHost {
             }
             dirty
         })
-        .unwrap_or(false)
+        .unwrap_or(false);
+
+        // La carpeta del escritorio se mira en este mismo latido, que es el que
+        // ya despierta al cambiar el minuto: así un fichero nuevo aparece sin
+        // abrir un inotify ni programar un temporizador propio. El precio es
+        // hasta un minuto de retraso, y es el trato de siempre aquí.
+        //
+        // Mientras se arrastra no se toca: releer rehace las superficies y el
+        // icono se quedaría clavado a media cuesta.
+        let escala = self.shell.scale();
+        let logica = (
+            self.screen.0 as f32 / escala,
+            self.screen.1 as f32 / escala,
+        );
+        let cambio = !self.escritorio_arrastrando()
+            && self
+                .guard("releer el escritorio", |host| {
+                    host.shell.escritorio_releer(logica)
+                })
+                .unwrap_or(false);
+        if cambio {
+            self.escritorio_recolocar();
+        }
+        dirty || cambio
     }
 
     /// Cuánto ha avanzado la animación de entrada, de 0 a 1.
@@ -2088,7 +2760,7 @@ impl ShellHost {
     /// La animación **no repinta nada**: el buffer está dibujado y lo único que
     /// cambia de un fotograma a otro son el alfa y el tamaño con que el
     /// compositor lo compone, que es trabajo de la GPU.
-    fn animacion(&self) -> (f32, f32) {
+    fn animacion(&self) -> (f32, f32, f32) {
         use bookos_shell::tema;
 
         // Yéndose: la misma duración, pero con la curva suave y no con el
@@ -2096,11 +2768,14 @@ impl ShellHost {
         // cuando el usuario ya ha decidido que no la quiere.
         if let Some(desde) = self.cerrando_en {
             let t = tema::C_SUAVE.eval(tema::fraccion(desde.elapsed(), Self::SALIDA));
-            return (1.0 - t, 1.0 + 0.05 * t);
+            // Se recoge hacia el panel: poca escala y más desplazamiento. La
+            // salida corta evita que cambiar entre varios widgets se sienta
+            // como esperar dos animaciones completas.
+            return (1.0 - t, 1.0 - 0.025 * t, -18.0 * t);
         }
 
         let Some(desde) = self.abierta_en else {
-            return (1.0, 1.0);
+            return (1.0, 1.0, 0.0);
         };
         let t = desde.elapsed();
         // El alfa va con la curva sin rebote aunque comparta duración: un muelle
@@ -2111,7 +2786,9 @@ impl ShellHost {
         // Entra encogiendo desde 1,05, que es el zoom hacia dentro del
         // launchpad. Con el muelle, la escala se pasa un poco por debajo de 1 y
         // vuelve, en vez de frenar y quedarse.
-        (alfa, 1.05 - 0.05 * escala)
+        // Nace ligeramente por encima y baja hasta su anclaje, como los
+        // popovers del panel de Plasma, conservando el muelle del HIG.
+        (alfa, 0.97 + 0.03 * escala, -16.0 * (1.0 - escala))
     }
 
     /// Lo que tarda una emergente en entrar y en irse: la duración de popover
@@ -2120,7 +2797,7 @@ impl ShellHost {
     /// dos duraciones distintas para el mismo gesto son justo lo que hace que un
     /// escritorio se note cosido a mano.
     const ENTRADA: std::time::Duration = bookos_shell::tema::D_POPOVER;
-    const SALIDA: std::time::Duration = bookos_shell::tema::D_POPOVER;
+    const SALIDA: std::time::Duration = std::time::Duration::from_millis(105);
     /// Lo que tarda el realce en deslizarse de una celda a otra. Es el token de
     /// hover del sistema: mover el resaltado con el cursor es un hover.
     const DESLIZ: std::time::Duration = bookos_shell::tema::D_HOVER;
@@ -2146,6 +2823,10 @@ impl ShellHost {
         // paraba hasta reiniciar la sesión.
         self.abierta_en.is_some_and(|t| t.elapsed() < Self::ENTRADA)
             || self.cerrando_en.is_some_and(|t| t.elapsed() < Self::SALIDA)
+            || self
+                .pagina_anterior
+                .as_ref()
+                .is_some_and(|(_, t, _)| t.elapsed() < bookos_shell::tema::D_PAGINA)
             || self
                 .realce_desde
                 .is_some_and(|(_, t)| t.elapsed() < Self::DESLIZ)
@@ -2195,11 +2876,14 @@ impl ShellHost {
         // en la lista. Antes se decidía por índice y el aviso, que va el
         // primero, se llevaba el alfa y el zoom de la emergente mientras la
         // emergente se quedaba sin animar.
+        #[derive(Clone, Copy)]
         enum Papel {
             /// Se desvanece con su propio reloj.
             Aviso,
             /// Entra y sale con la animación de la emergente.
             Emergente,
+            /// Página del Launchpad que sale por el lado contrario.
+            PaginaAnterior(std::time::Instant, f32),
             /// El aviso de una notificación, arriba a la derecha.
             Toast,
             /// Actividad viva que emerge del borde superior.
@@ -2208,9 +2892,20 @@ impl ShellHost {
             Realce,
             /// Se aparta por su borde al esquivar ventanas.
             Barra(Barra),
+            /// Quieto donde está, opaco: el panel de diagnóstico. No se anima a
+            /// propósito — una herramienta de medida que entra con un muelle
+            /// falsearía los primeros fotogramas de lo que se está midiendo.
+            Fijo,
         }
 
-        let (alfa_emergente, zoom) = self.animacion();
+        let (alfa_emergente, zoom, y_emergente) = self.animacion();
+        let pagina = self.pagina_anterior.as_ref().map(|(_, t0, hacia)| {
+            let t = bookos_shell::tema::C_SUAVE.eval(bookos_shell::tema::fraccion(
+                t0.elapsed(),
+                bookos_shell::tema::D_PAGINA,
+            ));
+            (t, *hacia)
+        });
         let alfa_osd = self.shell.osd_alfa();
         let escala_osd = self.shell.osd_escala();
         // Con el bloqueo echado **solo** se dibuja el bloqueo, y el aviso de
@@ -2223,13 +2918,37 @@ impl ShellHost {
             .bloqueo
             .iter()
             .map(|s| (s, Papel::Barra(Barra::Panel)))
+            // La capa de captura va por delante de todo lo demás menos el
+            // bloqueo: tapa el escritorio entero con su velo, y el panel o el
+            // dock por encima saldrían en la foto que se está encuadrando.
+            .chain(
+                self.captura
+                    .iter()
+                    .map(|s| (s, Papel::Fijo))
+                    .filter(|_| !bloqueado),
+            )
             .chain(self.osd.iter().map(|s| (s, Papel::Aviso)))
+            // Con el bloqueo echado tampoco sale el diagnóstico: la regla es
+            // que ahí solo se dibuja el bloqueo, y una excepción «porque esta
+            // no enseña nada» es como se erosionan las reglas de ese tipo.
+            .chain(
+                self.diagnostico
+                    .iter()
+                    .map(|s| (s, Papel::Fijo))
+                    .filter(|_| !bloqueado),
+            )
             .chain(self.toast.iter().map(|s| (s, Papel::Toast)))
             .chain(
                 self.actividad
                     .iter()
                     .map(|s| (s, Papel::Actividad))
                     .filter(|_| !bloqueado && self.actividad_visible),
+            )
+            .chain(
+                self.pagina_anterior
+                    .iter()
+                    .map(|(s, t, hacia)| (s, Papel::PaginaAnterior(*t, *hacia)))
+                    .filter(|_| !bloqueado),
             )
             .chain(
                 self.emergente
@@ -2241,7 +2960,7 @@ impl ShellHost {
                 self.realce
                     .iter()
                     .map(|s| (s, Papel::Realce))
-                    .filter(|_| !bloqueado),
+                    .filter(|_| !bloqueado && pagina.is_none()),
             )
             // Con una vista a pantalla completa no se dibujan las barras: el
             // panel por encima delataría que lo de debajo sigue ahí.
@@ -2251,17 +2970,35 @@ impl ShellHost {
                     (&self.dock, Papel::Barra(Barra::Dock)),
                 ]
                 .into_iter()
-                .filter(|_| !bloqueado && !self.shell.emergente_tapa_la_pantalla()),
+                .filter(|_| {
+                    !bloqueado
+                        && self.captura.is_none()
+                        && !self.shell.emergente_tapa_la_pantalla()
+                }),
             );
 
         superficies
             .filter_map(|(surface, papel)| {
-                let (alfa, zoom, desplazamiento_y) = match papel {
-                    Papel::Aviso => (alfa_osd, escala_osd, 0.0),
-                    Papel::Toast => (self.shell.toast_alfa(), self.shell.toast_escala(), 0.0),
-                    Papel::Emergente | Papel::Realce => (alfa_emergente, zoom, 0.0),
-                    Papel::Actividad => self.shell.actividad_entrada(),
-                    Papel::Barra(_) => (1.0, 1.0, 0.0),
+                let (alfa, zoom, desplazamiento_x, desplazamiento_y) = match papel {
+                    Papel::Aviso => (alfa_osd, escala_osd, 0.0, 0.0),
+                    Papel::Toast => (self.shell.toast_alfa(), self.shell.toast_escala(), 0.0, 0.0),
+                    Papel::Emergente => match pagina {
+                        Some((t, hacia)) => (t, 1.0, hacia * 140.0 * (1.0 - t), 0.0),
+                        None => (alfa_emergente, zoom, 0.0, y_emergente),
+                    },
+                    Papel::PaginaAnterior(t0, hacia) => {
+                        let t = bookos_shell::tema::C_SUAVE.eval(bookos_shell::tema::fraccion(
+                            t0.elapsed(),
+                            bookos_shell::tema::D_PAGINA,
+                        ));
+                        (1.0 - t, 1.0, -hacia * 140.0 * t, 0.0)
+                    }
+                    Papel::Realce => (alfa_emergente, zoom, 0.0, y_emergente),
+                    Papel::Actividad => {
+                        let (a, z, y) = self.shell.actividad_entrada();
+                        (a, z, 0.0, y)
+                    }
+                    Papel::Barra(_) | Papel::Fijo => (1.0, 1.0, 0.0, 0.0),
                 };
                 // El zoom crece desde el centro, así que hay que compensar la
                 // posición: si no, la superficie se agranda hacia la derecha y
@@ -2282,7 +3019,10 @@ impl ShellHost {
                             surface.location.y + signo * self.desplazamiento(cual),
                         ))
                     }
-                    _ => Point::from((surface.location.x, surface.location.y + desplazamiento_y as f64 * escala)),
+                    _ => Point::from((
+                        surface.location.x + desplazamiento_x as f64 * escala,
+                        surface.location.y + desplazamiento_y as f64 * escala,
+                    )),
                 };
                 let location = Point::<f64, Physical>::from((
                     base.x - ancho * (zoom as f64 - 1.0) / 2.0,
@@ -2345,5 +3085,125 @@ fn paint(buffer: &mut MemoryRenderBuffer, draw: impl FnOnce(&mut [u8]) -> Vec<Da
     // traga nada en silencio.
     if let Err(err) = result {
         match err {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// El buscador **no se mueve** mientras escribes.
+    ///
+    /// Su alto cambia con cada tecla —cada resultado que entra o sale es media
+    /// fila— y antes se recolocaba en cada cambio de tamaño, así que el campo
+    /// de texto subía y bajaba mientras tecleabas y el rectángulo de cristal de
+    /// detrás saltaba con él. Ahora se coloca por su alto máximo. Se comprueba
+    /// aquí y no en el shell porque quien coloca es el compositor.
+    #[test]
+    fn el_buscador_no_salta_al_escribir() {
+        use bookos_shell::TeclaPulsada;
+
+        let mut host = ShellHost::new(1920, 1080, 1.0, Some(bookos_shell::Config::default()));
+        host.alternar_buscador();
+        assert_eq!(host.shell.emergente_nombre(), Some("buscador"));
+        let (_, y0, _, alto0) = host.emergente_rect().expect("el buscador tiene superficie");
+
+        // «sh» encuentra al menos el ejecutable del PATH, que existe en
+        // cualquier Linux: la lista aparece y la tarjeta crece.
+        for c in "sh".chars() {
+            host.tecla(TeclaPulsada::Caracter(c));
+        }
+        let (_, y1, _, alto1) = host.emergente_rect().expect("sigue abierto");
+        assert!(alto1 > alto0, "la lista no apareció: el test no prueba nada");
+        assert_eq!(y1, y0, "la tarjeta se movió al escribir");
+
+        // Y al borrar tampoco vuelve a moverse.
+        host.tecla(TeclaPulsada::Retroceso);
+        let (_, y2, _, _) = host.emergente_rect().expect("sigue abierto");
+        assert_eq!(y2, y0, "la tarjeta se movió al borrar");
+    }
+
+    /// Una tarjeta que cuelga del panel no toca el borde de la pantalla, y la
+    /// franja de escritorios sigue pegada a él.
+    ///
+    /// El calendario cuelga del reloj, que está en la esquina superior derecha,
+    /// así que su sitio natural cae fuera de la pantalla. Antes se recortaba a
+    /// cero y quedaba pegado al borde exacto: su sombra cae fuera del buffer,
+    /// desaparecía justo por ese lado y la tarjeta se leía como cortada. Pero
+    /// el arreglo no puede ser dar margen a todo: la franja de escritorios se
+    /// ancla al borde de arriba a propósito y ahí 8 px la descolocan.
+    #[test]
+    fn el_calendario_no_toca_el_borde_y_la_franja_si() {
+        let mut host = ShellHost::new(1920, 1080, 1.0, Some(bookos_shell::Config::default()));
+
+        host.abrir_de_widget("reloj");
+        assert_eq!(host.shell.emergente_nombre(), Some("calendario"));
+        let (x, y, w, h) = host.emergente_rect().expect("el calendario tiene superficie");
+        assert!(x >= SEPARACION, "pegado al borde izquierdo: x={x}");
+        assert!(y >= SEPARACION, "pegado al borde de arriba: y={y}");
+        assert!(
+            x + w <= 1920.0 - SEPARACION,
+            "pegado al borde derecho: x+w={} de 1920",
+            x + w
+        );
+        assert!(
+            y + h <= 1080.0 - SEPARACION,
+            "pegado al borde de abajo: y+h={} de 1080",
+            y + h
+        );
+
+        host.cerrar_emergente();
+        host.alternar_vista_escritorios(0, vec!["Uno".into(), "Dos".into()]);
+        assert_eq!(host.shell.emergente_nombre(), Some("escritorios"));
+        let (x, y, _, _) = host.emergente_rect().expect("la franja tiene superficie");
+        assert_eq!((x, y), (0.0, 0.0), "la franja se ha descolocado del borde");
+    }
+
+    /// El shell vive solo en la pantalla principal y no puede quedarse con los
+    /// clics de las demás.
+    ///
+    /// Sin esto, con una pantalla colocada **a la izquierda** —que en el
+    /// escritorio normalizado tiene `x` negativa— pasaban dos cosas: la franja
+    /// de arriba caía dentro del panel de la principal y se tragaba los clics,
+    /// y con cualquier emergente abierta el shell reclamaba la pantalla
+    /// secundaria **entera**, así que el ratón dejaba de funcionar ahí hasta
+    /// cerrarla. Es un caso que no se ve sin dos monitores enchufados, de ahí
+    /// el test.
+    #[test]
+    fn el_shell_no_reclama_los_clics_de_otra_pantalla() {
+        // 1920×1080 a escala 1: el área lógica de la principal es (0,0)-(1920,1080).
+        let mut host = ShellHost::new(1920, 1080, 1.0, Some(bookos_shell::Config::default()));
+        assert_eq!(host.area_principal(), (1920.0, 1080.0));
+
+        // Dentro de la principal, la franja del panel es suya.
+        assert!(host.a_la_vista(Barra::Panel), "el panel arranca a la vista");
+        assert!(host.contiene(960.0, 4.0), "la franja del panel es del shell");
+
+        // La misma altura, pero en la pantalla de la izquierda.
+        assert!(
+            !host.contiene(-400.0, 4.0),
+            "x negativa es otro monitor: el clic es del cliente que haya ahí"
+        );
+        // Y a la derecha, pasado el borde.
+        assert!(!host.contiene(2400.0, 4.0), "pasado el ancho tampoco es suyo");
+
+        // Con una emergente abierta el shell se queda con todo lo de la
+        // principal —pulsar fuera la cierra— pero **solo** con lo de la
+        // principal.
+        host.abrir_acerca();
+        assert!(host.shell.hay_emergente(), "no se abrió la emergente");
+        assert!(
+            host.contiene(960.0, 600.0),
+            "con una emergente, el clic en la principal la cierra"
+        );
+        assert!(
+            !host.contiene(-400.0, 600.0),
+            "una emergente en la principal no puede tragarse el ratón del monitor de al lado"
+        );
+
+        // Y lo mismo para el escritorio: el hueco vacío de otra pantalla no
+        // arranca una banda elástica aquí.
+        assert!(host.escritorio_alcanza(960.0, 600.0));
+        assert!(!host.escritorio_alcanza(-400.0, 600.0));
     }
 }

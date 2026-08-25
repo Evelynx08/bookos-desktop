@@ -65,6 +65,15 @@ fn main() {
     medir(&format!("dock {dw}x{dh}"), 50, |_| {
         s.draw_dock(&mut dock);
     });
+    // Panel y dock **alternados**, que es lo que hace el compositor de verdad:
+    // los dos se dibujan en el mismo fotograma, uno detrás de otro. Se mide
+    // aparte porque comparten un solo `Renderer` de iced, y su caché de
+    // rasterizado tira todo lo que no salió en el último dibujo.
+    medir("panel y dock, alternados", 50, |_| {
+        s.draw_panel(&mut panel);
+        s.draw_dock(&mut dock);
+    });
+
     let mut repintados_dock = 0;
     medir("dock: recorrerlo con el ratón", 60, |i| {
         let x = 9.0 + (i % 5) as f32 * 64.0 + 25.0;

@@ -21,7 +21,7 @@ use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 use bookos_shell::TeclaPulsada;
 
 use crate::gestos::Gesto;
-use crate::state::BookosComp;
+use crate::state::{ArrastreEscritorio, BookosComp};
 
 /// Botones del ratón, según linux/input-event-codes.h.
 const BTN_LEFT: u32 = 0x110;
@@ -60,18 +60,40 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
             let serial = SERIAL_COUNTER.next_serial();
             let time = event.time_msec();
             let pulsada = event.state() == KeyState::Pressed;
+            // Smithay entrega el código XKB (evdev + 8). Se conserva porque
+            // algunas teclas Fn llegan sin keysym aunque el kernel sí haya
+            // identificado correctamente su botón físico.
+            let codigo = event.key_code();
             // El filtro corre con las teclas **antes** de reenviarlas, así que
             // los atajos del compositor funcionan aunque el cliente con foco
             // esté colgado. Esa es justamente la propiedad que hace que el
             // cambio de TTY sea una salida de emergencia fiable.
             let accion = kbd.input(
                 state,
-                event.key_code(),
+                codigo,
                 event.state(),
                 serial,
                 time,
                 |state, modifiers, handle| {
+                    let _ = modifiers;
                     let bloqueado = state.shell.as_ref().is_some_and(|s| s.esta_bloqueado());
+                    // Con la capa de captura abierta, el teclado es suyo: Esc
+                    // la cierra, Intro captura y las flechas cambian de modo.
+                    // Nada de eso puede llegar a la ventana de debajo.
+                    if state.shell.as_ref().is_some_and(|s| s.hay_captura()) {
+                        if !pulsada {
+                            return FilterResult::Intercept(None);
+                        }
+                        let accion = traducir_tecla(&handle)
+                            .and_then(|t| state.shell.as_mut().map(|s| s.captura_tecla(t)))
+                            .and_then(|(_, accion)| accion);
+                        state.needs_redraw = true;
+                        // Consumida o no, la tecla se queda aquí: mientras
+                        // encuadras, el escritorio no responde a nada más.
+                        return FilterResult::Intercept(
+                            accion.map(crate::keybinds::Accion::DelShell),
+                        );
+                    }
                     // Solo la pulsación: interceptar también la suelta le
                     // dejaría la tecla trabada al cliente. Bloqueado, tampoco
                     // la suelta sale de aquí.
@@ -95,10 +117,7 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
                         // Smithay actualiza el estado de modificadores antes de
                         // llamar al filtro. Mirarlo evita depender del keysym
                         // concreto de Alt/Meta en cada mapa de teclado.
-                        let cerrando = state
-                            .shell
-                            .as_ref()
-                            .is_some_and(|s| s.hay_conmutador())
+                        let cerrando = state.shell.as_ref().is_some_and(|s| s.hay_conmutador())
                             && !state.conmutador_pegado
                             && state
                                 .conmutador_modo
@@ -125,6 +144,7 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
                     // llega": anidado, el compositor de debajo se queda con
                     // Alt+Tab y aquí no aparece nada.
                     tracing::debug!(
+                        codigo = codigo.raw(),
                         sym = handle.modified_sym().raw(),
                         nombre = ?handle.modified_sym().name(),
                         alt = modifiers.alt,
@@ -151,7 +171,9 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
                             crate::keybinds::Accion::ConmutarCancelar,
                         ));
                     }
-                    if let Some(accion) = crate::keybinds::resolver(modifiers, &handle) {
+                    if let Some(accion) =
+                        crate::keybinds::resolver(modifiers, &handle, codigo.raw())
+                    {
                         // Con el bloqueo echado solo valen las salidas de
                         // emergencia. Que el cambio de TTY siga funcionando no
                         // es un descuido: es la puerta trasera con la que se
@@ -178,9 +200,7 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
                         let sym = handle.modified_sym();
                         let accion = match sym.raw() {
                             keysyms::KEY_Escape => Some(crate::keybinds::Accion::BloqueoLimpiar),
-                            keysyms::KEY_BackSpace => {
-                                Some(crate::keybinds::Accion::BloqueoBorrar)
-                            }
+                            keysyms::KEY_BackSpace => Some(crate::keybinds::Accion::BloqueoBorrar),
                             keysyms::KEY_Return | keysyms::KEY_KP_Enter => {
                                 Some(crate::keybinds::Accion::BloqueoComprobar)
                             }
@@ -244,7 +264,21 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
         // winit: posición absoluta, normalizada al tamaño de la ventana.
         InputEvent::PointerMotionAbsolute { event } => {
             let (w, h) = logical_size(state);
-            let destino = (event.x_transformed(w), event.y_transformed(h)).into();
+            // El backend anidado entrega coordenadas relativas a su única
+            // salida. Sumar su origen mantiene correcto el camino si la salida
+            // fue recolocada desde el editor de pantallas.
+            let origen = state
+                .space
+                .outputs()
+                .next()
+                .and_then(|o| state.space.output_geometry(o))
+                .map(|r| r.loc)
+                .unwrap_or_default();
+            let destino = (
+                origen.x as f64 + event.x_transformed(w),
+                origen.y as f64 + event.y_transformed(h),
+            )
+                .into();
             set_pointer(state, destino, event.time_msec());
         }
 
@@ -254,6 +288,26 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
             state.meta_sola = false;
             // Bloqueado, los clics no salen hacia los clientes: lo único que
             // atienden es el botón de apagado de la propia pantalla de bloqueo.
+            // La capa de captura se queda con el ratón mientras está: se está
+            // encuadrando una foto y un clic no puede llegar a la ventana de
+            // debajo. Va antes que el bloqueo porque son excluyentes y esta es
+            // la que puede estar abierta con el escritorio en uso.
+            if state.shell.as_ref().is_some_and(|s| s.hay_captura()) {
+                let (x, y) = (state.pointer_location.x, state.pointer_location.y);
+                let accion = match event.state() {
+                    ButtonState::Pressed => {
+                        state.shell.as_mut().and_then(|s| s.captura_pulsar(x, y))
+                    }
+                    ButtonState::Released => {
+                        state.shell.as_mut().and_then(|s| s.captura_soltar())
+                    }
+                };
+                if let Some(accion) = accion {
+                    crate::keybinds::hacer(state, accion);
+                }
+                state.needs_redraw = true;
+                return;
+            }
             if state.shell.as_ref().is_some_and(|s| s.esta_bloqueado()) {
                 if event.state() == ButtonState::Pressed {
                     let (x, y) = (state.pointer_location.x, state.pointer_location.y);
@@ -284,10 +338,9 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
                 state.conmutador_clic = true;
                 let elegida = (button == BTN_LEFT)
                     .then(|| {
-                        state
-                            .shell
-                            .as_ref()
-                            .and_then(|s| s.conmutador_en(state.pointer_location.x, state.pointer_location.y))
+                        state.shell.as_ref().and_then(|s| {
+                            s.conmutador_en(state.pointer_location.x, state.pointer_location.y)
+                        })
                     })
                     .flatten();
                 if let Some(i) = elegida {
@@ -308,6 +361,11 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
             // ver el soltar — sin eso se queda creyendo que sigues pulsando y no
             // vuelve a pedir otro movimiento nunca más.
             if pulsado == ButtonState::Released {
+                // La banda elástica o los iconos agarrados se cierran aquí, y
+                // ese soltar no es de nadie más: empezó sobre el escritorio.
+                if soltar_escritorio(state) {
+                    return;
+                }
                 // El shell primero: si tenía un deslizador agarrado, el soltar
                 // es suyo aunque el puntero esté ya fuera de su superficie.
                 if let Some(accion) = state.shell.as_mut().and_then(|s| s.soltar()) {
@@ -317,7 +375,9 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
                 // el mismo botón donde se pulsó, como cualquier botón del
                 // sistema: bajar el ratón en la ✕ y salirse antes de soltar no
                 // cierra nada.
-                if let Some((window, boton)) = crate::decoracion::soltar(state, state.pointer_location) {
+                if let Some((window, boton)) =
+                    crate::decoracion::soltar(state, state.pointer_location)
+                {
                     crate::decoracion::accionar(state, &window, boton);
                     return;
                 }
@@ -366,7 +426,10 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
             if pulsado == ButtonState::Pressed
                 && button == BTN_RIGHT
                 && !modificadores(state).logo
-                && state.shell.as_ref().is_some_and(|s| s.en_el_dock(punto.x, punto.y))
+                && state
+                    .shell
+                    .as_ref()
+                    .is_some_and(|s| s.en_el_dock(punto.x, punto.y))
             {
                 if state
                     .shell
@@ -377,12 +440,25 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
                     return;
                 }
             }
-            if state.shell.as_ref().is_some_and(|s| s.contiene(punto.x, punto.y)) {
+            if state
+                .shell
+                .as_ref()
+                .is_some_and(|s| s.contiene(punto.x, punto.y))
+            {
                 // Ni la pulsación ni el soltar llegan al cliente: para él este
                 // clic no ha existido. Reenviar solo el soltar le dejaría un
                 // botón que se levanta sin haberse pulsado nunca.
                 if pulsado == ButtonState::Pressed {
-                    if let Some(accion) = state.shell.as_mut().and_then(|s| s.pulsar(punto.x, punto.y))
+                    if button == BTN_RIGHT
+                        && state.shell.as_mut().is_some_and(|s| s.editar_launchpad())
+                    {
+                        state.needs_redraw = true;
+                        return;
+                    }
+                    if let Some(accion) = state
+                        .shell
+                        .as_mut()
+                        .and_then(|s| s.pulsar(punto.x, punto.y))
                     {
                         crate::keybinds::hacer(state, accion);
                     }
@@ -408,6 +484,19 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
                             state.arrastrar_ventana(&window, crate::ventanas::Modo::Mover, false);
                         }
                     }
+                    state.needs_redraw = true;
+                    return;
+                }
+            }
+
+            // El escritorio pelado: aquí no hay ventana ni barra ni shell, así
+            // que el clic es de los iconos. Va lo último de todo porque el
+            // escritorio está **detrás** de todo lo demás.
+            if pulsado == ButtonState::Pressed
+                && button == BTN_LEFT
+                && state.space.element_under(punto).is_none()
+            {
+                if pulsar_escritorio(state, punto) {
                     state.needs_redraw = true;
                     return;
                 }
@@ -446,11 +535,7 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
             // las dos se les da el mismo trato porque el umbral está en píxeles.
             let dx = event.amount(Axis::Horizontal).unwrap_or(0.0);
             let dy = event.amount(Axis::Vertical).unwrap_or(0.0);
-            if (dx != 0.0 || dy != 0.0)
-                && state
-                    .shell
-                    .as_mut()
-                    .is_some_and(|s| s.desplazar(dx, dy))
+            if (dx != 0.0 || dy != 0.0) && state.shell.as_mut().is_some_and(|s| s.desplazar(dx, dy))
             {
                 state.needs_redraw = true;
                 return;
@@ -491,11 +576,11 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
                 match gesto {
                     Gesto::Escritorio(pasos) => {
                         let destino = crate::escritorios::destino(
-                            state.escritorios.activo(),
+                            crate::escritorios::activo_aqui(state),
                             pasos,
                             state.escritorios.cuantos(),
                         );
-                        crate::escritorios::cambiar_a(state, destino);
+                        crate::escritorios::cambiar_aqui(state, destino);
                     }
                     Gesto::DespejarEscritorio => crate::escritorios::despejar(state),
                     // Subir con el escritorio despejado devuelve las ventanas;
@@ -601,17 +686,19 @@ fn traducir_tecla(handle: &smithay::input::keyboard::KeysymHandle<'_>) -> Option
     Some(tecla)
 }
 
-/// Mueve el cursor a un punto lógico, lo confina a la pantalla y reenvía el
+/// Mueve el cursor a un punto lógico, lo confina al escritorio y reenvía el
 /// movimiento al cliente que haya debajo.
 pub fn set_pointer(state: &mut BookosComp, destino: Point<f64, Logical>, time: u32) {
-    let (w, h) = logical_size(state);
-    // Sin confinar, el puntero se puede ir fuera de la pantalla y no hay forma
-    // de traerlo de vuelta: en una sesión real eso es un cursor perdido.
-    let location = (
-        destino.x.clamp(0.0, w as f64 - 1.0),
-        destino.y.clamp(0.0, h as f64 - 1.0),
-    )
-        .into();
+    // No se confina al rectángulo envolvente: con una pantalla arriba y otra a
+    // la derecha ese rectángulo contiene una esquina vacía donde el cursor
+    // desaparecería. Se proyecta sobre la salida real más cercana y por eso
+    // también funcionan coordenadas negativas (monitores a izquierda/arriba).
+    let geometrías: Vec<_> = state
+        .space
+        .outputs()
+        .filter_map(|o| state.space.output_geometry(o))
+        .collect();
+    let location = confinar_a_salidas(destino, &geometrías);
     state.pointer_location = location;
     // Mover el cursor **es** un cambio en pantalla. Sin esto el puntero solo se
     // repinta cuando algo más provoca un frame, y se arrastra a tirones.
@@ -621,6 +708,15 @@ pub fn set_pointer(state: &mut BookosComp, destino: Point<f64, Logical>, time: u
     // el cliente lo ven. Reenviarlo mientras arrastras una terminal la deja
     // creyendo que estás seleccionando texto.
     if state.seguir_arrastre() {
+        state.space.refresh();
+        let fallback = state.output_scale();
+        state.broadcast_preferred_scale(fallback);
+        return;
+    }
+
+    // Y con la banda elástica o unos iconos agarrados, igual: el gesto es del
+    // escritorio y no llega a ningún cliente.
+    if seguir_arrastre_escritorio(state, location) {
         return;
     }
 
@@ -647,17 +743,41 @@ pub fn set_pointer(state: &mut BookosComp, destino: Point<f64, Logical>, time: u
         return;
     }
 
+    // Con la capa de captura abierta el ratón es suyo entero: se está
+    // encuadrando, y ni el dock ni la ventana de debajo tienen nada que decir.
+    if state.shell.as_ref().is_some_and(|s| s.hay_captura()) {
+        if let Some(shell) = state.shell.as_mut() {
+            shell.captura_puntero(location.x, location.y);
+        }
+        state.needs_redraw = true;
+        return;
+    }
     if let Some(shell) = state.shell.as_mut() {
         shell.puntero(location.x, location.y);
     }
     // El cursor pegado a un borde trae de vuelta a la barra que se apartó. Va
     // en físicos porque la franja sensible se mide contra la pantalla.
-    let escala = state.output_scale();
-    let fisico = (location.x * escala, location.y * escala);
+    //
+    // Dos cosas que antes estaban mal y son la misma: las barras están en la
+    // **principal**, así que el punto hay que acotarlo a ella y escalarlo con
+    // **su** escala. Aquí se usaba `output_scale()`, que es la del monitor bajo
+    // el puntero, contra un `self.screen` que son físicos de la principal —con
+    // dos escalas distintas la comparación es sencillamente falsa—, y no se
+    // miraba la x, así que llevar el ratón al borde de **cualquier** monitor
+    // sacaba la barra oculta de la principal.
     let mut repintar = false;
-    for cual in [crate::shell::Barra::Panel, crate::shell::Barra::Dock] {
-        if let Some(shell) = state.shell.as_mut() {
-            repintar |= shell.reclamada(cual, fisico);
+    if let Some(shell) = state.shell.as_ref() {
+        let (ancho, alto) = shell.area_principal();
+        let escala = shell.escala_principal();
+        let dentro =
+            location.x >= 0.0 && location.y >= 0.0 && location.x < ancho && location.y < alto;
+        if dentro {
+            let fisico = (location.x * escala, location.y * escala);
+            for cual in [crate::shell::Barra::Panel, crate::shell::Barra::Dock] {
+                if let Some(shell) = state.shell.as_mut() {
+                    repintar |= shell.reclamada(cual, fisico);
+                }
+            }
         }
     }
     if repintar {
@@ -683,6 +803,38 @@ pub fn set_pointer(state: &mut BookosComp, destino: Point<f64, Logical>, time: u
         },
     );
     pointer.frame(state);
+}
+
+fn confinar_a_salidas(
+    destino: Point<f64, Logical>,
+    salidas: &[smithay::utils::Rectangle<i32, Logical>],
+) -> Point<f64, Logical> {
+    let dentro = |r: &smithay::utils::Rectangle<i32, Logical>| {
+        destino.x >= r.loc.x as f64
+            && destino.y >= r.loc.y as f64
+            && destino.x < (r.loc.x + r.size.w) as f64
+            && destino.y < (r.loc.y + r.size.h) as f64
+    };
+    if salidas.iter().any(dentro) {
+        return destino;
+    }
+
+    salidas
+        .iter()
+        .filter(|r| r.size.w > 0 && r.size.h > 0)
+        .map(|r| {
+            let x = destino
+                .x
+                .clamp(r.loc.x as f64, (r.loc.x + r.size.w - 1) as f64);
+            let y = destino
+                .y
+                .clamp(r.loc.y as f64, (r.loc.y + r.size.h - 1) as f64);
+            let distancia = (destino.x - x).powi(2) + (destino.y - y).powi(2);
+            (distancia, Point::from((x, y)))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, p)| p)
+        .unwrap_or_else(|| Point::from((0.0, 0.0)))
 }
 
 /// Lo que se considera "la barra de título" de una ventana, en lógicos.
@@ -760,6 +912,142 @@ fn doble_clic_en_barra(state: &mut BookosComp) -> bool {
     true
 }
 
+/// Lo que hay que alejarse del punto de pulsación para que agarrar un icono
+/// cuente como arrastrarlo, en píxeles lógicos.
+///
+/// Cuatro es el mismo umbral que usa el gestor de ventanas para distinguir un
+/// clic de un tirón. Sin umbral, una mano poco firme recoloca el icono cada vez
+/// que lo selecciona, y esa posición se guarda en disco.
+const UMBRAL_ARRASTRE: f64 = 4.0;
+
+/// Un clic sobre el escritorio pelado: abrir, seleccionar o empezar un gesto.
+///
+/// Devuelve `true` si el clic era suyo, que lo es siempre que haya shell: el
+/// escritorio es el último que mira, y por debajo de él no hay nadie.
+fn pulsar_escritorio(state: &mut BookosComp, punto: Point<f64, Logical>) -> bool {
+    // Los iconos viven en la principal, igual que el resto del shell. El
+    // hit-test de un icono ya se acota solo —ningún rectángulo cae fuera—, pero
+    // el hueco vacío no: sin esto, un clic en el escritorio pelado de la
+    // pantalla de al lado arrancaba una banda elástica en la principal.
+    if !state
+        .shell
+        .as_ref()
+        .is_some_and(|s| s.escritorio_alcanza(punto.x, punto.y))
+    {
+        return false;
+    }
+    // Se apunta el clic pase lo que pase, aunque no sea doble: el siguiente
+    // puede serlo con este de pareja.
+    let doble = es_doble_clic(state);
+    let ctrl = modificadores(state).ctrl;
+    let icono = state
+        .shell
+        .as_ref()
+        .and_then(|s| s.escritorio_en(punto.x, punto.y));
+
+    match icono {
+        Some(i) if doble => {
+            // El tercer clic no vuelve a abrir lo mismo.
+            state.ultimo_clic = None;
+            if let Some(accion) = state.shell.as_ref().and_then(|s| s.escritorio_abrir(i)) {
+                crate::keybinds::hacer(state, accion);
+            }
+        }
+        Some(i) => {
+            if let Some(shell) = state.shell.as_mut() {
+                // Pulsar sobre algo que **ya** estaba seleccionado no deshace la
+                // selección: es lo que permite arrastrar varios iconos de una
+                // vez, como en cualquier gestor de archivos.
+                let ya = shell.escritorio_seleccion().get(i).copied().unwrap_or(false);
+                if ctrl || !ya {
+                    shell.escritorio_seleccionar(Some(i), ctrl);
+                }
+            }
+            state.arrastre_escritorio = Some(ArrastreEscritorio::Iconos {
+                origen: punto,
+                movido: false,
+            });
+        }
+        None => {
+            let previa = match ctrl {
+                true => state
+                    .shell
+                    .as_ref()
+                    .map(|s| s.escritorio_seleccion())
+                    .unwrap_or_default(),
+                false => Vec::new(),
+            };
+            if !ctrl {
+                if let Some(shell) = state.shell.as_mut() {
+                    shell.escritorio_seleccionar(None, false);
+                }
+            }
+            state.arrastre_escritorio = Some(ArrastreEscritorio::Banda {
+                origen: punto,
+                previa,
+            });
+        }
+    }
+    true
+}
+
+/// Mueve la banda elástica o los iconos agarrados. `true` si el movimiento era
+/// del escritorio y no debe llegar a nadie más.
+fn seguir_arrastre_escritorio(state: &mut BookosComp, location: Point<f64, Logical>) -> bool {
+    // Se saca y se vuelve a poner porque el gesto y el shell viven los dos en
+    // `state`: con el gesto prestado no se puede tocar el shell.
+    let Some(arrastre) = state.arrastre_escritorio.take() else {
+        return false;
+    };
+    let arrastre = match arrastre {
+        ArrastreEscritorio::Banda { origen, previa } => {
+            let rect = (
+                origen.x.min(location.x),
+                origen.y.min(location.y),
+                (location.x - origen.x).abs(),
+                (location.y - origen.y).abs(),
+            );
+            if let Some(shell) = state.shell.as_mut() {
+                shell.escritorio_banda(rect, &previa);
+            }
+            state.needs_redraw = true;
+            ArrastreEscritorio::Banda { origen, previa }
+        }
+        ArrastreEscritorio::Iconos { origen, movido } => {
+            let delta = (location.x - origen.x, location.y - origen.y);
+            let movido = movido || delta.0.abs().max(delta.1.abs()) >= UMBRAL_ARRASTRE;
+            if movido {
+                if let Some(shell) = state.shell.as_mut() {
+                    shell.escritorio_arrastrar(delta);
+                }
+                state.needs_redraw = true;
+            }
+            ArrastreEscritorio::Iconos { origen, movido }
+        }
+    };
+    state.arrastre_escritorio = Some(arrastre);
+    true
+}
+
+/// Cierra el gesto del escritorio: quita la banda o deja los iconos en su celda.
+fn soltar_escritorio(state: &mut BookosComp) -> bool {
+    let Some(arrastre) = state.arrastre_escritorio.take() else {
+        return false;
+    };
+    if let Some(shell) = state.shell.as_mut() {
+        match arrastre {
+            ArrastreEscritorio::Banda { .. } => {
+                shell.escritorio_quitar_banda();
+            }
+            ArrastreEscritorio::Iconos { .. } => {
+                shell.escritorio_soltar();
+            }
+        }
+    }
+    state.needs_redraw = true;
+    true
+}
+
 /// Da el foco de teclado a la ventana bajo el cursor y la sube del todo.
 fn focus_under_pointer(state: &mut BookosComp) {
     let bajo = state
@@ -795,6 +1083,36 @@ mod tests {
     use super::*;
     use bookos_shell::conmutador::Modo;
     use smithay::input::keyboard::ModifiersState;
+
+    #[test]
+    fn el_cursor_recorre_salidas_con_coordenadas_negativas() {
+        let salidas = [
+            smithay::utils::Rectangle::new((-1280, 0).into(), (1280, 1024).into()),
+            smithay::utils::Rectangle::new((0, 0).into(), (1920, 1080).into()),
+        ];
+        assert_eq!(
+            confinar_a_salidas((-400.0, 500.0).into(), &salidas),
+            (-400.0, 500.0).into()
+        );
+        assert_eq!(
+            confinar_a_salidas((-2000.0, 500.0).into(), &salidas),
+            (-1280.0, 500.0).into()
+        );
+    }
+
+    #[test]
+    fn el_cursor_no_cae_en_huecos_del_escritorio_virtual() {
+        let salidas = [
+            smithay::utils::Rectangle::new((0, 0).into(), (1920, 1080).into()),
+            smithay::utils::Rectangle::new((1920, 500).into(), (1280, 1024).into()),
+        ];
+        // A la derecha de la principal pero por encima de la secundaria hay un
+        // hueco; se conserva el cursor en el borde real más próximo.
+        assert_eq!(
+            confinar_a_salidas((2000.0, 100.0).into(), &salidas),
+            (1919.0, 100.0).into()
+        );
+    }
 
     #[test]
     fn cada_selector_se_cierra_solo_con_su_modificador() {

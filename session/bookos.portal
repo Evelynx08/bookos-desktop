@@ -1,0 +1,6 @@
+# Le dice a xdg-desktop-portal que el compositor de BookOS implementa estas
+# interfaces él mismo, en el proceso que ya está corriendo. No hay servicio que
+# arrancar: el nombre aparece en el bus cuando arranca la sesión.
+[portal]
+DBusName=org.bookos.portal.desktop
+Interfaces=org.freedesktop.impl.portal.ScreenCast;org.freedesktop.impl.portal.Screenshot;

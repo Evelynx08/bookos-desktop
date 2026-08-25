@@ -26,7 +26,9 @@
 //! dock = konsole:Terminal:utilities-terminal, firefox:Navegador:firefox
 //!
 //! # Cursor y entrada. Las velocidades van en la escala de libinput: [-1, 1].
-//! fondo = /usr/share/wallpapers/BookOS/blue_dark.png
+//! # Uno para cada tema: el cambio de claro a oscuro se lleva el fondo con él.
+//! fondo_claro = /usr/share/wallpapers/BookOS/Light/blue.png
+//! fondo_oscuro = /usr/share/wallpapers/BookOS/Dark/blue_dark.png
 //! cursor = 24
 //! velocidad_touchpad = 0.3
 //! toque_para_clic = si
@@ -45,6 +47,22 @@
 
 use std::path::PathBuf;
 
+/// Cuánto adorno se dibuja.
+///
+/// `Reducidos` quita el desenfoque del panel y del dock y las animaciones de
+/// ventana —abrir, minimizar, encajar, mover—. No quita las del propio shell
+/// (emergentes, launchpad, cambio de escritorio): esas duran menos de 300 ms
+/// sobre buffers pequeños y no son lo que se come los fotogramas.
+///
+/// La batería baja lo enciende sola sin tocar esta clave: el usuario elige lo
+/// que quiere **cuando hay energía para ello**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Efectos {
+    #[default]
+    Completos,
+    Reducidos,
+}
+
 pub struct Config {
     pub centro: Option<String>,
     pub derecha: Vec<String>,
@@ -61,8 +79,19 @@ pub struct Config {
     /// trae se acerca más a ese tamaño por la escala de la pantalla.
     pub cursor: u32,
     pub entrada: Entrada,
-    /// Imagen del fondo del escritorio. `None` = la que se encuentre.
+    /// Imagen del fondo del escritorio, la misma con los dos temas.
+    /// `None` = la que se encuentre.
+    ///
+    /// Para tener una con cada tema están `fondo_claro` y `fondo_oscuro`, que
+    /// mandan sobre esta: los fondos de BookOS vienen emparejados —`blue.png` y
+    /// `blue_dark.png`, y lo mismo para las otras tres familias— y el cambio de
+    /// tema tiene que llevarse el fondo con él o el escritorio se queda claro
+    /// con una imagen oscura detrás.
     pub fondo: Option<String>,
+    /// El fondo con el tema claro. Si está, manda sobre `fondo`.
+    pub fondo_claro: Option<String>,
+    /// El fondo con el tema oscuro. Si está, manda sobre `fondo`.
+    pub fondo_oscuro: Option<String>,
     /// Distribución de teclado (`es`, `us`, `fr`…). `None` = la del sistema.
     pub teclado: Option<String>,
     /// Cuántos escritorios virtuales hay.
@@ -74,8 +103,28 @@ pub struct Config {
     pub nombres_escritorios: Vec<String>,
     /// Claro u oscuro. Lo aplica quien crea el shell, porque el tema es del
     /// proceso entero y no de una superficie.
+    /// El tema que toca **ahora mismo**, ya resuelto.
+    ///
+    /// Con `modo_tema` en automático esto cambia solo a lo largo del día; lo
+    /// deriva `cargar` y nadie más, para que no haya dos verdades.
     pub tema: crate::tema::Tema,
+    /// Lo que el usuario eligió: claro, oscuro o que siga la hora.
+    pub modo_tema: crate::tema::ModoTema,
+    /// A qué hora empieza el tramo claro, con `modo_tema` en automático.
+    pub tema_claro_desde: crate::tema::HoraDelDia,
+    /// Y a qué hora empieza el oscuro. Puede ser anterior al claro: entonces el
+    /// tramo claro cruza la medianoche.
+    ///
+    /// Son dos horas y no el amanecer de verdad porque calcular el amanecer
+    /// pide una posición, y sacarla del sistema significa geoclue —un servicio
+    /// con su permiso y su agente— o pedirle al usuario que escriba latitud y
+    /// longitud en un fichero. Dos horas se entienden solas y se cambian en un
+    /// segundo. Si algún día hay posición, esto se calcula desde ella sin que
+    /// cambie nada más: el resto del código ya solo habla de estas dos horas.
+    pub tema_oscuro_desde: crate::tema::HoraDelDia,
     /// El color de acento, de la tabla cerrada de [`crate::tema::Acento`].
+    /// Efectos visuales: completos o reducidos. Ver [`Efectos`].
+    pub efectos: Efectos,
     pub acento: crate::tema::Acento,
     /// Foto de perfil para el bloqueo. `None` = la del sistema (`~/.face` o
     /// AccountsService), y si tampoco hay, las iniciales.
@@ -244,10 +293,19 @@ impl Default for Config {
             cursor: 24,
             entrada: Entrada::default(),
             fondo: None,
+            fondo_claro: None,
+            fondo_oscuro: None,
             teclado: None,
             escritorios: 2,
             nombres_escritorios: vec!["Escritorio 1".into(), "Escritorio 2".into()],
             tema: crate::tema::Tema::Oscuro,
+            modo_tema: crate::tema::ModoTema::Oscuro,
+            // Las siete y las ocho: ni el amanecer ni el anochecer de ningún
+            // sitio en concreto, pero sí el tramo en el que la mayoría tiene
+            // luz en la habitación.
+            tema_claro_desde: (7, 0),
+            tema_oscuro_desde: (20, 0),
+            efectos: Efectos::default(),
             acento: crate::tema::Acento::Azul,
             avatar: None,
             bloqueo: Bloqueo::default(),
@@ -363,12 +421,20 @@ impl Config {
                 // Cualquier otra cosa se queda en oscuro y se avisa: un tema
                 // mal escrito no puede dejar el escritorio a medio pintar.
                 "tema" => match valor.trim() {
-                    "claro" => config.tema = crate::tema::Tema::Claro,
-                    "oscuro" => config.tema = crate::tema::Tema::Oscuro,
+                    "claro" => config.modo_tema = crate::tema::ModoTema::Claro,
+                    "oscuro" => config.modo_tema = crate::tema::ModoTema::Oscuro,
+                    "auto" | "automatico" | "automático" => {
+                        config.modo_tema = crate::tema::ModoTema::Automatico
+                    }
                     otro => tracing::warn!(otro, "«tema» solo entiende claro u oscuro"),
                 },
                 // Un nombre que no está en la tabla se ignora en vez de
                 // dejar el escritorio con un acento a medias.
+                "efectos" => match valor.trim() {
+                    "completos" => config.efectos = Efectos::Completos,
+                    "reducidos" => config.efectos = Efectos::Reducidos,
+                    otro => tracing::warn!(otro, "«efectos» solo entiende completos o reducidos"),
+                },
                 "acento" => match crate::tema::Acento::desde_nombre(valor) {
                     Some(a) => config.acento = a,
                     None => tracing::warn!(valor = valor.trim(), "acento desconocido"),
@@ -395,7 +461,22 @@ impl Config {
                         "tamaño de cursor fuera de [8 - 128]; se ignora"
                     ),
                 },
-                "fondo" => config.fondo = Some(valor.trim().to_string()),
+                "tema_claro_desde" => {
+                    if let Some(h) = hora_del_dia(valor, ruta, n + 1) {
+                        config.tema_claro_desde = h;
+                    }
+                }
+                "tema_oscuro_desde" => {
+                    if let Some(h) = hora_del_dia(valor, ruta, n + 1) {
+                        config.tema_oscuro_desde = h;
+                    }
+                }
+                // Vacío es «no hay», no «la ruta vacía»: un fichero editado a
+                // mano con `fondo =` suelto no puede dejar el escritorio
+                // buscando una imagen sin nombre.
+                "fondo" => config.fondo = no_vacio(valor),
+                "fondo_claro" => config.fondo_claro = no_vacio(valor),
+                "fondo_oscuro" => config.fondo_oscuro = no_vacio(valor),
                 "teclado" => config.teclado = Some(valor.trim().to_string()),
                 "velocidad_touchpad" => {
                     if let Some(v) = velocidad(valor, ruta, n + 1) {
@@ -427,13 +508,63 @@ impl Config {
                 config.nombres_escritorios.len() + 1
             ));
         }
+        // El tema efectivo se deriva aquí y en ningún otro sitio: con el modo
+        // automático depende de la hora, y tener dos verdades —lo elegido y lo
+        // pintado— solo funciona si una sale de la otra en un único punto.
+        config.tema = config.tema_ahora();
         config
+    }
+
+    /// El tema que toca en este instante, según el modo y el reloj.
+    ///
+    /// Se vuelve a llamar cuando el temporizador del compositor despierta en la
+    /// hora del cambio, que es lo que hace que el escritorio se ponga oscuro
+    /// solo al anochecer.
+    pub fn tema_ahora(&self) -> crate::tema::Tema {
+        self.modo_tema.resolver(
+            self.tema_claro_desde,
+            self.tema_oscuro_desde,
+            crate::state::hora_local_ahora(),
+        )
+    }
+
+    /// Cuánto falta para el próximo cambio automático de tema, si va a haberlo.
+    pub fn hasta_el_cambio_de_tema(&self) -> Option<std::time::Duration> {
+        self.modo_tema
+            .minutos_al_cambio(
+                self.tema_claro_desde,
+                self.tema_oscuro_desde,
+                crate::state::hora_local_ahora(),
+            )
+            .map(|min| std::time::Duration::from_secs(min as u64 * 60))
     }
 }
 
 /// Una velocidad de puntero en la escala de libinput. Fuera de [-1, 1]
 /// libinput rechaza el valor y el dispositivo se queda como estaba, así que
 /// más vale avisar aquí que dejar que falle en silencio al aplicarlo.
+/// Una hora del reloj en `HH:MM`. También vale `7` a secas, que es `07:00`.
+fn hora_del_dia(
+    valor: &str,
+    ruta: &std::path::Path,
+    linea: usize,
+) -> Option<crate::tema::HoraDelDia> {
+    let texto = valor.trim();
+    let partes = match texto.split_once(':') {
+        Some((h, m)) => h.trim().parse::<u8>().ok().zip(m.trim().parse::<u8>().ok()),
+        None => texto.parse::<u8>().ok().map(|h| (h, 0)),
+    };
+    // 24:00 no existe: el día acaba en 23:59 y quien quiera «medianoche» pone
+    // 0:00. Admitirlo daría un tramo que empieza después de acabarse.
+    match partes {
+        Some((h, m)) if h < 24 && m < 60 => Some((h, m)),
+        _ => {
+            tracing::warn!(?ruta, linea, valor = texto, "hora no válida; se ignora");
+            None
+        }
+    }
+}
+
 fn velocidad(valor: &str, ruta: &std::path::Path, linea: usize) -> Option<f64> {
     match valor.trim().replace(',', ".").parse::<f64>() {
         Ok(v) if (-1.0..=1.0).contains(&v) => Some(v),
@@ -469,6 +600,12 @@ fn decimal(
             None
         }
     }
+}
+
+/// El valor, o `None` si está en blanco.
+fn no_vacio(valor: &str) -> Option<String> {
+    let v = valor.trim();
+    (!v.is_empty()).then(|| v.to_string())
 }
 
 fn booleano(valor: &str, ruta: &std::path::Path, linea: usize) -> Option<bool> {
@@ -518,18 +655,56 @@ pub fn guardar_escritorios(nombres: &[String]) -> std::io::Result<()> {
 }
 
 /// Persiste el tema y el acento que se acaban de elegir en Apariencia.
+/// Guarda lo que el usuario **eligió**, no el tema que se está pintando.
+///
+/// Con el modo automático son cosas distintas: a las once de la noche lo
+/// pintado es oscuro y lo elegido es «automático», y escribir `oscuro` en el
+/// fichero convertiría el automático en fijo al reiniciar la sesión.
 pub fn guardar_apariencia(
-    tema: crate::tema::Tema,
+    modo: crate::tema::ModoTema,
     acento: crate::tema::Acento,
 ) -> std::io::Result<()> {
-    let tema = match tema {
-        crate::tema::Tema::Claro => "claro",
-        crate::tema::Tema::Oscuro => "oscuro",
+    let tema = match modo {
+        crate::tema::ModoTema::Claro => "claro",
+        crate::tema::ModoTema::Oscuro => "oscuro",
+        crate::tema::ModoTema::Automatico => "automatico",
     };
     escribir_claves(&[
         ("tema", tema.to_string()),
         ("acento", acento.nombre().to_string()),
     ])
+}
+
+/// Persiste la pareja de fondos elegida.
+///
+/// Escribe `fondo_claro` y `fondo_oscuro` y **vacía** `fondo`: si se quedara, el
+/// común mandaría sobre la pareja al volver a cargar y el cambio de tema dejaría
+/// de llevarse la imagen con él, que es justo lo que se acaba de elegir.
+pub fn guardar_fondo(claro: &std::path::Path, oscuro: &std::path::Path) -> std::io::Result<()> {
+    escribir_claves(&[
+        ("fondo", String::new()),
+        ("fondo_claro", claro.to_string_lossy().into_owned()),
+        ("fondo_oscuro", oscuro.to_string_lossy().into_owned()),
+    ])
+}
+
+/// Quita las tres claves del fondo, dejando el fichero como si nunca se hubiera
+/// elegido ninguno. La usa el autotest para devolver lo que encontró.
+pub fn olvidar_fondo() -> std::io::Result<()> {
+    escribir_claves(&[
+        ("fondo", String::new()),
+        ("fondo_claro", String::new()),
+        ("fondo_oscuro", String::new()),
+    ])
+}
+
+/// Persiste el modo de efectos elegido.
+pub fn guardar_efectos(efectos: Efectos) -> std::io::Result<()> {
+    let valor = match efectos {
+        Efectos::Completos => "completos",
+        Efectos::Reducidos => "reducidos",
+    };
+    escribir_claves(&[("efectos", valor.to_string())])
 }
 
 /// Reescribe esas claves del fichero y deja lo demás como está.
@@ -538,6 +713,11 @@ pub fn guardar_apariencia(
 /// usuario: lleva sus comentarios y su orden, y volcarlo desde el código los
 /// borraría. La clave que ya estaba se sustituye en su sitio; la que no,
 /// se añade al final.
+///
+/// **Un valor vacío borra la clave** en vez de escribir `clave = `. Es lo que
+/// hace falta para desdecirse: al elegir una pareja de fondos hay que quitar el
+/// `fondo` común, y dejarlo con el valor en blanco no lo quita —se relee como
+/// una ruta vacía y manda igual sobre la pareja.
 fn escribir_claves(valores: &[(&str, String)]) -> std::io::Result<()> {
     let Some(ruta) = ruta() else {
         return Ok(());
@@ -554,10 +734,12 @@ fn escribir_claves(valores: &[(&str, String)]) -> std::io::Result<()> {
             // Repetida en el fichero: la primera se sustituye y las demás se
             // caen, que es lo que hace la lectura —se queda con la última— al
             // revés, pero deja el fichero sin claves duplicadas.
-            if !vistos[i] {
+            if !vistos[i] && !valores[i].1.is_empty() {
                 salida.push_str(&format!("{} = {}", valores[i].0, valores[i].1));
                 vistos[i] = true;
             } else {
+                // Vacía: la línea se cae y la clave desaparece del fichero.
+                vistos[i] = true;
                 continue;
             }
         } else {
@@ -566,7 +748,9 @@ fn escribir_claves(valores: &[(&str, String)]) -> std::io::Result<()> {
         salida.push('\n');
     }
     for (i, (clave, valor)) in valores.iter().enumerate() {
-        if !vistos[i] {
+        // La que no estaba se añade al final; la vacía no se añade: borrar una
+        // clave que no existía es no hacer nada.
+        if !vistos[i] && !valor.is_empty() {
             salida.push_str(&format!("{clave} = {valor}\n"));
         }
     }
@@ -681,6 +865,56 @@ pub fn guardar_launchpad(datos: &Launchpad) -> std::io::Result<()> {
 
 fn ruta_launchpad() -> Option<PathBuf> {
     Some(ruta()?.with_file_name("launchpad.conf"))
+}
+
+/// Dónde ha dejado el usuario cada icono del escritorio.
+///
+/// El fichero es `~/.config/bookos/escritorio.conf` y cada línea es
+/// `columna,fila = nombre`. Las coordenadas van a la **izquierda** del `=` a
+/// propósito: un nombre de fichero puede llevar un igual dentro, y al revés la
+/// línea se partiría por donde no toca.
+pub fn cargar_escritorio() -> Vec<(String, (i32, i32))> {
+    let Some(ruta) = ruta_escritorio() else {
+        return Vec::new();
+    };
+    let Ok(texto) = std::fs::read_to_string(&ruta) else {
+        return Vec::new();
+    };
+    texto
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|linea| {
+            let (celda, nombre) = linea.split_once('=')?;
+            let (col, fila) = celda.trim().split_once(',')?;
+            Some((
+                nombre.trim().to_string(),
+                (col.trim().parse().ok()?, fila.trim().parse().ok()?),
+            ))
+        })
+        .collect()
+}
+
+/// Reescribe las posiciones enteras. Lo llama el escritorio al soltar un icono.
+pub fn guardar_escritorio(posiciones: &[(&str, (i32, i32))]) -> std::io::Result<()> {
+    let Some(ruta) = ruta_escritorio() else {
+        return Ok(());
+    };
+    if let Some(dir) = ruta.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut salida =
+        String::from("# Dónde va cada icono del escritorio: columna,fila = nombre.\n");
+    for (nombre, (col, fila)) in posiciones {
+        // Un salto de línea en el nombre partiría el fichero en dos entradas.
+        let nombre = nombre.replace(['\n', '\r'], " ");
+        salida.push_str(&format!("{col},{fila} = {nombre}\n"));
+    }
+    std::fs::write(ruta, salida)
+}
+
+fn ruta_escritorio() -> Option<PathBuf> {
+    Some(ruta()?.with_file_name("escritorio.conf"))
 }
 
 fn ruta() -> Option<PathBuf> {

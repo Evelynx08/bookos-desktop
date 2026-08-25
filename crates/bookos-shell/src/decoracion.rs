@@ -228,11 +228,25 @@ pub fn vista(estado: &Estado, ancho: f32) -> PanelElement<'static> {
     .align_y(Vertical::Center)
     .height(Length::Fill);
 
+    // Restaurada, la barra forma las dos esquinas superiores de la ventana.
+    // Maximizada toca los bordes de la salida y debe volver a ser rectangular:
+    // un radio ahí dejaría ver dos cuñas del fondo en las esquinas.
+    let radio = if estado.maximizada {
+        iced_core::border::Radius::default()
+    } else {
+        iced_core::border::Radius::default()
+            .top_left(tema::R_CONTROL)
+            .top_right(tema::R_CONTROL)
+    };
     container(fila)
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(|_theme| container::Style {
+        .style(move |_theme| container::Style {
             background: Some(tema::card().into()),
+            border: Border {
+                radius: radio,
+                ..Default::default()
+            },
             ..Default::default()
         })
         .into()

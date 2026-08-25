@@ -1,7 +1,5 @@
 //! El brillo de la pantalla, en tanto por ciento.
 
-use iced_widget::{row, text};
-
 use crate::icono::{self, Icono};
 use crate::state::read_brightness;
 use crate::tema;
@@ -40,33 +38,21 @@ impl Widget for Brillo {
         true
     }
 
-    /// El icono es un SVG del tema, **no un glifo**: el rasterizador de iced se
-    /// queda con la familia por defecto y no cae a otra fuente, así que un "☀"
-    /// desaparecía sin avisar y se veía "60%" a secas, indistinguible del
-    /// porcentaje de la batería de al lado.
-    /// Icono, hueco y el porcentaje: "50%" o "100%".
+    /// Solo el icono: el porcentaje ya se ve en la tarjeta al pulsarlo. Además
+    /// así el panel no cambia de anchura al pasar de 9 a 100.
     fn ancho(&self) -> f32 {
-        let Some(brillo) = self.dato else {
-            return 0.0;
-        };
-        tema::ICONO_PANEL + 4.0 + crate::widget::ancho_de(&format!("{brillo}%"), tema::T_CUERPO)
+        (self.dato.is_some() && self.icono.is_some())
+            .then_some(tema::ICONO_PANEL)
+            .unwrap_or(0.0)
     }
 
     fn ver(&self) -> PanelElement<'_> {
-        let Some(brillo) = self.dato else {
+        if self.dato.is_none() {
             return crate::widget::vacio();
-        };
-        let mut fila = row![]
-            .spacing(4)
-            .align_y(iced_core::alignment::Vertical::Center);
-        if let Some(ic) = &self.icono {
-            fila = fila.push(icono::ver_teñido(ic, tema::ICONO_PANEL, Some(TEXT())));
         }
-        fila.push(
-            text(format!("{brillo}%"))
-                .size(tema::T_CUERPO)
-                .color(TEXT()),
-        )
-        .into()
+        self.icono
+            .as_ref()
+            .map(|ic| icono::ver_teñido(ic, tema::ICONO_PANEL, Some(TEXT())))
+            .unwrap_or_else(crate::widget::vacio)
     }
 }

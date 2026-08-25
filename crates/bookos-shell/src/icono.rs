@@ -254,6 +254,17 @@ const PROPIOS: &[(&str, &[u8])] = &[
         include_bytes!("../assets/iconos/reproducir.svg"),
     ),
     ("pausa", include_bytes!("../assets/iconos/pausa.svg")),
+    // Los dos del emergente de energía: la marca del perfil elegido y la
+    // flecha del pie que lleva a los ajustes. Son `16/solid` y no `24/outline`
+    // porque a 14 px un trazo de 1,5 se ve gris en vez de nítido.
+    (
+        "comprobado",
+        include_bytes!("../assets/iconos/comprobado.svg"),
+    ),
+    (
+        "chevron-derecha",
+        include_bytes!("../assets/iconos/chevron-derecha.svg"),
+    ),
 ];
 
 /// Un icono propio por su nombre. `None` si no existe, que solo puede pasar por
@@ -422,6 +433,11 @@ const TEMAS: &[&str] = &[
 /// Las categorías de freedesktop que usa el escritorio. `status` y
 /// `preferences` hacen falta para el panel: los iconos de aplicación viven en
 /// `apps`, pero los de batería y red están en `status`.
+///
+/// `mimetypes` y `places` son las de los iconos del escritorio: un PNG resuelve
+/// a `image-x-generic`, que vive en `mimetypes`, y una carpeta a `folder`, que
+/// vive en `places`. Sin ellas la rejilla salía con los nombres y sin ningún
+/// dibujo — se vio en la previsualización.
 const CATEGORIAS: &[&str] = &[
     "status",
     "apps",
@@ -429,6 +445,8 @@ const CATEGORIAS: &[&str] = &[
     "devices",
     "preferences",
     "categories",
+    "mimetypes",
+    "places",
 ];
 /// El tamaño que anuncia el nombre de un directorio de tema, para ordenar de
 /// mayor a menor: es preferible reducir un icono grande que ampliar uno de 16

@@ -29,8 +29,57 @@ use smithay::utils::Transform;
 /// 640 llega de sobra y cuesta 1 MB por copia, frente a los 20 MB del original.
 const MINIATURA_ANCHO: i32 = 640;
 
+/// Qué fondo ha pedido el usuario, antes de decidir cuál toca.
+///
+/// Son tres rutas y no una porque el tema cambia en caliente: `claro` y
+/// `oscuro` son la pareja —los fondos de BookOS vienen así, `blue.png` y
+/// `blue_dark.png`— y `ambos` es el de toda la vida, el mismo con los dos
+/// temas. Con las tres vacías se busca el que venga instalado.
+#[derive(Debug, Default, Clone)]
+pub struct Eleccion {
+    /// `fondo`: el mismo con los dos temas.
+    pub ambos: Option<String>,
+    /// `fondo_claro`. Manda sobre `ambos` cuando el tema es claro.
+    pub claro: Option<String>,
+    /// `fondo_oscuro`. Manda sobre `ambos` cuando el tema es oscuro.
+    pub oscuro: Option<String>,
+}
+
+impl Eleccion {
+    /// La ruta que toca con el tema que está puesto **ahora**.
+    ///
+    /// El específico gana al común: quien se molesta en poner `fondo_oscuro`
+    /// está diciendo justo eso, y si además tiene un `fondo` suelto es el de
+    /// respaldo para el otro tema.
+    pub fn para_el_tema(&self) -> Option<&str> {
+        self.para(bookos_shell::tema::es_claro())
+    }
+
+    /// La decisión, sin preguntarle al tema global.
+    ///
+    /// Va aparte para poder probarla: el tema es un `static` del proceso y
+    /// `Shell::con_config` lo escribe, así que un test que lo moviera para
+    /// leerlo después competiría con cualquier otro del mismo binario.
+    fn para(&self, claro: bool) -> Option<&str> {
+        let propio = if claro {
+            self.claro.as_deref()
+        } else {
+            self.oscuro.as_deref()
+        };
+        propio.or(self.ambos.as_deref())
+    }
+
+    /// ¿Cambia la imagen al cambiar de tema? Si no, recargar no sirve de nada.
+    pub fn depende_del_tema(&self) -> bool {
+        self.claro.is_some() || self.oscuro.is_some() || self.ambos.is_none()
+    }
+}
+
 /// El fondo ya decodificado y listo para dibujar.
 pub struct Fondo {
+    /// De dónde salió. Solo para la traza y el autotest: es la única forma de
+    /// comprobar desde fuera que el cambio de tema se llevó el fondo con él.
+    ruta: PathBuf,
     buffer: MemoryRenderBuffer,
     /// Tamaño de la imagen en píxeles, para el recorte.
     pixeles: (i32, i32),
@@ -65,8 +114,8 @@ pub struct Fondo {
 impl Fondo {
     /// Carga el fondo. `None` si no hay ninguno donde mirar, y entonces el
     /// escritorio se queda con su color liso de siempre.
-    pub fn cargar(ruta: Option<&str>) -> Option<Self> {
-        let ruta = match ruta {
+    pub fn cargar(eleccion: &Eleccion) -> Option<Self> {
+        let ruta = match eleccion.para_el_tema() {
             Some(r) => PathBuf::from(r),
             None => buscar()?,
         };
@@ -85,6 +134,7 @@ impl Fondo {
         );
         let (mini_rgba, mini_pixeles) = reducir(&pixeles, (w as i32, h as i32), MINIATURA_ANCHO);
         Some(Self {
+            ruta,
             buffer,
             pixeles: (w as i32, h as i32),
             rgba: pixeles,
@@ -93,6 +143,11 @@ impl Fondo {
             mini: std::cell::RefCell::new(Vec::new()),
             gemelo: std::cell::RefCell::new(None),
         })
+    }
+
+    /// De qué fichero salió.
+    pub fn ruta(&self) -> &std::path::Path {
+        &self.ruta
     }
 
     /// Los píxeles y el tamaño, para quien necesite subirlos por su cuenta.
@@ -116,13 +171,29 @@ impl Fondo {
         posicion: (i32, i32),
         logico: (i32, i32),
     ) -> Option<MemoryRenderBufferRenderElement<GlesRenderer>> {
+        self.elemento_con_alfa(renderer, posicion, logico, 1.0)
+    }
+
+    /// El fondo con alfa, para el fundido entre dos imágenes.
+    ///
+    /// El que entra se dibuja **encima** del que sale y va de cero a uno; el
+    /// que sale se queda opaco todo el rato. Es el orden correcto para una
+    /// mezcla normal: bajarle el alfa al saliente a la vez dejaría ver el
+    /// escritorio a través de los dos a mitad de camino.
+    pub fn elemento_con_alfa(
+        &self,
+        renderer: &mut GlesRenderer,
+        posicion: (i32, i32),
+        logico: (i32, i32),
+        alfa: f32,
+    ) -> Option<MemoryRenderBufferRenderElement<GlesRenderer>> {
         use smithay::utils::Rectangle;
         let src = Rectangle::from_size((self.pixeles.0 as f64, self.pixeles.1 as f64).into());
         MemoryRenderBufferRenderElement::from_buffer(
             renderer,
             (posicion.0 as f64, posicion.1 as f64),
             &self.buffer,
-            None,
+            Some(alfa),
             Some(src),
             Some(logico.into()),
             Kind::Unspecified,
@@ -253,23 +324,98 @@ fn reducir(rgba: &[u8], (w, h): (i32, i32), ancho: i32) -> (Vec<u8>, (i32, i32))
 /// `blue_dark.png` oscuro—, y arrancar en claro con el fondo de noche deja el
 /// panel translúcido blanco sobre azul marino, que es justo lo que el tema
 /// claro no quiere.
+/// La familia de fondos que se usa cuando nadie ha elegido ninguna.
+///
+/// Los de BookOS vienen en cuatro familias —`blue`, `ember`, `pine`,
+/// `purple`— y cada una con su pareja: `blue.png` en `Light/` y
+/// `blue_dark.png` en `Dark/`. Aquí solo se nombra la familia; el sufijo y la
+/// carpeta los pone [`buscar`] según el tema que esté puesto, que es lo que
+/// permite que cambiar de tema se lleve el fondo con él.
+const FAMILIA: &str = "blue";
+
+/// El fondo que le toca al tema de ahora.
+///
+/// Se llama **cada vez que se recarga**, no solo al arrancar: es lo que hace
+/// que pasar a claro cambie también la imagen. Antes tenía `blue` escrito a
+/// fuego y las rutas de las cuatro familias instaladas no se miraban siquiera.
 fn buscar() -> Option<PathBuf> {
     let (carpeta, archivo) = if bookos_shell::tema::es_claro() {
-        ("Light", "blue.png")
+        ("Light", format!("{FAMILIA}.png"))
     } else {
-        ("Dark", "blue_dark.png")
+        ("Dark", format!("{FAMILIA}_dark.png"))
     };
     let mut candidatos: Vec<PathBuf> = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {
         let home = PathBuf::from(home);
-        candidatos.push(home.join(format!(".local/share/wallpapers/BookOS/{archivo}")));
+        let base = home.join(".local/share/wallpapers/BookOS");
+        // Con la carpeta del tema primero: es como los deja el instalador. La
+        // ruta plana se sigue mirando después para no romper una instalación
+        // hecha con la versión anterior, que las volcaba todas juntas.
+        candidatos.push(base.join(carpeta).join(&archivo));
+        candidatos.push(base.join(&archivo));
         // El repositorio de wallpapers, tal cual se clona para desarrollar.
-        candidatos.push(home.join(format!(
-            "Descargas/BookOS/BookOS-Wallpapers/Wallpapers-0.6/{carpeta}/{archivo}"
-        )));
+        candidatos.push(
+            home.join("Descargas/BookOS/BookOS-Wallpapers/Wallpapers-0.6")
+                .join(carpeta)
+                .join(&archivo),
+        );
     }
-    candidatos.push(PathBuf::from(format!(
-        "/usr/share/wallpapers/BookOS/{archivo}"
-    )));
+    let sistema = PathBuf::from("/usr/share/wallpapers/BookOS");
+    candidatos.push(sistema.join(carpeta).join(&archivo));
+    candidatos.push(sistema.join(&archivo));
     candidatos.into_iter().find(|p| p.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// La pareja manda sobre el fondo común, y cambiar de tema cambia la
+    /// imagen. Es lo que hacía falta para que pasar a claro no dejara el
+    /// escritorio con la foto oscura detrás.
+    #[test]
+    fn cada_tema_se_lleva_su_fondo() {
+        let eleccion = Eleccion {
+            ambos: Some("/comun.png".into()),
+            claro: Some("/claro.png".into()),
+            oscuro: Some("/oscuro.png".into()),
+        };
+        assert_eq!(eleccion.para(true), Some("/claro.png"));
+        assert_eq!(eleccion.para(false), Some("/oscuro.png"));
+    }
+
+    /// Con solo uno de los dos puestos, el otro tema cae al común: quien pone
+    /// `fondo_oscuro` y deja `fondo` está diciendo «este de noche y el otro el
+    /// resto del tiempo».
+    #[test]
+    fn el_tema_sin_pareja_cae_al_comun() {
+        let eleccion = Eleccion {
+            ambos: Some("/comun.png".into()),
+            claro: None,
+            oscuro: Some("/oscuro.png".into()),
+        };
+        assert_eq!(eleccion.para(true), Some("/comun.png"));
+        assert_eq!(eleccion.para(false), Some("/oscuro.png"));
+    }
+
+    /// Un `fondo` fijo y sin pareja no depende del tema: recargarlo al cambiar
+    /// de claro a oscuro serían veinte megas decodificados para poner lo mismo.
+    #[test]
+    fn un_fondo_fijo_no_se_recarga_por_el_tema() {
+        let fijo = Eleccion {
+            ambos: Some("/comun.png".into()),
+            claro: None,
+            oscuro: None,
+        };
+        assert!(!fijo.depende_del_tema());
+
+        // Con pareja sí, y sin nada también: ahí manda `buscar`, que elige
+        // carpeta y sufijo por el tema.
+        let con_pareja = Eleccion {
+            ambos: Some("/comun.png".into()),
+            claro: Some("/claro.png".into()),
+            oscuro: None,
+        };
+        assert!(con_pareja.depende_del_tema());
+        assert!(Eleccion::default().depende_del_tema());
+    }
 }

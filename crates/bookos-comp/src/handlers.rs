@@ -33,7 +33,7 @@ use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::{
     delegate_compositor, delegate_data_control, delegate_data_device, delegate_fractional_scale,
     delegate_output, delegate_primary_selection, delegate_seat, delegate_shm, delegate_viewporter,
-    delegate_xdg_shell,
+    delegate_xdg_shell, delegate_presentation,
 };
 
 use crate::state::{BookosComp, ClientState};
@@ -94,7 +94,10 @@ impl CompositorHandler for BookosComp {
 }
 
 impl BookosComp {
-    /// Reenvía la escala preferida a todas las superficies vivas.
+    /// Reenvía a cada superficie la escala de la salida que ocupa. Si una
+    /// ventana cruza dos monitores se elige la mayor, para que ninguno tenga
+    /// que ampliar un buffer de menor resolución; el compositor recorta y
+    /// reduce la misma superficie independientemente en cada escena.
     ///
     /// Hace falta al cambiar de escala en caliente: `new_fractional_scale` solo
     /// cubre a los clientes que se conectan después.
@@ -106,6 +109,12 @@ impl BookosComp {
             .filter_map(|w| w.wl_surface().map(|s| s.into_owned()))
             .collect();
         for surface in surfaces {
+            let scale = self.window_for_surface(&surface)
+                .and_then(|window| self.space.outputs_for_element(&window)
+                    .into_iter()
+                    .map(|o| o.current_scale().fractional_scale())
+                    .max_by(f64::total_cmp))
+                .unwrap_or(scale);
             with_states(&surface, |states| {
                 with_fractional_scale(states, |fractional| {
                     fractional.set_preferred_scale(scale);
@@ -114,12 +123,57 @@ impl BookosComp {
         }
     }
 
-    /// La escala de la pantalla. `Scale::Fractional` la guarda tal cual;
-    /// `wl_output` solo sabe de enteros, pero `wp_fractional_scale` no.
+    /// El tema que toca ahora mismo con el modo elegido y el reloj.
+    pub fn tema_que_toca(&self) -> bookos_shell::tema::Tema {
+        self.modo_tema.resolver(
+            self.horas_tema.0,
+            self.horas_tema.1,
+            bookos_shell::hora_local_ahora(),
+        )
+    }
+
+    /// Cuánto falta para el próximo cambio automático, si va a haberlo.
+    pub fn hasta_el_cambio_de_tema(&self) -> Option<std::time::Duration> {
+        self.modo_tema
+            .minutos_al_cambio(
+                self.horas_tema.0,
+                self.horas_tema.1,
+                bookos_shell::hora_local_ahora(),
+            )
+            .map(|min| std::time::Duration::from_secs(min as u64 * 60))
+    }
+
+    /// La salida donde está el puntero, o la principal si está en un hueco.
+    ///
+    /// Es la salida sobre la que actúan las acciones que tienen que elegir una:
+    /// cambiar de escritorio, maximizar, encajar. La principal se reconoce por
+    /// tener el origen en (0,0) —`pantallas::normalizar` la lleva ahí—.
+    pub fn salida_del_puntero(&self) -> Option<&smithay::output::Output> {
+        self.space
+            .outputs()
+            .find(|o| {
+                self.space
+                    .output_geometry(o)
+                    .is_some_and(|r| r.to_f64().contains(self.pointer_location))
+            })
+            .or_else(|| {
+                self.space
+                    .outputs()
+                    .find(|o| o.current_location() == (0, 0).into())
+            })
+            .or_else(|| self.space.outputs().next())
+    }
+
+    /// Escala de la salida bajo el puntero (o de la principal). Es la mejor
+    /// aproximación antes de que una superficie nueva esté mapeada.
     pub fn output_scale(&self) -> f64 {
         self.space
             .outputs()
-            .next()
+            .find(|o| self.space.output_geometry(o).is_some_and(|r| {
+                r.to_f64().contains(self.pointer_location)
+            }))
+            .or_else(|| self.space.outputs().find(|o| o.current_location() == (0, 0).into()))
+            .or_else(|| self.space.outputs().next())
             .map(|o| o.current_scale().fractional_scale())
             .unwrap_or(1.0)
     }
@@ -445,8 +499,94 @@ impl ShmHandler for BookosComp {
     }
 }
 
+impl smithay::wayland::dmabuf::DmabufHandler for BookosComp {
+    fn dmabuf_state(&mut self) -> &mut smithay::wayland::dmabuf::DmabufState {
+        &mut self.dmabuf_state
+    }
+
+    /// Un cliente nos ofrece un buffer de la GPU. Aquí solo se contesta si lo
+    /// vamos a saber leer; el uso de verdad ocurre al componer, y de eso ya se
+    /// encarga `GlesRenderer` por su cuenta con `ImportDmaWl`.
+    ///
+    /// La comprobación es hacer la `EGLImage` y tirarla. Se hace con la
+    /// `EGLDisplay` y no con el renderizador porque el renderizador vive dentro
+    /// del backend y aquí no se ve —y porque la pregunta es de EGL, no de GL:
+    /// si EGL sabe construir la imagen, el import del fotograma también podrá.
+    /// Sin `EGLDisplay` (no debería pasar: el global lo crea el backend, que es
+    /// quien la deja puesta) se rechaza en vez de aceptar a ciegas, que daría
+    /// una ventana en negro en vez de un fallo que se ve.
+    fn dmabuf_imported(
+        &mut self,
+        _global: &smithay::wayland::dmabuf::DmabufGlobal,
+        dmabuf: smithay::backend::allocator::dmabuf::Dmabuf,
+        notificar: smithay::wayland::dmabuf::ImportNotifier,
+    ) {
+        let Some(display) = self.egl_display.as_ref() else {
+            tracing::error!("import de dmabuf sin EGLDisplay: se rechaza");
+            notificar.failed();
+            return;
+        };
+        match display.create_image_from_dmabuf(&dmabuf) {
+            Ok(imagen) => {
+                // La imagen era la pregunta, no la respuesta: quien la vuelve a
+                // crear para dibujar es el renderizador. Dejarla viva sería una
+                // fuga de un descriptor por buffer y por cliente.
+                unsafe {
+                    smithay::backend::egl::ffi::egl::DestroyImageKHR(
+                        **display.get_display_handle(),
+                        imagen,
+                    );
+                }
+                let _ = notificar.successful::<Self>();
+            }
+            Err(err) => {
+                tracing::debug!("dmabuf rechazado: {err}");
+                notificar.failed();
+            }
+        }
+    }
+}
+
 impl SelectionHandler for BookosComp {
-    type SelectionUserData = ();
+    /// Lo que el compositor pone en el portapapeles cuando el dueño es él.
+    ///
+    /// Hoy solo lo usa la captura de pantalla, y por eso son bytes a secas: el
+    /// tipo de contenido va aparte, en la lista de tipos MIME que se anuncia al
+    /// poner la selección. Es un `Arc` porque el mismo contenido lo puede pedir
+    /// más de un cliente y no tiene sentido copiarlo por cada pegado.
+    type SelectionUserData = std::sync::Arc<Vec<u8>>;
+
+    /// Un cliente pega: le escribimos el contenido por el descriptor que trae.
+    ///
+    /// **En un hilo aparte, y no aquí.** Un pipe tiene 64 KB de buffer y una
+    /// captura son varios megas: escribirla desde el bucle dejaría el
+    /// compositor bloqueado hasta que el otro extremo terminara de leer, o sea
+    /// el escritorio congelado mientras pegas. El hilo se muere solo al acabar.
+    fn send_selection(
+        &mut self,
+        _ty: smithay::wayland::selection::SelectionTarget,
+        mime_type: String,
+        fd: std::os::fd::OwnedFd,
+        _seat: Seat<Self>,
+        datos: &Self::SelectionUserData,
+    ) {
+        let datos = datos.clone();
+        let hilo = std::thread::Builder::new()
+            .name("portapapeles".into())
+            .spawn(move || {
+                use std::io::Write;
+                let mut destino = std::fs::File::from(fd);
+                if let Err(err) = destino.write_all(&datos).and_then(|()| destino.flush()) {
+                    // Que el otro lado cierre antes de leerlo todo es normal
+                    // —hay clientes que solo miran la cabecera—, así que esto
+                    // se cuenta y no se grita.
+                    tracing::debug!(%mime_type, "el pegado se cortó: {err}");
+                }
+            });
+        if let Err(err) = hilo {
+            tracing::error!("no se pudo lanzar el hilo del portapapeles: {err}");
+        }
+    }
 }
 
 impl DataDeviceHandler for BookosComp {
@@ -516,6 +656,7 @@ smithay::delegate_xdg_decoration!(BookosComp);
 delegate_compositor!(BookosComp);
 delegate_xdg_shell!(BookosComp);
 delegate_shm!(BookosComp);
+smithay::delegate_dmabuf!(BookosComp);
 delegate_seat!(BookosComp);
 delegate_data_device!(BookosComp);
 delegate_primary_selection!(BookosComp);
@@ -523,6 +664,7 @@ delegate_data_control!(BookosComp);
 delegate_output!(BookosComp);
 delegate_fractional_scale!(BookosComp);
 delegate_viewporter!(BookosComp);
+delegate_presentation!(BookosComp);
 
 /// `wp_cursor_shape_v1` comparte el manejo del cursor con el de las tabletas,
 /// así que exige este trait aunque aquí no haya ninguna. Todos sus métodos

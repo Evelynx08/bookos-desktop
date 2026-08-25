@@ -49,6 +49,13 @@ const CAMPO: f32 = 60.0;
 const FILA: f32 = 52.0;
 /// Márgenes internos.
 const MARGEN: f32 = 10.0;
+/// El pelo que separa el campo de la lista. Es una constante y no un `1.0`
+/// suelto en el `view` porque la **posición** de la lista depende de él: el
+/// hit-test suponía que la lista empezaba en `CAMPO + MARGEN/2` = 65 y en el
+/// dibujo empieza en `CAMPO + 1` = 61, así que el hover y el clic iban cuatro
+/// píxeles por debajo de la fila que se veía y los últimos cuatro de la última
+/// eran zona muerta.
+const DIVISOR: f32 = 1.0;
 /// Cuántos resultados se enseñan. Más de seis y la lista pide desplazarse, que
 /// es justo lo que un buscador de teclado no quiere.
 const MAXIMO: usize = 6;
@@ -159,15 +166,41 @@ impl Buscador {
     }
 
     pub fn size(&self) -> (f32, f32) {
-        let filas = self.resultados.len().min(MAXIMO) as f32;
+        (self.ancho, Self::alto_para(self.resultados.len()))
+    }
+
+    /// Lo que mide la tarjeta con esa cantidad de resultados.
+    ///
+    /// Tiene que cuadrar con lo que apila `view()`: campo, divisor, las filas y
+    /// el respiro de abajo.
+    ///
+    /// Antes contaba `+ MARGEN` sin que ese margen existiera en la vista: el
+    /// buffer salía nueve píxeles más alto que la tarjeta y esos nueve píxeles
+    /// eran **transparentes**, no fondo. O sea que la tarjeta acababa nueve
+    /// píxeles antes del borde del buffer, y como el compositor centra por el
+    /// buffer, se dibujaba cuatro píxeles y medio por encima de donde tocaba.
+    /// El respiro sí se quiere —pegada al borde, la última fila se comía su
+    /// esquina redondeada—, así que ahora está dentro de la tarjeta y contado.
+    fn alto_para(resultados: usize) -> f32 {
+        let filas = resultados.min(MAXIMO) as f32;
         // Sin resultados no hay lista: la tarjeta es solo el campo, y así el
         // buscador vacío no es un rectángulo con un agujero.
-        let lista = if filas == 0.0 {
-            0.0
+        if filas == 0.0 {
+            CAMPO
         } else {
-            filas * FILA + MARGEN
-        };
-        (self.ancho, CAMPO + lista)
+            CAMPO + DIVISOR + filas * FILA + MARGEN
+        }
+    }
+
+    /// Lo que llega a medir con la lista llena.
+    ///
+    /// Es lo que usa el compositor para colocarla: si se centrara con el alto
+    /// **de ahora**, la tarjeta se movería media fila arriba y abajo con cada
+    /// tecla, porque cada resultado que entra o sale la hace crecer o encoger.
+    /// Con el alto máximo el campo de texto se queda clavado y la lista crece
+    /// hacia abajo, que es lo que hacen los dedos.
+    pub fn alto_maximo() -> f32 {
+        Self::alto_para(MAXIMO)
     }
 
     /// El velo de detrás. Más flojo que el del launchpad: esto no ocupa la
@@ -186,9 +219,10 @@ impl Buscador {
         self.señalada = None;
     }
 
-    /// Dónde empieza la lista dentro de la tarjeta.
+    /// Dónde empieza la lista dentro de la tarjeta. Tiene que ser exactamente
+    /// lo que apila `view()`: el campo y el divisor, sin relleno.
     fn y_lista(&self) -> f32 {
-        CAMPO + MARGEN / 2.0
+        CAMPO + DIVISOR
     }
 
     /// Qué fila cae en `y`, si cae en alguna.
@@ -298,7 +332,7 @@ impl Buscador {
             // El divisor separa el campo de la lista con la misma línea que usa
             // el pie de las tarjetas de conectividad.
             contenido = contenido.push(
-                container(Space::new().height(Length::Fixed(1.0)))
+                container(Space::new().height(Length::Fixed(DIVISOR)))
                     .width(Length::Fixed(self.ancho))
                     .style(|_theme| container::Style {
                         background: Some(tema::alfa(tema::tinta(), 0.10).into()),
@@ -310,6 +344,11 @@ impl Buscador {
                 lista = lista.push(self.fila(i, resultado));
             }
             contenido = contenido.push(lista);
+            // El respiro bajo la última fila: sin él su realce llega al borde y
+            // se come la esquina redondeada de la tarjeta. Va aquí y no como
+            // alto de más en `size()`, que es donde estaba: allí eran píxeles
+            // transparentes fuera de la tarjeta y descuadraban el centrado.
+            contenido = contenido.push(Space::new().height(Length::Fixed(MARGEN)));
         }
 
         container(contenido)
@@ -489,6 +528,13 @@ fn accion_sistema(consulta: &str) -> Option<Resultado> {
             "apagar",
             Accion::Emergente("apagar"),
         )
+    } else if coincide(&["efectos", "animaciones", "desenfoque"]) {
+        let (nombre, detalle) = if crate::tema::efectos_reducidos() {
+            ("Efectos completos", "Devolver el desenfoque y las animaciones")
+        } else {
+            ("Reducir efectos", "Quitar el desenfoque y las animaciones de ventana")
+        };
+        (nombre, detalle, "apariencia", Accion::AlternarEfectos)
     } else if coincide(&["energia", "energía", "power"]) {
         (
             "Energía",
@@ -736,6 +782,25 @@ mod pruebas {
                 ..
             })
         ));
+    }
+
+    /// «efectos» y «animaciones» llevan al mismo sitio: quien quiere quitar el
+    /// adorno no tiene por qué saber cómo lo llamamos aquí.
+    #[test]
+    fn los_efectos_se_encuentran_por_lo_que_quitan() {
+        for consulta in ["efectos", "animaciones", "desenfoque"] {
+            let lista = resultados(&[], consulta);
+            assert!(
+                matches!(
+                    lista.first(),
+                    Some(Resultado::Accion {
+                        accion: Accion::AlternarEfectos,
+                        ..
+                    })
+                ),
+                "«{consulta}» no encuentra el interruptor de efectos"
+            );
+        }
     }
 
     #[test]

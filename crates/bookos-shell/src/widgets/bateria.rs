@@ -2,11 +2,12 @@
 //!
 //! El pictograma **se dibuja aquí**, no sale del tema de iconos. Es lo mismo
 //! que hace el plasmoide `bookos-battery`: cuerpo de 23×11 con borde, relleno
-//! proporcional al tanto por ciento y un pezón de 2 px a la derecha. Un icono
+//! proporcional al tanto por ciento y un terminal de 2 px a la derecha. Un icono
 //! del tema solo tiene diez escalones y su color lo decide el tema; aquí el
 //! relleno es continuo, el color dice el **perfil de energía** —amarillo en
 //! ahorro, verde equilibrado, azul rendimiento— y el símbolo de dentro dice de
-//! dónde come el equipo: rayo cargando, enchufe conectado pero parado.
+//! dónde come el equipo: enchufe usando AC, rayo cargando y exclamación cuando
+//! la batería necesita atención.
 
 use std::time::{Duration, Instant};
 
@@ -18,11 +19,20 @@ use crate::tema;
 use crate::view::{PanelElement, PELIGRO, TEXT};
 use crate::widget::Widget;
 
-/// Medidas del pictograma, las del plasmoide: 23×11 el cuerpo más 3 px del
-/// pezón. No es cuadrado, y por eso no puede usar `ICONO_PANEL` para las dos
-/// dimensiones como los demás widgets.
-const ANCHO_ICONO: f32 = 26.0;
-const ALTO_ICONO: f32 = 11.0;
+/// Medidas del pictograma.
+///
+/// Parte de las proporciones y el trazo de `battery-*`, pero alarga la carcasa
+/// hasta una relación aproximada de 2,4:1, como el diseño del HIG. Así se lee
+/// como una batería horizontal y deja suficiente recorrido visible al nivel.
+///
+/// La caja conserva 18 unidades de alto para alinearse con el resto de iconos
+/// del panel; son los símbolos interiores los que deben tener más presencia,
+/// no la carcasa completa.
+///
+/// El dibujo tiene su tinta entre y=6.75 y 18.75, centrada en 12.75.
+const VIEWBOX: &str = "0 3.75 30 18";
+const ANCHO_ICONO: f32 = 30.0;
+const ALTO_ICONO: f32 = 18.0;
 
 /// El color en `#rrggbb`, que es lo que entiende el SVG.
 fn hex(c: iced_core::Color) -> String {
@@ -33,22 +43,27 @@ fn hex(c: iced_core::Color) -> String {
 /// Qué se dibuja dentro del cuerpo de la batería.
 ///
 /// De dónde come el equipo se dice **dentro** del pictograma y no con el color,
-/// que está reservado al perfil de energía: enchufado y cargando es un rayo;
-/// enchufado y parado —el umbral de carga del portátil, o la batería llena— es
-/// un enchufe, que es justo el estado que un rayo contaría mal.
+/// que está reservado al perfil de energía. La carga activa usa un rayo y la
+/// alimentación directa por el adaptador, cuando la batería ha dejado de
+/// cargar, usa un enchufe macizo diseñado para conservarse a 18 px.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Simbolo {
     Nada,
     Rayo,
-    Enchufe,
+    Ac,
+    Alerta,
 }
 
 impl Simbolo {
     fn de(bat: &Battery) -> Self {
-        match (bat.charging, bat.plugged) {
-            (true, _) => Self::Rayo,
-            (false, true) => Self::Enchufe,
-            (false, false) => Self::Nada,
+        if !bat.plugged && bat.percent <= 20 {
+            Self::Alerta
+        } else {
+            match (bat.charging, bat.plugged) {
+                (true, _) => Self::Rayo,
+                (false, true) => Self::Ac,
+                (false, false) => Self::Nada,
+            }
         }
     }
 
@@ -57,53 +72,70 @@ impl Simbolo {
         match self {
             Self::Nada => "-",
             Self::Rayo => "rayo",
-            Self::Enchufe => "enchufe",
+            Self::Ac => "ac",
+            Self::Alerta => "alerta",
         }
     }
 }
 
 /// El SVG de la batería con su relleno y su símbolo de alimentación.
 ///
-/// El borde va al 48 % del blanco y el pezón al 65 %, como en el plasmoide: a
-/// plena opacidad la silueta pesa más que el relleno y el widget se lee como un
-/// icono apagado.
+/// La carcasa conserva el trazo de 1.5 y las esquinas del Heroicon, pero con el
+/// cuerpo alargado de la referencia. Lo único que se añade es el relleno, que
+/// un icono del tema no puede dar porque solo tiene cuatro escalones y aquí es
+/// continuo.
+///
+/// El `viewBox` va recortado a la caja del dibujo para que el widget no arrastre
+/// el aire muerto del `viewBox` de 24: con él, la batería se vería un tercio
+/// más pequeña que sus vecinas a igualdad de altura.
 fn pictograma(porciento: u8, simbolo: Simbolo, color: iced_core::Color) -> String {
-    const W: f32 = 23.0;
-    const H: f32 = 11.0;
-    let relleno = (W - 3.0) * porciento.min(100) as f32 / 100.0;
+    // La referencia usa un bloque compacto, casi a toda la altura interior,
+    // con muy poco aire respecto a la carcasa. El radio bajo evita que parezca
+    // una píldora y hace que se lea como nivel incluso a escala 1x.
+    const X0: f32 = 3.35;
+    const ANCHO_UTIL: f32 = 21.4;
+    let relleno = ANCHO_UTIL * porciento.min(100) as f32 / 100.0;
     let c = hex(color);
+    let contorno = hex(crate::view::TEXT());
     let mut svg = format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="26" height="11" viewBox="0 0 26 11">
-<rect x="0.5" y="0.5" width="{w}" height="{h}" rx="2.75" fill="none" stroke="#ffffff" stroke-opacity="0.48"/>
-<rect x="1.5" y="1.5" width="{relleno:.2}" height="{alto_relleno}" rx="1.4" fill="{c}"/>
-<rect x="24" y="3.2" width="2" height="4.4" rx="1" fill="#ffffff" fill-opacity="0.65"/>"##,
-        w = W - 1.0,
-        h = H - 1.0,
-        alto_relleno = H - 3.0,
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="{VIEWBOX}">
+<rect x="1.5" y="7.5" width="24.75" height="10.5" rx="2.25" fill="none"
+      stroke="{contorno}" stroke-opacity="0.72" stroke-width="1.5"/>
+<rect x="27.0" y="10.5" width="1.5" height="4.5" rx="0.75" fill="none"
+      stroke="{contorno}" stroke-opacity="0.72" stroke-width="1.5"/>
+<rect x="{X0}" y="9.35" width="{relleno:.2}" height="6.8" rx="1.0" fill="{c}"/>"##
     );
-    // Los dos símbolos van en el centro del cuerpo, así que la tinta la decide
-    // si el relleno ha llegado hasta ahí: sobre el color, blanco no se
-    // distingue. El 52 % sale de que el centro del dibujo cae en x=11,5 de los
-    // 20 px de recorrido del relleno.
-    let tinta = if porciento > 52 { "#000000" } else { "#ffffff" };
+    // Los dos símbolos van centrados en el hueco, así que la tinta la decide si
+    // el relleno ha llegado hasta ahí: sobre el color, blanco no se distingue.
+    // El centro del dibujo cae en x=11,25, o sea al 50 % del recorrido.
+    let tinta = if porciento > 50 {
+        "#000000".to_string()
+    } else {
+        hex(crate::view::TEXT())
+    };
     match simbolo {
         Simbolo::Nada => {}
-        // El rayo del plasmoide, encajado en el cuerpo.
+        // El rayo es el `bolt` 16/solid del sistema de diseño, encogido al alto
+        // del hueco: a 4,5 unidades de alto un trazo no sobrevive —medido, las
+        // líneas de 1,5 se comen el hueco— y por eso va macizo y no perfilado.
         Simbolo::Rayo => svg.push_str(&format!(
-            r##"<g transform="translate(7.5 0.6) scale(0.098)"><polygon points="64,2 18,54 46,50 36,98 82,46 54,50" fill="{tinta}"/></g>"##
+            r##"<g transform="translate(10.35 9.27) scale(0.44)" fill="{tinta}">
+<path fill-rule="evenodd" d="M9.58 1.077a.75.75 0 0 1 .405.82L9.165 6h4.085a.75.75 0 0 1 .567 1.241l-6.5 7.5a.75.75 0 0 1-1.302-.638L6.835 10H2.75a.75.75 0 0 1-.567-1.241l6.5-7.5a.75.75 0 0 1 .897-.182Z" clip-rule="evenodd"/></g>"##
         )),
-        // El enchufe: dos clavijas, el cuerpo y el arranque del cable. A 7 px de
-        // alto no cabe el trazo de un heroicon —las líneas de 1,5 se comen el
-        // hueco entre las clavijas—, así que va en silueta maciza. Las medidas
-        // salieron de rasterizar tres variantes al tamaño real y mirarlas: con
-        // clavijas de 1,2 px y 1,8 de separación el antialias las funde en un
-        // bloque, y hacen falta 1,6 y 2,0 para que se sigan viendo dos.
-        Simbolo::Enchufe => svg.push_str(&format!(
+        // Enchufe macizo: las clavijas anchas y el cuerpo semicircular siguen
+        // siendo distinguibles después del rasterizado del panel. El pequeño
+        // vástago inferior cuenta que se está usando AC, no que está en pausa.
+        Simbolo::Ac => svg.push_str(&format!(
             r##"<g fill="{tinta}">
-<rect x="9.0" y="1.6" width="1.6" height="2.6" rx="0.3"/>
-<rect x="12.6" y="1.6" width="1.6" height="2.6" rx="0.3"/>
-<rect x="7.8" y="4.0" width="7.6" height="3.4" rx="1.2"/>
-<rect x="10.8" y="7.4" width="1.6" height="1.6"/>
+<rect x="11.45" y="9.3" width="1.05" height="2.65" rx="0.48"/>
+<rect x="15.25" y="9.3" width="1.05" height="2.65" rx="0.48"/>
+<path d="M10.8 11.2h6.15v.9a3.075 3.075 0 0 1-2.55 3.03v.72a.525.525 0 0 1-1.05 0v-.72a3.075 3.075 0 0 1-2.55-3.03v-.9Z"/>
+</g>"##
+        )),
+        Simbolo::Alerta => svg.push_str(&format!(
+            r##"<g fill="{tinta}">
+<rect x="12.98" y="9.45" width="1.8" height="4.45" rx="0.7"/>
+<circle cx="13.88" cy="15.15" r="1.0"/>
 </g>"##
         )),
     }
@@ -125,6 +157,8 @@ pub struct Bateria {
     /// [`CADA_PERFIL`] y [`CADA_MINUTOS`].
     perfil_leido: Instant,
     minutos_leidos: Instant,
+    /// Evita pedir `power-saver` en cada aviso de udev mientras siga baja.
+    ahorro_automatico: bool,
 }
 
 /// Cada cuánto se vuelven a leer las dos fuentes lentas.
@@ -153,6 +187,7 @@ impl Bateria {
             // dos: el panel tiene que salir con su color y su tiempo puestos.
             perfil_leido: Instant::now() - CADA_PERFIL,
             minutos_leidos: Instant::now() - CADA_MINUTOS,
+            ahorro_automatico: false,
         };
         b.refrescar();
         b
@@ -177,6 +212,50 @@ impl Bateria {
         }
         self.icono = Some(icono::desde_svg(&pictograma(bat.percent, simbolo, color)));
         self.icono_nombre = clave;
+    }
+
+    /// Activa ahorro al entrar en el tramo bajo, una vez por descarga.
+    ///
+    /// `busctl` no corre en el hilo del compositor: aunque D-Bus tarde, el
+    /// cursor y las animaciones siguen respondiendo. Al conectar corriente o
+    /// superar el 20 % se rearma, pero no se cambia de vuelta el perfil que
+    /// haya elegido el usuario.
+    fn revisar_ahorro_automatico(&mut self, bat: Option<&Battery>) {
+        let baja = bat.is_some_and(|b| !b.plugged && b.percent <= 20);
+        if !baja {
+            self.ahorro_automatico = false;
+            return;
+        }
+        if self.ahorro_automatico
+            || matches!(
+                self.perfil.as_deref(),
+                Some("low-power" | "power-saver" | "quiet")
+            )
+        {
+            return;
+        }
+        self.ahorro_automatico = true;
+        std::thread::Builder::new()
+            .name("bookos-battery-saver".into())
+            .spawn(|| {
+                let resultado = std::process::Command::new("busctl")
+                    .args([
+                        "--system",
+                        "set-property",
+                        "net.hadess.PowerProfiles",
+                        "/net/hadess/PowerProfiles",
+                        "net.hadess.PowerProfiles",
+                        "ActiveProfile",
+                        "s",
+                        "power-saver",
+                    ])
+                    .status();
+                if !resultado.is_ok_and(|s| s.success()) {
+                    tracing::warn!("no se pudo activar el ahorro automático de batería");
+                }
+            })
+            .inspect_err(|err| tracing::warn!("no se pudo iniciar el ahorro automático: {err}"))
+            .ok();
     }
 
     /// Amortigua el tiempo restante antes de enseñarlo.
@@ -227,7 +306,7 @@ impl Bateria {
     /// Antes mandaba el estado de carga —verde cargando, ámbar por debajo del
     /// 30 %— y el perfil solo se veía el resto del tiempo, que en un portátil
     /// enchufado es casi nunca. Ahora la alimentación la cuenta el símbolo de
-    /// dentro (rayo o enchufe) y el color queda libre para lo único que no
+    /// dentro (rayo, AC o alerta) y el color queda libre para lo único que no
     /// tiene otro sitio donde enseñarse: en qué perfil va el equipo.
     ///
     /// La única excepción es el rojo bajo mínimos y desenchufado, que es un
@@ -235,6 +314,8 @@ impl Bateria {
     fn color(bat: &Battery, perfil: Option<&str>) -> iced_core::Color {
         if bat.percent <= 15 && !bat.plugged {
             PELIGRO()
+        } else if bat.percent <= 20 && !bat.plugged {
+            tema::perfil_ahorro()
         } else {
             // Cada perfil con su color, que son los del diseño: ahorro
             // amarillo, equilibrado verde y rendimiento azul. `low-power` es
@@ -318,6 +399,8 @@ impl Widget for Bateria {
         }
         self.dato = fresco;
         self.perfil = perfil;
+        let dato = self.dato;
+        self.revisar_ahorro_automatico(dato.as_ref());
         self.actualizar_icono();
         true
     }
@@ -403,32 +486,71 @@ mod tests {
             Bateria::color(&bat(10, false, true), Some("balanced")),
             tema::perfil_equilibrado()
         );
+        assert_eq!(
+            Bateria::color(&bat(20, false, false), Some("performance")),
+            tema::perfil_ahorro(),
+            "el tramo 16-20 fuerza el amarillo de ahorro"
+        );
     }
 
-    /// Enchufado y parado —el umbral de carga del portátil— es un enchufe, no
-    /// un rayo: el rayo diría que está entrando energía y no entra.
+    /// El rayo y el enchufe distinguen carga activa de alimentación directa
+    /// por AC cuando el límite de carga ha detenido la batería.
     #[test]
-    fn el_enchufe_distingue_cargar_de_estar_conectado() {
+    fn el_rayo_solo_aparece_mientras_carga() {
         assert!(Simbolo::de(&bat(80, true, true)) == Simbolo::Rayo);
-        assert!(Simbolo::de(&bat(80, false, true)) == Simbolo::Enchufe);
+        assert!(Simbolo::de(&bat(80, false, true)) == Simbolo::Ac);
         assert!(Simbolo::de(&bat(80, false, false)) == Simbolo::Nada);
+        assert!(Simbolo::de(&bat(20, false, false)) == Simbolo::Alerta);
+        assert!(Simbolo::de(&bat(15, false, false)) == Simbolo::Alerta);
     }
 
     /// El SVG generado tiene que llevar el dibujo que toca. Es lo único que
-    /// distingue los dos estados de CA, y se genera con `format!`.
+    /// distingue la carga activa, y se genera con `format!`.
     #[test]
     fn el_pictograma_dibuja_su_simbolo() {
+        // El rayo del sistema de diseño va en un grupo con su escala.
         let rayo = pictograma(80, Simbolo::Rayo, tema::acento());
-        assert!(rayo.contains("polygon"), "el rayo es un polígono");
-        let enchufe = pictograma(80, Simbolo::Enchufe, tema::acento());
-        assert!(!enchufe.contains("polygon"));
-        // Las cuatro piezas del enchufe más los tres rectángulos del cuerpo.
-        assert_eq!(enchufe.matches("<rect").count(), 7);
-        assert_eq!(
-            pictograma(80, Simbolo::Nada, tema::acento())
-                .matches("<rect")
-                .count(),
-            3
+        assert!(
+            rayo.contains("<g transform"),
+            "el rayo va escalado en un grupo"
         );
+        assert_eq!(rayo.matches("<rect").count(), 3, "carcasa, terminal y relleno");
+
+        let nada = pictograma(80, Simbolo::Nada, tema::acento());
+        assert_eq!(nada.matches("<rect").count(), 3);
+
+        let ac = pictograma(80, Simbolo::Ac, tema::acento());
+        assert!(!ac.contains("<g transform"));
+        assert_eq!(ac.matches("<rect").count(), 5);
+        let alerta = pictograma(20, Simbolo::Alerta, tema::perfil_ahorro());
+        assert!(alerta.contains("<circle"));
+    }
+
+    /// El relleno es continuo y proporcional: es lo que un icono del tema, con
+    /// sus cuatro escalones, no puede dar.
+    #[test]
+    fn el_relleno_sigue_al_porcentaje() {
+        // Se busca el rectángulo por su origen para no confundirlo con la
+        // carcasa ni con el terminal.
+        let ancho = |p: u8| {
+            let svg = pictograma(p, Simbolo::Nada, tema::acento());
+            let rect = &svg[svg.find("<rect x=\"3.35\"").unwrap()..];
+            let i = rect.find("width=\"").unwrap() + 7;
+            let resto = &rect[i..];
+            resto[..resto.find('"').unwrap()].parse::<f32>().unwrap()
+        };
+        assert_eq!(ancho(0), 0.0);
+        assert!((ancho(50) - 10.7).abs() < 0.01, "la mitad del hueco");
+        assert!((ancho(100) - 21.4).abs() < 0.01, "el hueco entero");
+        // Un dato imposible no desborda la carcasa.
+        assert_eq!(ancho(200), ancho(100));
+    }
+
+    /// El símbolo se pinta en negro solo cuando el relleno le ha llegado por
+    /// debajo: en blanco sobre el color no se distinguiría.
+    #[test]
+    fn la_tinta_del_simbolo_depende_del_relleno() {
+        assert!(pictograma(80, Simbolo::Rayo, tema::acento()).contains("#000000"));
+        assert!(!pictograma(20, Simbolo::Rayo, tema::acento()).contains("#000000"));
     }
 }

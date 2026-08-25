@@ -59,7 +59,119 @@ pub enum Tema {
     Claro,
 }
 
+/// Lo que el usuario ha **elegido**, que no siempre es un tema concreto.
+///
+/// `Automatico` es un tercer estado y no un booleano suelto por lo de siempre:
+/// con `Tema` + una bandera «sigue la hora» se pueden escribir combinaciones que
+/// no significan nada, y alguien acabaría preguntando por la bandera sin mirar
+/// el tema. Aquí solo hay tres casos y el `match` los cubre.
+///
+/// El tema **efectivo** —el que se pinta— sale de [`ModoTema::resolver`], y en
+/// automático cambia solo a lo largo del día.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModoTema {
+    Claro,
+    #[default]
+    Oscuro,
+    Automatico,
+}
+
+/// Una hora del reloj de pared: `(hora, minuto)`.
+pub type HoraDelDia = (u8, u8);
+
+impl ModoTema {
+    /// Qué tema toca a esa hora.
+    ///
+    /// Es pura y toma la hora en vez de leer el reloj para poder probarla: con
+    /// `SystemTime::now()` dentro, un test tendría que esperar a las ocho de la
+    /// tarde para comprobar el caso interesante.
+    ///
+    /// El tramo claro va de `claro_desde` (incluida) a `oscuro_desde`
+    /// (excluida). Se admite que el claro empiece **después** del oscuro —quien
+    /// trabaja de noche y quiere el tema claro de madrugada—, y entonces el
+    /// tramo cruza la medianoche; de ahí que la comparación no sea un simple
+    /// `a <= x && x < b`.
+    pub fn resolver(self, claro_desde: HoraDelDia, oscuro_desde: HoraDelDia, ahora: HoraDelDia) -> Tema {
+        match self {
+            Self::Claro => Tema::Claro,
+            Self::Oscuro => Tema::Oscuro,
+            Self::Automatico => {
+                let m = |(h, min): HoraDelDia| h as u32 * 60 + min as u32;
+                let (a, b, x) = (m(claro_desde), m(oscuro_desde), m(ahora));
+                // Con los dos extremos iguales no hay tramo claro que valga:
+                // sería un día entero de cada cosa a la vez.
+                let claro = if a == b {
+                    false
+                } else if a < b {
+                    x >= a && x < b
+                } else {
+                    x >= a || x < b
+                };
+                if claro { Tema::Claro } else { Tema::Oscuro }
+            }
+        }
+    }
+
+    /// Cuántos minutos faltan para el próximo cambio de tema.
+    ///
+    /// `None` cuando no va a haber ninguno: los modos fijos, y el automático con
+    /// los dos extremos iguales. Sirve para programar **un** despertar en el
+    /// instante justo en vez de sondear el reloj, que es lo que este proyecto no
+    /// hace: un temporizador cada minuto para mirar si ya son las ocho son mil
+    /// cuatrocientos despertares al día para dos cambios.
+    ///
+    /// Nunca devuelve cero: si ahora mismo es la hora del cambio, el siguiente
+    /// es el otro, no este otra vez.
+    pub fn minutos_al_cambio(
+        self,
+        claro_desde: HoraDelDia,
+        oscuro_desde: HoraDelDia,
+        ahora: HoraDelDia,
+    ) -> Option<u32> {
+        if !matches!(self, Self::Automatico) {
+            return None;
+        }
+        let m = |(h, min): HoraDelDia| h as u32 * 60 + min as u32;
+        let (a, b, x) = (m(claro_desde), m(oscuro_desde), m(ahora));
+        if a == b {
+            return None;
+        }
+        // El primero de los dos que caiga por delante, dando la vuelta al día.
+        let falta = |objetivo: u32| match objetivo.checked_sub(x) {
+            Some(0) | None => objetivo + 24 * 60 - x,
+            Some(d) => d,
+        };
+        Some(falta(a).min(falta(b)))
+    }
+}
+
 static ACTUAL: AtomicU8 = AtomicU8::new(0);
+
+/// Lo elegido, global del proceso por lo mismo que el tema y el acento: lo
+/// pregunta la tarjeta de Apariencia, que se construye desde una tabla de
+/// punteros a función y no recibe la configuración.
+static MODO: AtomicU8 = AtomicU8::new(1);
+
+/// Guarda lo que el usuario eligió. **No** aplica ningún tema: el que toca sale
+/// de [`ModoTema::resolver`] y lo pone [`aplicar`].
+pub fn aplicar_modo(modo: ModoTema) {
+    MODO.store(
+        match modo {
+            ModoTema::Claro => 0,
+            ModoTema::Oscuro => 1,
+            ModoTema::Automatico => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+pub fn modo_actual() -> ModoTema {
+    match MODO.load(Ordering::Relaxed) {
+        0 => ModoTema::Claro,
+        2 => ModoTema::Automatico,
+        _ => ModoTema::Oscuro,
+    }
+}
 
 /// Pone el tema del proceso. Quien lo llame tiene que repintar: los colores ya
 /// dibujados no se enteran.
@@ -77,6 +189,24 @@ pub fn actual() -> Tema {
 
 pub fn es_claro() -> bool {
     actual() == Tema::Claro
+}
+
+/// Efectos reducidos: sin desenfoque y sin animaciones de ventana.
+///
+/// Global del proceso como el tema, y por lo mismo: lo pregunta código que se
+/// ejecuta en medio de un dibujo, donde no llega ninguna configuración. Lo
+/// enciende la configuración del usuario y también, solo, la batería baja —una
+/// animación de ventana son 260 ms de GPU y de repintados que en el 15 % de
+/// batería no compensan.
+static REDUCIDOS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Devuelve si el valor **cambió**, que es lo que decide si hay que repintar.
+pub fn aplicar_efectos_reducidos(reducidos: bool) -> bool {
+    REDUCIDOS.swap(reducidos, Ordering::Relaxed) != reducidos
+}
+
+pub fn efectos_reducidos() -> bool {
+    REDUCIDOS.load(Ordering::Relaxed)
 }
 
 /// Declara un color del tema como función, con su valor en cada uno.
@@ -520,6 +650,10 @@ pub const C_SUAVE: Curva = Curva::new(0.4, 0.0, 0.2, 1.0);
 pub const C_MUELLE_POPOVER: Curva = Curva::new(0.32, 1.3, 0.5, 1.0);
 /// Aparición de una tarjeta y transición de página. Sin rebote.
 pub const C_ENTRADA: Curva = Curva::new(0.25, 0.46, 0.45, 0.94);
+/// Geometría de ventanas: maximizar, restaurar, encajar y resize diferido.
+/// `cubic-bezier(.22, 1, .36, 1)` sale con decisión y aterriza suavemente sin
+/// rebote; un muelle aquí haría oscilar texto y bordes ya rasterizados.
+pub const C_VENTANA: Curva = Curva::new(0.22, 1.0, 0.36, 1.0);
 /// Conmutador y aparición de un modal. El muelle más marcado de los dos.
 pub const C_MUELLE: Curva = Curva::new(0.34, 1.4, 0.64, 1.0);
 
@@ -531,6 +665,8 @@ pub const D_HOVER: Duration = Duration::from_millis(120);
 pub const D_POPOVER: Duration = Duration::from_millis(180);
 /// Aparición de una tarjeta. Va con [`C_ENTRADA`].
 pub const D_TARJETA: Duration = Duration::from_millis(220);
+/// Maximizar, restaurar y encajar. Va con [`C_VENTANA`].
+pub const D_VENTANA: Duration = Duration::from_millis(260);
 /// Conmutador y aparición de un modal. Va con [`C_MUELLE`].
 pub const D_MODAL: Duration = Duration::from_millis(250);
 /// Transición de página completa. Va con [`C_ENTRADA`].
@@ -539,6 +675,21 @@ pub const D_PAGINA: Duration = Duration::from_millis(280);
 /// Cuánto se lleva recorrido de una duración, entre 0 y 1.
 pub fn fraccion(pasado: Duration, total: Duration) -> f32 {
     (pasado.as_secs_f32() / total.as_secs_f32()).clamp(0.0, 1.0)
+}
+
+/// Como [`fraccion`], pero saltando al final cuando los efectos están
+/// reducidos.
+///
+/// Va aparte y no dentro de `fraccion` a propósito: `fraccion` también mide
+/// desvanecidos que **no** son adorno —el aviso de contraseña incorrecta, la
+/// salida del OSD— y saltárselos escondería información en vez de ahorrar
+/// trabajo. Aquí se marca en cada sitio que de verdad es una animación
+/// prescindible.
+pub fn avance(pasado: Duration, total: Duration) -> f32 {
+    if efectos_reducidos() {
+        return 1.0;
+    }
+    fraccion(pasado, total)
 }
 
 /// Un número que va hacia otro con su curva y su duración.
@@ -687,6 +838,89 @@ impl Realce {
 
     pub fn animando(&self) -> bool {
         self.actual != self.previa && self.desde.elapsed() < D_HOVER
+    }
+}
+
+#[cfg(test)]
+mod tema_automatico {
+    use super::*;
+
+    const AMANECE: HoraDelDia = (7, 0);
+    const ANOCHECE: HoraDelDia = (20, 0);
+
+    /// Los modos fijos no miran el reloj: es lo que separa «quiero oscuro» de
+    /// «quiero lo que toque».
+    #[test]
+    fn los_modos_fijos_ignoran_la_hora() {
+        for hora in [(3, 0), (12, 0), (23, 59)] {
+            assert_eq!(ModoTema::Claro.resolver(AMANECE, ANOCHECE, hora), Tema::Claro);
+            assert_eq!(ModoTema::Oscuro.resolver(AMANECE, ANOCHECE, hora), Tema::Oscuro);
+        }
+        assert_eq!(ModoTema::Claro.minutos_al_cambio(AMANECE, ANOCHECE, (12, 0)), None);
+    }
+
+    /// El día es claro y la noche oscura, con los bordes en su sitio: la hora
+    /// del amanecer ya es clara y la del anochecer ya es oscura.
+    #[test]
+    fn el_automatico_sigue_al_sol() {
+        let claro = |h, m| ModoTema::Automatico.resolver(AMANECE, ANOCHECE, (h, m)) == Tema::Claro;
+        assert!(!claro(6, 59), "un minuto antes de amanecer todavía es de noche");
+        assert!(claro(7, 0), "la hora del amanecer ya es de día");
+        assert!(claro(19, 59));
+        assert!(!claro(20, 0), "la hora del anochecer ya es de noche");
+        assert!(!claro(3, 0));
+    }
+
+    /// Quien trabaja de noche puede querer el tramo claro cruzando la
+    /// medianoche: de las 22:00 a las 06:00. El tramo da la vuelta al día.
+    #[test]
+    fn el_tramo_claro_puede_cruzar_la_medianoche() {
+        let (a, b) = ((22, 0), (6, 0));
+        let claro = |h, m| ModoTema::Automatico.resolver(a, b, (h, m)) == Tema::Claro;
+        assert!(claro(23, 30), "antes de medianoche, dentro del tramo");
+        assert!(claro(2, 0), "después de medianoche, sigue dentro");
+        assert!(!claro(6, 0), "y a las seis se acaba");
+        assert!(!claro(12, 0));
+    }
+
+    /// Los dos extremos iguales no describen ningún tramo: sería un día entero
+    /// de cada cosa a la vez. Se queda oscuro y no se programa ningún cambio,
+    /// que es mejor que despertar cada día para no hacer nada.
+    #[test]
+    fn con_los_dos_extremos_iguales_no_hay_tramo() {
+        let h = (9, 0);
+        assert_eq!(ModoTema::Automatico.resolver(h, h, (9, 0)), Tema::Oscuro);
+        assert_eq!(ModoTema::Automatico.resolver(h, h, (21, 0)), Tema::Oscuro);
+        assert_eq!(ModoTema::Automatico.minutos_al_cambio(h, h, (9, 0)), None);
+    }
+
+    /// El despertar se programa para el primero de los dos cambios que caiga
+    /// por delante, dando la vuelta al día si hace falta.
+    #[test]
+    fn el_despertar_va_al_proximo_cambio() {
+        let falta = |h, m| ModoTema::Automatico.minutos_al_cambio(AMANECE, ANOCHECE, (h, m));
+        assert_eq!(falta(6, 0), Some(60), "una hora para amanecer");
+        assert_eq!(falta(12, 0), Some(8 * 60), "ocho horas para anochecer");
+        assert_eq!(falta(21, 0), Some(10 * 60), "diez horas hasta el amanecer de mañana");
+        // Justo en la hora del cambio, el siguiente es el **otro**: si no,
+        // el temporizador saltaría cada cero minutos y giraría en vacío.
+        assert_eq!(falta(7, 0), Some(13 * 60), "en el amanecer, toca esperar al anochecer");
+        assert_eq!(falta(20, 0), Some(11 * 60));
+    }
+
+    /// Y nunca es cero, a ninguna hora del día: un temporizador de cero
+    /// segundos es un bucle cerrado.
+    #[test]
+    fn el_despertar_nunca_es_ya() {
+        for h in 0..24u8 {
+            for m in [0u8, 30, 59] {
+                let falta = ModoTema::Automatico
+                    .minutos_al_cambio(AMANECE, ANOCHECE, (h, m))
+                    .expect("en automático siempre hay un próximo cambio");
+                assert!(falta > 0, "a las {h}:{m} el próximo cambio salía en {falta}");
+                assert!(falta <= 24 * 60, "a las {h}:{m} salía en {falta} minutos");
+            }
+        }
     }
 }
 
@@ -851,7 +1085,7 @@ mod tests {
         // Lo de "exacto" no es purismo: el compositor compara el resultado con
         // 1,0 para decidir si puede dibujar sin la capa de escalado, y un
         // 0,999999 dejaría a las ventanas envueltas el resto de su vida.
-        for curva in [C_SUAVE, C_MUELLE_POPOVER, C_ENTRADA, C_MUELLE] {
+        for curva in [C_SUAVE, C_MUELLE_POPOVER, C_ENTRADA, C_VENTANA, C_MUELLE] {
             assert_eq!(curva.eval(0.0), 0.0);
             assert_eq!(curva.eval(1.0), 1.0);
         }
@@ -869,6 +1103,7 @@ mod tests {
         assert!(maximo(C_MUELLE) > 1.0, "el muelle tiene que pasarse de 1");
         assert!(maximo(C_MUELLE_POPOVER) > 1.0);
         assert!(maximo(C_ENTRADA) <= 1.0, "la entrada no debe rebotar");
+        assert!(maximo(C_VENTANA) <= 1.0, "el resize no debe rebotar");
         assert!(maximo(C_SUAVE) <= 1.0);
     }
 
@@ -889,5 +1124,22 @@ mod tests {
         // `cubic-bezier(.4, 0, .2, 1)` es la de material/One UI: arranca lenta y
         // adelanta a la mitad. Si esto falla, los ejes están cambiados.
         assert!(C_SUAVE.eval(0.5) > 0.45);
+    }
+
+    /// Los efectos reducidos saltan al final de la animación, pero **no**
+    /// tocan `fraccion`: los desvanecidos que llevan información —el aviso de
+    /// contraseña incorrecta— siguen su curso.
+    #[test]
+    fn los_efectos_reducidos_solo_saltan_lo_prescindible() {
+        let mitad = D_VENTANA / 2;
+        assert!(!efectos_reducidos(), "de serie están completos");
+        assert!((avance(mitad, D_VENTANA) - 0.5).abs() < 0.01);
+
+        assert!(aplicar_efectos_reducidos(true), "cambia la primera vez");
+        assert!(!aplicar_efectos_reducidos(true), "y no la segunda");
+        assert_eq!(avance(mitad, D_VENTANA), 1.0);
+        assert!((fraccion(mitad, D_VENTANA) - 0.5).abs() < 0.01);
+
+        aplicar_efectos_reducidos(false);
     }
 }

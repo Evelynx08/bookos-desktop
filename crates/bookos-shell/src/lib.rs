@@ -29,6 +29,8 @@ mod apps;
 pub mod actividad;
 pub mod bloqueo;
 mod config;
+pub mod fondos;
+pub mod captura;
 /// El conmutador de Alt+Tab. Público porque el compositor le da la lista de
 /// aplicaciones por orden de uso: el shell no ve el foco.
 pub mod conmutador;
@@ -37,6 +39,9 @@ pub mod conmutador;
 pub mod decoracion;
 mod dock;
 mod emergente;
+/// Los iconos del escritorio. Público porque el compositor los coloca sobre el
+/// fondo, por debajo de las ventanas, y le da los clics que no son de nadie.
+pub mod escritorio;
 mod icono;
 /// El logo, incrustado en el binario. Público porque el "Acerca de" del menú
 /// lo pinta grande.
@@ -45,6 +50,7 @@ pub mod medios;
 /// La cola de notificaciones. Pública porque quien las recibe es el compositor:
 /// el shell no habla D-Bus.
 pub mod notificaciones;
+pub mod diagnostico;
 pub mod osd;
 mod state;
 /// Los tokens del sistema de diseño. Público porque el compositor anima con
@@ -57,7 +63,10 @@ mod view;
 mod widget;
 mod widgets;
 
-pub use emergente::{Ancla, Emergente};
+pub use emergente::{Ancla, Emergente, ModoProyeccion, PantallaCompartible};
+/// Qué hacer con una tecla que llega a una capa del shell. Lo necesita el
+/// compositor para la capa de captura, que gobierna él.
+pub use emergente::Tecla;
 /// El icono ya cargado de una aplicación. Sale al exterior porque el conmutador
 /// lo arma el compositor, que conoce las ventanas pero no el tema de iconos.
 pub use icono::Icono;
@@ -93,7 +102,9 @@ pub fn entrada_de_ventana(app_id: &str, titulo: &str) -> conmutador::Entrada {
 }
 
 pub use config::{
-    guardar_apariencia, guardar_dock, guardar_escritorios, Actividades as ConfigActividades,
+    guardar_apariencia, guardar_dock, guardar_efectos, guardar_escritorios, guardar_fondo,
+    olvidar_fondo,
+    Actividades as ConfigActividades, Efectos,
     Bloqueo as ConfigBloqueo, Config, Entrada, MAXIMO_ESCRITORIOS,
 };
 pub use dock::{
@@ -101,6 +112,9 @@ pub use dock::{
     PAD as DOCK_PAD,
 };
 pub use state::PanelData;
+/// La hora local de ahora, en `(hora, minuto)`. La necesita el compositor para
+/// el temporizador del tema automático.
+pub use state::hora_local_ahora;
 pub use widget::Widget;
 
 /// Alto del panel en píxeles lógicos.
@@ -142,13 +156,47 @@ pub enum Accion {
     /// compositor escribe las dos claves de una vez y no puede quedarse con un
     /// fichero a medio cambiar si algo falla entre medias.
     Apariencia {
-        tema: tema::Tema,
+        /// Lo **elegido**, que puede ser «automático». El tema concreto que
+        /// toca lo resuelve el compositor con el reloj: la tarjeta no tiene por
+        /// qué saber la hora.
+        modo: tema::ModoTema,
         acento: tema::Acento,
     },
     /// Abrir otra tarjeta del shell por su nombre de widget. Es lo que hace el
     /// centro de control al pulsar «Wi-Fi»: la lista de redes ya existe como
     /// emergente y no tiene sentido dibujarla dos veces.
     Emergente(&'static str),
+    /// Capturar ese rectángulo de la pantalla, en lógicos. Lo pide la capa de
+    /// captura al soltar el arrastre o al pulsar «Pantalla».
+    Capturar {
+        x: i32,
+        y: i32,
+        ancho: i32,
+        alto: i32,
+        /// A un fichero. Con `false` va al portapapeles, que es lo normal: la
+        /// mayoría de las capturas se pegan en un chat y no se vuelven a mirar.
+        guardar: bool,
+    },
+    /// Poner una familia de fondos: la imagen clara y la oscura de golpe.
+    ///
+    /// Las **dos** y no la que toca ahora, que es lo que permite que el cambio
+    /// de tema se lleve el fondo con él. Es lo mismo que hace Apariencia con el
+    /// tema y el acento: la tarjeta manda su estado entero.
+    Fondo {
+        claro: std::path::PathBuf,
+        oscuro: std::path::PathBuf,
+    },
+    /// Elegir cómo se reparten dos pantallas desde el selector de Fn+F4.
+    Proyeccion(ModoProyeccion),
+    /// Contestar al permiso de compartir pantalla del portal de escritorio.
+    ///
+    /// `pantalla` es el índice dentro de la lista que se le pasó a la tarjeta,
+    /// y `None` es la negativa. Lleva la sesión porque puede haber más de una
+    /// petición en vuelo y la respuesta tiene que llegar a la suya.
+    Compartir {
+        sesion: u32,
+        pantalla: Option<usize>,
+    },
     /// Retirar esa notificación. La lista vive en el shell, pero avisar a la
     /// aplicación de que se cerró es D-Bus, y eso lo hace el compositor.
     CerrarNotificacion(u32),
@@ -177,6 +225,9 @@ pub enum Accion {
     /// Acción de una actividad viva; el compositor la devuelve a la aplicación
     /// propietaria por la señal privada de BookOS.
     Actividad(actividad::Accion),
+    /// Poner o quitar los efectos reducidos. El compositor la escribe en la
+    /// configuración, como el resto de lo que se elige desde el shell.
+    AlternarEfectos,
 }
 
 impl Accion {
@@ -220,6 +271,28 @@ fn emergente_de(nombre: &str) -> Option<fn() -> Emergente> {
         // esa otra tarjeta del shell» y no hacía falta un segundo.
         "apariencia" => Some(Emergente::apariencia),
         "apagar" => Some(Emergente::apagar),
+        _ => None,
+    }
+}
+
+/// Nombre interno de la tarjeta que corresponde a una zona del panel.
+///
+/// El widget y su emergente no siempre se llaman igual (`bateria`/`energia`,
+/// `reloj`/`calendario`). El compositor necesita ambos nombres: el primero para
+/// construirla después de una transición y el segundo para saber si el segundo
+/// clic debe cerrarla.
+fn nombre_emergente_de(nombre: &str) -> Option<&'static str> {
+    match nombre {
+        "reloj" => Some("calendario"),
+        "volumen" => Some("sonido"),
+        "brillo" => Some("brillo"),
+        "bateria" => Some("energia"),
+        "red" => Some("red"),
+        "bluetooth" => Some("bluetooth"),
+        "notificaciones" => Some("notificaciones"),
+        "control" => Some("centro"),
+        "apariencia" => Some("apariencia"),
+        "apagar" => Some("apagar"),
         _ => None,
     }
 }
@@ -383,8 +456,32 @@ impl Canvas {
 }
 
 pub struct Shell {
-    renderer: Renderer,
     theme: Theme,
+
+    /// **Tres renderizadores, no uno**, porque dentro de cada uno vive la caché
+    /// de rasterizado de iced —los SVG ya parseados y los pixmaps ya pintados—
+    /// y esa caché **se purga al final de cada `draw`**: `iced_tiny_skia` tira
+    /// todo lo que no haya salido en el último dibujo (`Engine::trim`).
+    ///
+    /// Con uno solo, el panel y el dock se pisaban mutuamente: dibujar el panel
+    /// tiraba los iconos del dock y viceversa, así que en cada fotograma se
+    /// reparseaban y re-rasterizaban los SVG de los dos. Medido en release a
+    /// 2881×1801 y escala 1,75: el panel solo cuesta 1,19 ms y el dock solo
+    /// 1,39 ms, pero **alternándolos —que es lo que hace el compositor de
+    /// verdad— costaban 7,61 ms**, casi tres veces la suma. Separándolos, 2,84.
+    ///
+    /// El tercero lo comparte todo lo demás —emergentes, conmutador, bloqueo,
+    /// barras de título— y no pasa nada: de esas se dibuja **una por
+    /// fotograma**, así que no hay a quién pisar. Van juntas y no cada una con
+    /// el suyo porque nacen y mueren, y un renderizador por superficie efímera
+    /// se llevaría la caché con él: el conmutador recrea su lienzo en cada
+    /// Alt+Tab, y con caché fría cada apertura costaba 64 ms en vez de 15.
+    ///
+    /// Crear uno es barato —tres mapas vacíos— y el sistema de fuentes es un
+    /// estático compartido que no se duplica.
+    renderer_panel: Renderer,
+    renderer_dock: Renderer,
+    renderer: Renderer,
 
     panel: Canvas,
     widgets: widget::Panel,
@@ -396,6 +493,9 @@ pub struct Shell {
     avatar: Option<String>,
     /// Disposición y elementos visibles del bloqueo. Se guarda aparte del
     /// `Config` porque el resto se consume al construir panel y dock.
+    /// Lo que el usuario ha elegido. El valor **efectivo** puede ser otro: la
+    /// batería baja fuerza los efectos reducidos sin tocar esta preferencia.
+    efectos_config: config::Efectos,
     bloqueo_config: config::Bloqueo,
     actividades_config: config::Actividades,
 
@@ -408,9 +508,17 @@ pub struct Shell {
     /// texto pero no llega a rasterizarlo hasta la siguiente vuelta, y el
     /// reloj salía en blanco.
     bloqueo: Option<(bloqueo::Bloqueo, Canvas)>,
+    /// La capa de captura de pantalla, mientras está abierta. Ocupa la pantalla
+    /// entera como el bloqueo, y por lo mismo: se queda con el ratón y el
+    /// teclado mientras se elige qué capturar.
+    captura: Option<(captura::Captura, Canvas)>,
 
     /// El aviso de volumen, brillo y demás, mientras dura.
     osd: Option<(osd::Osd, Canvas)>,
+    /// El panel de diagnóstico, mientras esté puesto. Va con su propio lienzo
+    /// por lo mismo que el aviso: es una superficie aparte, con su tamaño, que
+    /// aparece y desaparece sin tocar al panel.
+    diagnostico: Option<(diagnostico::Hud, Canvas)>,
     /// El conmutador de Alt+Tab, mientras el modificador siga pulsado.
     conmutador: Option<(conmutador::Conmutador, Canvas)>,
 
@@ -445,6 +553,16 @@ pub struct Shell {
     /// abrir el calendario con el menú desplegado cierra el menú, que es lo que
     /// hace cualquier barra de menús.
     emergente: Option<(Emergente, Canvas)>,
+
+    /// Los iconos del escritorio y el lienzo con el que se pinta **cada** uno.
+    ///
+    /// El lienzo es uno solo y no uno por icono porque todas las celdas miden
+    /// lo mismo: lo único que guarda es el tamaño, la escala y la caché de
+    /// disposición de iced, y esa se reconstruye igual entre celdas —el árbol
+    /// de widgets de todas es el mismo—. El buffer no está aquí: lo pone el
+    /// compositor, que es quien tiene una superficie por icono.
+    escritorio: escritorio::Escritorio,
+    escritorio_canvas: Canvas,
 }
 
 impl Shell {
@@ -462,7 +580,25 @@ impl Shell {
         // construyen, y con el tema puesto después el primer frame saldría con
         // la paleta anterior.
         tema::aplicar(config.tema);
+        tema::aplicar_modo(config.modo_tema);
         tema::aplicar_acento(config.acento);
+        // Cuál de las familias instaladas está puesta, para que la tarjeta de
+        // Apariencia pueda marcarla. Se mira la del tema que toca y, si esa
+        // clave no está, el `fondo` común; sin ninguna no hay nada que marcar y
+        // manda la que elija `fondos::por_defecto`.
+        let puesto = if config.tema == tema::Tema::Claro {
+            config.fondo_claro.as_deref()
+        } else {
+            config.fondo_oscuro.as_deref()
+        }
+        .or(config.fondo.as_deref());
+        fondos::poner_elegida(
+            puesto
+                .map(std::path::Path::new)
+                .and_then(fondos::familia_de)
+                .or_else(|| fondos::por_defecto(config.tema == tema::Tema::Claro).map(|f| f.nombre)),
+        );
+        tema::aplicar_efectos_reducidos(config.efectos == config::Efectos::Reducidos);
         // Un nombre que no existe en la configuración se ignora y se avisa: el
         // panel se queda sin ese widget, no sin panel.
         let construir = |nombre: &String| match widgets::por_nombre(nombre) {
@@ -480,6 +616,8 @@ impl Shell {
         let (dw, dh) = dock_items.size();
         Self {
             // Font::DEFAULT resuelve contra las fuentes del sistema vía fontdb.
+            renderer_panel: Renderer::new(Font::DEFAULT, Pixels(13.0)),
+            renderer_dock: Renderer::new(Font::DEFAULT, Pixels(13.0)),
             renderer: Renderer::new(Font::DEFAULT, Pixels(13.0)),
             theme: view::theme(),
             panel: Canvas::new(Size::new(width as f32, PANEL_HEIGHT as f32), scale),
@@ -487,11 +625,14 @@ impl Shell {
             dock: Canvas::new(Size::new(dw, dh), scale),
             dock_items,
             avatar: config.avatar.clone(),
+            efectos_config: config.efectos,
             bloqueo_config: config.bloqueo,
             actividades_config: config.actividades,
             emergente: None,
             bloqueo: None,
+            captura: None,
             osd: None,
+            diagnostico: None,
             conmutador: None,
             notificaciones: notificaciones::Registro::default(),
             silencio: None,
@@ -499,6 +640,13 @@ impl Shell {
             actividad: None,
             actividades: std::collections::HashMap::new(),
             barras: std::collections::HashMap::new(),
+            // Sin alto todavía: lo sabe el compositor y llega por
+            // `escritorio_pantalla` antes del primer frame.
+            escritorio: escritorio::Escritorio::new(PANEL_HEIGHT as f32, (width as f32, 0.0)),
+            escritorio_canvas: Canvas::new(
+                Size::new(escritorio::CELDA.0, escritorio::CELDA.1),
+                scale,
+            ),
         }
     }
 
@@ -547,6 +695,58 @@ impl Shell {
 
     pub fn dock(&self) -> &Dock {
         &self.dock_items
+    }
+
+    // --- Iconos del escritorio ---------------------------------------------
+
+    pub fn escritorio(&self) -> &escritorio::Escritorio {
+        &self.escritorio
+    }
+
+    pub fn escritorio_mut(&mut self) -> &mut escritorio::Escritorio {
+        &mut self.escritorio
+    }
+
+    /// Le dice al escritorio el tamaño **lógico** de la pantalla, que el shell
+    /// no conoce: solo se le pasa el ancho al construirlo.
+    pub fn escritorio_pantalla(&mut self, pantalla: (f32, f32), scale: f32) {
+        self.escritorio.recolocar(PANEL_HEIGHT as f32, pantalla);
+        if self.escritorio_canvas.scale != scale {
+            self.escritorio_canvas = Canvas::new(
+                Size::new(escritorio::CELDA.0, escritorio::CELDA.1),
+                scale,
+            );
+        }
+    }
+
+    /// Vuelve a mirar la carpeta del escritorio. `true` si la lista cambió.
+    pub fn escritorio_releer(&mut self, pantalla: (f32, f32)) -> bool {
+        self.escritorio.releer(PANEL_HEIGHT as f32, pantalla)
+    }
+
+    /// Tamaño en píxeles físicos del buffer de **una** celda. Son todas
+    /// iguales, así que el compositor reserva el mismo para cada icono.
+    pub fn escritorio_buffer_size(&self) -> (u32, u32) {
+        self.escritorio_canvas.buffer_size()
+    }
+
+    pub fn escritorio_logical_size(&self) -> (f32, f32) {
+        (
+            self.escritorio_canvas.size.width,
+            self.escritorio_canvas.size.height,
+        )
+    }
+
+    /// Pinta la celda `i` en `buf`, del tamaño de [`Shell::escritorio_buffer_size`].
+    pub fn draw_escritorio(&mut self, i: usize, buf: &mut [u8]) -> Vec<Damage> {
+        let view = self.escritorio.ver(i);
+        let Self {
+            renderer,
+            theme,
+            escritorio_canvas,
+            ..
+        } = self;
+        Self::paint(escritorio_canvas, renderer, theme, view, buf)
     }
 
     /// Relee los estados. Devuelve `true` si hay que repintar el panel.
@@ -855,13 +1055,7 @@ impl Shell {
             return Vec::new();
         };
         let vista = decoracion::vista(&barra.estado, barra.canvas.size.width);
-        Self::paint(
-            &mut barra.canvas,
-            &mut self.renderer,
-            &self.theme,
-            vista,
-            buf,
-        )
+        Self::paint(&mut barra.canvas, &mut self.renderer, &self.theme, vista, buf)
     }
 
     /// Tira las barras de las ventanas que ya no están. Sin esto, cada ventana
@@ -1045,11 +1239,14 @@ impl Shell {
     }
 
     /// Tamaño **lógico** de la emergente abierta, y dónde quiere colocarse.
-    pub fn emergente_geometria(&self) -> Option<((i32, i32), Ancla)> {
+    /// El tercer campo es el alto con el que hay que **colocarla** cuando no es
+    /// el que mide: ver [`Emergente::alto_estable`].
+    pub fn emergente_geometria(&self) -> Option<((i32, i32), Ancla, Option<i32>)> {
         let (e, canvas) = self.emergente.as_ref()?;
         Some((
             (canvas.size.width as i32, canvas.size.height as i32),
             e.ancla(),
+            e.alto_estable().map(|h| h as i32),
         ))
     }
 
@@ -1331,6 +1528,35 @@ impl Shell {
         None
     }
 
+    /// Nombre de la tarjeta que corresponde a una coordenada del panel.
+    /// Permite al compositor encadenar la salida de una tarjeta con la entrada
+    /// de otra sin construir la nueva encima de la textura anterior.
+    pub fn objetivo_emergente_panel(&self, x: f32) -> Option<(&'static str, &'static str)> {
+        if x <= view::ANCHO_LOGO {
+            return Some(("menu", "menu"));
+        }
+        self.zonas_panel()
+            .into_iter()
+            .find(|(_, x0, x1)| x >= *x0 && x <= *x1)
+            .and_then(|(widget, _, _)| {
+                nombre_emergente_de(widget).map(|emergente| (widget, emergente))
+            })
+    }
+
+    pub fn abrir_emergente_nombre(&mut self, nombre: &'static str) -> bool {
+        let nueva = if nombre == "menu" {
+            Some(Emergente::menu())
+        } else {
+            emergente_de(nombre).map(|f| f())
+        };
+        if let Some(nueva) = nueva {
+            self.abrir(nueva);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Lo que el compositor sabe de los escritorios y el panel no puede saber.
     ///
     /// `true` si hay que repintar. Se llama en cada cambio de escritorio, no en
@@ -1508,6 +1734,99 @@ impl Shell {
         Self::paint(canvas, &mut self.renderer, &self.theme, vista, buf)
     }
 
+    /// Cambia la preferencia de efectos y la aplica. Devuelve la elegida, que
+    /// es lo que el compositor tiene que escribir en el fichero.
+    ///
+    /// Lo elegido y lo efectivo no son lo mismo: con la batería baja el
+    /// escritorio ya está en reducidos, y volver a «completos» desde aquí
+    /// guarda la preferencia aunque no se vea hasta que haya corriente.
+    pub fn alternar_efectos(&mut self) -> config::Efectos {
+        self.efectos_config = match self.efectos_config {
+            config::Efectos::Completos => config::Efectos::Reducidos,
+            config::Efectos::Reducidos => config::Efectos::Completos,
+        };
+        self.revisar_efectos();
+        self.efectos_config
+    }
+
+    /// Recalcula si tocan efectos reducidos y lo aplica. Devuelve si cambió,
+    /// que es cuando hay que repintar.
+    ///
+    /// El umbral es el mismo 20 % con el que el widget de batería pide el perfil
+    /// de ahorro: dos umbrales distintos para «va justo de batería» harían que
+    /// el escritorio cambiara de aspecto en un momento y de perfil en otro.
+    /// Leer la batería aquí cuesta 0,02 ms —`capacity` y `status`, sin
+    /// `current_now`— y se hace solo cuando el panel ya se estaba refrescando.
+    pub fn revisar_efectos(&self) -> bool {
+        let bateria_baja = state::Battery::read(false)
+            .is_some_and(|b| !b.plugged && b.percent <= 20);
+        tema::aplicar_efectos_reducidos(
+            self.efectos_config == config::Efectos::Reducidos || bateria_baja,
+        )
+    }
+
+    // --- Panel de diagnóstico -----------------------------------------------
+
+    pub fn diagnostico_visible(&self) -> bool {
+        self.diagnostico.is_some()
+    }
+
+    /// Pone o quita el panel. Devuelve si quedó puesto.
+    pub fn alternar_diagnostico(&mut self) -> bool {
+        match self.diagnostico.take() {
+            Some(_) => false,
+            None => {
+                let hud = diagnostico::Hud::new();
+                let (w, h) = hud.size();
+                let canvas = Canvas::new(Size::new(w, h), self.panel.scale);
+                self.diagnostico = Some((hud, canvas));
+                true
+            }
+        }
+    }
+
+    /// Entrega la medida de la última ventana. Solo repinta si algo cambió: con
+    /// el escritorio quieto, los números son los mismos y despertar para
+    /// redibujar lo mismo es exactamente lo que este panel existe para detectar.
+    pub fn diagnostico_datos(&mut self, datos: diagnostico::Datos) -> bool {
+        let Some((hud, canvas)) = self.diagnostico.as_mut() else {
+            return false;
+        };
+        if hud.datos == datos {
+            return false;
+        }
+        // El número de salidas cambia el alto, y con él el buffer.
+        let alto_antes = hud.size().1;
+        hud.datos = datos;
+        let (w, h) = hud.size();
+        if h != alto_antes {
+            *canvas = Canvas::new(Size::new(w, h), canvas.scale);
+        } else {
+            canvas.painted_once = false;
+        }
+        true
+    }
+
+    pub fn diagnostico_buffer_size(&self) -> Option<(u32, u32)> {
+        self.diagnostico.as_ref().map(|(_, c)| c.buffer_size())
+    }
+
+    pub fn diagnostico_logical_size(&self) -> Option<(f32, f32)> {
+        self.diagnostico.as_ref().map(|(h, _)| h.size())
+    }
+
+    pub fn diagnostico_needs_paint(&self) -> bool {
+        self.diagnostico.as_ref().is_some_and(|(_, c)| !c.painted_once)
+    }
+
+    pub fn draw_diagnostico(&mut self, buf: &mut [u8]) -> Vec<Damage> {
+        let Some((hud, canvas)) = self.diagnostico.as_mut() else {
+            return Vec::new();
+        };
+        let vista = hud.view();
+        Self::paint(canvas, &mut self.renderer, &self.theme, vista, buf)
+    }
+
     // --- Conmutador de aplicaciones ----------------------------------------
 
     /// Abre el conmutador con las celdas por orden de uso reciente.
@@ -1613,6 +1932,85 @@ impl Shell {
         let bloqueo =
             bloqueo::Bloqueo::new(hora, fecha, self.avatar.as_deref(), self.bloqueo_config);
         self.bloqueo = Some((bloqueo, canvas));
+    }
+
+    /// Abre la capa de captura. `pantalla` es el tamaño **lógico**: la ocupa
+    /// entera, igual que el bloqueo.
+    pub fn abrir_captura(&mut self, pantalla: (f32, f32)) {
+        let canvas = Canvas::new(Size::new(pantalla.0, pantalla.1), self.panel.scale);
+        self.captura = Some((captura::Captura::new(pantalla), canvas));
+    }
+
+    pub fn cerrar_captura(&mut self) -> bool {
+        self.captura.take().is_some()
+    }
+
+    pub fn hay_captura(&self) -> bool {
+        self.captura.is_some()
+    }
+
+    pub fn captura_buffer_size(&self) -> Option<(u32, u32)> {
+        self.captura.as_ref().map(|(_, c)| c.buffer_size())
+    }
+
+    /// ¿Se está moviendo el recuadro? Es lo que impide que el compositor se
+    /// duerma mientras se arrastra.
+    pub fn captura_animando(&self) -> bool {
+        self.captura.as_ref().is_some_and(|(c, _)| c.animando())
+    }
+
+    /// Mueve el puntero sobre la capa. `true` si hay que repintar.
+    pub fn captura_puntero(&mut self, x: f32, y: f32) -> bool {
+        let Some((c, canvas)) = self.captura.as_mut() else {
+            return false;
+        };
+        if !c.puntero(x, y) {
+            return false;
+        }
+        canvas.painted_once = false;
+        true
+    }
+
+    pub fn captura_pulsar(&mut self, x: f32, y: f32) -> Option<Accion> {
+        let (c, canvas) = self.captura.as_mut()?;
+        let accion = c.pulsar(x, y);
+        canvas.painted_once = false;
+        accion
+    }
+
+    pub fn captura_soltar(&mut self) -> Option<Accion> {
+        let (c, canvas) = self.captura.as_mut()?;
+        let accion = c.soltar();
+        canvas.painted_once = false;
+        accion
+    }
+
+    /// Una tecla para la capa de captura.
+    pub fn captura_tecla(&mut self, tecla: TeclaPulsada) -> Tecla {
+        let Some((c, canvas)) = self.captura.as_mut() else {
+            return Tecla::Ignorada;
+        };
+        let resultado = c.tecla(tecla);
+        canvas.painted_once = false;
+        resultado
+    }
+
+    /// ¿Hay que repintar su buffer?
+    pub fn captura_needs_paint(&self) -> bool {
+        self.captura
+            .as_ref()
+            .is_some_and(|(_, c)| !c.painted_once)
+    }
+
+    /// Pinta la capa de captura. Sale **transparente** donde no hay velo: el
+    /// hueco del recuadro es justo eso, un agujero por el que se ve lo de
+    /// debajo.
+    pub fn draw_captura(&mut self, buf: &mut [u8]) -> Vec<Damage> {
+        let Some((c, canvas)) = self.captura.as_mut() else {
+            return Vec::new();
+        };
+        let vista = c.view();
+        Self::paint(canvas, &mut self.renderer, &self.theme, vista, buf)
     }
 
     pub fn desbloquear(&mut self) {
@@ -1803,12 +2201,12 @@ impl Shell {
         }
         let view = view::panel(&self.widgets);
         let Self {
-            renderer,
+            renderer_panel,
             theme,
             panel,
             ..
         } = self;
-        Self::paint(panel, renderer, theme, view, buf)
+        Self::paint(panel, renderer_panel, theme, view, buf)
     }
 
     /// Pinta el dock en `buf`, que debe tener el tamaño de
@@ -1826,12 +2224,12 @@ impl Shell {
     pub fn draw_dock(&mut self, buf: &mut [u8]) -> Vec<Damage> {
         let view = self.dock_items.view();
         let Self {
-            renderer,
+            renderer_dock,
             theme,
             dock,
             ..
         } = self;
-        Self::paint(dock, renderer, theme, view, buf)
+        Self::paint(dock, renderer_dock, theme, view, buf)
     }
 
     fn paint(

@@ -207,15 +207,26 @@ impl Compartido {
         poner("live_apply", Value::from(true));
         poner("fractional_scale", Value::from(true));
         poner("per_output_scale", Value::from(true));
+        // El modelo entiende un escritorio lógico bidimensional aunque el
+        // backend anidado solo tenga una salida y el DRM aún anuncie aparte si
+        // puede encender varias. Settings puede ofrecer el editor de posiciones
+        // sin confundir esta capacidad con `multi_output`.
+        poner("virtual_layout", Value::from(true));
+        poner("layout_negative_coordinates", Value::from(true));
         poner("position", Value::from(udev));
         poner("rotation", Value::from(udev));
         poner("mode", Value::from(udev));
         poner("refresh", Value::from(udev));
         poner("vrr", Value::from(udev));
-        // Encender un segundo conector todavía no: el backend arma una sola
-        // `DrmOutput`. Se enumera todo lo conectado, pero solo se configura lo
-        // que ya está encendido. Ver la nota de `backend::udev::censo`.
-        poner("multi_output", Value::from(false));
+        poner("multi_output", Value::from(udev));
+        poner("hotplug", Value::from(udev));
+        poner("per_output_refresh", Value::from(udev));
+        poner("mixed_scale_spanning", Value::from(udev));
+        poner("presentation_time", Value::from(udev));
+        // Hoy ambas barras viajan juntas con la salida principal. El contrato
+        // lo anuncia para que Settings pueda explicar qué monitor las lleva.
+        poner("shell_follows_primary", Value::from(true));
+        poner("independent_panel_dock_outputs", Value::from(false));
         poner("primary", Value::from(true));
         // Puntos de extensión declarados a propósito: la interfaz ya los
         // anuncia como ausentes para que Settings no tenga que adivinar.
@@ -397,18 +408,75 @@ pub fn validar(actual: &[Salida], peticion: &[Peticion]) -> Result<(), String> {
         }
     }
 
+    // Todas las pantallas extendidas deben formar una sola isla alcanzable.
+    // Un hueco entre dos rectángulos crea una salida a la que el puntero no
+    // puede llegar de forma continua. Tocar solo una esquina tampoco sirve:
+    // el paso tendría un único punto lógico y sería prácticamente imposible
+    // cruzarlo. Las salidas clonadas sí pertenecen al mismo grupo.
+    if activas.len() > 1 {
+        let mut alcanzables = vec![false; activas.len()];
+        alcanzables[0] = true;
+        loop {
+            let mut cambio = false;
+            for i in 0..activas.len() {
+                if !alcanzables[i] {
+                    continue;
+                }
+                for j in 0..activas.len() {
+                    if !alcanzables[j] && salidas_conectadas(activas[i], activas[j]) {
+                        alcanzables[j] = true;
+                        cambio = true;
+                    }
+                }
+            }
+            if !cambio {
+                break;
+            }
+        }
+        if let Some((i, _)) = alcanzables.iter().enumerate().find(|(_, ok)| !**ok) {
+            return Err(format!(
+                "«{}» queda separada del resto del escritorio; coloca sus bordes en contacto",
+                activas[i].id
+            ));
+        }
+    }
+
     Ok(())
+}
+
+fn salidas_conectadas(a: &Peticion, b: &Peticion) -> bool {
+    let (aw, ah) = tamano_logico(a.ancho, a.alto, a.escala, &a.transformacion);
+    let (bw, bh) = tamano_logico(b.ancho, b.alto, b.escala, &b.transformacion);
+    let clonadas = a.x == b.x && a.y == b.y && aw == bw && ah == bh;
+    let borde_vertical = (a.x + aw == b.x || b.x + bw == a.x)
+        && a.y < b.y + bh
+        && b.y < a.y + ah;
+    let borde_horizontal = (a.y + ah == b.y || b.y + bh == a.y)
+        && a.x < b.x + bw
+        && b.x < a.x + aw;
+    clonadas || borde_vertical || borde_horizontal
 }
 
 /// Rellena lo que la petición no decide: si nadie se declaró principal, lo es
 /// la primera encendida. Se hace después de validar para que el hueco no se
 /// confunda con un error.
 pub fn normalizar(peticion: &mut [Peticion]) {
-    if peticion.iter().any(|p| p.principal && p.activa) {
-        return;
+    if !peticion.iter().any(|p| p.principal && p.activa) {
+        if let Some(p) = peticion.iter_mut().find(|p| p.activa) {
+            p.principal = true;
+        }
     }
-    if let Some(p) = peticion.iter_mut().find(|p| p.activa) {
-        p.principal = true;
+
+    // El origen del escritorio siempre es la principal. Así las superficies
+    // propias del shell —panel, dock, bloqueo y OSD— conservan coordenadas
+    // locales desde (0,0), mientras que una pantalla a la izquierda o arriba
+    // usa coordenadas negativas de forma natural.
+    if let Some(principal) = peticion.iter().find(|p| p.principal && p.activa) {
+        let (ox, oy) = (principal.x, principal.y);
+        for p in peticion.iter_mut().filter(|p| p.activa) {
+            p.x -= ox;
+            p.y -= oy;
+        }
     }
 }
 
@@ -654,6 +722,71 @@ pub fn aplicar(state: &mut crate::state::BookosComp, mut peticion: Vec<Peticion>
     Ok(())
 }
 
+/// Construye y aplica los cinco perfiles del selector Fn+F4. La decisión se
+/// toma con el censo actual para no guardar resoluciones inventadas.
+pub fn aplicar_modo_rapido(
+    state: &mut crate::state::BookosComp,
+    modo: bookos_shell::ModoProyeccion,
+) -> Result<(), String> {
+    use bookos_shell::ModoProyeccion::*;
+    if modo == SinCambios { return Ok(()); }
+    let salidas = state.pantallas.compartido.salidas();
+    if salidas.len() < 2 { return Err("No hay otra pantalla conectada".into()); }
+    let principal = salidas.iter().position(|s| s.principal).unwrap_or(0);
+    let externa = (0..salidas.len()).find(|&i| i != principal).unwrap();
+    let mut peticiones = peticion_de(&salidas);
+    let poner_modo = |p: &mut Peticion, s: &Salida| -> Result<(), String> {
+        let m = s.modos.iter().find(|m| m.actual)
+            .or_else(|| s.modos.iter().find(|m| m.preferido))
+            .or_else(|| s.modos.first())
+            .ok_or_else(|| format!("«{}» no anuncia ningún modo", s.id))?;
+        p.ancho = m.ancho; p.alto = m.alto; p.refresco_mhz = m.refresco_mhz;
+        Ok(())
+    };
+    for (i, p) in peticiones.iter_mut().enumerate() {
+        p.activa = false;
+        p.principal = false;
+        if p.ancho == 0 { poner_modo(p, &salidas[i])?; }
+    }
+    match modo {
+        Principal => {
+            peticiones[principal].activa = true;
+            peticiones[principal].principal = true;
+        }
+        Externa => {
+            peticiones[externa].activa = true;
+            peticiones[externa].principal = true;
+            peticiones[externa].x = 0; peticiones[externa].y = 0;
+        }
+        Extender => {
+            peticiones[principal].activa = true;
+            peticiones[principal].principal = true;
+            peticiones[principal].x = 0; peticiones[principal].y = 0;
+            peticiones[externa].activa = true;
+            let (w, _) = tamano_logico(peticiones[principal].ancho, peticiones[principal].alto,
+                peticiones[principal].escala, &peticiones[principal].transformacion);
+            peticiones[externa].x = w; peticiones[externa].y = 0;
+        }
+        Duplicar => {
+            let comun = salidas[principal].modos.iter().find(|a| {
+                salidas[externa].modos.iter().any(|b| a.ancho == b.ancho && a.alto == b.alto)
+            }).ok_or_else(|| "Las pantallas no comparten una resolución para duplicar".to_string())?;
+            for i in [principal, externa] {
+                peticiones[i].activa = true;
+                peticiones[i].ancho = comun.ancho;
+                peticiones[i].alto = comun.alto;
+                let m = salidas[i].modos.iter().find(|m| m.ancho == comun.ancho && m.alto == comun.alto).unwrap();
+                peticiones[i].refresco_mhz = m.refresco_mhz;
+                peticiones[i].escala = 1.0;
+                peticiones[i].x = 0; peticiones[i].y = 0;
+            }
+            peticiones[principal].principal = true;
+        }
+        SinCambios => unreachable!(),
+    }
+    aplicar(state, peticiones)
+}
+
 /// Reajusta el escritorio a un censo nuevo: dónde va cada salida, de qué tamaño
 /// se dibuja el shell y qué escala se les anuncia a los clientes.
 pub fn tras_aplicar(state: &mut crate::state::BookosComp, aplicado: Aplicado) {
@@ -675,6 +808,10 @@ pub fn tras_aplicar(state: &mut crate::state::BookosComp, aplicado: Aplicado) {
     for (output, pos) in &mapa {
         state.space.map_output(output, *pos);
     }
+    // Las ventanas guardadas de una pantalla que acaba de irse no pueden
+    // quedarse esperándola: pasan a la que queda. Va aquí, con el `Space` ya
+    // recolocado, porque el reencuadre necesita el área de destino de ahora.
+    crate::escritorios::adoptar_huerfanas(state);
 
     if let Some((output, _)) = mapa.get(principal) {
         let escala = output.current_scale().fractional_scale();
@@ -688,10 +825,11 @@ pub fn tras_aplicar(state: &mut crate::state::BookosComp, aplicado: Aplicado) {
         }
         state.escala_forzada = Some(escala);
         state.broadcast_preferred_scale(escala);
+        let escala_cursor = mapa.iter()
+            .map(|(o, _)| o.current_scale().fractional_scale())
+            .max_by(f64::total_cmp).unwrap_or(escala);
         state.cursor_theme = Some(crate::cursor::CursorTheme::con_tamano(
-            escala,
-            state.cursor_nominal,
-        ));
+            escala_cursor, state.cursor_nominal));
     }
 
     state.pantallas.compartido.publicar(salidas);
@@ -882,6 +1020,34 @@ mod pruebas {
     }
 
     #[test]
+    fn las_pantallas_pueden_ir_en_los_cuatro_lados() {
+        let a = peticion("A");
+        for (x, y) in [(-1646, 0), (1646, 0), (0, -1029), (0, 1029)] {
+            let mut b = peticion("B");
+            b.principal = false;
+            b.x = x;
+            b.y = y;
+            assert!(
+                validar(&[salida("A"), salida("B")], &[a.clone(), b]).is_ok(),
+                "posición {x},{y}"
+            );
+        }
+    }
+
+    #[test]
+    fn una_isla_separada_o_unida_solo_por_la_esquina_se_rechaza() {
+        let a = peticion("A");
+        let mut b = peticion("B");
+        b.principal = false;
+        b.x = 2000;
+        assert!(validar(&[salida("A"), salida("B")], &[a.clone(), b.clone()]).is_err());
+
+        b.x = 1646;
+        b.y = 1029;
+        assert!(validar(&[salida("A"), salida("B")], &[a, b]).is_err());
+    }
+
+    #[test]
     fn la_rotacion_desconocida_se_rechaza() {
         let mut p = peticion("A");
         p.transformacion = "45".into();
@@ -956,5 +1122,22 @@ mod pruebas {
         normalizar(&mut p);
         assert!(!p[0].principal);
         assert!(p[1].principal);
+    }
+
+    #[test]
+    fn la_principal_define_el_origen_del_escritorio() {
+        let mut p = vec![{
+            let mut a = peticion("A");
+            a.x = 1646;
+            a
+        }, {
+            let mut b = peticion("B");
+            b.principal = false;
+            b.x = 0;
+            b
+        }];
+        normalizar(&mut p);
+        assert_eq!((p[0].x, p[0].y), (0, 0));
+        assert_eq!((p[1].x, p[1].y), (-1646, 0));
     }
 }

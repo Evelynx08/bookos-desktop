@@ -27,6 +27,7 @@ mod brillo;
 mod buscador;
 mod calendario;
 mod centro;
+mod compartir;
 pub(crate) mod control;
 mod energia;
 mod escritorios;
@@ -35,6 +36,7 @@ mod lista;
 mod menu;
 mod menu_dock;
 mod notificaciones;
+mod proyeccion;
 mod red;
 mod sonido;
 
@@ -74,7 +76,9 @@ pub enum Tecla {
     Hacer(Accion),
 }
 
+pub use compartir::Pantalla as PantallaCompartible;
 pub use menu_dock::Objetivo;
+pub use proyeccion::Modo as ModoProyeccion;
 
 /// Recorta un texto al ancho que hay, con puntos suspensivos.
 ///
@@ -107,6 +111,8 @@ pub enum Emergente {
     Launchpad(launchpad::Launchpad),
     Buscador(buscador::Buscador),
     Escritorios(escritorios::Escritorios),
+    Proyeccion(proyeccion::Proyeccion),
+    Compartir(compartir::Compartir),
 }
 
 impl Emergente {
@@ -115,7 +121,7 @@ impl Emergente {
     }
 
     pub fn apariencia() -> Self {
-        Self::Apariencia(apariencia::Apariencia::new())
+        Self::Apariencia(apariencia::Apariencia::new(crate::tema::modo_actual()))
     }
 
     /// El diálogo del botón de encendido.
@@ -186,6 +192,15 @@ impl Emergente {
         Self::Escritorios(escritorios::Escritorios::new(pantalla, activo, nombres))
     }
 
+    pub fn proyeccion(conectadas: usize) -> Self {
+        Self::Proyeccion(proyeccion::Proyeccion::new(conectadas))
+    }
+
+    /// El permiso de compartir pantalla que pide el portal de escritorio.
+    pub fn compartir(sesion: u32, app: String, pantallas: Vec<compartir::Pantalla>) -> Self {
+        Self::Compartir(compartir::Compartir::new(sesion, app, pantallas))
+    }
+
     /// Nombre para las trazas.
     pub fn nombre(&self) -> &'static str {
         match self {
@@ -205,6 +220,8 @@ impl Emergente {
             Self::Launchpad(_) => "launchpad",
             Self::Buscador(_) => "buscador",
             Self::Escritorios(_) => "escritorios",
+            Self::Proyeccion(_) => "proyeccion",
+            Self::Compartir(_) => "compartir",
         }
     }
 
@@ -227,6 +244,24 @@ impl Emergente {
             Self::Launchpad(l) => l.size(),
             Self::Buscador(b) => b.size(),
             Self::Escritorios(e) => e.size(),
+            Self::Proyeccion(p) => p.size(),
+            Self::Compartir(c) => c.size(),
+        }
+    }
+
+    /// El alto con el que hay que **colocarla**, cuando no es el que mide
+    /// ahora mismo.
+    ///
+    /// Solo el buscador lo tiene: su alto cambia con cada tecla —cada resultado
+    /// que entra o sale es media fila— y centrarlo por el alto de ahora lo hace
+    /// saltar mientras escribes, con el rectángulo de cristal detrás saltando
+    /// con él. Colocándolo por el máximo, el campo de texto se queda clavado y
+    /// la lista crece hacia abajo. Las demás devuelven `None` y se colocan por
+    /// lo que miden, que es lo que siempre han hecho.
+    pub fn alto_estable(&self) -> Option<f32> {
+        match self {
+            Self::Buscador(_) => Some(buscador::Buscador::alto_maximo()),
+            _ => None,
         }
     }
 
@@ -248,6 +283,8 @@ impl Emergente {
             Self::Launchpad(l) => l.ancla(),
             Self::Buscador(b) => b.ancla(),
             Self::Escritorios(e) => e.ancla(),
+            Self::Proyeccion(p) => p.ancla(),
+            Self::Compartir(c) => c.ancla(),
         }
     }
 
@@ -286,6 +323,8 @@ impl Emergente {
             Self::Bluetooth(b) => b.animando(),
             Self::Acerca(a) => a.animando(),
             Self::Escritorios(e) => e.animando(),
+            Self::Proyeccion(p) => p.animando(),
+            Self::Compartir(c) => c.animando(),
             // El brillo no tiene nada que animar dentro: sus dos píldoras
             // siguen al dedo y sus botones no se pulsan.
             Self::Brillo(_) => false,
@@ -314,6 +353,9 @@ impl Emergente {
             // Es un diálogo: hay que contestarle antes de seguir, y el velo es
             // lo que lo dice sin escribirlo.
             Self::Apagar(a) => Some(a.velo()),
+            // También es un diálogo, y de los que hay que mirar dos veces:
+            // alguien está pidiendo ver la pantalla entera.
+            Self::Compartir(c) => Some(c.velo()),
             _ => None,
         }
     }
@@ -357,6 +399,8 @@ impl Emergente {
             Self::Launchpad(l) => l.view(),
             Self::Buscador(b) => b.view(),
             Self::Escritorios(e) => e.view(),
+            Self::Proyeccion(p) => p.view(),
+            Self::Compartir(c) => c.view(),
         }
     }
 
@@ -388,6 +432,8 @@ impl Emergente {
             Self::Launchpad(l) => l.puntero(punto),
             Self::Buscador(b) => b.puntero(punto),
             Self::Escritorios(e) => e.puntero(punto),
+            Self::Proyeccion(p) => p.puntero(punto),
+            Self::Compartir(c) => c.puntero(punto),
         }
     }
 
@@ -411,6 +457,8 @@ impl Emergente {
             Self::Launchpad(l) => l.pulsar(x, y),
             Self::Buscador(b) => b.pulsar(x, y),
             Self::Escritorios(e) => e.pulsar(x, y),
+            Self::Proyeccion(p) => p.pulsar(x, y),
+            Self::Compartir(c) => c.pulsar(x, y),
         }
     }
 
@@ -474,6 +522,20 @@ impl Emergente {
             Self::Launchpad(l) => l.tecla(tecla),
             Self::Buscador(b) => b.tecla(tecla),
             Self::Escritorios(e) => e.tecla(tecla),
+            Self::Proyeccion(p) => p.tecla(tecla),
+            Self::Compartir(c) => c.tecla(tecla),
+        }
+    }
+
+    /// La respuesta que hay que mandar si esto se cierra sin contestarlo.
+    ///
+    /// Solo el permiso de compartir pantalla la tiene: hay alguien bloqueado al
+    /// otro lado del portal, y un clic fuera de la tarjeta tiene que llegarle
+    /// como una negativa y no como silencio.
+    pub fn respuesta_pendiente(&self) -> Option<Accion> {
+        match self {
+            Self::Compartir(c) => Some(c.denegar()),
+            _ => None,
         }
     }
 

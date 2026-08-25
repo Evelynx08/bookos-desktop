@@ -34,39 +34,17 @@ use crate::state::BookosComp;
 /// Ya no es genérica sobre el renderer: los dos backends componen con GLES y
 /// el cristal necesita copiar el framebuffer, que es GL crudo. La genericidad
 /// solo servía para un segundo renderer que no existe.
-pub fn escena(
-    state: &mut BookosComp,
-    renderer: &mut GlesRenderer,
-    output: &Output,
-) -> Vec<OverlayElement> {
-    let scale = output.current_scale().fractional_scale();
-    let cursor_en = (
-        state.pointer_location.x * scale,
-        state.pointer_location.y * scale,
-    )
-        .into();
-
-    // El cursor va delante: los elementos se apilan de delante hacia atrás, así
-    // que el primero de la lista queda arriba del todo.
-    let _t = std::time::Instant::now();
-    let mut elementos = crate::cursor::elements(
-        renderer,
-        &state.cursor_status,
-        state.cursor_theme.as_ref(),
-        cursor_en,
-        scale,
-    );
-
-    let t_cursor = _t.elapsed();
-    let _t = std::time::Instant::now();
-    // Con una ventana a pantalla completa el shell no se dibuja: un vídeo con
-    // el panel encima no está a pantalla completa, está maximizado. El cursor
-    // sí sigue delante, que es lo que hace todo el mundo.
-    let completa = state.hay_pantalla_completa();
-    let vista_escritorios = state
-        .shell
-        .as_ref()
-        .is_some_and(|s| s.vista_escritorios_abierta());
+/// Avanza todo lo que se mueve solo: las animaciones del shell, el
+/// deslizamiento entre escritorios y las ventanas que van o vuelven del dock.
+///
+/// Vive aparte de [`escena`] porque **`escena` se llama una vez por salida**, y
+/// esto no es idempotente: `escritorios::animar` mueve ventanas dentro del
+/// `Space` y varias de las `animar_*` del shell rasterizan un buffer con
+/// tiny-skia. Con dos monitores eso avanzaba y repintaba dos veces por
+/// fotograma, y además la segunda salida leía posiciones ya adelantadas: las
+/// dos pantallas deslizaban desfasadas entre sí. Se llama una sola vez por
+/// vuelta, antes de componer ninguna salida.
+pub fn avanzar_animaciones(state: &mut BookosComp) {
     let app_en_foco = state
         .seat
         .get_keyboard()
@@ -122,6 +100,42 @@ pub fn escena(
     if minimizando || restaurando {
         state.genio_commit.increment();
     }
+}
+
+pub fn escena(
+    state: &mut BookosComp,
+    renderer: &mut GlesRenderer,
+    output: &Output,
+) -> Vec<OverlayElement> {
+    let scale = output.current_scale().fractional_scale();
+    let cursor_en = (
+        state.pointer_location.x * scale,
+        state.pointer_location.y * scale,
+    )
+        .into();
+
+    // El cursor va delante: los elementos se apilan de delante hacia atrás, así
+    // que el primero de la lista queda arriba del todo.
+    let _t = std::time::Instant::now();
+    let mut elementos = crate::cursor::elements(
+        renderer,
+        &state.cursor_status,
+        state.cursor_theme.as_ref(),
+        cursor_en,
+        scale,
+    );
+
+    let t_cursor = _t.elapsed();
+    let _t = std::time::Instant::now();
+    // Con una ventana a pantalla completa el shell no se dibuja: un vídeo con
+    // el panel encima no está a pantalla completa, está maximizado. El cursor
+    // sí sigue delante, que es lo que hace todo el mundo.
+    let completa = state.hay_pantalla_completa_en(output);
+    let bloqueado = state.shell.as_ref().is_some_and(|s| s.esta_bloqueado());
+    let vista_escritorios = state
+        .shell
+        .as_ref()
+        .is_some_and(|s| s.vista_escritorios_abierta());
 
     // Meta+Tab reutiliza directamente las superficies de los clientes. No se
     // captura ningún bitmap ni se abre un temporizador: Smithay las escala con
@@ -179,7 +193,12 @@ pub fn escena(
             .as_ref()
             .map(|s| s.escritorios_miniaturas())
             .unwrap_or_default();
-        let escritorios = crate::escritorios::ventanas_para_vista(state);
+        // La vista general enseña los escritorios de **una** salida: la que
+        // tiene el puntero, que es sobre la que van a actuar el clic y el
+        // gesto. Mezclar las ventanas de los dos monitores en las mismas
+        // miniaturas no describiría ningún estado que exista.
+        let salida_vista = crate::escritorios::salida_para_vista(state);
+        let escritorios = crate::escritorios::ventanas_para_vista(state, &salida_vista);
         let (pantalla_w, pantalla_h) = state.pantalla_logica();
         for (i, (ventanas, hueco)) in escritorios.iter().zip(huecos).enumerate() {
             let factor = (hueco.size.w as f64 / pantalla_w.max(1.0) as f64)
@@ -240,6 +259,24 @@ pub fn escena(
             .into_iter()
             .map(OverlayElement::Memory),
     );
+
+    // El bloqueo interactivo vive en la salida principal. Las demás deben
+    // quedar cubiertas también: nunca se deja una ventana visible porque el
+    // monitor se conectó después de bloquear. Al desbloquear desaparece en el
+    // mismo frame que la superficie principal.
+    if bloqueado && output.current_location() != (0, 0).into() {
+        static BLOQUEO_SECUNDARIO: std::sync::OnceLock<Id> = std::sync::OnceLock::new();
+        let escala = output.current_scale().fractional_scale();
+        let origen = output.current_location().to_f64().to_physical_precise_round(escala);
+        let tamano = output.current_mode().map(|m| m.size).unwrap_or((1, 1).into());
+        elementos.push(OverlayElement::Color(SolidColorRenderElement::new(
+            BLOQUEO_SECUNDARIO.get_or_init(Id::new).clone(),
+            Rectangle::new(origen, tamano),
+            0,
+            [0.015, 0.02, 0.03, 1.0],
+            Kind::Unspecified,
+        )));
+    }
 
     // El velo del conmutador va detrás del panel y del dock —que siguen
     // legibles— y delante de las ventanas del escritorio.
@@ -302,7 +339,11 @@ pub fn escena(
         .current_mode()
         .map(|m| (m.size.w, m.size.h))
         .unwrap_or((1, 1));
-    if !completa && !vista_escritorios {
+    // Con los efectos reducidos no hay cristal: el desenfoque es lo más caro
+    // que dibuja este compositor —copia el framebuffer y lo vuelve a muestrear
+    // por cada zona— y el panel y el dock se ven igual de bien con su color
+    // plano, que es lo que hacían antes de que existiera.
+    if !completa && !vista_escritorios && !bookos_shell::tema::efectos_reducidos() {
         if let (Some(cristal), Some(shell)) = (state.cristal.clone(), state.shell.as_ref()) {
             let zonas = shell.zonas_cristal();
             // El commit **no** sube por frame: el cristal desenfoca el fondo,
@@ -334,7 +375,6 @@ pub fn escena(
     // se dibujan, el escritorio se ve por debajo de la pantalla de bloqueo y
     // esta deja de proteger nada. Se comprobó en pantalla — konsole se veía
     // entera detrás del reloj.
-    let bloqueado = state.shell.as_ref().is_some_and(|s| s.esta_bloqueado());
 
     // Y por último las ventanas, que quedan debajo de todo lo anterior.
     //
@@ -380,10 +420,10 @@ pub fn escena(
                 continue;
             }
         }
-        let (alfa, zoom) = match encogido {
+        let (alfa, escala_ventana, zoom_entrada, redimensionando) = match encogido {
             Some(e) => {
                 let (_, escala, alfa) = crate::ventanas::encogido_ahora(e);
-                (alfa, escala)
+                (alfa, Scale::from(escala), escala, false)
             }
             None => {
                 let (alfa, zoom) = crate::ventanas::animacion(&window);
@@ -391,9 +431,13 @@ pub fn escena(
                 // el tamaño viejo: es la parte de la animación que faltaba,
                 // porque `posicion` solo movía la esquina y el tamaño cambiaba
                 // de golpe.
+                let resize = crate::ventanas::escala_resize(&window, window.geometry().size);
+                let redimensionando = resize.x != 1.0 || resize.y != 1.0;
                 (
                     alfa,
-                    zoom * crate::ventanas::escala_resize(&window, window.geometry().size),
+                    Scale::from((zoom * resize.x, zoom * resize.y)),
+                    zoom,
+                    redimensionando,
                 )
             }
         };
@@ -427,6 +471,15 @@ pub fn escena(
             animada.y + geo.h as f64 / 2.0,
         ))
         .to_physical_precise_round(scale);
+        // Un resize se ancla en la esquina interpolada: así cada borde ocupa
+        // exactamente el rectángulo intermedio. La entrada de una ventana sí
+        // nace desde el centro, que es un gesto distinto.
+        let ancla_ventana = if redimensionando {
+            Point::<f64, Logical>::from((animada.x, animada.y))
+                .to_physical_precise_round(scale)
+        } else {
+            centro
+        };
 
         // La barra va **delante de su ventana y detrás de las de encima**, así
         // que se emite aquí dentro y no con el resto del shell: en
@@ -444,18 +497,33 @@ pub fn escena(
                 if let Some(elemento) =
                     shell.barra_ventana(renderer, id, geo.w, barra, origen_barra, alfa)
                 {
-                    elementos.push(if zoom == 1.0 {
+                    // La barra acompaña el ancho, pero mantiene sus 32 px de
+                    // alto durante el resize; escalarla en Y haría que los
+                    // botones engordasen y se separasen del cliente.
+                    let escala_barra = if redimensionando {
+                        Scale::from((escala_ventana.x, zoom_entrada))
+                    } else {
+                        escala_ventana
+                    };
+                    let ancla_barra = if redimensionando {
+                        origen_barra.to_i32_round()
+                    } else {
+                        centro
+                    };
+                    elementos.push(if escala_barra.x == 1.0 && escala_barra.y == 1.0 {
                         OverlayElement::Memory(elemento)
                     } else {
                         OverlayElement::MemoriaEscalada(RescaleRenderElement::from_element(
-                            elemento, centro, zoom,
+                            elemento,
+                            ancla_barra,
+                            escala_barra,
                         ))
                     });
                 }
             }
         }
 
-        if zoom == 1.0 {
+        if escala_ventana.x == 1.0 && escala_ventana.y == 1.0 {
             elementos.extend(superficies.into_iter().map(OverlayElement::Surface));
             continue;
         }
@@ -466,22 +534,53 @@ pub fn escena(
             // fotogramas intermedios es verlos pasar aquí.
             tracing::info!(
                 alfa = format_args!("{alfa:.2}"),
-                zoom = format_args!("{zoom:.3}"),
+                escala_x = format_args!("{:.3}", escala_ventana.x),
+                escala_y = format_args!("{:.3}", escala_ventana.y),
                 "fotograma de entrada"
             );
         }
-        // El zoom crece desde el centro de la ventana: con el origen en la
-        // esquina, la ventana se despliega hacia abajo y a la derecha y parece
-        // que entre deslizándose en diagonal, no que aparezca.
+        // La entrada crece desde el centro; el resize, desde su esquina visible
+        // interpolada. `ancla_ventana` elige uno u otro sin cambiar el tipo de
+        // elemento que compone la GPU.
         elementos.extend(superficies.into_iter().map(|elemento| {
-            OverlayElement::Escalada(RescaleRenderElement::from_element(elemento, centro, zoom))
+            OverlayElement::Escalada(RescaleRenderElement::from_element(
+                elemento,
+                ancla_ventana,
+                escala_ventana,
+            ))
         }));
+    }
+
+    // Los iconos del escritorio, entre el fondo y las ventanas: son parte del
+    // escritorio, no de lo que va por encima. Con el bloqueo echado no se
+    // dibujan por lo mismo que las ventanas — enseñarían qué hay en la carpeta
+    // de quien no ha desbloqueado todavía.
+    //
+    // La banda elástica va delante de ellos: al barrer se ve el filo cruzando
+    // por encima de los nombres, no por debajo.
+    if !bloqueado && !completa {
+        if let Some(shell) = state.shell.as_ref() {
+            elementos.extend(shell.banda_elementos().into_iter().map(OverlayElement::Color));
+        }
+        let iconos = state
+            .shell
+            .as_ref()
+            .map(|shell| shell.elementos_escritorio(renderer))
+            .unwrap_or_default();
+        elementos.extend(iconos.into_iter().map(OverlayElement::Memory));
     }
 
     // El fondo va el último de la lista, o sea el más atrás de todo: detrás de
     // las ventanas, del shell y del cristal.
+    // El avance del fundido se pide **antes** del `if`: es también quien suelta
+    // el fondo saliente al terminar, y dentro del `if` no correría en el caso en
+    // que no hay fondo nuevo.
+    let fundido = avance_fundido(state);
     if let Some(fondo) = state.fondo.as_ref() {
-        let (lw, lh) = state.pantalla_logica();
+        let geo = state.space.output_geometry(output).unwrap_or_else(|| {
+            Rectangle::new((0, 0).into(), (1, 1).into())
+        });
+        let (lw, lh) = (geo.size.w, geo.size.h);
         // Mientras se cambia de escritorio el fondo no se queda quieto: se
         // agranda un poco y se corre en sentido contrario a la vista. Fuera de
         // la transición esto devuelve la posición y el tamaño de siempre.
@@ -489,18 +588,52 @@ pub fn escena(
         // misma velocidad: la pantalla entera es una tira que se corre de lado.
         // Son dos porque el que se va deja el borde al descubierto y detrás
         // está el del escritorio al que se llega, pegado a él.
-        let (saliente, entrante) = match state.escritorios.tira_fondo() {
+        // La tira es la de **esta** salida: con un cambio en marcha en un solo
+        // monitor, el fondo del otro no se mueve.
+        let (saliente, entrante) = match state.escritorios.tira_fondo(&output.name()) {
             Some((s, e)) => (s, Some(e)),
             None => (0, None),
         };
         if let Some(x) = entrante {
-            if let Some(elemento) = fondo.elemento_gemelo_en(renderer, (x, 0), (lw as i32, lh as i32))
+            if let Some(elemento) = fondo.elemento_gemelo_en(
+                renderer, (geo.loc.x + x, geo.loc.y), (lw, lh))
             {
                 elementos.push(OverlayElement::Memory(elemento));
             }
         }
-        if let Some(elemento) = fondo.elemento_en(renderer, (saliente, 0), (lw as i32, lh as i32)) {
+        if let Some(elemento) = fondo.elemento_con_alfa(
+            renderer,
+            (geo.loc.x + saliente, geo.loc.y),
+            (lw, lh),
+            // Mientras dura el cambio de imagen, el fondo nuevo entra
+            // apareciendo por encima del que se va. Fuera de la transición
+            // esto es 1,0 y no cuesta nada.
+            fundido.unwrap_or(1.0),
+        ) {
             elementos.push(OverlayElement::Memory(elemento));
+        }
+    }
+
+    // Y debajo de todo, el fondo que se está yendo. Va el último de la lista
+    // —los elementos se apilan de delante hacia atrás— para que el nuevo se
+    // mezcle **sobre** él y no al revés.
+    if fundido.is_some() {
+        if let Some((saliente, _)) = state.fondo_saliente.as_ref() {
+            let geo = state
+                .space
+                .output_geometry(output)
+                .unwrap_or_else(|| Rectangle::new((0, 0).into(), (1, 1).into()));
+            // Su buffer propio, no el gemelo: son dos `Fondo` distintos, así
+            // que los identificadores ya son distintos y el seguimiento de daño
+            // los ve como dos rectángulos. Pedir el gemelo aquí sería una
+            // segunda copia de veinte megas para nada.
+            if let Some(elemento) = saliente.elemento_en(
+                renderer,
+                (geo.loc.x, geo.loc.y),
+                (geo.size.w, geo.size.h),
+            ) {
+                elementos.push(OverlayElement::Memory(elemento));
+            }
         }
     }
 
@@ -546,6 +679,525 @@ const DPI_OBJETIVO: f64 = 138.0;
 /// Devuelve 1,0 cuando el monitor no dice cuánto mide —muchos proyectores y
 /// algunas KVM mandan 0×0— porque inventar una escala a partir de un dato que
 /// no existe es peor que quedarse en la que siempre funciona.
+/// Sirve las copias de pantalla pendientes de esta salida y, si hay alguna
+/// sesión compartiendo esta pantalla, le manda su fotograma.
+///
+/// Los dos consumidores salen del **mismo** composite: `zwlr_screencopy` y el
+/// portal de PipeWire piden lo mismo —la salida entera, ya compuesta— y hacerlo
+/// dos veces era pagar dos veces por el mismo píxel.
+///
+/// ## Se compone aparte, no se lee del fotograma que se acaba de enseñar
+///
+/// Lo primero que probé fue leer directamente del framebuffer recién dibujado,
+/// que es lo barato: la imagen ya está en la GPU. **No vale.** `copy_framebuffer`
+/// deja el contexto donde quiere —Smithay lo avisa: «may change or invalidate
+/// the current bind»—, y medido, cada captura tumbaba la superficie EGL del
+/// backend anidado: `BAD_SURFACE` en `eglSwapBuffers` y el contexto perdido,
+/// una vez por captura y de forma reproducible. El compositor se recuperaba,
+/// pero perdiendo un fotograma cada vez.
+///
+/// Así que la captura compone la escena **otra vez**, en su propio buffer, y se
+/// hace después de presentar. Cuesta un segundo composite por captura: para una
+/// captura de pantalla no se nota, y para compartir pantalla es el doble de
+/// trabajo de composición, que se podrá quitar cuando la copia salga por dmabuf
+/// en vez de por memoria compartida. A cambio, el camino es **el mismo en los
+/// dos backends** y no toca nada de lo que hay dibujando.
+pub fn servir_capturas(state: &mut BookosComp, renderer: &mut GlesRenderer, output: &Output) {
+    use smithay::backend::renderer::damage::OutputDamageTracker;
+    use smithay::backend::renderer::{ExportMem, Offscreen, TextureMapping};
+
+    // Solo las de esta salida; las de otra esperan a que le toque dibujar.
+    let mias: Vec<usize> = state
+        .capturas_pantalla
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.output == *output)
+        .map(|(i, _)| i)
+        .collect();
+    let ahora = std::time::Instant::now();
+    let emisiones = state.emisiones.tocan(output, ahora);
+    if mias.is_empty() && emisiones.is_empty() {
+        return;
+    }
+
+    let tamano = crate::captura::tamano_de(output);
+    let mut destino = match Offscreen::<smithay::backend::renderer::gles::GlesRenderbuffer>::create_buffer(
+        renderer,
+        smithay::backend::allocator::Fourcc::Abgr8888,
+        tamano,
+    ) {
+        Ok(b) => b,
+        Err(err) => {
+            tracing::warn!("no se pudo crear el buffer de la captura: {err}");
+            fallar(state, &mias);
+            return;
+        }
+    };
+    // El buffer donde se compone va en `Abgr8888` —es el formato natural del
+    // renderizador—; la conversión al que espera el cliente la hace
+    // `copy_framebuffer` al leerlo.
+
+    let elementos = escena(state, renderer, output);
+    let mut seguimiento = OutputDamageTracker::from_output(output);
+    let mut framebuffer = match smithay::backend::renderer::Bind::bind(renderer, &mut destino) {
+        Ok(fb) => fb,
+        Err(err) => {
+            tracing::warn!("no se pudo apuntar a la captura: {err}");
+            fallar(state, &mias);
+            return;
+        }
+    };
+    // `age = 0` es un redibujo completo, que es justo lo que hace falta: el
+    // buffer es nuevo y no tiene nada de antes que reaprovechar.
+    if let Err(err) = seguimiento.render_output(
+        renderer,
+        &mut framebuffer,
+        0,
+        &elementos,
+        [0.05, 0.05, 0.06, 1.0],
+    ) {
+        tracing::warn!("no se pudo componer la captura: {err:?}");
+        drop(framebuffer);
+        fallar(state, &mias);
+        return;
+    }
+
+    // De atrás hacia delante para que quitarlas no mueva los índices que
+    // quedan por mirar.
+    let mut resultados: Vec<(crate::captura::Pendiente, Option<(Vec<u8>, bool)>)> = Vec::new();
+    for i in mias.into_iter().rev() {
+        let pendiente = state.capturas_pantalla.remove(i);
+        let mapeo = match renderer.copy_framebuffer(
+            &framebuffer,
+            crate::captura::region_gl(pendiente.region, tamano.h),
+            // **`Xrgb8888`, que es lo que se le anunció al cliente.** Los
+            // nombres de fourcc describen el entero de 32 bits, así que en
+            // little-endian `Xrgb8888` son los bytes B,G,R,X y `Abgr8888` son
+            // R,G,B,A. Pedir aquí el segundo mientras el protocolo anuncia el
+            // primero saca la captura con el rojo y el azul cambiados: medido,
+            // el fondo `Light/blue.png` es (61,172,200) y salía (200,172,61).
+            smithay::backend::allocator::Fourcc::Xrgb8888,
+        ) {
+            Ok(m) => m,
+            Err(err) => {
+                tracing::warn!("no se pudo leer la captura: {err}");
+                resultados.push((pendiente, None));
+                continue;
+            }
+        };
+        let invertida = TextureMapping::flipped(&mapeo);
+        match renderer.map_texture(&mapeo) {
+            // Se copia a un `Vec` en vez de usar el préstamo: el mapeo toma
+            // prestado el renderizador y `volcar` no lo necesita, pero
+            // mantenerlo vivo obligaría a soltar el framebuffer antes de tiempo.
+            Ok(pixeles) => resultados.push((pendiente, Some((pixeles.to_vec(), invertida)))),
+            Err(err) => {
+                tracing::warn!("no se pudo mapear la captura: {err}");
+                resultados.push((pendiente, None));
+            }
+        }
+    }
+    // La emisión lee la salida entera de una vez: el consumidor negoció ese
+    // tamaño y no hay recorte que valga.
+    if !emisiones.is_empty() {
+        match renderer.copy_framebuffer(
+            &framebuffer,
+            Rectangle::from_size(tamano),
+            smithay::backend::allocator::Fourcc::Xrgb8888,
+        ) {
+            Ok(mapeo) => {
+                let invertida = TextureMapping::flipped(&mapeo);
+                match renderer.map_texture(&mapeo) {
+                    // Aquí sí se pasa el préstamo en vez de copiar a un `Vec`
+                    // como hace el bucle de arriba: `emitir` copia a su propio
+                    // buffer reciclado y no vuelve a tocar el renderizador.
+                    Ok(pixeles) => {
+                        // De atrás hacia delante: una emisión puede caerse si
+                        // la salida cambió de tamaño, y eso movería los índices
+                        // que quedan por mirar.
+                        for i in emisiones.into_iter().rev() {
+                            state.emisiones.emitir(i, pixeles, tamano, invertida, ahora);
+                        }
+                    }
+                    Err(err) => tracing::warn!("no se pudo mapear el fotograma a compartir: {err}"),
+                }
+            }
+            Err(err) => tracing::warn!("no se pudo leer el fotograma a compartir: {err}"),
+        }
+    }
+    drop(framebuffer);
+
+    for (pendiente, datos) in resultados {
+        match datos {
+            Some((pixeles, invertida)) => {
+                if crate::captura::volcar(&pendiente, &pixeles, invertida) {
+                    crate::captura::contestar(&pendiente, pendiente.region.size);
+                }
+            }
+            None => pendiente.frame.failed(),
+        }
+    }
+}
+
+/// Hace la captura que pidió la capa del escritorio: compone, recorta, guarda
+/// el PNG y avisa.
+///
+/// Va por el mismo camino que las de `zwlr_screencopy` —componer aparte en su
+/// propio buffer— y por el mismo motivo, que está explicado en
+/// [`servir_capturas`]: leer del framebuffer que se está enseñando tumba la
+/// superficie EGL.
+///
+/// Solo la salida principal: la capa se dibuja ahí y sus coordenadas son las de
+/// esa pantalla. Capturar una secundaria pide elegirla primero, y eso es otra
+/// tanda.
+pub fn servir_captura_propia(state: &mut BookosComp, renderer: &mut GlesRenderer, output: &Output) {
+    use smithay::backend::renderer::damage::OutputDamageTracker;
+    use smithay::backend::renderer::{ExportMem, Offscreen, TextureMapping};
+
+    let Some(pedida) = state.captura_pedida else {
+        return;
+    };
+    // La principal tiene el origen en (0,0); ver `pantallas::normalizar`.
+    if output.current_location() != (0, 0).into() {
+        return;
+    }
+    state.captura_pedida = None;
+
+    let escala = output.current_scale().fractional_scale();
+    let tamano = crate::captura::tamano_de(output);
+    // De lógicos a físicos, que es en lo que está el buffer. Se redondea hacia
+    // fuera para no perder media fila de píxeles en el borde del recorte.
+    let fisico = |v: i32| (v as f64 * escala).round() as i32;
+    let region = smithay::utils::Rectangle::new(
+        (fisico(pedida.x), fisico(pedida.y)).into(),
+        (fisico(pedida.ancho).max(1), fisico(pedida.alto).max(1)).into(),
+    );
+    let Some(region) = region.intersection(smithay::utils::Rectangle::from_size(tamano)) else {
+        tracing::warn!(?region, "la captura pedida cae fuera de la pantalla");
+        return;
+    };
+
+    let mut destino = match Offscreen::<smithay::backend::renderer::gles::GlesRenderbuffer>::create_buffer(
+        renderer,
+        smithay::backend::allocator::Fourcc::Abgr8888,
+        tamano,
+    ) {
+        Ok(b) => b,
+        Err(err) => {
+            tracing::error!("no se pudo crear el buffer de la captura: {err}");
+            return;
+        }
+    };
+    let elementos = escena(state, renderer, output);
+    let mut seguimiento = OutputDamageTracker::from_output(output);
+    let mut framebuffer = match smithay::backend::renderer::Bind::bind(renderer, &mut destino) {
+        Ok(fb) => fb,
+        Err(err) => {
+            tracing::error!("no se pudo apuntar a la captura: {err}");
+            return;
+        }
+    };
+    if let Err(err) = seguimiento.render_output(
+        renderer,
+        &mut framebuffer,
+        0,
+        &elementos,
+        [0.05, 0.05, 0.06, 1.0],
+    ) {
+        tracing::error!("no se pudo componer la captura: {err:?}");
+        drop(framebuffer);
+        return;
+    }
+    let leido = renderer
+        .copy_framebuffer(
+            &framebuffer,
+            crate::captura::region_gl(region, tamano.h),
+            // `Xrgb8888` y no `Abgr8888`, aunque el PNG quiera R,G,B,A y este
+            // sea B,G,R,X: **medido**, leer en `Abgr8888` devuelve valores más
+            // oscuros que los del fondo que se está enseñando —(1,31,62) donde
+            // la imagen tiene (10,79,141)—, mientras que en `Xrgb8888` la
+            // captura cuadra exacta con el original. La conversión a R,G,B,A la
+            // hace el bucle de abajo, que ya recorre las filas para darles la
+            // vuelta y no cuesta nada más.
+            smithay::backend::allocator::Fourcc::Xrgb8888,
+        )
+        .and_then(|mapeo| {
+            let invertida = TextureMapping::flipped(&mapeo);
+            renderer
+                .map_texture(&mapeo)
+                .map(|pixeles| (pixeles.to_vec(), invertida))
+        });
+    drop(framebuffer);
+
+    let (pixeles, invertida) = match leido {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!("no se pudo leer la captura: {err}");
+            return;
+        }
+    };
+    let (w, h) = (region.size.w as u32, region.size.h as u32);
+    // De B,G,R,X a R,G,B,A, y de abajo arriba a arriba abajo si hace falta.
+    //
+    // Lo de la vuelta es porque OpenGL tiene el origen en la esquina inferior
+    // izquierda: sin invertir, la captura sale del revés. Se hace aquí y no al
+    // guardar porque el PNG no tiene forma de decir «esto va invertido».
+    let fila = w as usize * 4;
+    let mut rgba = vec![0u8; fila * h as usize];
+    for y in 0..h as usize {
+        let origen = if invertida { h as usize - 1 - y } else { y };
+        for x in 0..w as usize {
+            let (o, d) = (origen * fila + x * 4, y * fila + x * 4);
+            rgba[d] = pixeles[o + 2];
+            rgba[d + 1] = pixeles[o + 1];
+            rgba[d + 2] = pixeles[o];
+            // La `X` no lleva información: la captura es opaca.
+            rgba[d + 3] = 255;
+        }
+    }
+    if pedida.guardar {
+        match bookos_shell::captura::guardar_png(&rgba, w, h) {
+            Ok(ruta) => {
+                tracing::info!(?ruta, w, h, "captura guardada");
+                // Si la pidió el portal, la ruta es la respuesta y no hay nada
+                // que notificar: quien la quería es la aplicación, que ya la
+                // está esperando, y el usuario no ha pulsado Impr.
+                match state.captura_portal.take() {
+                    Some(quien) => quien.entregar(ruta),
+                    None => {
+                        let nombre = ruta
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        notificar_captura(state, "Captura guardada", &nombre);
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::error!("no se pudo guardar la captura: {err}");
+                match state.captura_portal.take() {
+                    // Soltarlo sin entregar nada ya es el «no se pudo».
+                    Some(_) => {}
+                    None => notificar_captura(
+                        state,
+                        "No se pudo guardar la captura",
+                        &err.to_string(),
+                    ),
+                }
+            }
+        }
+    } else {
+        match bookos_shell::captura::png_en_memoria(&rgba, w, h) {
+            Ok(png) => {
+                let bytes = png.len();
+                al_portapapeles(state, png);
+                tracing::info!(w, h, bytes, "captura al portapapeles");
+                notificar_captura(state, "Captura copiada", "Ya se puede pegar");
+            }
+            Err(err) => {
+                tracing::error!("no se pudo codificar la captura: {err}");
+                notificar_captura(state, "No se pudo copiar la captura", &err.to_string());
+            }
+        }
+    }
+    state.needs_redraw = true;
+}
+
+/// Pone la captura en el portapapeles.
+///
+/// El compositor pasa a ser el **dueño** de la selección: cuando alguien pegue,
+/// Smithay llamará a `SelectionHandler::send_selection` y allí se escriben
+/// estos bytes. No hay ningún proceso de por medio, así que la captura sigue
+/// pegándose aunque no haya gestor de portapapeles instalado; a cambio, se
+/// pierde al cerrar la sesión, que es lo que hace cualquier compositor.
+fn al_portapapeles(state: &mut BookosComp, png: Vec<u8>) {
+    use smithay::wayland::selection::data_device::set_data_device_selection;
+    // Los dos nombres del mismo tipo. `image/png` es el que mira todo el mundo;
+    // `PNG` a secas lo piden algunas aplicaciones de X11 a través de XWayland, y
+    // anunciarlo no cuesta nada.
+    let tipos = vec!["image/png".to_string(), "PNG".to_string()];
+    let dh = state.display_handle.clone();
+    let seat = state.seat.clone();
+    set_data_device_selection(&dh, &seat, tipos, std::sync::Arc::new(png));
+}
+
+fn notificar_captura(state: &mut BookosComp, resumen: &str, cuerpo: &str) {
+    let Some(shell) = state.shell.as_mut() else {
+        return;
+    };
+    // Por el mismo camino que las notificaciones de las aplicaciones: el aviso
+    // sale arriba a la derecha y se va solo, como cualquier otro.
+    let notificacion = bookos_shell::notificaciones::Notificacion::nueva(
+        0,
+        "BookOS".into(),
+        resumen.into(),
+        cuerpo.into(),
+        // El icono de la aplicación de imágenes si el tema lo trae; si no,
+        // `nueva` cae al de notificaciones.
+        "image-x-generic",
+        false,
+    );
+    shell.notificar(notificacion, 4000);
+    state.needs_redraw = true;
+}
+
+/// Contesta `failed` a un puñado de capturas y las quita de la lista.
+fn fallar(state: &mut BookosComp, indices: &[usize]) {
+    for i in indices.iter().rev() {
+        let pendiente = state.capturas_pantalla.remove(*i);
+        pendiente.frame.failed();
+    }
+}
+
+/// Vuelve a cargar el fondo si alguien lo ha pedido, y con él la copia
+/// mipmapeada que usa el cristal.
+///
+/// **Las dos cosas, y por eso están juntas.** El desenfoque del panel y del
+/// dock no muestrea la pantalla: muestrea una textura aparte del fondo, subida
+/// una sola vez al arrancar. Recargar solo `state.fondo` dejaba el escritorio
+/// con la imagen nueva y las barras esmerilando la vieja, que es más raro que
+/// no haber cambiado nada.
+///
+/// Vive aquí y no en `keybinds` porque decodificar y subir necesita el
+/// `GlesRenderer`, que es del backend. Quien quiere el cambio pone
+/// `state.recargar_fondo` y esto lo consume, igual que `needs_redraw`.
+pub fn recargar_fondo(state: &mut BookosComp, renderer: &mut GlesRenderer) {
+    if !std::mem::take(&mut state.recargar_fondo) {
+        return;
+    }
+    let Some(fondo) = crate::fondo::Fondo::cargar(&state.fondo_config) else {
+        // Sin imagen se deja la que había: quedarse sin fondo por no encontrar
+        // la nueva es peor que seguir con la anterior.
+        tracing::warn!("no se encontró ningún fondo: se deja el que estaba");
+        return;
+    };
+    if let Some(cristal) = state.cristal.as_ref() {
+        let (rgba, tam) = fondo.rgba();
+        cristal.borrow_mut().preparar(renderer, rgba, tam);
+    }
+    // El que había se queda para fundirse con el nuevo. **El cristal no se
+    // funde**: el desenfoque muestrea una sola textura y mezclar dos pediría
+    // otro shader, así que las barras cambian de golpe mientras el escritorio
+    // se disuelve. Se nota poco —el desenfoque ya es una mancha de color— y la
+    // alternativa era no fundir nada.
+    //
+    // Si ya había uno yéndose, se suelta y manda el nuevo: dos fundidos
+    // encadenados sobre tres imágenes no describen nada que nadie haya pedido,
+    // y guardar la cadena serían sesenta megas de texturas vivas.
+    if let Some(anterior) = state.fondo.take() {
+        state.fondo_saliente = Some((anterior, std::time::Instant::now()));
+    }
+    state.fondo = Some(fondo);
+    state.needs_redraw = true;
+}
+
+/// Cuánto dura el fundido entre dos fondos.
+///
+/// La «transición de página completa» del sistema de diseño: cambiar de fondo
+/// **es** eso, la pantalla entera pasando a otra cosa, y usar la misma tabla que
+/// el launchpad y el cambio de escritorio es lo que hace que el escritorio se
+/// mueva siempre igual. Nada de un valor propio aquí.
+const FUNDIDO: std::time::Duration = bookos_shell::tema::D_PAGINA;
+
+/// Cuánto lleva el fundido del fondo, de 0 a 1 y con su curva. `None` cuando no
+/// hay ninguno en marcha.
+///
+/// Al llegar a uno suelta el fondo saliente, que son veinte megas: la función
+/// que consulta el avance es también la que cierra la transición porque es la
+/// única que se llama en **todos** los caminos de dibujo, y dejar la limpieza
+/// en otro sitio significaría que un fondo se queda vivo si ese sitio no corre.
+fn avance_fundido(state: &mut BookosComp) -> Option<f32> {
+    let (_, desde) = state.fondo_saliente.as_ref()?;
+    let t = bookos_shell::tema::fraccion(desde.elapsed(), FUNDIDO);
+    if t >= 1.0 {
+        state.fondo_saliente = None;
+        return None;
+    }
+    Some(bookos_shell::tema::C_ENTRADA.eval(t))
+}
+
+/// Anuncia `zwp_linux_dmabuf_v1` con los formatos que este contexto EGL sabe
+/// leer como textura.
+///
+/// Es el global que decide si el escritorio mueve píxeles o descriptores. Sin
+/// él, Mesa no encuentra manera de acelerar EGL sobre Wayland y **todo**
+/// cliente cae a software: el navegador rasteriza en llvmpipe y entrega el
+/// resultado por `wl_shm`, lo que obliga a una copia CPU→GPU por ventana y por
+/// fotograma. Y como un buffer de memoria compartida no se puede exportar a un
+/// plano DRM, el direct scanout tampoco podía ocurrir para ningún cliente.
+///
+/// Medido con Firefox 153 a pantalla completa sobre una página con cuarenta
+/// círculos animados, anidado y en `--release`, con y sin este global sobre el
+/// **mismo** binario (`BOOKOS_SIN_DMABUF`):
+///
+/// | | fps | escena | peor | saltados/s |
+/// |---|---|---|---|---|
+/// | sin dmabuf | 14,7 | 0,50 ms | 6,5 ms | 75 |
+/// | con dmabuf | 29,4 | 0,15 ms | 1,1 ms | 0 |
+///
+/// O sea: el doble de fotogramas —el tope anidado son 30—, un tercio del
+/// tiempo de escena y seis veces menos en el peor fotograma. Los 75 saltados
+/// por segundo de la primera fila son despertares que no produjeron daño: el
+/// navegador hacía commit y el fotograma salía vacío porque iba por detrás.
+///
+/// **Versión 4 con feedback, no versión 3.** Medido con el mismo Firefox: con
+/// el global de la versión 3 se enlaza al protocolo y aun así sigue pidiendo
+/// `wl_shm.create_pool` de 21 MB para su ventana. Necesita que el feedback le
+/// diga sobre qué nodo DRM asignar, y eso solo está en la 4; con la 4 pasa a
+/// entregar la ventana como `create_immed` de 2350×1712 en AR24. `create_global`
+/// a secas se queda en la 3, así que no vale aquí.
+///
+/// El nodo sale de `EGL_EXT_device_drm_render_node`, o sea del propio contexto
+/// que va a hacer la importación, y no de la GPU que se abrió para KMS: son la
+/// misma en un portátil, pero preguntárselo a EGL vale igual en la sesión real
+/// y anidado, y evita tener dos caminos que se pueden desviar.
+///
+/// Se anuncian los formatos de **textura** y no los de render: la pregunta es
+/// qué sabemos leer, no qué sabemos dibujar, y la de textura es la lista ancha.
+/// Los estrechos —los que además valen para un plano— ya se los queda el
+/// `DrmOutputManager` al elegir el formato del primario.
+///
+/// Con `BOOKOS_SIN_DMABUF` no se anuncia nada: sirve para medir con y sin, y
+/// para salir del paso si un driver importa mal. Los clientes vuelven a
+/// `wl_shm`, que es exactamente lo que había antes de esto.
+pub fn anunciar_dmabuf(
+    state: &mut BookosComp,
+    display: &smithay::backend::egl::EGLDisplay,
+    formatos: smithay::backend::allocator::format::FormatSet,
+) {
+    use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
+
+    if std::env::var_os("BOOKOS_SIN_DMABUF").is_some() {
+        tracing::info!("dmabuf desactivado por BOOKOS_SIN_DMABUF");
+        return;
+    }
+    let nodo = match smithay::backend::egl::EGLDevice::device_for_display(display)
+        .and_then(|d| d.try_get_render_node())
+    {
+        Ok(Some(nodo)) => nodo,
+        // Sin nodo no hay feedback, y sin feedback el navegador se queda en
+        // shm igual: más vale decirlo que anunciar una versión 3 que no sirve.
+        otro => {
+            tracing::error!(?otro, "sin nodo de render: no se anuncia dmabuf");
+            return;
+        }
+    };
+    match DmabufFeedbackBuilder::new(nodo.dev_id(), formatos).build() {
+        Ok(feedback) => {
+            let dh = state.display_handle.clone();
+            state.dmabuf_global = Some(
+                state
+                    .dmabuf_state
+                    .create_global_with_default_feedback::<BookosComp>(&dh, &feedback),
+            );
+            state.egl_display = Some(display.clone());
+            tracing::info!(nodo = ?nodo.dev_path(), "zwp_linux_dmabuf_v1 anunciado (versión 4)");
+        }
+        // Sin el global la sesión sigue, con los clientes por shm.
+        Err(err) => tracing::error!("no se pudo construir el feedback de dmabuf: {err}"),
+    }
+}
+
 pub fn escala_sugerida(px: (i32, i32), mm: (i32, i32)) -> f64 {
     if mm.0 <= 0 || mm.1 <= 0 || px.0 <= 0 || px.1 <= 0 {
         return 1.0;
@@ -648,6 +1300,17 @@ pub fn schedule_panel_tick(state: &mut BookosComp) {
 /// Relee los estados y marca repintado **solo** si algo cambió de verdad.
 fn refresh_panel(state: &mut BookosComp) {
     if state.shell.as_mut().is_some_and(|s| s.refresh()) {
+        state.needs_redraw = true;
+    }
+    // Aquí y no en un temporizador propio: este refresco ya ocurre al cambiar
+    // el hardware —enchufar el cargador es un evento de udev— y una vez por
+    // minuto con el tick del reloj. La batería no baja del 21 al 20 % más
+    // deprisa que eso.
+    if state.shell.as_ref().is_some_and(|s| s.revisar_efectos()) {
+        tracing::info!(
+            reducidos = bookos_shell::tema::efectos_reducidos(),
+            "efectos visuales"
+        );
         state.needs_redraw = true;
     }
 }

@@ -10,130 +10,82 @@
 //! forma más rápida de mirar el panel sin arrancar una sesión.
 
 use bookos_shell::{Config, Shell};
-use image::ImageEncoder as _;
 
-const ANCHO: u32 = 1280;
+mod comun;
+use comun::{distinto_del_fondo, fondo_luma, luma, mezclar, pinta, shell, tinta, volcar, ANCHO};
 
-/// Siempre con la configuración por defecto: `Shell::new` leería el
-/// `panel.conf` del usuario y el test pasaría o fallaría según lo que tenga
-/// puesto en su casa.
-fn shell(escala: f32) -> Shell {
-    // `BOOKOS_TEMA=claro` pinta todos los volcados con la paleta clara. Es la
-    // forma de mirarla sin arrancar una sesión, y va aquí y no en cada test
-    // porque el tema es del proceso: a medias no se puede ver.
-    let mut config = Config::default();
-    if std::env::var("BOOKOS_TEMA").as_deref() == Ok("claro") {
-        config.tema = bookos_shell::tema::Tema::Claro;
-    }
-    Shell::con_config(ANCHO, escala, config)
-}
 
-fn pinta(escala: f32) -> (Vec<u8>, u32, u32) {
-    let mut shell = shell(escala);
-    let (w, h) = shell.panel_buffer_size();
+/// El panel de diagnóstico se pinta y enseña los números que se le pasan.
+///
+/// Con `BOOKOS_DIAG_PNG=/tmp/d.png` deja el volcado para mirarlo, que es la
+/// única forma de comprobar que la letra pequeña se lee sin arrancar la sesión.
+#[test]
+fn el_panel_de_diagnostico_se_pinta() {
+    use bookos_shell::diagnostico::{Datos, Salida};
+
+    let mut shell = shell(1.0);
+    assert!(shell.alternar_diagnostico(), "queda puesto al primer toque");
+    let cambio = shell.diagnostico_datos(Datos {
+        cpu: 12.4,
+        gpu: Some(31.0),
+        salidas: vec![
+            Salida {
+                nombre: "eDP-1".into(),
+                ancho: 2880,
+                alto: 1800,
+                escala: 1.75,
+                hz: 120.0,
+                vrr: true,
+                fps: 118.6,
+                ms_total: 3.42,
+                ms_escena: 2.11,
+                ms_render: 1.31,
+                ms_peor: 9.87,
+                saltados: 42,
+                aplazados: 3,
+                perdidos: 1,
+            },
+            Salida {
+                nombre: "DP-2".into(),
+                ancho: 3840,
+                alto: 2160,
+                escala: 1.0,
+                hz: 60.0,
+                fps: 0.0,
+                ..Default::default()
+            },
+        ],
+    });
+    assert!(cambio, "con números nuevos hay que repintar");
+
+    let (w, h) = shell.diagnostico_buffer_size().expect("está puesto");
     let mut buf = vec![0u8; (w * h * 4) as usize];
-    let damage = shell.draw_panel(&mut buf);
-    assert_eq!(damage.len(), 1, "el panel se repinta entero");
-    (buf, w, h)
-}
+    let damage = shell.draw_diagnostico(&mut buf);
+    assert_eq!(damage.len(), 1, "se repinta entero");
+    volcar("BOOKOS_DIAG_PNG", &buf, w, h);
 
-/// El brillo de un píxel del buffer, de 0 a 255.
-fn luma(buf: &[u8], w: u32, x: u32, y: u32) -> i32 {
-    let i = ((y * w + x) * 4) as usize;
-    (buf[i] as i32 + buf[i + 1] as i32 + buf[i + 2] as i32) / 3
-}
+    // Hay tinta en la mitad de abajo: es donde va el bloque de la segunda
+    // salida, o sea que la tarjeta creció con ella en vez de recortarla.
+    assert!(
+        tinta(&buf, w, h, 0, w) > 20,
+        "el panel salió casi vacío"
+    );
 
-/// El brillo del fondo de una superficie: el valor que más se repite.
-///
-/// La moda y no una esquina concreta porque el margen no siempre está vacío —el
-/// nombre del panel empieza casi pegado al borde—, y no la media porque un
-/// texto claro sobre fondo oscuro la desplaza. Lo que domina en cualquiera de
-/// estas superficies es el fondo, por definición.
-fn fondo_luma(buf: &[u8], w: u32, h: u32) -> i32 {
-    let mut cuentas = [0u32; 256];
-    for y in 0..h {
-        for x in 0..w {
-            cuentas[luma(buf, w, x, y) as usize] += 1;
-        }
-    }
-    cuentas
-        .iter()
-        .enumerate()
-        .max_by_key(|(_, n)| **n)
-        .map(|(v, _)| v as i32)
-        .unwrap_or(0)
-}
-
-/// Si un píxel se aparta del fondo lo bastante como para ser algo dibujado.
-///
-/// El criterio es la **diferencia** con el fondo y no un umbral absoluto: en
-/// tema oscuro la tinta sube el brillo y en claro lo baja, y un `> 60` fijo
-/// daba por dibujado el panel entero en cuanto la paleta se aclaró.
-///
-/// 12 y no más: el logo del panel tiene paleta propia —lila y azul claro, no se
-/// tiñe— y sobre el panel claro se separa del fondo solo 17 puntos de brillo.
-fn distinto_del_fondo(luma_px: i32, fondo: i32) -> bool {
-    (luma_px - fondo).abs() > 12
-}
-
-/// Cuántos píxeles no son el fondo en una franja vertical dada, en tanto por
-/// mil. Sirve para preguntar "¿hay algo dibujado *ahí*?" sin fijar colores.
-fn tinta(buf: &[u8], w: u32, h: u32, desde: u32, hasta: u32) -> u32 {
-    let fondo = fondo_luma(buf, w, h);
-    let mut con_tinta = 0;
-    let mut total = 0;
-    for y in 0..h {
-        for x in desde..hasta.min(w) {
-            total += 1;
-            if distinto_del_fondo(luma(buf, w, x, y), fondo) {
-                con_tinta += 1;
-            }
-        }
-    }
-    if total == 0 { 0 } else { con_tinta * 1000 / total }
-}
-
-/// Pone `src` encima de `dst` con alfa, para componer el volcado igual que
-/// hace el compositor. Los dos están en B,G,R,A premultiplicado.
-fn mezclar(dst: &mut [u8], dw: u32, src: &[u8], sw: u32, sh: u32, x0: u32, y0: u32) {
-    for y in 0..sh {
-        for x in 0..sw {
-            let (dx, dy) = (x + x0, y + y0);
-            if dx >= dw {
-                continue;
-            }
-            let si = ((y * sw + x) * 4) as usize;
-            let di = ((dy * dw + dx) * 4) as usize;
-            if di + 3 >= dst.len() {
-                continue;
-            }
-            let a = src[si + 3] as u32;
-            for c in 0..3 {
-                // `src` ya viene premultiplicado, así que es sobre-encima
-                // clásico: src + dst*(1-a).
-                dst[di + c] =
-                    (src[si + c] as u32 + dst[di + c] as u32 * (255 - a) / 255).min(255) as u8;
-            }
-        }
-    }
-}
-
-/// Guarda el buffer como PNG si la variable está puesta.
-fn volcar(variable: &str, buf: &[u8], w: u32, h: u32) {
-    let Some(destino) = std::env::var_os(variable) else {
-        return;
+    // Los mismos números no repintan: el escritorio quieto no debe despertar
+    // para redibujar lo mismo, que es justo lo que este panel sirve para ver.
+    let datos = Datos {
+        cpu: 12.4,
+        gpu: Some(31.0),
+        salidas: vec![Salida {
+            nombre: "eDP-1".into(),
+            ..Default::default()
+        }],
     };
-    // El buffer sale en B,G,R,A y el PNG se escribe en R,G,B,A: sin este
-    // cambio el volcado enseña los azules en naranja y manda a buscar un
-    // fallo de color que no existe.
-    let mut rgba = buf.to_vec();
-    for p in rgba.chunks_exact_mut(4) {
-        p.swap(0, 2);
-    }
-    let fichero = std::fs::File::create(&destino).unwrap();
-    image::codecs::png::PngEncoder::new(std::io::BufWriter::new(fichero))
-        .write_image(&rgba, w, h, image::ExtendedColorType::Rgba8)
-        .unwrap();
+    assert!(shell.diagnostico_datos(datos.clone()));
+    assert!(!shell.diagnostico_datos(datos), "sin cambios, no se repinta");
+
+    assert!(!shell.alternar_diagnostico(), "el segundo toque lo quita");
+    assert!(shell.diagnostico_buffer_size().is_none());
 }
 
 #[test]
@@ -207,35 +159,93 @@ fn el_brillo_se_abre_desde_su_icono() {
     assert!(tinta(&buf, w, h, 0, w) > 0, "el emergente sale en blanco");
 }
 
-/// Pasar de página en el launchpad anima: la rejilla entra deslizándose y
-/// apareciendo, y el buffer se repinta mientras dure.
+/// Pasar de página en el launchpad cambia la rejilla en un solo repintado y
+/// **no** deja al compositor animando.
 ///
-/// Con `BOOKOS_PAGINA_PNG=/ruta.png` guarda un fotograma **a mitad** de la
-/// transición, que es el único que demuestra que hay algo entre las dos
-/// páginas.
+/// La transición deslizada se quitó a propósito (ver `Launchpad::animando`):
+/// rasterizar esta rejilla cuesta decenas de milisegundos, así que animarla
+/// por CPU bloqueaba el hilo del compositor durante toda la transición y se
+/// notaba hasta en el cursor. Lo que hay que garantizar es lo contrario de lo
+/// que se comprobaba antes: que se pinta **una** vez y se acaba.
+///
+/// Con `BOOKOS_PAGINA_PNG=/ruta.png` guarda la página nueva ya pintada.
 #[test]
-fn el_launchpad_anima_el_cambio_de_pagina() {
+fn el_launchpad_cambia_de_pagina_en_un_solo_repintado() {
     let mut shell = shell(1.0);
     shell.abrir(bookos_shell::Emergente::launchpad((ANCHO as f32, 800.0)));
     assert!(shell.hay_emergente(), "no abrió el launchpad");
+
+    let (w, h) = shell.emergente_buffer_size().expect("tiene superficie");
+    let mut primera = vec![0u8; (w * h * 4) as usize];
+    shell.draw_emergente(&mut primera);
+
     // Un gesto de sobra para pasar el umbral de 20 px.
     if !shell.emergente_desplazar(60.0, 0.0) {
         // Con menos de treinta aplicaciones instaladas no hay segunda página.
         return;
     }
-    assert!(shell.emergente_animando(), "el cambio de página no anima");
+    assert!(
+        !shell.emergente_animando(),
+        "el cambio de página no debe animar: rasterizar la rejilla por fotograma \
+         bloquea el hilo del compositor"
+    );
     assert!(
         shell.emergente_needs_paint(),
-        "mientras anima hay que repintar el buffer en cada fotograma"
+        "la página nueva tiene que repintar el buffer una vez"
     );
-    let (w, h) = shell.emergente_buffer_size().expect("tiene superficie");
-    let mut buf = vec![0u8; (w * h * 4) as usize];
-    shell.draw_emergente(&mut buf);
-    volcar("BOOKOS_PAGINA_PNG", &buf, w, h);
 
-    // Y termina sola.
-    std::thread::sleep(std::time::Duration::from_millis(320));
-    assert!(!shell.emergente_animando(), "la transición no acaba");
+    let mut segunda = vec![0u8; (w * h * 4) as usize];
+    shell.draw_emergente(&mut segunda);
+    volcar("BOOKOS_PAGINA_PNG", &segunda, w, h);
+    assert_ne!(primera, segunda, "la rejilla no cambió de página");
+
+    // Y una vez pintada, el compositor puede dormirse: no queda nada en marcha.
+    assert!(
+        !shell.emergente_needs_paint(),
+        "tras pintar la página nueva no queda nada que repintar"
+    );
+}
+
+/// El buscador declara el alto que de verdad dibuja, y sus filas se pulsan
+/// donde se ven.
+///
+/// Los dos números iban descuadrados: `size()` reportaba `campo + filas + 10`
+/// cuando `view()` apila `campo + 1 + filas`, o sea nueve píxeles de aire al
+/// fondo del buffer que además entraban en el centrado; y el hit-test suponía
+/// que la lista empezaba en 65 cuando empieza en 61, así que el hover y el clic
+/// iban cuatro píxeles por debajo de la fila que se veía.
+#[test]
+fn el_buscador_pulsa_donde_dibuja() {
+    use bookos_shell::TeclaPulsada;
+    let mut shell = shell(1.0);
+    shell.abrir(bookos_shell::Emergente::buscador());
+    for c in "sh".chars() {
+        shell.emergente_tecla(TeclaPulsada::Caracter(c));
+    }
+    let ((_, alto), _, _) = shell.emergente_geometria().unwrap();
+
+    // Cuántas filas hay: lo que sobra del campo y el divisor, en filas de 52.
+    let filas = (alto - 60 - 1 - 10) / 52;
+    assert!(filas >= 1, "«sh» tiene que encontrar algo: el alto es {alto}");
+    assert_eq!(
+        alto,
+        60 + 1 + filas * 52 + 10,
+        "el alto declarado no cuadra con lo que apila la vista"
+    );
+
+    // Y el borde de arriba de la primera fila es suyo, no del campo de texto.
+    // Se comprueba por el hover, que usa el mismo `fila_en` que el clic:
+    // `emergente_puntero` devuelve `true` solo cuando la fila señalada
+    // **cambia**, así que partiendo de ninguna, el orden de estas dos dice
+    // exactamente dónde empieza la lista.
+    assert!(
+        !shell.emergente_puntero(Some((100.0, 59.0))),
+        "el campo de texto no es ninguna fila: no puede cambiar el realce"
+    );
+    assert!(
+        shell.emergente_puntero(Some((100.0, 61.0))),
+        "el primer píxel de la lista tiene que señalar la fila 0"
+    );
 }
 
 /// Ninguna superficie del shell puede pedirle al compositor un tamaño lógico
@@ -259,7 +269,7 @@ fn las_superficies_caen_en_pixel_entero() {
             ("acerca", bookos_shell::Emergente::acerca()),
         ] {
             shell.abrir(emergente);
-            let ((lw, lh), _) = shell.emergente_geometria().expect("hay emergente");
+            let ((lw, lh), _, _) = shell.emergente_geometria().expect("hay emergente");
             let (bw, bh) = shell.emergente_buffer_size().expect("hay buffer");
             assert_eq!(
                 bw,
@@ -567,7 +577,7 @@ fn el_menu_se_abre_se_recorre_y_se_cierra() {
     shell.panel_pulsado(20.0, 16.0);
     assert!(shell.hay_emergente(), "pulsar el logo tiene que abrir el menú");
 
-    let ((w, h), _ancla) = shell.emergente_geometria().unwrap();
+    let ((w, h), _ancla, _) = shell.emergente_geometria().unwrap();
     // Más ancho que los 210 del plasmoide desde que las filas llevan icono.
     assert_eq!(w, 236, "el ancho del menú");
     assert!(h > 0);
@@ -620,7 +630,7 @@ fn el_calendario_se_abre_desde_el_reloj() {
     shell.panel_pulsado(ANCHO as f32 - 30.0, 16.0);
     assert!(shell.hay_emergente(), "pulsar el reloj abre el calendario");
 
-    let ((w, _h), _) = shell.emergente_geometria().unwrap();
+    let ((w, _h), _, _) = shell.emergente_geometria().unwrap();
     assert_eq!(w, 340, "el ancho es el de la tarjeta del plasmoide");
 
     let (bw, bh) = shell.emergente_buffer_size().unwrap();
@@ -632,6 +642,33 @@ fn el_calendario_se_abre_desde_el_reloj() {
     // Pulsar el logo con el calendario abierto cambia al menú, no lo cierra.
     shell.panel_pulsado(20.0, 16.0);
     assert_eq!(shell.emergente_geometria().unwrap().0 .0, 236);
+}
+
+/// El compositor compara el nombre de la zona pulsada con el nombre interno
+/// de la tarjeta abierta. No siempre son iguales: si se compara `bateria` con
+/// `energia`, el segundo clic cree que son widgets distintos y vuelve a abrir
+/// la misma tarjeta en vez de cerrarla.
+#[test]
+fn cada_widget_declara_el_nombre_real_de_su_emergente() {
+    let shell = shell(1.0);
+    let zonas = shell.zonas_panel();
+
+    let centro = |nombre: &str| {
+        let (_, x0, x1) = zonas
+            .iter()
+            .find(|(n, _, _)| *n == nombre)
+            .expect("el widget está en el panel de prueba");
+        (x0 + x1) / 2.0
+    };
+
+    assert_eq!(
+        shell.objetivo_emergente_panel(centro("bateria")),
+        Some(("bateria", "energia"))
+    );
+    assert_eq!(
+        shell.objetivo_emergente_panel(centro("reloj")),
+        Some(("reloj", "calendario"))
+    );
 }
 
 /// El launchpad se abre y se pinta con las aplicaciones de esta máquina.
@@ -738,8 +775,16 @@ fn el_bloqueo_enseña_la_foto_de_la_configuracion() {
     });
     foto.save(&ruta).expect("se puede escribir en el temporal");
 
+    // Sin la animación de entrada: el test pinta un único fotograma en el
+    // instante del bloqueo, y ahí el avatar todavía está a alfa cero. Es una
+    // configuración de verdad —la que deja puesta «reducir movimiento»—, no un
+    // apaño para el test.
     let config = Config {
         avatar: Some(ruta.to_string_lossy().into_owned()),
+        bloqueo: bookos_shell::ConfigBloqueo {
+            animaciones: false,
+            ..Default::default()
+        },
         ..Config::default()
     };
     let mut shell = Shell::con_config(ANCHO, 1.0, config);
@@ -791,7 +836,11 @@ fn el_bloqueo_se_pinta_con_reloj_avatar_y_campo() {
     use bookos_shell::bloqueo::{Estado, Medio};
 
     let pantalla = (1645.0, 1029.0);
-    let mut shell = shell(1.0);
+    // Igual que el de la foto: un solo fotograma, y con la entrada animada ese
+    // fotograma es el primero, o sea la pantalla entera a alfa cero.
+    let mut config = Config::default();
+    config.bloqueo.animaciones = false;
+    let mut shell = Shell::con_config(ANCHO, 1.0, config);
     shell.bloquear("12:30".into(), "lunes, 17 de agosto".into(), pantalla);
     assert!(shell.esta_bloqueado());
     if let Some(b) = shell.bloqueo_mut() {
@@ -1122,52 +1171,6 @@ fn el_menu_del_bloqueo_se_despliega() {
     );
 }
 
-/// La tarjeta de Apariencia se pinta, elige color y lo aplica a todo el shell.
-///
-/// Con `BOOKOS_APARIENCIA_PNG=/ruta.png` guarda lo que pinta.
-#[test]
-fn la_apariencia_elige_acento_y_repinta_el_shell() {
-    use bookos_shell::tema::{self, Acento, Tema};
-
-    // El tema y el acento son globales del proceso y los demás tests corren a
-    // la vez: se dejan como estaban al salir.
-    let antes = (tema::actual(), tema::acento_actual());
-
-    let mut shell = shell(1.0);
-    shell.abrir(bookos_shell::Emergente::apariencia());
-    let (w, h) = shell.emergente_buffer_size().expect("tiene superficie");
-    let mut buf = vec![0u8; (w * h * 4) as usize];
-    shell.draw_emergente(&mut buf);
-    volcar("BOOKOS_APARIENCIA_PNG", &buf, w, h);
-    assert!(tinta(&buf, w, h, 0, w) > 0, "la tarjeta sale en blanco");
-
-    // Pulsar el tercer color pide cambiarlo; el shell no lo aplica solo, eso
-    // es cosa del compositor, que es quien además lo guarda.
-    let ((lw, _), _) = shell.emergente_geometria().unwrap();
-    let accion = shell.emergente_pulsar(lw as f32 / 2.0, 250.0);
-    let Some(bookos_shell::Accion::Apariencia { tema: t, acento }) = accion else {
-        panic!("pulsar en la rejilla tiene que pedir un cambio: {accion:?}");
-    };
-    assert_eq!(t, tema::actual(), "el tema no se ha tocado");
-
-    // Y aplicarlo cambia el acento del proceso y obliga a repintar el panel.
-    shell.aplicar_apariencia(t, Acento::Verde);
-    assert_eq!(tema::acento_actual(), Acento::Verde);
-    assert_eq!(tema::acento(), tema::Acento::Verde.color());
-    assert!(shell.refresh(), "cambiar de acento tiene que repintar el panel");
-
-    // Cambiar de tema es lo mismo por el otro camino, y lo que se pinta con la
-    // otra paleta tiene que ser **otro dibujo**: es la comprobación de que el
-    // acento llega hasta el píxel y no se queda en el estado.
-    shell.aplicar_apariencia(Tema::Claro, acento);
-    assert!(tema::es_claro());
-    let mut claro = vec![0u8; (w * h * 4) as usize];
-    shell.draw_emergente(&mut claro);
-    volcar("BOOKOS_APARIENCIA_CLARO_PNG", &claro, w, h);
-    assert_ne!(buf, claro, "la tarjeta se pinta igual con la otra paleta");
-
-    shell.aplicar_apariencia(antes.0, antes.1);
-}
 
 /// El diálogo del botón de encendido se pinta y sus cinco opciones responden.
 ///
@@ -1423,6 +1426,10 @@ fn la_barra_de_titulo_pinta_sus_botones() {
     let damage = shell.draw_barra(1, &mut buf);
     assert_eq!(damage.len(), 1, "la barra se repinta entera");
     volcar("BOOKOS_BARRA_PNG", &buf, w, h);
+    assert_eq!(
+        buf[3], 0,
+        "restaurada, la esquina superior izquierda debe ser transparente"
+    );
 
     // Los tres botones dejan tinta en su zona.
     for (boton, nombre) in [
@@ -1459,6 +1466,20 @@ fn la_barra_de_titulo_pinta_sus_botones() {
         pulsado: None,
     };
     assert!(!shell.barra_preparar(1, ANCHO_BARRA, igual), "repinta de más");
+
+    // Maximizada vuelve a ser rectangular para no enseñar el fondo por las
+    // esquinas de la pantalla.
+    let maximizada = Estado {
+        titulo: "Konsole — bash".into(),
+        activa: true,
+        maximizada: true,
+        señalado: None,
+        pulsado: None,
+    };
+    assert!(shell.barra_preparar(1, ANCHO_BARRA, maximizada));
+    let mut buf_max = vec![0u8; (w * h * 4) as usize];
+    shell.draw_barra(1, &mut buf_max);
+    assert_ne!(buf_max[3], 0, "maximizada no debe conservar el recorte");
 }
 
 /// El buscador se abre, escribe, se recorre con las flechas y lanza con Intro.
@@ -1476,7 +1497,7 @@ fn el_buscador_busca_y_lanza() {
 
     // Vacío es solo el campo: sin lista, la tarjeta no puede tener el alto de
     // seis filas vacías.
-    let ((w, alto_vacio), _) = shell.emergente_geometria().unwrap();
+    let ((w, alto_vacio), _, _) = shell.emergente_geometria().unwrap();
     assert_eq!(w, 640);
 
     // «sh» encuentra al menos el ejecutable del PATH, que existe en cualquier
@@ -1484,7 +1505,7 @@ fn el_buscador_busca_y_lanza() {
     for c in "sh".chars() {
         assert!(shell.emergente_tecla(TeclaPulsada::Caracter(c)).0);
     }
-    let ((_, alto), _) = shell.emergente_geometria().unwrap();
+    let ((_, alto), _, _) = shell.emergente_geometria().unwrap();
     assert!(alto > alto_vacio, "la lista no apareció al escribir");
 
     let (bw, bh) = shell.emergente_buffer_size().unwrap();
@@ -1492,6 +1513,16 @@ fn el_buscador_busca_y_lanza() {
     shell.draw_emergente(&mut buf);
     volcar("BOOKOS_BUSCADOR_PNG", &buf, bw, bh);
     assert!(tinta(&buf, bw, bh, 0, bw) > 0, "el buscador sale vacío");
+
+    // El alto con el que el compositor lo **coloca** no cambia con lo escrito:
+    // es lo que impide que el campo de texto salte media fila con cada tecla.
+    // Ver `Emergente::alto_estable`.
+    let estable = shell.emergente_geometria().unwrap().2;
+    assert_eq!(
+        estable,
+        Some(60 + 1 + 6 * 52 + 10),
+        "el buscador tiene que colocarse por su alto máximo, no por el de ahora"
+    );
 
     // Intro lanza lo elegido y cierra.
     let (repintar, accion) = shell.emergente_tecla(TeclaPulsada::Intro);
@@ -1516,4 +1547,40 @@ fn el_escape_del_buscador_borra_antes_de_cerrar() {
     assert!(shell.hay_emergente(), "el primer Esc solo borra lo escrito");
     shell.emergente_tecla(TeclaPulsada::Escape);
     assert!(!shell.hay_emergente(), "el segundo Esc cierra");
+}
+
+/// La capa de captura se pinta: el velo, el recuadro con sus medidas y la barra
+/// de modos abajo.
+///
+/// Con `BOOKOS_CAPTURA_PNG=/ruta.png` guarda lo que sale, para mirarlo contra
+/// el resto del escritorio.
+#[test]
+fn la_capa_de_captura_se_pinta() {
+    let pantalla = (1280.0, 800.0);
+    let mut shell = shell(1.0);
+    shell.abrir_captura(pantalla);
+    assert!(shell.hay_captura());
+
+    // Un recuadro marcado a mano, que es lo que enseña de verdad la capa.
+    shell.captura_pulsar(240.0, 180.0);
+    shell.captura_puntero(880.0, 560.0);
+
+    let (w, h) = shell.captura_buffer_size().expect("tiene superficie");
+    let mut buf = vec![0u8; (w * h * 4) as usize];
+    shell.draw_captura(&mut buf);
+    volcar("BOOKOS_CAPTURA_PNG", &buf, w, h);
+    assert!(tinta(&buf, w, h, 0, w) > 0, "la capa sale en blanco");
+
+    // El agujero del recuadro tiene que estar **sin velo**: es lo que hace que
+    // se vea qué va a salir en la foto. Se compara el alfa del centro del
+    // recuadro con el de una esquina, que sí lleva velo.
+    let alfa = |x: u32, y: u32| buf[((y * w + x) * 4 + 3) as usize];
+    assert!(alfa(20, 20) > 80, "el velo de fuera no se pintó");
+    assert_eq!(alfa(560, 370), 0, "el hueco del recuadro tiene que ser transparente");
+
+    // Y soltar pide la captura de lo marcado, al portapapeles por defecto.
+    assert_eq!(
+        shell.captura_soltar(),
+        Some(bookos_shell::Accion::Capturar { x: 240, y: 180, ancho: 640, alto: 380, guardar: false })
+    );
 }

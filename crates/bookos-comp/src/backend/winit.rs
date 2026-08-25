@@ -135,13 +135,32 @@ pub fn run(
         shell.refresh();
     }
     crate::backend::schedule_panel_tick(state);
+    // El despertar del tema automático, si está puesto. Con un modo fijo no
+    // deja ningún temporizador. Ver `crate::apariencia`.
+    crate::apariencia::programar_cambio(state);
     // También anidado: los estados salen de sysfs, no del compositor de debajo,
     // así que aquí se ven igual de vivos que en la sesión real.
     crate::backend::watch_hardware(state);
     state.cursor_theme = Some(crate::cursor::CursorTheme::con_tamano(scale, state.cursor_nominal));
+    // dmabuf también anidado: lo que se prueba aquí tiene que ser el mismo
+    // camino de buffers que en la sesión real, o lo medido no dice nada del
+    // escritorio de verdad. Versión 3 —`create_global` a secas— y no 4: el
+    // feedback de la 4 nombra un nodo DRM, y anidado el KMS no es nuestro.
+    // Anidado también: lo que se prueba aquí tiene que ser el mismo camino de
+    // buffers que en la sesión real, o lo medido no dice nada del escritorio de
+    // verdad. Ver `backend::anunciar_dmabuf`.
+    {
+        let formatos = backend
+            .renderer()
+            .egl_context()
+            .dmabuf_texture_formats()
+            .clone();
+        let display = backend.renderer().egl_context().display().clone();
+        crate::backend::anunciar_dmabuf(state, &display, formatos);
+    }
     state.cristal = crate::desenfoque::Cristal::new(backend.renderer());
     state.genio = crate::genio::Genio::new(backend.renderer());
-    state.fondo = crate::fondo::Fondo::cargar(state.fondo_config.as_deref());
+    state.fondo = crate::fondo::Fondo::cargar(&state.fondo_config);
     // El cristal desenfoca el fondo, así que necesita su propia copia con
     // mipmaps. Se sube aquí, una vez, y no se vuelve a tocar.
     if let (Some(fondo), Some(cristal)) = (state.fondo.as_ref(), state.cristal.as_ref()) {
@@ -171,6 +190,8 @@ pub fn run(
     // primer frame tiene que ser un redibujo completo de todas formas, que es
     // justo lo que significa age = 0.
     let mut rendered_once = false;
+    // Si el fotograma anterior compuso además en un offscreen. Ver dónde se usa.
+    let mut uso_offscreen = false;
     let mut ultimo_frame = std::time::Instant::now() - MIN_FRAME;
     let mut vueltas = 0u32;
     let mut con_pendiente = 0u32;
@@ -193,26 +214,45 @@ pub fn run(
                 con_pendiente = 0;
                 reloj_vueltas = std::time::Instant::now();
             }
-            if state.needs_redraw && toca_dibujar {
+            // `hay_animacion()` va en la condición, no solo `needs_redraw`, y no
+            // es un detalle: lo que hace avanzar las animaciones vive dentro de
+            // `draw`, y `draw` limpia `needs_redraw` cuando el damage sale
+            // vacío. En cuanto la ventana que se desliza salía de la pantalla el
+            // fotograma no cambiaba nada, se limpiaba la marca, y a la vuelta
+            // siguiente ya no se entraba aquí: **el cambio de escritorio se
+            // quedaba congelado a medias**, con la ventana fuera de sitio y
+            // `deslizando` puesto para siempre. Medido con
+            // `BOOKOS_SELFTEST_ESCRITORIOS`: la ventana se paraba en x=-1507 de
+            // los -1646 que tenía que recorrer. `udev` ya preguntaba esto en
+            // `dibujar_todas`; aquí faltaba.
+            if (state.needs_redraw || state.hay_animacion()) && toca_dibujar {
                 ultimo_frame = std::time::Instant::now();
                 let cronometro = std::time::Instant::now();
-                let age = if rendered_once {
+                // La edad del buffer **no se puede preguntar** si el último
+                // que compuso algo fue el offscreen de una captura:
+                // `EGL_BUFFER_AGE_EXT` solo vale sobre la superficie activa en
+                // este hilo, y `Bind<EGLSurface>` de Smithay no la activa —lo
+                // hace `render_output` al dibujar—. Preguntarla igualmente no
+                // devolvía nada útil y además llenaba el registro:
+                // medido, 194 `BAD_SURFACE` en 14 s compartiendo pantalla.
+                // Con 0 se redibuja entero, que es exactamente lo que ya
+                // ocurría cuando la consulta fallaba, pero sin el ruido.
+                let age = if rendered_once && !uso_offscreen {
                     backend.buffer_age().unwrap_or(0)
                 } else {
                     0
                 };
+                uso_offscreen = state.hay_offscreen_pendiente();
                 match draw(&mut backend, state, &output, &mut damage_tracker, age) {
-                    Ok(submitted) => {
-                        rendered_once |= submitted;
-                        if submitted {
-                            state.frames.submitted += 1;
-                        } else {
-                            state.frames.skipped += 1;
-                        }
-                    }
+                    Ok(submitted) => rendered_once |= submitted,
                     Err(err) => tracing::error!("fallo al dibujar: {err}"),
                 }
-                state.frames.dibujado(cronometro.elapsed());
+                // Anidado no hay vblank: el fotograma se da por presentado al
+                // volver de `draw`, que es lo más cerca de la verdad que se
+                // puede estar sin hablar con el hardware. Las cifras de aquí
+                // valen para comparar cambios entre sí, no como medida absoluta
+                // — para eso está el backend de KMS.
+                let _ = cronometro;
             }
             // Sin post_dispatch aquí: el callback de `event_loop.run` ya lo hace
             // al cerrar cada vuelta, y repetirlo son refresh + flush por
@@ -320,6 +360,28 @@ fn pump(winit_loop: &mut winit::WinitEventLoop, state: &mut BookosComp, refresco
     hubo
 }
 
+/// Sirve las capturas pendientes y deja el contexto donde estaba.
+///
+/// Las capturas componen su propio buffer —leer del framebuffer del anfitrión
+/// tumbaba su superficie EGL, ver `backend::servir_capturas`—, así que hay que
+/// volver a apuntar a la ventana al terminar: la vuelta siguiente pregunta la
+/// edad del buffer **antes** de apuntar, y sin esto `eglQuerySurface` fallaba y
+/// cada captura costaba además un redibujo completo del fotograma siguiente.
+fn servir_capturas(
+    backend: &mut WinitGraphicsBackend<GlesRenderer>,
+    state: &mut BookosComp,
+    output: &Output,
+) {
+    if !state.hay_offscreen_pendiente() {
+        return;
+    }
+    crate::backend::servir_capturas(state, backend.renderer(), output);
+    crate::backend::servir_captura_propia(state, backend.renderer(), output);
+    if let Err(err) = backend.bind() {
+        tracing::warn!("no se pudo volver a apuntar a la ventana: {err}");
+    }
+}
+
 /// Devuelve `true` si llegó a enviarse un frame a la pantalla.
 fn draw(
     backend: &mut WinitGraphicsBackend<GlesRenderer>,
@@ -328,9 +390,17 @@ fn draw(
     damage_tracker: &mut OutputDamageTracker,
     age: usize,
 ) -> anyhow::Result<bool> {
+    // Lo que se mueve solo avanza antes de componer, y una sola vez: anidado
+    // hay una única salida, pero el orden tiene que ser el mismo que en KMS
+    // para que lo que se prueba aquí valga. Ver `backend::avanzar_animaciones`.
+    crate::backend::avanzar_animaciones(state);
+
     let (renderer, mut framebuffer) = backend
         .bind()
         .map_err(|err| anyhow::anyhow!("bind del framebuffer: {err}"))?;
+    // Si el tema cambió, el fondo y el cristal tienen que ser ya los nuevos en
+    // este mismo fotograma.
+    crate::backend::recargar_fondo(state, renderer);
 
     // El panel va por delante de las ventanas: `custom_elements` se apila
     // encima de los espacios.
@@ -356,6 +426,47 @@ fn draw(
 
     drop(framebuffer);
 
+    let nombre = output.name();
+    // Un refresco, para el umbral de los frame callbacks. Ver la explicación en
+    // `udev::enviar_frames`: aquí se usa la misma política a propósito, porque
+    // si anidado los clientes se comportan distinto que en la sesión real, lo
+    // que se mide anidado no dice nada del escritorio de verdad. Antes esto era
+    // `Some(Duration::ZERO)`, que da callback a **todo** en cada fotograma,
+    // ocluidos incluidos: los clientes tapados corrían en vacío.
+    let periodo = output
+        .current_mode()
+        .filter(|m| m.refresh > 0)
+        .map(|m| Duration::from_nanos(1_000_000_000_000u64 / m.refresh as u64))
+        .unwrap_or(Duration::from_millis(16));
+    if let Some(modo) = output.current_mode() {
+        state.metricas.modo(
+            &nombre,
+            modo.size.w,
+            modo.size.h,
+            output.current_scale().fractional_scale(),
+            modo.refresh as f32 / 1000.0,
+            false,
+        );
+    }
+    state.metricas.dibujado(&nombre, t_escena, t_render);
+
+    // Qué superficie se enseña en qué salida. Anidado solo hay una, pero sin
+    // esto `surface_primary_scanout_output` devuelve `None` para todo y los
+    // frame callbacks pasan a depender solo del umbral: hasta la única ventana
+    // visible recibiría uno por refresco en vez de uno por fotograma. Es lo que
+    // hacía que anidado y KMS no se comportaran igual.
+    for window in state.space.elements() {
+        window.with_surfaces(|surface, data| {
+            smithay::desktop::utils::update_surface_primary_scanout_output(
+                surface,
+                output,
+                data,
+                &result.states,
+                smithay::backend::renderer::element::default_primary_scanout_output_compare,
+            );
+        });
+    }
+
     // `damage == None` significa que el damage tracker no encontró nada que
     // cambiara: se salta el submit entero y no se toca la pantalla.
     match result.damage {
@@ -366,6 +477,20 @@ fn draw(
         }
         None => {
             state.needs_redraw = false;
+            state.metricas.saltado(&nombre);
+            // Aun sin damage hay que contestar a los frame callbacks: un
+            // cliente que pidió uno para engancharse al vsync se queda parado
+            // para siempre si aquí se sale sin decirle nada.
+            let time = state.start_time.elapsed();
+            for window in state.space.elements() {
+                window.send_frame(output, time, Some(periodo), surface_primary_scanout_output);
+            }
+            // Y las capturas también aquí: componen su propio buffer y no
+            // dependen de que este fotograma haya cambiado nada. Sin esto, una
+            // captura pedida con el escritorio quieto no se servía nunca —el
+            // primer fotograma sin daño salía por este `return` y ya no se
+            // volvía a entrar.
+            servir_capturas(backend, state, output);
             return Ok(false);
         }
     }
@@ -385,8 +510,12 @@ fn draw(
     // vacío y es una fuga de consumo clásica.
     let time = state.start_time.elapsed();
     for window in state.space.elements() {
-        window.send_frame(output, time, Some(Duration::ZERO), surface_primary_scanout_output);
+        window.send_frame(output, time, Some(periodo), surface_primary_scanout_output);
     }
+
+    state.metricas.presentado(&nombre);
+
+    servir_capturas(backend, state, output);
 
     state.needs_redraw = false;
     Ok(true)

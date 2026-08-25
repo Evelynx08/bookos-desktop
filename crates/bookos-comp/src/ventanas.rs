@@ -32,8 +32,9 @@ use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 use smithay::desktop::Window;
+use smithay::output::Output;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
-use smithay::utils::{Logical, Point, Rectangle, Size, SERIAL_COUNTER};
+use smithay::utils::{Logical, Point, Rectangle, Scale, Size, SERIAL_COUNTER};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::shell::xdg::ToplevelSurface;
 
@@ -63,7 +64,7 @@ const ENTRADA_ZOOM: Duration = tema::D_MODAL;
 ///
 /// No cubre el arrastre con el ratón: ahí la ventana tiene que ir pegada al
 /// cursor, y suavizarla se siente como arrastrar algo con retardo.
-const MOVIMIENTO: Duration = tema::D_PAGINA;
+const MOVIMIENTO: Duration = tema::D_VENTANA;
 
 /// De qué tamaño arranca una ventana al aparecer.
 ///
@@ -147,7 +148,10 @@ pub fn encoger(window: &Window, origen: Rectangle<i32, Logical>, destino: Rectan
 /// El encogido en marcha, o `None` si ya terminó.
 pub fn encogido(window: &Window) -> Option<Encogido> {
     let e = estado(window).encogido.get()?;
-    if e.desde.elapsed() >= ENCOGIDO {
+    // Con los efectos reducidos el minimizar no tiene recorrido: la ventana se
+    // va al dock en el mismo fotograma. Devolver `None` es además lo que hace
+    // que `animar_minimizados` la desmapee ya, sin dejarla colgando.
+    if tema::efectos_reducidos() || e.desde.elapsed() >= ENCOGIDO {
         estado(window).encogido.set(None);
         return None;
     }
@@ -159,7 +163,7 @@ pub fn encogido(window: &Window) -> Option<Encogido> {
 /// Va con la curva de entrada y no lineal, que es la misma que usa el resto del
 /// recorrido: el shader del genio recibe esto y no el tiempo crudo.
 pub fn progreso_encogido(e: Encogido) -> f32 {
-    avance_encogido(tema::fraccion(e.desde.elapsed(), ENCOGIDO), e.hacia_el_dock)
+    avance_encogido(tema::avance(e.desde.elapsed(), ENCOGIDO), e.hacia_el_dock)
 }
 
 fn avance_encogido(t: f32, hacia_el_dock: bool) -> f32 {
@@ -176,7 +180,7 @@ pub fn encogido_ahora(e: Encogido) -> (Point<f64, Logical>, f64, f32) {
     // De ida el tiempo corre hacia delante y de vuelta hacia atrás: es la misma
     // curva recorrida al revés, y por eso no hay dos animaciones que mantener.
     let s = avance_encogido(
-        tema::fraccion(e.desde.elapsed(), ENCOGIDO),
+        tema::avance(e.desde.elapsed(), ENCOGIDO),
         e.hacia_el_dock,
     ) as f64;
     let escala = 1.0 + (e.destino.size.w as f64 / e.origen.size.w.max(1) as f64 - 1.0) * s;
@@ -346,6 +350,48 @@ pub fn mover_desde(window: &Window, origen: Rectangle<i32, Logical>) {
     estado(window).desde.set(Some((origen, Instant::now())));
 }
 
+/// Progreso único para posición y tamaño durante un cambio de geometría.
+///
+/// Mantenerlo en una función evita que maximizar use una curva para la esquina
+/// y otra para los bordes. Es una cubic-bezier sin rebote: el contenido del
+/// cliente ya está rasterizado y cualquier sobrepaso se leería como borrosidad.
+fn avance_movimiento(pasado: Duration) -> f64 {
+    tema::C_VENTANA.eval(tema::avance(pasado, MOVIMIENTO)) as f64
+}
+
+/// Interpola las cuatro aristas de un rectángulo con una sola fracción.
+fn interpolar_rect(
+    origen: Rectangle<i32, Logical>,
+    destino: Rectangle<i32, Logical>,
+    s: f64,
+) -> Rectangle<i32, Logical> {
+    let lerp = |a: i32, b: i32| (a as f64 + (b - a) as f64 * s).round() as i32;
+    Rectangle::new(
+        (
+            lerp(origen.loc.x, destino.loc.x),
+            lerp(origen.loc.y, destino.loc.y),
+        )
+            .into(),
+        (
+            lerp(origen.size.w, destino.size.w).max(1),
+            lerp(origen.size.h, destino.size.h).max(1),
+        )
+            .into(),
+    )
+}
+
+/// Geometría que se está viendo ahora, aunque el `Space` ya guarde el destino.
+/// Sirve para redirigir maximizar/restaurar sin saltar al extremo anterior.
+fn geometria_visual(window: &Window, destino: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
+    let Some((origen, t0)) = estado(window).desde.get() else {
+        return destino;
+    };
+    if t0.elapsed() >= MOVIMIENTO {
+        return destino;
+    }
+    interpolar_rect(origen, destino, avance_movimiento(t0.elapsed()))
+}
+
 /// Guarda —o consume— la geometría a la que hay que volver al desmaximizar.
 pub fn guardar_restaurar(window: &Window, geo: Rectangle<i32, Logical>) {
     estado(window).restaurar.set(Some(geo));
@@ -361,6 +407,9 @@ pub fn tomar_restaurar(window: &Window) -> Option<Rectangle<i32, Logical>> {
 /// `is_some()` deja al compositor dibujando para siempre, que es exactamente el
 /// ciclo que ya se coló una vez en las emergentes del shell.
 pub fn animando(window: &Window) -> bool {
+    if tema::efectos_reducidos() {
+        return false;
+    }
     let estado = estado(window);
     estado
         .encogido
@@ -387,8 +436,8 @@ pub fn animacion(window: &Window) -> (f32, f64) {
         return (0.0, 1.0);
     };
     let t = nacida.elapsed();
-    let alfa = tema::C_ENTRADA.eval(tema::fraccion(t, ENTRADA_ALFA));
-    let zoom = tema::C_MUELLE.eval(tema::fraccion(t, ENTRADA_ZOOM));
+    let alfa = tema::C_ENTRADA.eval(tema::avance(t, ENTRADA_ALFA));
+    let zoom = tema::C_MUELLE.eval(tema::avance(t, ENTRADA_ZOOM));
     (
         alfa,
         ZOOM_INICIAL + (1.0 - ZOOM_INICIAL) * zoom as f64,
@@ -412,7 +461,7 @@ pub fn posicion(window: &Window, destino: Point<i32, Logical>) -> Point<f64, Log
         estado.desde.set(None);
         return destino.to_f64();
     }
-    let s = tema::C_ENTRADA.eval(tema::fraccion(t0.elapsed(), MOVIMIENTO)) as f64;
+    let s = avance_movimiento(t0.elapsed());
     (
         origen.loc.x as f64 + (destino.x - origen.loc.x) as f64 * s,
         origen.loc.y as f64 + (destino.y - origen.loc.y) as f64 * s,
@@ -428,26 +477,29 @@ pub fn posicion(window: &Window, destino: Point<i32, Logical>) -> Point<f64, Log
 /// Escalando el buffer desde la proporción vieja hasta 1 durante el mismo
 /// recorrido que hace la posición, el salto se reparte.
 ///
-/// El factor es **uno solo** —la media geométrica de los dos ejes— porque
-/// `RescaleRenderElement` escala igual en X y en Y. Con formas muy distintas la
-/// proporción no es exacta a mitad del camino; lo que se busca es que crezca,
-/// no una interpolación fiel de un rectángulo a otro.
-pub fn escala_resize(window: &Window, actual: Size<i32, Logical>) -> f64 {
+/// Los dos ejes se interpolan por separado. Antes se usaba la media geométrica,
+/// que convertía maximizar en un zoom uniforme: el ancho podía haber llegado
+/// mientras el alto aún no, y la barra se despegaba visualmente del contenido.
+pub fn escala_resize(window: &Window, actual: Size<i32, Logical>) -> Scale<f64> {
     let Some((origen, t0)) = estado(window).desde.get() else {
-        return 1.0;
+        return Scale::from(1.0);
     };
     let t = t0.elapsed();
     if t >= MOVIMIENTO || actual.w <= 0 || actual.h <= 0 {
-        return 1.0;
+        return Scale::from(1.0);
     }
     if origen.size.w <= 0 || origen.size.h <= 0 || origen.size == actual {
-        return 1.0;
+        return Scale::from(1.0);
     }
-    let f0 = ((origen.size.w as f64 / actual.w as f64)
-        * (origen.size.h as f64 / actual.h as f64))
-        .sqrt();
-    let s = tema::C_ENTRADA.eval(tema::fraccion(t, MOVIMIENTO)) as f64;
-    f0 + (1.0 - f0) * s
+    let intermedio = interpolar_rect(
+        origen,
+        Rectangle::new(origen.loc, actual),
+        avance_movimiento(t),
+    );
+    Scale::from((
+        intermedio.size.w as f64 / actual.w as f64,
+        intermedio.size.h as f64 / actual.h as f64,
+    ))
 }
 
 /// Tamaño mínimo al que se deja encoger una ventana arrastrando.
@@ -681,7 +733,7 @@ impl Arrastre {
         let Some((origen, t0)) = self.previa_desde else {
             return Some(destino);
         };
-        let s = tema::C_ENTRADA.eval(tema::fraccion(t0.elapsed(), tema::D_POPOVER));
+        let s = tema::C_ENTRADA.eval(tema::avance(t0.elapsed(), tema::D_POPOVER));
         let mezcla = |a: i32, b: i32| a + ((b - a) as f32 * s).round() as i32;
         Some(Rectangle::new(
             (
@@ -699,6 +751,9 @@ impl Arrastre {
 
     /// ¿Sigue moviéndose la vista previa?
     pub fn animando(&self) -> bool {
+        if tema::efectos_reducidos() {
+            return false;
+        }
         self.previa_nacida
             .is_some_and(|t| t.elapsed() < tema::D_TARJETA)
             || self
@@ -733,7 +788,7 @@ impl Arrastre {
 
         let alfa = self
             .previa_nacida
-            .map(|t| tema::C_ENTRADA.eval(tema::fraccion(t.elapsed(), tema::D_TARJETA)))
+            .map(|t| tema::C_ENTRADA.eval(tema::avance(t.elapsed(), tema::D_TARJETA)))
             .unwrap_or(1.0);
 
         let fisico = |r: Rectangle<i32, Logical>| {
@@ -912,31 +967,28 @@ impl BookosComp {
     }
 
     pub fn work_area(&self) -> Rectangle<i32, Logical> {
-        let logico = self
-            .space
-            .outputs()
-            .next()
-            .and_then(|o| Some((o.current_mode()?, o.current_scale().fractional_scale())))
-            // `xdg_toplevel.configure` habla en lógico; el modo está en físico.
-            .map(|(mode, scale)| {
-                (
-                    (mode.size.w as f64 / scale).round() as i32,
-                    (mode.size.h as f64 / scale).round() as i32,
-                )
-            })
-            .unwrap_or((1, 1));
+        let pantalla = self.pantalla();
         // Un panel que esquiva ventanas **no reserva sitio**: si lo reservara
         // no habría nada que esquivar, porque ninguna ventana llegaría hasta
         // él. Es lo que hace KDE con el mismo modo.
-        let panel = self
-            .shell
-            .as_ref()
-            .filter(|s| s.visibilidad(crate::shell::Barra::Panel) == crate::shell::Visibilidad::Siempre)
-            .map(|s| s.panel_height())
+        // El shell vive en la pantalla principal, cuyo origen se normaliza a
+        // (0,0). Las secundarias aprovechan toda su altura: reservar allí el
+        // panel dejaría una franja vacía que nunca se dibuja.
+        let panel = (pantalla.loc == (0, 0).into())
+            .then(|| {
+                self.shell
+                    .as_ref()
+                    .filter(|s| {
+                        s.visibilidad(crate::shell::Barra::Panel)
+                            == crate::shell::Visibilidad::Siempre
+                    })
+                    .map(|s| s.panel_height())
+                    .unwrap_or(0)
+            })
             .unwrap_or(0);
         Rectangle::new(
-            (0, panel).into(),
-            (logico.0.max(1), (logico.1 - panel).max(1)).into(),
+            (pantalla.loc.x, pantalla.loc.y + panel).into(),
+            (pantalla.size.w.max(1), (pantalla.size.h - panel).max(1)).into(),
         )
     }
 
@@ -1269,7 +1321,7 @@ impl BookosComp {
             if estado(window).restaurar.get().is_none() {
                 guardar_restaurar(window, actual);
             }
-            mover_desde(window, actual);
+            mover_desde(window, geometria_visual(window, actual));
         }
         estado(window).zona.set(Some(zona));
 
@@ -1316,7 +1368,8 @@ impl BookosComp {
         );
         estado(window).zona.set(None);
         if let Some(actual) = self.space.element_location(window) {
-            mover_desde(window, Rectangle::new(actual, window.geometry().size));
+            let actual = Rectangle::new(actual, window.geometry().size);
+            mover_desde(window, geometria_visual(window, actual));
         }
         if let Some(toplevel) = window.toplevel() {
             toplevel.with_pending_state(|state| {
@@ -1409,10 +1462,24 @@ impl BookosComp {
     /// La pantalla entera, en lógicos: lo mismo que `work_area` pero sin
     /// descontar el panel ni el dock.
     fn pantalla(&self) -> Rectangle<i32, Logical> {
+        // Las acciones se aplican a la pantalla bajo el puntero. Esto hace que
+        // maximizar, pantalla completa y encajar funcionen en salidas situadas
+        // a cualquier lado del origen, no siempre en el primer monitor.
+        let punto = self.pointer_location;
         self.space
             .outputs()
-            .next()
-            .and_then(|o| self.space.output_geometry(o))
+            .filter_map(|o| self.space.output_geometry(o))
+            .find(|r| {
+                punto.x >= r.loc.x as f64
+                    && punto.y >= r.loc.y as f64
+                    && punto.x < (r.loc.x + r.size.w) as f64
+                    && punto.y < (r.loc.y + r.size.h) as f64
+            })
+            .or_else(|| {
+                self.space
+                    .outputs()
+                    .find_map(|o| self.space.output_geometry(o))
+            })
             .unwrap_or_else(|| Rectangle::from_size((1920, 1080).into()))
     }
 
@@ -1468,11 +1535,6 @@ impl BookosComp {
         let Some(zonas) = self.shell.as_ref().map(|s| s.zonas_barras()) else {
             return;
         };
-        // Una ventana a pantalla completa tapa las dos por definición, y las
-        // barras ya no se dibujan: no hace falta consultarla.
-        if self.hay_pantalla_completa() {
-            return;
-        }
         let geometrias: Vec<Rectangle<i32, Logical>> = self
             .space
             .elements()
@@ -1500,6 +1562,18 @@ impl BookosComp {
     /// Lo pregunta la escena para no dibujar el shell encima.
     pub fn hay_pantalla_completa(&self) -> bool {
         self.space.elements().any(completa)
+    }
+
+    /// ¿Hay una ventana a pantalla completa sobre esta salida concreta?
+    /// Una aplicación fullscreen en el proyector no debe esconder el panel del
+    /// portátil ni alterar la composición de los demás monitores.
+    pub fn hay_pantalla_completa_en(&self, output: &Output) -> bool {
+        let Some(salida) = self.space.output_geometry(output) else { return false };
+        self.space.elements().filter(|w| completa(w)).any(|window| {
+            self.space.element_location(window).is_some_and(|loc| {
+                Rectangle::new(loc, window.geometry().size).overlaps(salida)
+            })
+        })
     }
 
 }
@@ -1738,6 +1812,37 @@ mod tests {
         // cuando acaba la animación.
         let zoom = tema::C_MUELLE.eval(1.0);
         assert_eq!(ZOOM_INICIAL + (1.0 - ZOOM_INICIAL) * zoom as f64, 1.0);
+    }
+
+    #[test]
+    fn maximizar_interpela_las_cuatro_aristas_con_la_misma_bezier() {
+        let origen = Rectangle::new((220, 180).into(), (800, 600).into());
+        let destino = Rectangle::new((0, 32).into(), (1920, 1048).into());
+
+        assert_eq!(interpolar_rect(origen, destino, 0.0), origen);
+        assert_eq!(interpolar_rect(origen, destino, 1.0), destino);
+
+        let s = tema::C_VENTANA.eval(0.5) as f64;
+        let medio = interpolar_rect(origen, destino, s);
+        // Esta curva es ease-out: a mitad de tiempo ya ha recorrido más de la
+        // mitad, pero aún no ha saltado al destino.
+        assert!(s > 0.5 && s < 1.0);
+        assert!(medio.loc.x < origen.loc.x / 2);
+        assert!(medio.size.w > (origen.size.w + destino.size.w) / 2);
+        assert!(medio.size.w < destino.size.w);
+        assert!(medio.size.h < destino.size.h);
+    }
+
+    #[test]
+    fn restaurar_es_la_misma_interpolacion_con_los_extremos_invertidos() {
+        let flotante = Rectangle::new((220, 180).into(), (800, 600).into());
+        let maxima = Rectangle::new((0, 32).into(), (1920, 1048).into());
+        for i in 0..=20 {
+            let s = i as f64 / 20.0;
+            let ida = interpolar_rect(flotante, maxima, s);
+            let vuelta = interpolar_rect(maxima, flotante, 1.0 - s);
+            assert_eq!(ida, vuelta, "maximizar y restaurar divergen en {s}");
+        }
     }
 
     #[test]

@@ -270,13 +270,62 @@ fn decodificar_portada(valor: &str) -> Option<bookos_shell::actividad::Portada> 
 }
 
 fn recargar(state: &mut crate::state::BookosComp, seccion: &str) {
-    if seccion != "lockscreen" && seccion != "bloqueo"
-        && seccion != "activities" && seccion != "actividades" && seccion != "all"
-    {
+    const CONOCIDAS: &[&str] = &[
+        "lockscreen",
+        "bloqueo",
+        "activities",
+        "actividades",
+        "wallpaper",
+        "fondo",
+        "appearance",
+        "apariencia",
+        "all",
+    ];
+    if !CONOCIDAS.contains(&seccion) {
         tracing::warn!(seccion, "sección de ajustes desconocida");
         return;
     }
     let config = bookos_shell::Config::cargar();
+
+    // El tema se aplica **antes** de tocar el fondo: `Eleccion::para_el_tema`
+    // pregunta por el que esté puesto, y con el orden al revés se recargaría la
+    // imagen del tema viejo. Lo aplica el shell, que es quien tiene que
+    // repintarse con él, y ese cambio es global al proceso.
+    if matches!(seccion, "appearance" | "apariencia" | "all") {
+        state.modo_tema = config.modo_tema;
+        state.horas_tema = (config.tema_claro_desde, config.tema_oscuro_desde);
+        bookos_shell::tema::aplicar_modo(config.modo_tema);
+        // `config.tema` ya viene resuelto contra el reloj por `Config::cargar`.
+        if let Some(shell) = state.shell.as_mut() {
+            shell.aplicar_apariencia(config.tema, config.acento);
+        }
+        // Y el despertar del próximo cambio, que pudo cambiar de hora o dejar
+        // de existir si el modo pasó a fijo.
+        crate::apariencia::programar_cambio(state);
+    }
+    if matches!(
+        seccion,
+        "wallpaper" | "fondo" | "appearance" | "apariencia" | "all"
+    ) {
+        state.fondo_config = crate::fondo::Eleccion {
+            ambos: config.fondo.clone(),
+            claro: config.fondo_claro.clone(),
+            oscuro: config.fondo_oscuro.clone(),
+        };
+        // Y qué familia queda marcada en la tarjeta de Apariencia.
+        bookos_shell::fondos::poner_elegida(
+            state
+                .fondo_config
+                .para_el_tema()
+                .map(std::path::Path::new)
+                .and_then(bookos_shell::fondos::familia_de),
+        );
+        // Aquí no se compara con lo que había: quien pide recargar el fondo lo
+        // pide porque cambió el fichero, y ahorrarse la comparación es más
+        // barato que llevar la cuenta de qué imagen estaba puesta.
+        state.recargar_fondo = true;
+    }
+
     if let Some(shell) = state.shell.as_mut() {
         if matches!(seccion, "lockscreen" | "bloqueo" | "all") {
             shell.aplicar_bloqueo_config(config.bloqueo);
@@ -284,13 +333,14 @@ fn recargar(state: &mut crate::state::BookosComp, seccion: &str) {
         if matches!(seccion, "activities" | "actividades" | "all") {
             shell.aplicar_actividades_config(config.actividades);
         }
-        state.needs_redraw = true;
     }
+    state.needs_redraw = true;
 }
 
-/// Vuelve a censar las salidas sin tocar la configuración. Es lo que se hace
-/// cuando el kernel avisa de un cambio de conector: enterarse de que hay un
-/// monitor nuevo no es lo mismo que decidir qué hacer con él.
+/// Reconcilia conectores y configuración sin reiniciar el compositor. Un EDID
+/// conocido recupera su perfil; uno nuevo se extiende a la derecha. Al quitar
+/// una pantalla desaparece del mapa y la primera restante pasa a principal si
+/// hacía falta.
 fn redetectar(state: &mut crate::state::BookosComp) {
     let Some(censar) = state.censar_pantallas.take() else {
         return;
@@ -300,8 +350,81 @@ fn redetectar(state: &mut crate::state::BookosComp) {
     if salidas == state.pantallas.compartido.salidas() {
         return;
     }
-    state.pantallas.compartido.publicar(salidas);
-    avisar_salidas(state);
+    state.pantallas.compartido.publicar(salidas.clone());
+    let guardadas = crate::pantallas::cargar();
+    let mut peticion = crate::pantallas::peticion_de(&salidas);
+    let mut derecha = peticion.iter().filter(|p| p.activa).map(|p| {
+        let (w, _) = crate::pantallas::tamano_logico(
+            p.ancho, p.alto, p.escala, &p.transformacion);
+        p.x + w
+    }).max().unwrap_or(0);
+
+    for (p, salida) in peticion.iter_mut().zip(&salidas) {
+        if p.activa { continue; }
+        if let Some(g) = guardadas.iter().find(|g| g.id == p.id) {
+            if !g.activa { continue; }
+            let modo_existe = salida.modos.iter().any(|m| {
+                m.ancho == g.ancho && m.alto == g.alto
+                    && m.refresco_mhz == g.refresco_mhz
+            });
+            if modo_existe { *p = g.clone(); continue; }
+        }
+        let Some(modo) = salida.modos.iter().find(|m| m.preferido)
+            .or_else(|| salida.modos.first()) else { continue };
+        p.activa = true;
+        p.ancho = modo.ancho;
+        p.alto = modo.alto;
+        p.refresco_mhz = modo.refresco_mhz;
+        p.x = derecha;
+        p.y = 0;
+        let (w, _) = crate::pantallas::tamano_logico(
+            p.ancho, p.alto, p.escala, &p.transformacion);
+        derecha += w;
+    }
+    if !peticion.iter().any(|p| p.activa) {
+        if let Some((p, salida)) = peticion.first_mut().zip(salidas.first()) {
+            if let Some(modo) = salida.modos.iter().find(|m| m.preferido)
+                .or_else(|| salida.modos.first()) {
+                p.activa = true;
+                p.principal = true;
+                p.ancho = modo.ancho;
+                p.alto = modo.alto;
+                p.refresco_mhz = modo.refresco_mhz;
+                p.x = 0;
+                p.y = 0;
+            }
+        }
+    }
+    crate::pantallas::normalizar(&mut peticion);
+    if crate::pantallas::validar(&salidas, &peticion).is_err() {
+        // Un perfil antiguo puede solaparse con una pantalla desconocida. En
+        // hotplug prima conservar imagen: se crea una fila válida y Settings
+        // puede recolocarla después en cualquier dirección.
+        let principal = peticion.iter().position(|p| p.activa && p.principal)
+            .or_else(|| peticion.iter().position(|p| p.activa)).unwrap_or(0);
+        peticion[principal].principal = true;
+        let mut x = 0;
+        let orden = std::iter::once(principal)
+            .chain((0..peticion.len()).filter(|i| *i != principal));
+        for i in orden {
+            if !peticion[i].activa { continue; }
+            peticion[i].principal = i == principal;
+            peticion[i].x = x;
+            peticion[i].y = 0;
+            let (w, _) = crate::pantallas::tamano_logico(
+                peticion[i].ancho, peticion[i].alto, peticion[i].escala,
+                &peticion[i].transformacion);
+            x += w;
+        }
+        crate::pantallas::normalizar(&mut peticion);
+    }
+    // La vuelta atrás de un hotplug debe representar solo conectores que aún
+    // existen; una salida desenchufada no puede formar parte del rollback.
+    state.pantallas.ultima = crate::pantallas::peticion_de(&salidas);
+    if let Err(err) = crate::pantallas::aplicar(state, peticion) {
+        tracing::warn!("no se pudo aplicar el cambio de monitores en caliente: {err}");
+        avisar_salidas(state);
+    }
 }
 
 /// Emite `OutputsChanged`. Se llama desde el hilo del compositor con la

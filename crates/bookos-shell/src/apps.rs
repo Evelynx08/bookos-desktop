@@ -87,7 +87,7 @@ pub fn por_app_id(app_id: &str) -> Option<App> {
     None
 }
 
-fn leer_una(ruta: &std::path::Path) -> Option<App> {
+pub(crate) fn leer_una(ruta: &std::path::Path) -> Option<App> {
     let texto = std::fs::read_to_string(ruta).ok()?;
 
     let mut nombre = None;

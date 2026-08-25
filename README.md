@@ -161,10 +161,11 @@ usable hoy de lo que todavía necesita integración para una sesión de producci
 | Panel, dock y launchpad | ✅ Funcional | Widgets modulares, carpetas, búsqueda, anclado y menús contextuales |
 | Notificaciones | 🟡 Parcial | Servidor D-Bus, toast, historial y No molestar; faltan acciones y respuesta rápida |
 | Bloqueo | 🟡 Parcial | Diseño vivo y contraseña local mediante `unix_chkpwd`; falta PAM completo, huella e inactividad |
-| Pantallas | 🟡 Parcial | Modos, escala por salida, rotación y VRR; el backend DRM todavía arma una sola salida activa |
+| Pantallas | ✅ Funcional | Varias salidas DRM/KMS, disposición 2D, escala/modo/Hz/VRR independientes, principal, perfiles EDID y hotplug; panel y dock siguen a la principal |
 | BookOS Settings | 🟡 Parcial | Pantallas, bloqueo y recarga de actividades; faltan panel, dock, gestos, atajos y efectos |
 | Actividades dinámicas | 🟡 Parcial | Player, Timer y Voice Recorder; falta endurecer identidad D-Bus e integración final de las apps |
-| Captura y compartir pantalla | ❌ Pendiente | Faltan screencopy, PipeWire y portal de escritorio |
+| Captura de pantalla | ✅ Funcional | Selector de región con Impr, a fichero o al portapapeles, y `zwlr_screencopy_v1` v3 para `grim` y compañía (solo `wl_shm`) |
+| Compartir pantalla | 🟡 Parcial | Portal `impl.portal.ScreenCast` y `Screenshot` dentro del compositor, con nodo PipeWire y tarjeta de permiso propia. Probado anidado con `gst-launch-1.0 pipewiresrc`: imagen correcta a 2240×1400. Solo pantallas enteras, el cursor siempre sale, y los fotogramas van por CPU: falta el camino DMA-BUF |
 | Accesibilidad | ❌ Pendiente | Falta preferencia global de movimiento, alto contraste, escala de texto y AT-SPI |
 
 > [!NOTE]
@@ -291,6 +292,7 @@ login. El registro de cada arranque queda en `$XDG_RUNTIME_DIR/bookos-session.lo
 | <kbd>Meta</kbd>+<kbd>L</kbd> | Echar la pantalla de bloqueo (se sale con la contraseña de la cuenta) |
 | <kbd>Meta</kbd>+<kbd>Esc</kbd> · botón de encendido | El diálogo de energía: dormir, bloquear, cerrar sesión, reiniciar, apagar |
 | <kbd>Meta</kbd>+<kbd>Alt</kbd>+<kbd>B</kbd> / <kbd>D</kbd> | El panel / el dock: esquivar ventanas o siempre visible |
+| <kbd>Meta</kbd>+<kbd>Alt</kbd>+<kbd>F</kbd> | Panel de diagnóstico: fps, coste del fotograma y fotogramas perdidos por monitor |
 | <kbd>Meta</kbd>+arrastrar | Mover la ventana (con el botón derecho, redimensionar) |
 | arrastrar al borde | Encajar: los lados dan mitades, las esquinas cuartos |
 
@@ -327,6 +329,12 @@ tema = oscuro
 # de BookOS → «Apariencia…», que lo aplica en caliente y lo escribe aquí.
 acento = azul
 avatar = /ruta/al/avatar.png
+
+# Efectos visuales: «completos» o «reducidos». Reducidos quita el desenfoque
+# del panel y del dock y las animaciones de ventana —abrir, minimizar, mover,
+# encajar—; las del shell (emergentes, cambio de escritorio) siguen. Por debajo
+# del 20 % de batería y sin cargador se activa solo, sin tocar esta clave.
+efectos = completos
 
 # Pantalla de bloqueo. Las posiciones son fracciones del alto lógico: 0.36 es
 # el 36 %, así que la composición se conserva con HiDPI y otras resoluciones.
@@ -460,19 +468,19 @@ configurable y segura. El trabajo se organiza en estas etapas:
   lea y escriba panel, dock, apariencia, escritorios, entrada, gestos, atajos,
   notificaciones, bloqueo, actividades y efectos. El compositor debe validar y
   persistir; Settings no debe mantener un segundo parser de `panel.conf`.
-- **Protocolos Wayland.** Añadir `linux-dmabuf`, `xdg-activation`,
-  `presentation-time`, relative pointer, pointer constraints, text input, input
-  method, idle notify/inhibit y layer shell.
-- **Portales.** Captura de pantalla, selección de ventana, compartir por
-  PipeWire y file chooser mediante un backend de `xdg-desktop-portal` para
-  BookOS.
+- **Protocolos Wayland.** Añadir `xdg-activation`, relative pointer, pointer
+  constraints, text input, input method, idle notify/inhibit y layer shell.
+- **Portales.** Ya están `ScreenCast` y `Screenshot`, dentro del propio
+  compositor. Quedan la selección de ventana suelta, el file chooser, y quitar
+  el paso por CPU: hoy cada fotograma compartido se compone aparte y se lee de
+  la GPU con `glReadPixels`, y el camino bueno es exportar DMA-BUF y
+  entregárselo a PipeWire sin tocarlo.
 - **Seguridad del bloqueo.** Sustituir la comprobación limitada por PAM en un
   worker, con huella, políticas de intentos, cambio de layout, Bloq Mayús,
   bloqueo automático, DPMS y suspensión respetando inhibidores.
-- **Multi-monitor real.** Crear varias `DrmOutput`, extender/clonar, monitor
-  principal, escala independiente, hotplug y shell por salida. El modelo y el
-  contrato de Settings ya están preparados, pero el backend anuncia
-  `multi_output=false` hasta completar esta parte.
+- **Shell multipantalla avanzado.** La salida principal lleva panel, dock y
+  superficies interactivas; queda permitir duplicarlas o repartir panel y dock
+  por separado entre monitores desde Settings.
 
 ### P1 · Integración del sistema
 
@@ -506,6 +514,11 @@ configurable y segura. El trabajo se organiza en estas etapas:
 - Pruebas visuales en claro y oscuro a escalas 1, 1.25, 1.5, 1.75 y 2.
 - Mantener en CPU el layout y los widgets estáticos; dejar a la GPU composición,
   blur, sombras grandes, transformaciones, Magic Lamp y movimiento continuo.
+- Quitar el re-rasterizado de los SVG del launchpad al buscar. La caché de iced
+  se purga por dibujo, así que al filtrar se tiran los iconos que salen de la
+  rejilla y al borrar hay que reparsearlos: medido en release, 37 ms por
+  dibujo contra los 12 de repintarlo sin cambios. El panel y el dock ya no lo
+  sufren —cada uno tiene su renderizador—, pero el launchpad se pisa a sí mismo.
 - Añadir un overlay de diagnóstico con FPS, frametime, frames perdidos, daño,
   subidas de textura y memoria GPU; validar en 60, 120 y 144 Hz.
 

@@ -60,3 +60,20 @@ zbus = { version = "5", default-features = false, features = [
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
+# PipeWire, para el portal de compartir pantalla. No hay alternativa: es la
+# única forma de entregar vídeo a un navegador, a OBS o a cualquier cosa que
+# pase por `xdg-desktop-portal`.
+#
+# Añade dos cabeceras de sistema a las que ya hacían falta —`pipewire-devel`
+# trae `libpipewire-0.3.pc` y `libspa-0.2.pc`— y `clang-devel` para el bindgen
+# de `pipewire-sys`. No va detrás de una característica por lo mismo que
+# `xwayland`: una sesión de escritorio sin compartir pantalla no es una sesión
+# de escritorio, y el runtime de PipeWire ya está en cualquier instalación
+# porque es quien lleva el audio.
+#
+# `v0_3_34` es el mínimo que hace falta: es donde aparecen `pw_stream_is_driving`
+# y `pw_stream_trigger_process`, que son los que permiten que el reloj del
+# stream sea el compositor y no PipeWire. Se pide la versión más baja que sirve
+# y no la más alta para no exigir un PipeWire recién sacado.
+pipewire = { version = "0.10", features = ["v0_3_34"] }
+libspa = "0.10"

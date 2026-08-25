@@ -171,9 +171,6 @@ pub struct Launchpad {
     acumulado: f32,
     /// Cuándo se cambió de página por última vez, para no encadenar saltos.
     ultimo_paso: Option<std::time::Instant>,
-    /// Transición de página en curso: cuándo empezó y hacia dónde se fue
-    /// (`1` a la siguiente, `-1` a la anterior).
-    transicion: Option<(std::time::Instant, f32)>,
     /// El icono que se está arrastrando, si hay alguno.
     arrastre: Option<Arrastre>,
     /// Iconos ya resueltos, por índice en `apps`. El `None` de dentro es "se
@@ -216,7 +213,6 @@ impl Launchpad {
             seleccion: None,
             acumulado: 0.0,
             ultimo_paso: None,
-            transicion: None,
             arrastre: None,
             iconos: HashMap::new(),
         };
@@ -823,27 +819,16 @@ impl Launchpad {
         }
     }
 
-    /// Cuánto se desliza la rejilla al entrar una página, en lógicos.
+    /// El cambio de página no anima dentro del buffer.
     ///
-    /// La rejilla ocupa el 72 % de la pantalla, así que el margen que hay para
-    /// deslizarse sin recortar es el 14 % de cada lado: en una pantalla de
-    /// 1646 lógicos son 230 px. 110 se queda holgadamente dentro y ya se lee
-    /// como un cambio de página; con los 48 de antes el movimiento apenas se
-    /// notaba.
-    const DESLIZ: f32 = 110.0;
-
-    /// ¿Sigue entrando la página nueva?
+    /// Rasterizar esta rejilla completa cuesta decenas de milisegundos. Hacerlo
+    /// en cada frame bloqueaba el hilo del compositor durante toda la
+    /// transición y se notaba incluso en el cursor, especialmente a 120 Hz.
+    /// Una animación correcta necesitará dos superficies ya rasterizadas y
+    /// moverlas en la GPU; hasta entonces el salto inmediato es mucho más
+    /// fluido que una falsa animación hecha por CPU.
     pub fn animando(&self) -> bool {
-        self.transicion
-            .is_some_and(|(t0, _)| t0.elapsed() < tema::D_PAGINA)
-    }
-
-    /// Avance de la transición, de 0 a 1. Uno cuando no hay ninguna.
-    fn avance(&self) -> f32 {
-        match self.transicion {
-            Some((t0, _)) => tema::C_ENTRADA.eval(tema::fraccion(t0.elapsed(), tema::D_PAGINA)),
-            None => 1.0,
-        }
+        false
     }
 
     /// Desplazamiento del touchpad o de la rueda, en píxeles lógicos.
@@ -880,7 +865,6 @@ impl Launchpad {
         self.preparar_pagina();
         let ahora = std::time::Instant::now();
         self.ultimo_paso = Some(ahora);
-        self.transicion = Some((ahora, hacia as f32));
         true
     }
 
@@ -1041,17 +1025,13 @@ impl Launchpad {
             return hueco();
         };
         let px = self.icono_px();
-        // La página que entra lo hace apareciendo, no solo deslizándose. Empieza
-        // en 0,1 y no en 0: a cero, el primer fotograma es una pantalla vacía y
-        // parece que el launchpad ha parpadeado.
-        let alfa = 0.1 + 0.9 * self.avance();
+        let alfa = 1.0;
 
         // La carpeta tiene su propia baldosa —la rejilla de miniaturas— y su
         // propio rótulo; el resto de la celda es idéntico.
         let (indice_app, nombre) = match item {
             Item::App(a) => (a, self.apps[a].nombre.clone()),
             Item::Carpeta(c) => {
-                let alfa = 0.1 + 0.9 * self.avance();
                 let interior = column![
                     self.tapa_carpeta(c, px, alfa),
                     Space::new().height(Length::Fixed(6.0)),
@@ -1139,7 +1119,7 @@ impl Launchpad {
             .into()
     }
 
-    /// La rejilla de la página actual, con su deslizamiento si está entrando.
+    /// La rejilla de la página actual.
     fn rejilla_view(&self) -> PanelElement<'_> {
         let mut rejilla = column![];
         for fila in 0..FILAS {
@@ -1150,23 +1130,7 @@ impl Launchpad {
             }
             rejilla = rejilla.push(linea);
         }
-        // La página que entra viene del lado hacia el que se ha pasado y se va
-        // colocando. Solo se dibuja la nueva: pintar además la que se va
-        // obligaría a tener resueltos los iconos de las dos páginas, que es
-        // justo el trabajo que `preparar_pagina` evita.
-        match self.transicion {
-            Some((_, hacia)) if self.animando() => {
-                let resto = 1.0 - self.avance();
-                let corrimiento = Self::DESLIZ * resto;
-                let padding = if hacia > 0.0 {
-                    iced_core::Padding::ZERO.left(corrimiento)
-                } else {
-                    iced_core::Padding::ZERO.right(corrimiento)
-                };
-                container(rejilla).padding(padding).into()
-            }
-            _ => rejilla.into(),
-        }
+        rejilla.into()
     }
 
     /// La vista de dentro de una carpeta: su nombre arriba y su rejilla.
@@ -1474,7 +1438,6 @@ mod tests {
             seleccion: None,
             acumulado: 0.0,
             ultimo_paso: None,
-            transicion: None,
             arrastre: None,
             iconos: HashMap::new(),
         };
@@ -1754,6 +1717,10 @@ mod tests {
         // Al superar los 20 px acumulados, cambia.
         assert!(l.desplazar(8.0, 0.0));
         assert_eq!(l.pagina, 1);
+        assert!(
+            !l.animando(),
+            "cambiar de página no debe iniciar repintados completos por frame"
+        );
 
         // Y justo después no encadena otro salto: un gesto de touchpad manda
         // decenas de eventos y sin la espera se recorrerían cinco páginas.
