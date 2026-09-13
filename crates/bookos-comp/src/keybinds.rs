@@ -12,7 +12,7 @@
 //! llegarán con la configuración, no cableados en el compositor.
 
 use smithay::desktop::Window;
-use smithay::input::keyboard::{keysyms, KeysymHandle, ModifiersState};
+use smithay::input::keyboard::{KeysymHandle, ModifiersState, keysyms};
 use smithay::utils::{IsAlive, SERIAL_COUNTER};
 
 use crate::state::BookosComp;
@@ -343,7 +343,10 @@ pub fn resolver(
     // nivel de traza para poder averiguar qué manda una tecla rara —Fn+algo—
     // sin tener que instalar herramientas.
     if sym >= 0xff00 && !modifiers.logo && !modifiers.ctrl && !modifiers.alt {
-        tracing::trace!(keysym = format_args!("{sym:#06x}"), "tecla especial sin atajo");
+        tracing::trace!(
+            keysym = format_args!("{sym:#06x}"),
+            "tecla especial sin atajo"
+        );
     }
     // Y Meta+Mayús+S, que es lo que tienen en los dedos los que vienen de
     // Windows o de GNOME. Antes que el brazo de Meta a secas por lo mismo que
@@ -357,10 +360,10 @@ pub fn resolver(
     if modifiers.logo && modifiers.alt {
         match sym {
             keysyms::KEY_b | keysyms::KEY_B => {
-                return Some(Accion::AlternarBarra(crate::shell::Barra::Panel))
+                return Some(Accion::AlternarBarra(crate::shell::Barra::Panel));
             }
             keysyms::KEY_d | keysyms::KEY_D => {
-                return Some(Accion::AlternarBarra(crate::shell::Barra::Dock))
+                return Some(Accion::AlternarBarra(crate::shell::Barra::Dock));
             }
             // F de fotogramas. Va en el brazo de Meta+Alt, así que no le quita
             // nada a Meta+F, que sigue maximizando.
@@ -390,10 +393,10 @@ pub fn resolver(
             // abrir el mismo selector con un atajo que siempre llega.
             keysyms::KEY_p | keysyms::KEY_P => return Some(Accion::Proyeccion),
             keysyms::KEY_Left => {
-                return Some(Accion::Encajar(crate::ventanas::Direccion::Izquierda))
+                return Some(Accion::Encajar(crate::ventanas::Direccion::Izquierda));
             }
             keysyms::KEY_Right => {
-                return Some(Accion::Encajar(crate::ventanas::Direccion::Derecha))
+                return Some(Accion::Encajar(crate::ventanas::Direccion::Derecha));
             }
             keysyms::KEY_Up => return Some(Accion::Encajar(crate::ventanas::Direccion::Arriba)),
             keysyms::KEY_Down => return Some(Accion::Encajar(crate::ventanas::Direccion::Abajo)),
@@ -403,7 +406,7 @@ pub fn resolver(
             _ if (keysyms::KEY_1..keysyms::KEY_1 + crate::escritorios::MAXIMO as u32)
                 .contains(&sym) =>
             {
-                return Some(Accion::Escritorio((sym - keysyms::KEY_1) as usize))
+                return Some(Accion::Escritorio((sym - keysyms::KEY_1) as usize));
             }
             _ => {}
         }
@@ -492,10 +495,14 @@ pub fn ejecutar(state: &mut BookosComp, accion: Accion) {
             state.needs_redraw = true;
         }
         Accion::Desbloquear => {
+            crate::backend::cancelar_suspension_inactividad(state);
             state.bloqueo = Default::default();
             if let Some(shell) = state.shell.as_mut() {
                 shell.desbloquear();
             }
+            state.last_input = Some(std::time::Instant::now());
+            crate::backend::programar_bloqueo_inactividad(state);
+            crate::backend::despertar_dpms(state);
             state.needs_redraw = true;
         }
         Accion::BloqueoEscribir(c) => {
@@ -535,9 +542,13 @@ pub fn ejecutar(state: &mut BookosComp, accion: Accion) {
         Accion::Energia(peticion) => {
             use bookos_shell::bloqueo::Peticion;
             let orden = match peticion {
-                Peticion::Apagar => "systemctl poweroff -i || systemctl poweroff --force",
-                Peticion::Reiniciar => "systemctl reboot -i || systemctl reboot --force",
-                Peticion::Suspender => "systemctl suspend -i",
+                // Respetar los inhibidores de logind: una aplicación que está
+                // guardando datos o una presentación activa debe poder
+                // retrasar la transición. Forzar desde la UI escondería ese
+                // estado y puede cortar trabajo del usuario.
+                Peticion::Apagar => "systemctl poweroff",
+                Peticion::Reiniciar => "systemctl reboot",
+                Peticion::Suspender => "systemctl suspend",
             };
             lanzar(state, orden);
         }
@@ -608,7 +619,9 @@ pub fn hacer(state: &mut BookosComp, accion: bookos_shell::Accion) {
             state.needs_redraw = true;
         }
         bookos_shell::Accion::Proyeccion(modo) => {
-            if let Some(shell) = state.shell.as_mut() { shell.cerrar_emergente(); }
+            if let Some(shell) = state.shell.as_mut() {
+                shell.cerrar_emergente();
+            }
             if let Err(err) = crate::pantallas::aplicar_modo_rapido(state, modo) {
                 tracing::warn!("no se pudo aplicar el modo de proyección: {err}");
                 if let Some(shell) = state.shell.as_mut() {
@@ -659,9 +672,18 @@ pub fn hacer(state: &mut BookosComp, accion: bookos_shell::Accion) {
             // Elegir «automático» —o cambiar de hora— reprograma el despertar
             // del próximo cambio; elegir uno fijo lo cancela.
             crate::apariencia::programar_cambio(state);
+            // Y las aplicaciones de fuera se enteran por el portal: sin esto,
+            // una ventana GTK ya abierta se queda con el tema de antes.
+            crate::portal::apariencia_cambiada(state.bus_portal.as_ref());
             state.needs_redraw = true;
         }
-        bookos_shell::Accion::Capturar { x, y, ancho, alto, guardar } => {
+        bookos_shell::Accion::Capturar {
+            x,
+            y,
+            ancho,
+            alto,
+            guardar,
+        } => {
             // La capa se cierra **antes** de capturar: si no, el velo y la
             // barra de modos saldrían en la foto.
             if let Some(shell) = state.shell.as_mut() {
@@ -708,6 +730,9 @@ pub fn hacer(state: &mut BookosComp, accion: bookos_shell::Accion) {
                 reducidos = bookos_shell::tema::efectos_reducidos(),
                 "efectos visuales"
             );
+            // Las aplicaciones de fuera lo leen como `reduced-motion`, así que
+            // calmar el escritorio también calma sus animaciones.
+            crate::portal::apariencia_cambiada(state.bus_portal.as_ref());
             // No hace falta repintar el panel ni el dock: su buffer lleva su
             // color y el cristal es un elemento aparte de la escena. Basta con
             // componer otra vez sin él.
@@ -727,6 +752,10 @@ pub fn hacer(state: &mut BookosComp, accion: bookos_shell::Accion) {
                     crate::notificaciones::CERRADA_POR_EL_USUARIO,
                 );
             }
+            state.needs_redraw = true;
+        }
+        bookos_shell::Accion::NotificacionAccion { id, clave } => {
+            crate::notificaciones::accion_invocada(state.bus_notificaciones.as_ref(), id, &clave);
             state.needs_redraw = true;
         }
         bookos_shell::Accion::BorrarNotificaciones => {
@@ -757,11 +786,12 @@ pub fn hacer(state: &mut BookosComp, accion: bookos_shell::Accion) {
             app_id,
             exec,
             icono,
+            fijar,
         } => {
             let Some(shell) = state.shell.as_mut() else {
                 return;
             };
-            if let Some(lista) = shell.anclar(&app_id, &exec, &icono) {
+            if let Some(lista) = shell.anclar(&app_id, &exec, &icono, fijar) {
                 if let Err(err) = bookos_shell::guardar_dock(&lista) {
                     tracing::warn!("no se pudo guardar el dock: {err}");
                 }
@@ -839,10 +869,16 @@ fn cambiar_vt(state: &mut BookosComp, vt: i32) {
 /// Le cuenta al shell cuántos puntos dibujar y en qué estado está.
 fn refrescar_bloqueo(state: &mut BookosComp) {
     use bookos_shell::bloqueo::Estado;
-    let estado = match (&state.bloqueo.comprobando, state.bloqueo.fallo) {
-        (Some(_), _) => Estado::Comprobando,
-        (None, true) => Estado::Fallo,
-        (None, false) => Estado::Escribiendo,
+    let espera = state.bloqueo.reintentar_desde.and_then(|hasta| {
+        hasta
+            .checked_duration_since(std::time::Instant::now())
+            .map(|d| d.as_secs().saturating_add(u64::from(d.subsec_nanos() > 0)) as u32)
+    });
+    let estado = match (&state.bloqueo.comprobando, espera, state.bloqueo.fallo) {
+        (Some(_), _, _) => Estado::Comprobando,
+        (None, Some(segundos), _) => Estado::Espera(segundos.max(1)),
+        (None, None, true) => Estado::Fallo,
+        (None, None, false) => Estado::Escribiendo,
     };
     let escritos = state.bloqueo.escrito.chars().count();
     if let Some(shell) = state.shell.as_mut() {
@@ -860,14 +896,23 @@ fn comprobar_bloqueo(state: &mut BookosComp) {
     if state.bloqueo.comprobando.is_some() || state.bloqueo.escrito.is_empty() {
         return;
     }
+    if state
+        .bloqueo
+        .reintentar_desde
+        .is_some_and(|hasta| hasta > std::time::Instant::now())
+    {
+        refrescar_bloqueo(state);
+        return;
+    }
+    state.bloqueo.reintentar_desde = None;
     let usuario = crate::autenticar::usuario();
     let Some(comprobacion) =
         crate::autenticar::Comprobacion::lanzar(&usuario, &state.bloqueo.escrito)
     else {
-        // Sin ayudante en el sistema no hay forma de comprobar nada. Se dice en
+        // Sin PAM en el sistema no hay forma de comprobar nada. Se dice en
         // el log y el campo se pone en rojo: colar a quien sea porque falte un
         // binario es lo contrario de lo que hace un bloqueo.
-        tracing::error!("no hay unix_chkpwd: el bloqueo no puede autenticar");
+        tracing::error!("no se pudo iniciar PAM: el bloqueo no puede autenticar");
         state.bloqueo.escrito.clear();
         state.bloqueo.fallo = true;
         refrescar_bloqueo(state);
@@ -876,6 +921,16 @@ fn comprobar_bloqueo(state: &mut BookosComp) {
     state.bloqueo.comprobando = Some(comprobacion);
     refrescar_bloqueo(state);
     recoger_comprobacion(state);
+}
+
+/// Demora local frente a intentos repetidos. PAM conserva su propia política;
+/// esta capa evita crear trabajadores sin límite desde la interfaz.
+fn demora_reintento(fallos: u32) -> u64 {
+    if fallos < 3 {
+        0
+    } else {
+        (1_u64 << (fallos - 3).min(5)).min(30)
+    }
 }
 
 /// Mira cada poco si el ayudante ya contestó.
@@ -904,6 +959,27 @@ fn recoger_comprobacion(state: &mut BookosComp) {
                     state.bloqueo.comprobando = None;
                     state.bloqueo.escrito.clear();
                     state.bloqueo.fallo = true;
+                    state.bloqueo.fallos = state.bloqueo.fallos.saturating_add(1);
+                    let demora = demora_reintento(state.bloqueo.fallos);
+                    if demora > 0 {
+                        state.bloqueo.reintentar_desde = Some(
+                            std::time::Instant::now() + std::time::Duration::from_secs(demora),
+                        );
+                        let generacion = state.bloqueo_generacion;
+                        let resultado = state.loop_handle.insert_source(
+                            Timer::from_duration(std::time::Duration::from_secs(demora)),
+                            move |_, _, state| {
+                                if state.bloqueo_generacion == generacion {
+                                    state.bloqueo.reintentar_desde = None;
+                                    refrescar_bloqueo(state);
+                                }
+                                TimeoutAction::Drop
+                            },
+                        );
+                        if let Err(err) = resultado {
+                            tracing::warn!("no se pudo programar la espera del bloqueo: {err}");
+                        }
+                    }
                     refrescar_bloqueo(state);
                     TimeoutAction::Drop
                 }
@@ -936,14 +1012,17 @@ fn diagnostico(state: &mut BookosComp) {
         return;
     }
     tracing::info!("panel de diagnóstico puesto (Meta+Alt+F)");
-    let timer = smithay::reexports::calloop::timer::Timer::from_duration(
-        std::time::Duration::from_secs(1),
-    );
+    let timer =
+        smithay::reexports::calloop::timer::Timer::from_duration(std::time::Duration::from_secs(1));
     // El callback no hace nada por sí mismo: basta con que el bucle dé una
     // vuelta para que `post_dispatch` cierre la ventana de medida y le pase los
     // números al panel, que solo repinta si cambiaron.
     let r = state.loop_handle.insert_source(timer, |_, _, state| {
-        if state.shell.as_ref().is_some_and(|s| s.diagnostico_visible()) {
+        if state
+            .shell
+            .as_ref()
+            .is_some_and(|s| s.diagnostico_visible())
+        {
             smithay::reexports::calloop::timer::TimeoutAction::ToDuration(
                 std::time::Duration::from_secs(1),
             )
@@ -992,6 +1071,13 @@ fn cerrar(window: &smithay::desktop::Window) {
 /// inicial y el atajo del terminal quiere exactamente el mismo entorno: si se
 /// escribiera dos veces, tarde o temprano una de las copias se olvidaría de
 /// quitar `DISPLAY` y el programa acabaría en el X11 del anfitrión.
+/// Cuánto vale un vale de activación.
+///
+/// Sin plazo, una aplicación puede guardarse el suyo y saltar al frente media
+/// hora después, que es el robo de foco que el protocolo venía a impedir.
+/// Treinta segundos es lo que tarda en arrancar la peor de esta máquina.
+pub const VALE_VALIDO: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub fn lanzar(state: &mut BookosComp, cmd: &str) {
     // Los hijos ya terminados se recogen aquí, no con un manejador de SIGCHLD:
     // el bucle es de un solo hilo y esto no necesita señales ni dependencias.
@@ -1023,13 +1109,43 @@ pub fn lanzar(state: &mut BookosComp, cmd: &str) {
         .map(|t| (t.nombre().to_string(), t.tamano_logico().to_string()))
         .unwrap_or_default();
 
+    // El vale de `xdg-activation` para lo que se lanza desde aquí. Es lo que
+    // separa «una ventana ha aparecido» de «el usuario ha pedido esta ventana»:
+    // sin él, o se enfoca todo lo que se mapea —y una notificación que abre una
+    // ventana te quita el teclado— o no se enfoca nada, y pulsar en el dock
+    // deja una ventana muerta delante.
+    //
+    // Va sin `serial` ni `surface`: no lo pide un cliente por un clic suyo, lo
+    // emite el compositor porque el clic lo ha recibido él. `create_external_token`
+    // existe justo para este caso y no dispara `token_created`.
+    let vale = {
+        use smithay::wayland::xdg_activation::XdgActivationTokenData;
+        // Los que nadie usó se tiran aquí y no con un temporizador: un vale
+        // caduca solo por el paso del tiempo, así que basta con barrer cuando
+        // se crea el siguiente. Una aplicación que no arranca, o que arranca y
+        // no lo gasta, dejaría el suyo en el mapa para siempre.
+        state
+            .activacion_state
+            .retain_tokens(|_, datos| datos.timestamp.elapsed() < VALE_VALIDO);
+        let (token, _) = state
+            .activacion_state
+            .create_external_token(XdgActivationTokenData::default());
+        token.as_str().to_string()
+    };
+
     let mut orden = std::process::Command::new("/bin/sh");
     orden
         .arg("-c")
         .arg(linea)
         .env("WAYLAND_DISPLAY", &state.socket_name)
         .env("XCURSOR_THEME", tema)
-        .env("XCURSOR_SIZE", tamano);
+        .env("XCURSOR_SIZE", tamano)
+        // El nombre de la variable lo fija el protocolo; los toolkits la leen y
+        // la borran del entorno para que no la hereden sus propios hijos.
+        .env("XDG_ACTIVATION_TOKEN", &vale)
+        // La de X11, que es la misma idea con otro nombre. XWayland la traduce,
+        // así que una aplicación X11 lanzada del dock también llega enfocada.
+        .env("DESKTOP_STARTUP_ID", &vale);
     // DISPLAY solo si XWayland ya contestó. Ponerlo antes es peor que no
     // ponerlo: una aplicación que sabe hablar los dos protocolos prefiere X11
     // en cuanto ve un DISPLAY, y acabaría yendo por el camino largo hacia un
@@ -1075,6 +1191,9 @@ fn alternar_dialogo_energia(state: &mut BookosComp) {
 }
 
 fn bloquear(state: &mut BookosComp) {
+    if let Some(token) = state.tick_bloqueo.take() {
+        state.loop_handle.remove(token);
+    }
     let pantalla = state.pantalla_logica();
     let hora = bookos_shell::Shell::hora_bloqueo();
     let fecha = bookos_shell::Shell::fecha_bloqueo();
@@ -1094,6 +1213,8 @@ fn bloquear(state: &mut BookosComp) {
         .inspect_err(|err| tracing::warn!("no se pudo consultar MPRIS para el bloqueo: {err}"))
         .ok();
     tracing::info!("bloqueo echado");
+    crate::backend::programar_dpms_bloqueo(state);
+    crate::backend::programar_suspension_inactividad(state);
     state.needs_redraw = true;
 }
 
@@ -1198,5 +1319,16 @@ mod tests {
         assert!(es_tecla_de_pantalla(0, 227 + 8));
         assert!(es_tecla_de_pantalla(0, 431 + 8));
         assert!(!es_tecla_de_pantalla(keysyms::KEY_F4, 62));
+    }
+
+    #[test]
+    fn los_reintentos_de_bloqueo_tienen_espera_acotada() {
+        assert_eq!(demora_reintento(0), 0);
+        assert_eq!(demora_reintento(2), 0);
+        assert_eq!(demora_reintento(3), 1);
+        assert_eq!(demora_reintento(4), 2);
+        assert_eq!(demora_reintento(5), 4);
+        assert_eq!(demora_reintento(8), 30);
+        assert_eq!(demora_reintento(u32::MAX), 30);
     }
 }

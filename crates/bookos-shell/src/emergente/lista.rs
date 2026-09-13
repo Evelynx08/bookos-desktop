@@ -11,7 +11,7 @@
 
 use iced_core::alignment::Vertical;
 use iced_core::{Border, Color, Length};
-use iced_widget::{column, container, row, text, Space};
+use iced_widget::{Space, column, container, row, text};
 
 use crate::icono::{self, Icono};
 use crate::tema;
@@ -183,9 +183,11 @@ pub fn fila<'a>(entrada: &'a Entrada, señalada: f32) -> PanelElement<'a> {
     } else {
         tema::TEXTO2
     };
-    let mut textos = column![text(recortar(&entrada.nombre, ANCHO_NOMBRE, 14.0))
-        .size(14.0)
-        .color(color)];
+    let mut textos = column![
+        text(recortar(&entrada.nombre, ANCHO_NOMBRE, 14.0))
+            .size(14.0)
+            .color(color)
+    ];
     if !entrada.estado.is_empty() {
         textos = textos.push(
             text(recortar(&entrada.estado, ANCHO_NOMBRE, 10.0))

@@ -15,10 +15,10 @@
 use std::path::PathBuf;
 
 use smithay::backend::allocator::Fourcc;
+use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::memory::{
     MemoryRenderBuffer, MemoryRenderBufferRenderElement,
 };
-use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::Transform;
 
@@ -291,10 +291,14 @@ fn reducir(rgba: &[u8], (w, h): (i32, i32), ancho: i32) -> (Vec<u8>, (i32, i32))
     let mut destino = vec![0u8; (nw * nh * 4) as usize];
     for y in 0..nh {
         let y0 = (y as i64 * h as i64 / nh as i64) as i32;
-        let y1 = (((y + 1) as i64 * h as i64 / nh as i64) as i32).max(y0 + 1).min(h);
+        let y1 = (((y + 1) as i64 * h as i64 / nh as i64) as i32)
+            .max(y0 + 1)
+            .min(h);
         for x in 0..nw {
             let x0 = (x as i64 * w as i64 / nw as i64) as i32;
-            let x1 = (((x + 1) as i64 * w as i64 / nw as i64) as i32).max(x0 + 1).min(w);
+            let x1 = (((x + 1) as i64 * w as i64 / nw as i64) as i32)
+                .max(x0 + 1)
+                .min(w);
             let mut suma = [0u32; 4];
             let mut cuenta = 0u32;
             for sy in y0..y1 {

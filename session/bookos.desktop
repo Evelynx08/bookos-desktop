@@ -1,8 +1,8 @@
 [Desktop Entry]
 Name=BookOS
 Comment=Escritorio BookOS sobre Wayland
-Exec=/usr/local/bin/bookos-session
-TryExec=/usr/local/bin/bookos-session
+Exec=bookos-session
+TryExec=bookos-session
 Type=Application
 DesktopNames=BookOS
 Keywords=wayland;compositor;bookos;

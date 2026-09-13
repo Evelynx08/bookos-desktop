@@ -29,12 +29,13 @@ pub fn schedule(state: &mut BookosComp) {
         return;
     }
     // Se espera a que el cliente de prueba se haya mapeado.
-    let result = state
-        .loop_handle
-        .insert_source(Timer::from_duration(Duration::from_secs(4)), |_, _, state| {
+    let result = state.loop_handle.insert_source(
+        Timer::from_duration(Duration::from_secs(4)),
+        |_, _, state| {
             run(state);
             TimeoutAction::Drop
-        });
+        },
+    );
     if let Err(err) = result {
         tracing::error!("no se pudo programar el autotest: {err}");
     }
@@ -46,6 +47,176 @@ pub fn schedule(state: &mut BookosComp) {
 /// es una superficie Wayland, así que ningún cliente puede decir si un clic le
 /// llegó. Aquí se pregunta directamente por el centro del primer icono, que es
 /// donde el usuario apuntaría.
+/// Anclar y desanclar arrastrando entre el launchpad y el dock.
+///
+/// `BOOKOS_SELFTEST_ANCLAR=1`. Recorre el gesto entero por el mismo camino que
+/// el ratón —`pulsar`, `puntero`, `soltar`— porque lo que se comprueba no es la
+/// lógica de `Dock`, que ya tiene sus tests, sino el enrutado: con el launchpad
+/// abierto la emergente ocupa la pantalla entera y se comía el clic del dock.
+fn comprobar_anclar(state: &mut BookosComp) {
+    let Some(shell) = state.shell.as_mut() else {
+        tracing::error!("no hay shell");
+        return;
+    };
+    shell.alternar_launchpad();
+    if shell.emergente_nombre() != Some("launchpad") {
+        tracing::error!("el launchpad no abrió");
+        return;
+    }
+    tracing::info!(dock = shell.dock_visible(), rect = ?shell.dock_rect(), "launchpad abierto");
+    if !shell.dock_visible() {
+        tracing::error!("el dock no se ve con el launchpad abierto");
+        return;
+    }
+
+    // `BOOKOS_SELFTEST_ANCLAR=captura` se queda aquí: guarda un PNG del
+    // launchpad recién abierto y no toca nada más. Es la única forma de
+    // comprobar que el dock se **dibuja** ahí —que su superficie esté en la
+    // lista no dice nada del orden—, y hacerlo antes del arrastre evita
+    // fotografiar el dock a medio rehacer, que es lo que pasa justo después
+    // de anclar: la superficie se recrea vacía y se pinta en el refresco
+    // siguiente.
+    if std::env::var("BOOKOS_SELFTEST_ANCLAR").is_ok_and(|v| v == "captura") {
+        let (w, h) = state
+            .space
+            .outputs()
+            .next()
+            .map(|o| {
+                let g = state.space.output_geometry(o).unwrap_or_default();
+                (g.size.w, g.size.h)
+            })
+            .unwrap_or((1280, 800));
+        state.captura_pedida = Some(crate::state::CapturaPedida {
+            x: 0,
+            y: 0,
+            ancho: w,
+            alto: h,
+            guardar: true,
+        });
+        state.needs_redraw = true;
+        return;
+    }
+
+    let Some((cx, cy)) = shell.celda_launchpad(0) else {
+        tracing::error!("la rejilla está vacía");
+        return;
+    };
+    let (dx, dy, dw, dh) = shell.dock_rect();
+    let (mx, my) = (dx + dw / 2.0, dy + dh / 2.0);
+
+    // Arrastre de ida: del primer icono de la rejilla al centro del dock.
+    shell.pulsar(cx, cy);
+    shell.puntero(mx, my);
+    let accion = shell.soltar();
+    tracing::info!(?accion, celda = ?(cx, cy), dock = ?(mx, my), "soltado sobre el dock");
+    let Some(bookos_shell::Accion::Anclar {
+        app_id,
+        exec,
+        icono,
+        fijar,
+    }) = accion
+    else {
+        tracing::error!("soltar sobre el dock no ancló");
+        return;
+    };
+    if fijar != Some(true) {
+        tracing::error!(?fijar, "el arrastre tiene que fijar, no alternar");
+    }
+    let Some(lista) = shell.anclar(&app_id, &exec, &icono, fijar) else {
+        tracing::error!("el anclado no llegó al dock");
+        return;
+    };
+    tracing::info!(
+        app_id,
+        anclada = shell.esta_anclada(&app_id),
+        ?lista,
+        "anclada"
+    );
+
+    // Y de vuelta: se agarra su icono en el dock y se saca fuera.
+    let Some((ix, iy, iw, ih)) = shell.icono_dock(&app_id) else {
+        tracing::error!(app_id, "la anclada no tiene icono en el dock");
+        return;
+    };
+    shell.pulsar(ix + iw / 2.0, iy + ih / 2.0);
+    // Arriba del todo, que con el launchpad abierto sigue siendo rejilla.
+    shell.puntero(ix + iw / 2.0, 60.0);
+    let accion = shell.soltar();
+    tracing::info!(?accion, desde = ?(ix + iw / 2.0, iy + ih / 2.0), "sacado del dock");
+    match accion {
+        Some(bookos_shell::Accion::Anclar {
+            app_id,
+            exec,
+            icono,
+            fijar: Some(false),
+        }) => {
+            shell.anclar(&app_id, &exec, &icono, Some(false));
+            if shell.esta_anclada(&app_id) {
+                tracing::error!(app_id, "sigue anclada después de sacarla");
+            } else {
+                tracing::info!(app_id, "desanclada al sacarla del dock");
+            }
+        }
+        otra => tracing::error!(?otra, "sacar del dock no desancló"),
+    }
+    state.needs_redraw = true;
+}
+
+/// Crear una carpeta arrastrando un icono del launchpad sobre otro.
+///
+/// `BOOKOS_SELFTEST_CARPETA=1`. Recorre el gesto por el camino del ratón, que es
+/// donde puede fallar: la lógica de `soltar_en` ya tiene su test en el shell.
+fn comprobar_carpeta(state: &mut BookosComp) {
+    let Some(shell) = state.shell.as_mut() else {
+        tracing::error!("no hay shell");
+        return;
+    };
+    shell.alternar_launchpad();
+    let (Some(a), Some(b)) = (shell.celda_launchpad(0), shell.celda_launchpad(1)) else {
+        tracing::error!("la rejilla no tiene dos celdas");
+        return;
+    };
+    let antes = shell.primeros_del_launchpad(3);
+    tracing::info!(?antes, origen = ?a, destino = ?b, "antes de arrastrar");
+    shell.pulsar(a.0, a.1);
+    // Un par de pasos intermedios, como haría la mano: con un solo salto el
+    // umbral se pasa igual, pero así se comprueba también el señalado.
+    shell.puntero((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+    shell.puntero(b.0, b.1);
+    // `BOOKOS_SELFTEST_CARPETA=captura` se queda **a mitad del arrastre**, con
+    // el botón todavía pulsado: es el instante que hay que mirar, porque lo que
+    // faltaba era la señal de que soltar ahí va a hacer algo.
+    if std::env::var("BOOKOS_SELFTEST_CARPETA").is_ok_and(|v| v == "captura") {
+        let (w, h) = state
+            .space
+            .outputs()
+            .next()
+            .map(|o| {
+                let g = state.space.output_geometry(o).unwrap_or_default();
+                (g.size.w, g.size.h)
+            })
+            .unwrap_or((1280, 800));
+        state.captura_pedida = Some(crate::state::CapturaPedida {
+            x: 0,
+            y: 0,
+            ancho: w,
+            alto: h,
+            guardar: true,
+        });
+        state.needs_redraw = true;
+        return;
+    }
+    let accion = shell.soltar();
+    let despues = shell.primeros_del_launchpad(3);
+    tracing::info!(?accion, ?despues, "tras soltar encima del segundo");
+    if despues.first().is_some_and(|n| n == "Carpeta") {
+        tracing::info!("la carpeta se creó");
+    } else {
+        tracing::error!(?despues, "no nació ninguna carpeta");
+    }
+    state.needs_redraw = true;
+}
+
 fn comprobar_dock(state: &mut BookosComp) {
     let Some((dx, dy, dw, dh)) = state.shell.as_ref().map(|s| s.dock_rect()) else {
         tracing::error!("no hay shell: nada que comprobar en el dock");
@@ -65,15 +236,26 @@ fn comprobar_dock(state: &mut BookosComp) {
     // siempre es la escala, que convierte físicos en lógicos.
     tracing::info!(?centro, dentro, "centro del primer icono");
 
-    match state.shell.as_mut().and_then(|s| s.pulsar(centro.0, centro.1)) {
+    match state
+        .shell
+        .as_mut()
+        .and_then(|s| s.pulsar(centro.0, centro.1))
+    {
         Some(accion) => tracing::info!(?accion, "el primer icono responde"),
         None => tracing::error!("el centro del primer icono no devuelve acción"),
     }
 
     // Y un punto del hueco entre el primero y el segundo, que no debe ser de
     // nadie: si aquí sale acción, el hit-test se está comiendo los huecos.
-    let hueco = (dx + bookos_shell::DOCK_PAD as f64 + bookos_shell::DOCK_ICON as f64 + 7.0, centro.1);
-    match state.shell.as_mut().and_then(|s| s.pulsar(hueco.0, hueco.1)) {
+    let hueco = (
+        dx + bookos_shell::DOCK_PAD as f64 + bookos_shell::DOCK_ICON as f64 + 7.0,
+        centro.1,
+    );
+    match state
+        .shell
+        .as_mut()
+        .and_then(|s| s.pulsar(hueco.0, hueco.1))
+    {
         Some(accion) => tracing::error!(?accion, "el hueco entre iconos ha lanzado algo"),
         None => tracing::info!("el hueco entre iconos no es de nadie, correcto"),
     }
@@ -160,18 +342,19 @@ fn comprobar_bordes(state: &mut BookosComp, paso: u32) {
     let y = loc.y as f64 + tam.h as f64 / 2.0;
     crate::input::set_pointer(state, (x, y).into(), 500 + paso);
 
-    let result = state
-        .loop_handle
-        .insert_source(Timer::from_duration(ESPERA), move |_, _, state| {
-            tracing::info!(
-                x = format_args!("{x:.0}"),
-                desde_el_borde = format_args!("{:.0}", x - loc.x as f64),
-                cursor = ?state.cursor_status,
-                "columna"
-            );
-            comprobar_bordes(state, paso + 1);
-            TimeoutAction::Drop
-        });
+    let result =
+        state
+            .loop_handle
+            .insert_source(Timer::from_duration(ESPERA), move |_, _, state| {
+                tracing::info!(
+                    x = format_args!("{x:.0}"),
+                    desde_el_borde = format_args!("{:.0}", x - loc.x as f64),
+                    cursor = ?state.cursor_status,
+                    "columna"
+                );
+                comprobar_bordes(state, paso + 1);
+                TimeoutAction::Drop
+            });
     if let Err(err) = result {
         tracing::error!("no se pudo programar el barrido: {err}");
     }
@@ -183,7 +366,7 @@ fn comprobar_bordes(state: &mut BookosComp, paso: u32) {
 /// ninguna tecla llegaba a resolverse como atajo, así que ni Escape ni el
 /// cambio de TTY funcionaban y la sesión se quedaba muerta.
 fn comprobar_encierro(state: &mut BookosComp) {
-    use smithay::input::keyboard::{keysyms, ModifiersState};
+    use smithay::input::keyboard::{ModifiersState, keysyms};
 
     tracing::info!("--- salidas del bloqueo ---");
     crate::keybinds::ejecutar(state, crate::keybinds::Accion::Bloquear);
@@ -226,6 +409,60 @@ fn comprobar_encierro(state: &mut BookosComp) {
     tracing::info!("--- fin ---");
 }
 
+/// Lanza una aplicación como lo hace el dock y mira si llega con el foco.
+///
+/// Es la comprobación de `xdg-activation` de punta a punta: el compositor emite
+/// un vale, lo pone en el entorno del hijo, el toolkit lo lee y pide activación
+/// con él, y aquí se mira quién tiene el teclado al final. Ninguna de esas
+/// cuatro piezas se puede probar por separado —el vale no significa nada sin un
+/// cliente que lo gaste—, y de las cuatro solo dos son código de aquí.
+///
+/// `BOOKOS_SELFTEST_ACTIVACION=1`, con un cliente en la línea de órdenes.
+fn comprobar_activacion(state: &mut BookosComp) {
+    tracing::info!("--- activación al lanzar ---");
+
+    let vales_antes = state.activacion_state.tokens().count();
+    let cliente = std::env::var("BOOKOS_TERMINAL").unwrap_or_else(|_| "konsole".into());
+    crate::keybinds::lanzar(state, &cliente);
+    let vales = state.activacion_state.tokens().count();
+    if vales <= vales_antes {
+        tracing::error!(vales, "lanzar no dejó ningún vale en el mapa");
+        return;
+    }
+    tracing::info!(vales, "vale emitido");
+
+    // El cliente tarda en arrancar y en mapear. Se mira al final, no ahora.
+    let result = state.loop_handle.insert_source(
+        Timer::from_duration(Duration::from_secs(6)),
+        move |_, _, state: &mut BookosComp| {
+            let con_foco = state
+                .ventana_con_foco()
+                .and_then(|w| crate::handlers::app_id(&w));
+            match con_foco {
+                Some(id) => tracing::info!(app_id = %id, "la ventana lanzada tiene el foco"),
+                None => tracing::error!("nadie tiene el foco tras lanzar"),
+            }
+            // Y el vale se ha gastado: `request_activation` lo retira. Si sigue
+            // ahí es que el cliente no lo usó —no todos lo hacen— y entonces
+            // esta prueba no dice nada del camino completo.
+            let quedan = state.activacion_state.tokens().count();
+            if quedan == 0 {
+                tracing::info!("el vale se gastó: el cliente pidió activación con él");
+            } else {
+                tracing::warn!(
+                    quedan,
+                    "el vale sigue sin gastar; este cliente no usa el protocolo"
+                );
+            }
+            tracing::info!("--- fin ---");
+            TimeoutAction::Drop
+        },
+    );
+    if let Err(err) = result {
+        tracing::error!("no se pudo programar la comprobación: {err}");
+    }
+}
+
 /// Recorre entero el permiso de compartir pantalla, sin D-Bus de por medio.
 ///
 /// Es la mitad que no se puede provocar desde un script: `Start` bloquea al
@@ -245,6 +482,10 @@ fn comprobar_compartir(state: &mut BookosComp) {
         state,
         crate::portal::Aviso::Consentir {
             sesion: 1,
+            ruta: zbus::zvariant::OwnedObjectPath::try_from(
+                "/org/freedesktop/portal/desktop/session/bookos/selftest",
+            )
+            .expect("ruta D-Bus fija válida"),
             app: "Autotest".into(),
             respuesta,
             nodo,
@@ -377,8 +618,14 @@ fn comprobar_barras(state: &mut BookosComp) {
     state.encajar(&window, crate::ventanas::Zona::Maxima);
     state.revisar_barras();
     let escondidas = (
-        !state.shell.as_ref().is_some_and(|s| s.a_la_vista(Barra::Panel)),
-        !state.shell.as_ref().is_some_and(|s| s.a_la_vista(Barra::Dock)),
+        !state
+            .shell
+            .as_ref()
+            .is_some_and(|s| s.a_la_vista(Barra::Panel)),
+        !state
+            .shell
+            .as_ref()
+            .is_some_and(|s| s.a_la_vista(Barra::Dock)),
     );
     // La animación tarda, así que se mira pasado su tiempo.
     let queda = std::env::var("BOOKOS_SELFTEST_BARRAS").is_ok_and(|v| v == "queda");
@@ -386,20 +633,45 @@ fn comprobar_barras(state: &mut BookosComp) {
     let result = state.loop_handle.insert_source(
         Timer::from_duration(Duration::from_millis(400)),
         move |_, _, state| {
-            let panel = state.shell.as_ref().is_some_and(|s| s.a_la_vista(Barra::Panel));
-            let dock = state.shell.as_ref().is_some_and(|s| s.a_la_vista(Barra::Dock));
+            let panel = state
+                .shell
+                .as_ref()
+                .is_some_and(|s| s.a_la_vista(Barra::Panel));
+            let dock = state
+                .shell
+                .as_ref()
+                .is_some_and(|s| s.a_la_vista(Barra::Dock));
             if queda {
-                let zonas = state.shell.as_ref().map(|s| s.zonas_barras()).unwrap_or_default();
+                let zonas = state
+                    .shell
+                    .as_ref()
+                    .map(|s| s.zonas_barras())
+                    .unwrap_or_default();
                 let geos: Vec<_> = state
                     .space
                     .elements()
-                    .filter_map(|w| state.space.element_location(w).map(|l| (l, w.geometry().size)))
+                    .filter_map(|w| {
+                        state
+                            .space
+                            .element_location(w)
+                            .map(|l| (l, w.geometry().size))
+                    })
                     .collect();
-                tracing::info!(panel, dock, ?zonas, ?geos, "se queda con las barras apartadas");
+                tracing::info!(
+                    panel,
+                    dock,
+                    ?zonas,
+                    ?geos,
+                    "se queda con las barras apartadas"
+                );
                 return TimeoutAction::Drop;
             }
             if panel || dock {
-                tracing::error!(panel, dock, "una barra sigue a la vista con la ventana encima");
+                tracing::error!(
+                    panel,
+                    dock,
+                    "una barra sigue a la vista con la ventana encima"
+                );
             } else {
                 tracing::info!("las dos barras se apartaron de la ventana");
             }
@@ -410,7 +682,10 @@ fn comprobar_barras(state: &mut BookosComp) {
             // La barra tarda lo que dura su animación en llegar; preguntar en
             // el mismo instante siempre diría que no ha vuelto.
             std::thread::sleep(Duration::from_millis(300));
-            let vuelve = state.shell.as_ref().is_some_and(|s| s.a_la_vista(Barra::Panel));
+            let vuelve = state
+                .shell
+                .as_ref()
+                .is_some_and(|s| s.a_la_vista(Barra::Panel));
             if vuelve {
                 tracing::info!("el cursor en el borde trae el panel de vuelta");
             } else {
@@ -420,7 +695,11 @@ fn comprobar_barras(state: &mut BookosComp) {
             // seguir a la vista: es lo que permite llegar a pulsar un icono.
             crate::input::set_pointer(state, (400.0, 20.0).into(), 602);
             std::thread::sleep(Duration::from_millis(120));
-            if state.shell.as_ref().is_some_and(|s| s.a_la_vista(Barra::Panel)) {
+            if state
+                .shell
+                .as_ref()
+                .is_some_and(|s| s.a_la_vista(Barra::Panel))
+            {
                 tracing::info!("el panel aguanta con el cursor encima");
             } else {
                 tracing::error!("el panel se esconde al subir el cursor hacia sus iconos");
@@ -429,7 +708,10 @@ fn comprobar_barras(state: &mut BookosComp) {
             // Y al apartarlo del borde se vuelve a esconder.
             crate::input::set_pointer(state, (400.0, 400.0).into(), 601);
             std::thread::sleep(Duration::from_millis(300));
-            let sigue = state.shell.as_ref().is_some_and(|s| s.a_la_vista(Barra::Panel));
+            let sigue = state
+                .shell
+                .as_ref()
+                .is_some_and(|s| s.a_la_vista(Barra::Panel));
             if sigue {
                 tracing::error!("el panel se queda tras apartar el cursor del borde");
             } else {
@@ -443,8 +725,14 @@ fn comprobar_barras(state: &mut BookosComp) {
             let result = state.loop_handle.insert_source(
                 Timer::from_duration(Duration::from_millis(400)),
                 |_, _, state| {
-                    let panel = state.shell.as_ref().is_some_and(|s| s.a_la_vista(Barra::Panel));
-                    tracing::info!(panel, "el panel tras apartar la ventana del borde de arriba");
+                    let panel = state
+                        .shell
+                        .as_ref()
+                        .is_some_and(|s| s.a_la_vista(Barra::Panel));
+                    tracing::info!(
+                        panel,
+                        "el panel tras apartar la ventana del borde de arriba"
+                    );
                     if !panel {
                         tracing::error!("el panel no volvió cuando dejó de estorbar");
                     }
@@ -485,7 +773,10 @@ fn comprobar_doble_clic(state: &mut BookosComp) {
     tracing::info!(?inicial, ?tam, maximizada = antes, "antes del doble clic");
 
     // En la franja de arriba de la ventana, que es donde vive la barra.
-    let barra = (inicial.x as f64 + tam.w as f64 / 2.0, inicial.y as f64 + 8.0);
+    let barra = (
+        inicial.x as f64 + tam.w as f64 / 2.0,
+        inicial.y as f64 + 8.0,
+    );
     crate::input::set_pointer(state, barra.into(), 400);
     pulsar_dos_veces(state);
     let tras_uno = crate::ventanas::maximizada(&window);
@@ -540,9 +831,7 @@ fn comprobar_decoracion(state: &mut BookosComp) {
         return;
     };
     if !crate::decoracion::decorada(&window) {
-        tracing::warn!(
-            "el cliente se decora solo; con konsole esta comprobación sí corre"
-        );
+        tracing::warn!("el cliente se decora solo; con konsole esta comprobación sí corre");
         return;
     }
     let Some(rect) = crate::decoracion::barra_rect(state, &window) else {
@@ -673,7 +962,7 @@ const FUNDIDO_MARGEN: Duration = Duration::from_millis(500);
 /// un recuadro arrastrando y se comprueba que el PNG acaba en el disco con las
 /// medidas que se pidieron.
 fn comprobar_captura(state: &mut BookosComp) {
-    use crate::keybinds::{ejecutar, Accion};
+    use crate::keybinds::{Accion, ejecutar};
 
     tracing::info!("--- captura de pantalla ---");
     ejecutar(state, Accion::Captura);
@@ -700,7 +989,9 @@ fn comprobar_captura(state: &mut BookosComp) {
     // La del fichero se pide después, con la misma región: son dos caminos
     // distintos y hay que pasar por los dos.
     let region = match accion {
-        bookos_shell::Accion::Capturar { x, y, ancho, alto, .. } => (x, y, ancho, alto),
+        bookos_shell::Accion::Capturar {
+            x, y, ancho, alto, ..
+        } => (x, y, ancho, alto),
         _ => {
             tracing::error!("el arrastre pidió algo que no era una captura");
             return;
@@ -778,7 +1069,7 @@ fn comprobar_captura(state: &mut BookosComp) {
 /// apariencia— y se mira qué fichero acabó puesto.
 fn comprobar_apariencia(state: &mut BookosComp) {
     use crate::keybinds::hacer;
-    use bookos_shell::tema::{actual, Tema};
+    use bookos_shell::tema::{Tema, actual};
 
     tracing::info!("--- apariencia ---");
     // Lo que había, para dejarlo como estaba: este autotest va por el camino de
@@ -1068,12 +1359,13 @@ fn comprobar_xwayland(state: &mut BookosComp) {
 
     // Tres segundos: xmessage tarda en conectarse a X, pedir el mapeo y que el
     // xwm nos lo cuente. Menos daba falsos negativos al medir.
-    let result = state
-        .loop_handle
-        .insert_source(Timer::from_duration(Duration::from_secs(3)), |_, _, state| {
+    let result = state.loop_handle.insert_source(
+        Timer::from_duration(Duration::from_secs(3)),
+        |_, _, state| {
             revisar_x11(state);
             TimeoutAction::Drop
-        });
+        },
+    );
     if let Err(err) = result {
         tracing::error!("no se pudo programar la revisión de X11: {err}");
     }
@@ -1108,9 +1400,9 @@ fn revisar_x11(state: &mut BookosComp) {
     let esperado = zona.rect(state.work_area());
     state.encajar(&window.clone(), zona);
     let ventana = window.clone();
-    let result = state
-        .loop_handle
-        .insert_source(Timer::from_duration(Duration::from_secs(2)), move |_, _, state| {
+    let result = state.loop_handle.insert_source(
+        Timer::from_duration(Duration::from_secs(2)),
+        move |_, _, state| {
             let real = ventana.geometry().size;
             let loc = state.space.element_location(&ventana);
             if real == esperado.size {
@@ -1121,7 +1413,8 @@ fn revisar_x11(state: &mut BookosComp) {
             tracing::info!(?loc, esperado = ?esperado.loc, "posición tras el encaje");
             tracing::info!("--- fin del autotest de xwayland ---");
             TimeoutAction::Drop
-        });
+        },
+    );
     if let Err(err) = result {
         tracing::error!("no se pudo programar la medición del encaje: {err}");
     }
@@ -1148,7 +1441,7 @@ fn comprobar_conmutador(state: &mut BookosComp) {
 /// varios segundos en mapearse: sin esta espera, la prueba se ejecutaba siempre
 /// antes de que llegara y no comprobaba nada.
 fn comprobar_conmutador_tras(state: &mut BookosComp, intento: u32) {
-    use crate::keybinds::{ejecutar, Accion};
+    use crate::keybinds::{Accion, ejecutar};
     const INTENTOS: u32 = 8;
 
     // **Dos ventanas**, no dos aplicaciones: desde que el conmutador va por
@@ -1170,8 +1463,14 @@ fn comprobar_conmutador_tras(state: &mut BookosComp, intento: u32) {
 
     tracing::info!("--- conmutador ---");
     let ventanas: Vec<_> = state.space.elements().cloned().collect();
-    let ids: Vec<_> = ventanas.iter().filter_map(crate::handlers::app_id).collect();
-    let titulos: Vec<_> = ventanas.iter().filter_map(crate::handlers::titulo).collect();
+    let ids: Vec<_> = ventanas
+        .iter()
+        .filter_map(crate::handlers::app_id)
+        .collect();
+    let titulos: Vec<_> = ventanas
+        .iter()
+        .filter_map(crate::handlers::titulo)
+        .collect();
     tracing::info!(?ids, ?titulos, "ventanas de partida");
     if ventanas.len() < 2 {
         tracing::error!(
@@ -1248,7 +1547,7 @@ fn comprobar_conmutador_tras(state: &mut BookosComp, intento: u32) {
 /// dura la transición: si el deslizamiento no ocurre, todas las muestras salen
 /// iguales y se ve en la traza.
 fn comprobar_escritorios(state: &mut BookosComp) {
-    use crate::keybinds::{ejecutar, Accion};
+    use crate::keybinds::{Accion, ejecutar};
 
     tracing::info!("--- escritorios ---");
     let Some(window) = state.space.elements().next_back().cloned() else {
@@ -1260,7 +1559,12 @@ fn comprobar_escritorios(state: &mut BookosComp) {
         return;
     };
     let cuantas = state.space.elements().count();
-    tracing::info!(escritorio = crate::escritorios::activo_aqui(state), cuantas, ?antes, "de partida");
+    tracing::info!(
+        escritorio = crate::escritorios::activo_aqui(state),
+        cuantas,
+        ?antes,
+        "de partida"
+    );
 
     ejecutar(state, Accion::EscritorioRelativo(1));
     muestrear_deslizamiento(state, window, antes, cuantas, 0);
@@ -1278,20 +1582,26 @@ fn muestrear_deslizamiento(
     cuantas: usize,
     paso: u32,
 ) {
-    use crate::keybinds::{ejecutar, Accion};
+    use crate::keybinds::{Accion, ejecutar};
     const PASOS: u32 = 9;
     const ESPERA: Duration = Duration::from_millis(40);
 
     let x = state.space.element_location(&window).map(|p| p.x);
-    tracing::info!(paso, ?x, deslizando = state.escritorios.deslizando(), "saliendo");
+    tracing::info!(
+        paso,
+        ?x,
+        deslizando = state.escritorios.deslizando(),
+        "saliendo"
+    );
 
     if paso < PASOS {
-        let result = state
-            .loop_handle
-            .insert_source(Timer::from_duration(ESPERA), move |_, _, state| {
-                muestrear_deslizamiento(state, window.clone(), antes, cuantas, paso + 1);
-                TimeoutAction::Drop
-            });
+        let result =
+            state
+                .loop_handle
+                .insert_source(Timer::from_duration(ESPERA), move |_, _, state| {
+                    muestrear_deslizamiento(state, window.clone(), antes, cuantas, paso + 1);
+                    TimeoutAction::Drop
+                });
         if let Err(err) = result {
             tracing::error!("no se pudo programar la muestra: {err}");
         }
@@ -1300,7 +1610,11 @@ fn muestrear_deslizamiento(
 
     // Terminada la animación: el escritorio nuevo tiene que estar vacío.
     let vacio = state.space.elements().count();
-    tracing::info!(escritorio = crate::escritorios::activo_aqui(state), quedan = vacio, "tras ir al 2");
+    tracing::info!(
+        escritorio = crate::escritorios::activo_aqui(state),
+        quedan = vacio,
+        "tras ir al 2"
+    );
     if vacio != 0 || state.escritorios.deslizando() {
         tracing::error!(vacio, "el escritorio nuevo debería estar vacío y quieto");
     }
@@ -1434,9 +1748,17 @@ fn comprobar_ventanas(state: &mut BookosComp) {
         state.soltar_arrastre();
         match state.space.element_location(&window) {
             Some(p) if p.y >= area.loc.y => {
-                tracing::info!(y = p.y, techo = area.loc.y, "el borde de arriba respeta el panel")
+                tracing::info!(
+                    y = p.y,
+                    techo = area.loc.y,
+                    "el borde de arriba respeta el panel"
+                )
             }
-            otra => tracing::error!(?otra, techo = area.loc.y, "la ventana se metió bajo el panel"),
+            otra => tracing::error!(
+                ?otra,
+                techo = area.loc.y,
+                "la ventana se metió bajo el panel"
+            ),
         }
     } else {
         tracing::error!(?borde, "no se pudo agarrar el borde de arriba");
@@ -1565,6 +1887,14 @@ fn run(state: &mut BookosComp) {
     tracing::info!(?modo, escala, "salida");
 
     comprobar_dock(state);
+    if std::env::var_os("BOOKOS_SELFTEST_CARPETA").is_some() {
+        comprobar_carpeta(state);
+        return;
+    }
+    if std::env::var_os("BOOKOS_SELFTEST_ANCLAR").is_some() {
+        comprobar_anclar(state);
+        return;
+    }
     if std::env::var_os("BOOKOS_SELFTEST_MENU").is_some() {
         recorrer_menu(state);
         return;
@@ -1602,6 +1932,10 @@ fn run(state: &mut BookosComp) {
     }
     if std::env::var_os("BOOKOS_SELFTEST_ENCIERRO").is_some() {
         comprobar_encierro(state);
+        return;
+    }
+    if std::env::var_os("BOOKOS_SELFTEST_ACTIVACION").is_some() {
+        comprobar_activacion(state);
         return;
     }
     if std::env::var_os("BOOKOS_SELFTEST_COMPARTIR").is_some() {
@@ -1747,10 +2081,7 @@ fn run(state: &mut BookosComp) {
         // Pulsa el icono del volumen y deja la emergente abierta, para poder
         // capturarla: el hit-test se prueba en el shell, esto comprueba que la
         // tarjeta sale **bajo su icono** y no en un sitio fijo.
-        let zona = state
-            .shell
-            .as_ref()
-            .and_then(|s| s.zona_widget("volumen"));
+        let zona = state.shell.as_ref().and_then(|s| s.zona_widget("volumen"));
         match zona {
             Some((x0, x1)) => {
                 let x = (x0 + x1) / 2.0;

@@ -23,7 +23,7 @@ use iced_widget::{row, text};
 use crate::icono::{self, Icono};
 use crate::state::Battery;
 use crate::tema;
-use crate::view::{PanelElement, OK, PELIGRO, TEXT};
+use crate::view::{OK, PELIGRO, PanelElement, TEXT};
 use crate::widget::Widget;
 
 pub struct BateriaSimple {

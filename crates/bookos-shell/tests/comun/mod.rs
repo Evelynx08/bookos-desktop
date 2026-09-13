@@ -15,6 +15,13 @@ pub const ANCHO: u32 = 1280;
 /// `panel.conf` del usuario y el test pasaría o fallaría según lo que tenga
 /// puesto en su casa.
 pub fn shell(escala: f32) -> Shell {
+    static DATA: std::sync::Once = std::sync::Once::new();
+    DATA.call_once(|| bookos_system::seed_test_state(bookos_system::State {
+        network: serde_json::json!({"enabled":true,"ssid":"BookOS prueba","ethernet":{"connected":false},"networks":[{"ssid":"BookOS prueba","signal":80,"active":true}]}),
+        bluetooth: serde_json::json!({"present":true,"enabled":true,"devices":[]}),
+        audio: serde_json::json!({"output":{"volume":50,"muted":false},"input":{"volume":70,"muted":false}}),
+        ..Default::default()
+    }));
     // `BOOKOS_TEMA=claro` pinta todos los volcados con la paleta clara. Es la
     // forma de mirarla sin arrancar una sesión, y va aquí y no en cada test
     // porque el tema es del proceso: a medias no se puede ver.
@@ -87,7 +94,11 @@ pub fn tinta(buf: &[u8], w: u32, h: u32, desde: u32, hasta: u32) -> u32 {
             }
         }
     }
-    if total == 0 { 0 } else { con_tinta * 1000 / total }
+    if total == 0 {
+        0
+    } else {
+        con_tinta * 1000 / total
+    }
 }
 
 /// Pone `src` encima de `dst` con alfa, para componer el volcado igual que

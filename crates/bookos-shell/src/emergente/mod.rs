@@ -31,7 +31,7 @@ mod compartir;
 pub(crate) mod control;
 mod energia;
 mod escritorios;
-mod launchpad;
+pub mod launchpad;
 mod lista;
 mod menu;
 mod menu_dock;
@@ -40,8 +40,8 @@ mod proyeccion;
 mod red;
 mod sonido;
 
-use crate::view::PanelElement;
 use crate::Accion;
+use crate::view::PanelElement;
 
 /// Dónde se coloca una superficie emergente.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -297,6 +297,9 @@ impl Emergente {
         match self {
             Self::Red(r) => r.refrescar(),
             Self::Bluetooth(b) => b.refrescar(),
+            Self::Sonido(s) => s.refrescar(),
+            Self::Centro(c) => c.refrescar(),
+            Self::Brillo(b) => b.refrescar(),
             _ => false,
         }
     }

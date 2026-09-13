@@ -18,7 +18,7 @@
 
 use iced_core::alignment::{Horizontal, Vertical};
 use iced_core::{Border, Length};
-use iced_widget::{container, row, text, Space};
+use iced_widget::{Space, container, row, text};
 
 use crate::tema;
 use crate::view::PanelElement;

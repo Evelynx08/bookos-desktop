@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+bookos-system = { path = "../bookos-system" }
 iced_core = "0.14"
 iced_runtime = "0.14"
 # iced_widget arrastra iced_renderer, que en release exige elegir rasterizador
@@ -24,3 +25,8 @@ tiny-skia = "0.11"
 # decodifica antes y se le pasan píxeles ya listos, así esa ruta no existe.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 tracing.workspace = true
+
+serde_json = "1"
+
+[dev-dependencies]
+bookos-system = { path = "../bookos-system", features = ["test-fixtures"] }

@@ -20,7 +20,7 @@
 
 use iced_core::alignment::Horizontal;
 use iced_core::{Border, Color, Length, Rectangle};
-use iced_widget::{column, container, row, text, Column, Row, Space};
+use iced_widget::{Column, Row, Space, column, container, row, text};
 
 use crate::icono::{self, Icono};
 use crate::tema;

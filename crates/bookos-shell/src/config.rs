@@ -10,6 +10,7 @@
 //! tema = oscuro
 //! acento = azul
 //! avatar = ~/Imágenes/yo.png
+//! launchpad_dock = si
 //! bloqueo_animaciones = si
 //! bloqueo_fecha = si
 //! bloqueo_medios = si
@@ -18,12 +19,15 @@
 //! bloqueo_medios_y = 0.68
 //! bloqueo_reloj_tamano = 120
 //! bloqueo_avatar_tamano = 112
+//! bloqueo_inactividad = 900
+//! suspension_inactividad = 0
 //! actividades = si
 //! actividades_animaciones = si
+//! alto_contraste = no
 //! temporizador_siempre_visible = no
 //! escritorios = 2
 //! nombres_escritorios = Escritorio 1, Escritorio 2
-//! dock = konsole:Terminal:utilities-terminal, firefox:Navegador:firefox
+//! dock = bookos-shell:Terminal:utilities-terminal, bookos-explorer:Archivos:system-file-manager, firefox:Navegador:firefox, bookos-settings:Ajustes:bookos-settings
 //!
 //! # Cursor y entrada. Las velocidades van en la escala de libinput: [-1, 1].
 //! # Uno para cada tema: el cambio de claro a oscuro se lleva el fondo con él.
@@ -78,6 +82,13 @@ pub struct Config {
     /// Tamaño **lógico** del cursor. El tema elige luego qué imagen de las que
     /// trae se acerca más a ese tamaño por la escala de la pantalla.
     pub cursor: u32,
+    /// ¿Se ve el dock con el launchpad abierto?
+    ///
+    /// Es lo que hace macOS, y no es cosmético: es lo que convierte el
+    /// launchpad en el sitio de donde se sacan los iconos para anclarlos.
+    /// Quien prefiera la rejilla sola lo apaga y pierde el arrastre, no el
+    /// launchpad.
+    pub launchpad_dock: bool,
     pub entrada: Entrada,
     /// Imagen del fondo del escritorio, la misma con los dos temas.
     /// `None` = la que se encuentre.
@@ -125,6 +136,8 @@ pub struct Config {
     /// El color de acento, de la tabla cerrada de [`crate::tema::Acento`].
     /// Efectos visuales: completos o reducidos. Ver [`Efectos`].
     pub efectos: Efectos,
+    /// Paleta con bordes y separadores reforzados para mejorar la lectura.
+    pub alto_contraste: bool,
     pub acento: crate::tema::Acento,
     /// Foto de perfil para el bloqueo. `None` = la del sistema (`~/.face` o
     /// AccountsService), y si tampoco hay, las iniciales.
@@ -132,6 +145,12 @@ pub struct Config {
     /// Composición visual del bloqueo. Vive en la configuración compartida
     /// para que BookOS Settings pueda editarla sin conocer el código de iced.
     pub bloqueo: Bloqueo,
+    /// Segundos sin entrada antes de bloquear automáticamente. Cero desactiva
+    /// el bloqueo automático; por defecto son quince minutos.
+    pub bloqueo_inactividad: u64,
+    /// Segundos que permanece bloqueada la sesión antes de suspender. Cero la
+    /// desactiva: es una política optativa y nunca debe sorprender al usuario.
+    pub suspension_inactividad: u64,
     /// Isla de tareas vivas; estas claves quedan preparadas para BookOS
     /// Settings y permiten desactivar movimiento sin apagar la función.
     pub actividades: Actividades,
@@ -146,7 +165,11 @@ pub struct Actividades {
 
 impl Default for Actividades {
     fn default() -> Self {
-        Self { habilitadas: true, animaciones: true, temporizador_siempre: false }
+        Self {
+            habilitadas: true,
+            animaciones: true,
+            temporizador_siempre: false,
+        }
     }
 }
 
@@ -269,14 +292,14 @@ impl Default for Config {
                 // El primero, como en el dock de macOS: es el cajón de todo lo
                 // demás y conviene que esté donde siempre.
                 (LAUNCHPAD, "Aplicaciones", "launchpad"),
-                ("konsole", "Terminal", "utilities-terminal"),
-                ("dolphin", "Archivos", "system-file-manager"),
+                ("bookos-shell", "Terminal", "utilities-terminal"),
+                ("bookos-explorer", "Archivos", "system-file-manager"),
                 ("firefox", "Navegador", "firefox"),
                 // Los ajustes son los de BookOS, no los de Plasma: abrir el
                 // panel de otro escritorio desde este es enseñar opciones que
                 // no gobiernan lo que se está usando.
                 ("bookos-settings", "Ajustes", "bookos-settings"),
-                ("kate", "Editor", "accessories-text-editor"),
+                ("bookos-notepad", "Bloc de notas", "accessories-text-editor"),
             ]
             .into_iter()
             .map(|(e, l, i)| Lanzador {
@@ -291,6 +314,7 @@ impl Default for Config {
             // al elegir imagen. Pedir 24 a escala 1,75 da los 42 px que el
             // tema tiene dibujados de verdad, sin inventar píxeles.
             cursor: 24,
+            launchpad_dock: true,
             entrada: Entrada::default(),
             fondo: None,
             fondo_claro: None,
@@ -306,9 +330,12 @@ impl Default for Config {
             tema_claro_desde: (7, 0),
             tema_oscuro_desde: (20, 0),
             efectos: Efectos::default(),
+            alto_contraste: false,
             acento: crate::tema::Acento::Azul,
             avatar: None,
             bloqueo: Bloqueo::default(),
+            bloqueo_inactividad: 900,
+            suspension_inactividad: 0,
             actividades: Actividades::default(),
         }
     }
@@ -363,6 +390,11 @@ impl Config {
                 // la configuración —un montaje de red, por ejemplo— y descartar
                 // la ruta aquí obligaría a editar el fichero otra vez.
                 "avatar" => config.avatar = Some(valor.trim().to_string()),
+                "launchpad_dock" => {
+                    if let Some(v) = booleano(valor, ruta, n + 1) {
+                        config.launchpad_dock = v;
+                    }
+                }
                 "bloqueo_animaciones" => {
                     if let Some(v) = booleano(valor, ruta, n + 1) {
                         config.bloqueo.animaciones = v;
@@ -418,6 +450,20 @@ impl Config {
                         config.bloqueo.avatar_tamano = v as f32;
                     }
                 }
+                "bloqueo_inactividad" => match valor.trim().parse::<u64>() {
+                    Ok(v) if v <= 86_400 => config.bloqueo_inactividad = v,
+                    _ => tracing::warn!(
+                        valor = valor.trim(),
+                        "«bloqueo_inactividad» debe estar entre 0 y 86400 segundos"
+                    ),
+                },
+                "suspension_inactividad" => match valor.trim().parse::<u64>() {
+                    Ok(v) if v <= 86_400 => config.suspension_inactividad = v,
+                    _ => tracing::warn!(
+                        valor = valor.trim(),
+                        "«suspension_inactividad» debe estar entre 0 y 86400 segundos"
+                    ),
+                },
                 // Cualquier otra cosa se queda en oscuro y se avisa: un tema
                 // mal escrito no puede dejar el escritorio a medio pintar.
                 "tema" => match valor.trim() {
@@ -435,6 +481,11 @@ impl Config {
                     "reducidos" => config.efectos = Efectos::Reducidos,
                     otro => tracing::warn!(otro, "«efectos» solo entiende completos o reducidos"),
                 },
+                "alto_contraste" => {
+                    if let Some(v) = booleano(valor, ruta, n + 1) {
+                        config.alto_contraste = v;
+                    }
+                }
                 "acento" => match crate::tema::Acento::desde_nombre(valor) {
                     Some(a) => config.acento = a,
                     None => tracing::warn!(valor = valor.trim(), "acento desconocido"),
@@ -707,6 +758,17 @@ pub fn guardar_efectos(efectos: Efectos) -> std::io::Result<()> {
     escribir_claves(&[("efectos", valor.to_string())])
 }
 
+/// Punto único de persistencia para la API estructurada del compositor.
+/// Las claves ya llegan validadas por `org.bookos.Desktop`; esta función
+/// conserva comentarios, orden y claves que una versión nueva aún no conozca.
+pub fn guardar_configuracion(valores: &[(String, String)]) -> std::io::Result<()> {
+    let prestados: Vec<_> = valores
+        .iter()
+        .map(|(clave, valor)| (clave.as_str(), valor.clone()))
+        .collect();
+    escribir_claves(&prestados)
+}
+
 /// Reescribe esas claves del fichero y deja lo demás como está.
 ///
 /// A mano y no serializando la `Config` entera porque el fichero es del
@@ -845,7 +907,9 @@ pub fn guardar_launchpad(datos: &Launchpad) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     let mut salida = String::from(
-        "# El launchpad: carpetas y aplicaciones quitadas de la rejilla.\n         # Lo escribe el escritorio; se puede editar a mano.\n         # Una carpeta por línea: nombre[:color] = exec1, exec2, …\n",
+        "# El launchpad: carpetas y aplicaciones quitadas de la rejilla.\n\
+         # Lo escribe el escritorio; se puede editar a mano.\n\
+         # Una carpeta por línea: nombre[:color] = exec1, exec2, …\n",
     );
     for (nombre, color, apps) in &datos.carpetas {
         // Ni `=`, ni `,`, ni `:` en el nombre: los tres partirían la línea al
@@ -903,8 +967,7 @@ pub fn guardar_escritorio(posiciones: &[(&str, (i32, i32))]) -> std::io::Result<
     if let Some(dir) = ruta.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let mut salida =
-        String::from("# Dónde va cada icono del escritorio: columna,fila = nombre.\n");
+    let mut salida = String::from("# Dónde va cada icono del escritorio: columna,fila = nombre.\n");
     for (nombre, (col, fila)) in posiciones {
         // Un salto de línea en el nombre partiría el fichero en dos entradas.
         let nombre = nombre.replace(['\n', '\r'], " ");
@@ -1018,6 +1081,32 @@ mod tests {
 
         // Una posición fuera de pantalla no pisa el valor utilizable de serie.
         assert_eq!(parsear("bloqueo_acceso_y = 4").bloqueo.acceso_y, 0.36);
+    }
+
+    #[test]
+    fn la_inactividad_del_bloqueo_tiene_limites() {
+        assert_eq!(
+            parsear("bloqueo_inactividad = 600").bloqueo_inactividad,
+            600
+        );
+        assert_eq!(parsear("bloqueo_inactividad = 0").bloqueo_inactividad, 0);
+        assert_eq!(
+            parsear("bloqueo_inactividad = 90001").bloqueo_inactividad,
+            900
+        );
+        assert_eq!(parsear("bloqueo_inactividad = no").bloqueo_inactividad, 900);
+        assert_eq!(
+            parsear("suspension_inactividad = 1800").suspension_inactividad,
+            1800
+        );
+        assert_eq!(
+            parsear("suspension_inactividad = 90001").suspension_inactividad,
+            0
+        );
+        assert_eq!(
+            parsear("suspension_inactividad = no").suspension_inactividad,
+            0
+        );
     }
 
     #[test]

@@ -123,12 +123,20 @@ guarda todo esto: una línea por carpeta, `nombre[:color] = exec1, exec2, …`.
 Buscando no hay carpetas: se busca entre todas las aplicaciones, estén dentro de
 una o no.
 
+**El dock se queda a la vista con el launchpad abierto**, como en macOS, y ahí
+es donde se ancla y se desancla: se arrastra un icono de la rejilla hasta el
+dock para fijarlo, y se saca del dock arrastrándolo hacia arriba para soltarlo.
+Es lo mismo que hace el «Fijar en el dock» del menú del clic derecho, pero sin
+tener que abrir la aplicación primero. Con `launchpad_dock = no` en `panel.conf`
+el dock desaparece del launchpad y con él el gesto; el menú sigue estando.
+
 **Pantalla de bloqueo** — con la disposición del bloqueo de macOS: reloj y fecha
 grandes arriba, y abajo el bloque de acceso —foto de perfil recortada en
 círculo, nombre, campo de contraseña y el renglón que dice qué está pasando—.
 La foto sale de `avatar` en la configuración, de `~/.face` o de AccountsService,
-y si no hay ninguna, de las iniciales. Autentica contra `unix_chkpwd`, el
-ayudante SUID de `pam_unix`.
+y si no hay ninguna, de las iniciales. Autentica mediante la pila PAM del
+sistema en un worker separado, para que una comprobación lenta no congele el
+compositor.
 
 **Avisos (OSD)** — la cápsula que sale al tocar volumen, brillo, brillo de
 teclado o el touchpad.
@@ -159,14 +167,15 @@ usable hoy de lo que todavía necesita integración para una sesión de producci
 | Animaciones de ventana | ✅ Funcional | Entrada, cambios de tamaño y Magic Lamp reversible hacia el dock |
 | Escritorios y Exposé | ✅ Funcional | 1–5 escritorios, nombres, vista general, miniaturas vivas y gestos |
 | Panel, dock y launchpad | ✅ Funcional | Widgets modulares, carpetas, búsqueda, anclado y menús contextuales |
-| Notificaciones | 🟡 Parcial | Servidor D-Bus, toast, historial y No molestar; faltan acciones y respuesta rápida |
-| Bloqueo | 🟡 Parcial | Diseño vivo y contraseña local mediante `unix_chkpwd`; falta PAM completo, huella e inactividad |
+| Notificaciones | 🟡 Parcial | Servidor D-Bus, toast, historial, No molestar, acciones `ActionInvoked`, progreso, agrupación visual por aplicación y navegación con teclado; faltan respuesta persistente y preferencias por aplicación |
+| Bloqueo | 🟡 Parcial | Diseño vivo, autenticación PAM, bloqueo automático por inactividad y bloqueo al reanudar; faltan huella y políticas avanzadas |
 | Pantallas | ✅ Funcional | Varias salidas DRM/KMS, disposición 2D, escala/modo/Hz/VRR independientes, principal, perfiles EDID y hotplug; panel y dock siguen a la principal |
 | BookOS Settings | 🟡 Parcial | Pantallas, bloqueo y recarga de actividades; faltan panel, dock, gestos, atajos y efectos |
 | Actividades dinámicas | 🟡 Parcial | Player, Timer y Voice Recorder; falta endurecer identidad D-Bus e integración final de las apps |
 | Captura de pantalla | ✅ Funcional | Selector de región con Impr, a fichero o al portapapeles, y `zwlr_screencopy_v1` v3 para `grim` y compañía (solo `wl_shm`) |
-| Compartir pantalla | 🟡 Parcial | Portal `impl.portal.ScreenCast` y `Screenshot` dentro del compositor, con nodo PipeWire y tarjeta de permiso propia. Probado anidado con `gst-launch-1.0 pipewiresrc`: imagen correcta a 2240×1400. Solo pantallas enteras, el cursor siempre sale, y los fotogramas van por CPU: falta el camino DMA-BUF |
-| Accesibilidad | ❌ Pendiente | Falta preferencia global de movimiento, alto contraste, escala de texto y AT-SPI |
+| Compartir pantalla | 🟡 Parcial | Portal `impl.portal.ScreenCast` y `Screenshot` dentro del compositor, nodo PipeWire dirigido por frames, contrapresión, cancelación `Request`, `Session.Closed` y tarjeta de permiso propia. Probado anidado con `gst-launch-1.0 pipewiresrc`: imagen correcta a 2240×1400. Solo pantallas enteras, el cursor siempre sale, y los fotogramas van por CPU: falta el camino DMA-BUF |
+| Aplicaciones de fuera | 🟡 Parcial | El portal sirve `impl.portal.Settings`, así que GTK, Qt y Tauri siguen el tema, el acento, el contraste y los efectos reducidos de BookOS en caliente. `xdg-activation`, decoración de servidor, text-input/input-method, idle-notify, layer-shell y foreign-toplevel están integrados. |
+| Accesibilidad | 🟡 Parcial | Movimiento reducido, alto contraste, foco y navegación de notificaciones con teclado; faltan escala global de texto y AT-SPI |
 
 > [!NOTE]
 > El backend `winit` es una previsualización anidada para desarrollar. La prueba
@@ -346,6 +355,10 @@ bloqueo_acceso_y = 0.36
 bloqueo_medios_y = 0.68
 bloqueo_reloj_tamano = 144
 bloqueo_avatar_tamano = 132
+bloqueo_inactividad = 900
+# Cero desactiva la suspensión automática. Si se activa, cuenta desde que la
+# sesión está bloqueada y respeta inhibidores Wayland y de logind.
+suspension_inactividad = 0
 
 # Actividades dinámicas de Player, Clock y Voice Recorder.
 actividades = si
@@ -401,7 +414,7 @@ crates/
 │   ├── input.rs            # libinput: puntero, teclado, touchpad
 │   ├── keybinds.rs         # atajos y acciones
 │   ├── desenfoque.rs       # el cristal esmerilado, en GL
-│   ├── autenticar.rs       # unix_chkpwd para el bloqueo
+│   ├── autenticar.rs       # PAM para el bloqueo
 │   ├── ajustes.rs          # contrato D-Bus con BookOS Settings y actividades
 │   ├── pantallas.rs        # modelo, validación y persistencia de salidas
 │   ├── notificaciones.rs   # servidor org.freedesktop.Notifications
@@ -464,20 +477,26 @@ configurable y segura. El trabajo se organiza en estas etapas:
 
 ### P0 · Base de una sesión completa
 
-- **API única de configuración.** Ampliar `org.bookos.Desktop` para que Settings
-  lea y escriba panel, dock, apariencia, escritorios, entrada, gestos, atajos,
-  notificaciones, bloqueo, actividades y efectos. El compositor debe validar y
-  persistir; Settings no debe mantener un segundo parser de `panel.conf`.
-- **Protocolos Wayland.** Añadir `xdg-activation`, relative pointer, pointer
-  constraints, text input, input method, idle notify/inhibit y layer shell.
+- **API única de configuración.** `org.bookos.Desktop` ya expone `GetConfig` y
+  `ApplyConfig`: valida la actualización completa antes de persistirla y
+  Settings no necesita analizar `panel.conf`. Apariencia, fondo, bloqueo,
+  actividades y efectos se aplican en caliente; queda reconstruir panel, dock,
+  escritorios y dispositivos de entrada sin reiniciar, y ampliar el contrato a
+  gestos, atajos y preferencias de notificaciones.
+- **Protocolos Wayland.** Ya están `relative-pointer`, `pointer-constraints`,
+  `idle-inhibit`, `fractional-scale`, `viewporter`, `presentation-time`,
+  `cursor-shape`, `xdg-activation`, `text-input-v3`, input method,
+  `ext-idle-notify`, layer shell y `ext-foreign-toplevel-list`.
 - **Portales.** Ya están `ScreenCast` y `Screenshot`, dentro del propio
-  compositor. Quedan la selección de ventana suelta, el file chooser, y quitar
-  el paso por CPU: hoy cada fotograma compartido se compone aparte y se lee de
-  la GPU con `glReadPixels`, y el camino bueno es exportar DMA-BUF y
-  entregárselo a PipeWire sin tocarlo.
-- **Seguridad del bloqueo.** Sustituir la comprobación limitada por PAM en un
-  worker, con huella, políticas de intentos, cambio de layout, Bloq Mayús,
-  bloqueo automático, DPMS y suspensión respetando inhibidores.
+  compositor, con cancelación, cierre de sesión y contrapresión por stream.
+  Quedan la selección de ventana suelta, el file chooser, y quitar el paso por
+  CPU: hoy cada fotograma compartido se compone aparte y se lee de la GPU con
+  `glReadPixels`; el camino bueno es exportar DMA-BUF y entregárselo a
+  PipeWire sin tocarlo.
+- **Seguridad del bloqueo.** Ya hay PAM en worker, bloqueo automático y al
+  reanudar, DPMS KMS, respeto a `idle-inhibit`, aviso de Bloq Mayús, espera
+  progresiva tras fallos y suspensión automática configurable que también
+  respeta inhibidores. Quedan huella y cambio de layout desde el bloqueo.
 - **Shell multipantalla avanzado.** La salida principal lleva panel, dock y
   superficies interactivas; queda permitir duplicarlas o repartir panel y dock
   por separado entre monitores desde Settings.
@@ -489,8 +508,8 @@ configurable y segura. El trabajo se organiza en estas etapas:
   `busctl` y `systemctl`.
 - Verificar el propietario D-Bus de las actividades dinámicas; una lista de
   `app_id` permitidos no demuestra por sí sola qué proceso está publicando.
-- Añadir acciones, respuesta rápida, agrupación, progreso y preferencias por
-  aplicación a las notificaciones.
+- Completar agrupación, respuesta persistente y preferencias por aplicación en
+  las notificaciones; ya funcionan acciones `ActionInvoked` y progreso.
 - Convertir el buscador en un sistema de proveedores: aplicaciones, archivos,
   ajustes, calculadora, conversiones, comandos, historial y acciones.
 - Completar Wi-Fi con contraseña, pairing Bluetooth y perfiles de audio sin
@@ -498,10 +517,8 @@ configurable y segura. El trabajo se organiza en estas etapas:
 
 ### P2 · Experiencia y accesibilidad
 
-- Preferencia global de movimiento reducido que cubra Magic Lamp, escritorios,
-  dock, ventanas, OSD, bloqueo y actividades.
-- Alto contraste, escala de texto, foco visible y navegación completa con
-  teclado; después, integración AT-SPI para lector de pantalla.
+- Escala global de texto y navegación completa con teclado; después, integración
+  AT-SPI para lector de pantalla.
 - Reglas por ventana, recordar geometría, siempre encima, mover a escritorio y
   animación de cierre a partir de una captura previa.
 - Historial de portapapeles con tratamiento especial de contenido sensible.
@@ -560,3 +577,32 @@ Los iconos del sistema de diseño vienen de [Heroicons](https://heroicons.com)
 **[BookOS](https://github.com/Evelynx08)** · Hecho para funcionar en un portátil de verdad
 
 </div>
+
+## Servicio compartido de red, Bluetooth y audio
+
+`bookos-system` atiende `org.bookos.System1` en el bus de sesión, ruta
+`/org/bookos/System1`. El panel lee una caché y encola operaciones; NetworkManager,
+BlueZ y los procesos de audio se atienden fuera del compositor. Ajustes comparte
+el estado mediante `GetState` y la señal `StateChanged`, y envía operaciones
+estructuradas a `Perform`. El protocolo no admite comandos de shell.
+
+```sh
+cargo build --release -p bookos-system
+sudo ./session/instalar.sh
+```
+
+El instalador incluye el ejecutable, la activación D-Bus y la unidad de usuario
+`bookos-system.service`. Requiere NetworkManager, BlueZ, `rfkill`, `pactl` y
+`wpctl` (PipeWire con pipewire-pulse). Para desarrollo se puede ejecutar
+`cargo run -p bookos-system` en el bus de sesión, sin instalarlo.
+
+El estado versión 1 contiene `network`, `bluetooth`, `audio` y `errors` por dominio.
+Un dominio sin datos es `null`; un error no se convierte en un dispositivo apagado.
+Las consultas no fuerzan escaneos. Los cambios y reinicios de los proveedores
+provocan nuevas lecturas. Las contraseñas Wi-Fi se solicitan por un método
+separado y no se publican en el estado. El emparejamiento utiliza
+`PairingRequested` y `AnswerPairing` con confirmación en Ajustes.
+
+`cargo test --workspace --offline` incluye pruebas de renderizado y del protocolo.
+La prueba del servicio usa un bus D-Bus privado y requiere permiso para crear
+un socket local; no cambia el hardware ni la sesión del usuario.

@@ -109,12 +109,13 @@ fn despertar_para_la_salida(state: &mut BookosComp) {
         return;
     };
     let hasta_la_salida = queda.saturating_sub(bookos_shell::osd::SALIDA);
-    let result = state
-        .loop_handle
-        .insert_source(Timer::from_duration(hasta_la_salida), |_, _, state| {
-            state.needs_redraw = true;
-            TimeoutAction::Drop
-        });
+    let result =
+        state
+            .loop_handle
+            .insert_source(Timer::from_duration(hasta_la_salida), |_, _, state| {
+                state.needs_redraw = true;
+                TimeoutAction::Drop
+            });
     if let Err(err) = result {
         tracing::error!("no se pudo programar la salida del aviso: {err}");
     }
@@ -126,34 +127,31 @@ fn despertar_para_la_salida(state: &mut BookosComp) {
 /// puede haber cambiado otro programa, y sumarle el paso a un número viejo da
 /// saltos raros.
 fn volumen(paso: i32) -> (&'static str, Option<u8>, Option<String>) {
-    let (actual, silenciado) = leer_volumen().unwrap_or((0, false));
-    let nuevo = (actual as i32 + paso).clamp(0, 100) as u8;
-    let _ = wpctl(&[
-        "set-volume",
-        "@DEFAULT_AUDIO_SINK@",
-        &format!("{:.2}", nuevo as f32 / 100.0),
-    ]);
-    // Subir el volumen de algo silenciado lo devuelve a la vida: si no, la
-    // barra sube y no se oye nada.
-    if silenciado && paso > 0 {
-        let _ = wpctl(&["set-mute", "@DEFAULT_AUDIO_SINK@", "0"]);
-    }
-    (icono_volumen(nuevo, false), Some(nuevo), None)
+    bookos_system::request(bookos_system::Operation::VolumeStep { step: paso });
+    ("volumen-medio", None, Some("Ajustando volumen…".into()))
 }
 
 fn silenciar(destino: &str, micro: bool) -> (&'static str, Option<u8>, Option<String>) {
-    let (nivel, silenciado) = leer_volumen_de(destino).unwrap_or((0, false));
-    let _ = wpctl(&["set-mute", destino, "toggle"]);
-    let ahora = !silenciado;
-    if micro {
-        let icono = if ahora { "micro-silencio" } else { "micro" };
-        let texto = if ahora { "Micrófono silenciado" } else { "Micrófono activo" };
-        (icono, None, Some(texto.into()))
-    } else if ahora {
-        ("volumen-silencio", Some(0), None)
-    } else {
-        (icono_volumen(nivel, false), Some(nivel), None)
+    bookos_system::request(bookos_system::Operation::Mute { target: destino.into(), muted: None });
+    (if micro { "micro" } else { "volumen-medio" }, None, Some("Aplicando…".into()))
+}
+
+pub fn recibir_sistema(state: &mut BookosComp) {
+    use bookos_system::Operation;
+    while let Some((operation,result))=bookos_system::take_feedback() {
+        let osd=match result {
+            Err(e)=>Some(("sin-red",None,Some(e))),
+            Ok(())=>match operation {
+                Operation::VolumeStep{..}|Operation::Volume{..}|Operation::Mute{..}=>{
+                    let input=matches!(&operation,Operation::Mute{target,..}|Operation::Volume{target,..} if target=="input"||target=="@DEFAULT_AUDIO_SOURCE@");
+                    bookos_system::volume(input).map(|(level,muted)|
+                        (if input {if muted {"micro-silencio"} else {"micro"}} else {icono_volumen(level,muted)},Some(if muted {0} else {level}),None))
+                }, _=>None,
+            }
+        };
+        if let (Some(shell),Some((icon,level,text)))=(state.shell.as_mut(),osd) {shell.mostrar_osd(icon,level,text);}
     }
+    despertar_para_la_salida(state);
 }
 
 fn icono_volumen(nivel: u8, silenciado: bool) -> &'static str {
@@ -165,57 +163,16 @@ fn icono_volumen(nivel: u8, silenciado: bool) -> &'static str {
     }
 }
 
-fn leer_volumen() -> Option<(u8, bool)> {
-    leer_volumen_de("@DEFAULT_AUDIO_SINK@")
-}
-
-fn leer_volumen_de(destino: &str) -> Option<(u8, bool)> {
-    let salida = Command::new("wpctl")
-        .arg("get-volume")
-        .arg(destino)
-        .output()
-        .ok()?;
-    salida.status.success().then_some(())?;
-    let texto = String::from_utf8_lossy(&salida.stdout);
-    let resto = texto.split_once("Volume:")?.1;
-    let valor: f32 = resto.split_whitespace().next()?.parse().ok()?;
-    Some((
-        (valor * 100.0).round().clamp(0.0, 100.0) as u8,
-        texto.contains("[MUTED]"),
-    ))
-}
-
-fn wpctl(args: &[&str]) -> Option<std::process::Child> {
-    Command::new("wpctl")
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()
-}
-
 /// Sube o baja el brillo de la pantalla por logind, que es quien tiene el
 /// permiso: `/sys/class/backlight/*/brightness` es de root.
 fn brillo(state: &mut BookosComp, paso: i32) -> (&'static str, Option<u8>, Option<String>) {
-    let actual = bookos_shell::brillo_actual().unwrap_or(50);
+    let Some(actual) = bookos_shell::brillo_actual() else {
+        return ("brillo", None, Some("Brillo de pantalla no disponible".into()));
+    };
     let nuevo = (actual as i32 + paso).clamp(5, 100) as u8;
     if let Some((dispositivo, maximo)) = bookos_shell::backlight() {
         let crudo = (maximo as f64 * nuevo as f64 / 100.0).round() as u32;
-        let _ = Command::new("busctl")
-            .args([
-                "call",
-                "org.freedesktop.login1",
-                "/org/freedesktop/login1/session/auto",
-                "org.freedesktop.login1.Session",
-                "SetBrightness",
-                "ssu",
-                "backlight",
-                &dispositivo,
-                &crudo.to_string(),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+        bookos_shell::retroiluminacion::solicitar("backlight", &dispositivo, crudo);
     }
     // El widget del panel lo relee en su próximo refresco; forzarlo aquí
     // costaría los 21 ms de `wpctl` que ya evitamos en otro sitio.
@@ -226,50 +183,15 @@ fn brillo(state: &mut BookosComp, paso: i32) -> (&'static str, Option<u8>, Optio
 /// El teclado tiene su propia retroiluminación, con niveles enteros (0..max) y
 /// no un tanto por ciento: en este portátil son cuatro pasos.
 fn brillo_teclado(paso: i32) -> (&'static str, Option<u8>, Option<String>) {
-    let Some((dispositivo, maximo)) = leds_teclado() else {
+    let Some((dispositivo, actual, maximo)) = bookos_shell::brillo_teclado_actual() else {
         return ("teclado", None, Some("Sin luz de teclado".into()));
     };
-    let actual = std::fs::read_to_string(format!("/sys/class/leds/{dispositivo}/brightness"))
-        .ok()
-        .and_then(|s| s.trim().parse::<i32>().ok())
-        .unwrap_or(0);
-    let nuevo = (actual + paso).clamp(0, maximo as i32);
-    let _ = Command::new("busctl")
-        .args([
-            "call",
-            "org.freedesktop.login1",
-            "/org/freedesktop/login1/session/auto",
-            "org.freedesktop.login1.Session",
-            "SetBrightness",
-            "ssu",
-            "leds",
-            &dispositivo,
-            &nuevo.to_string(),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+    let nuevo = (i64::from(actual) + i64::from(paso)).clamp(0, i64::from(maximo));
+    bookos_shell::retroiluminacion::solicitar("leds", &dispositivo, nuevo as u32);
     // El nivel se enseña en tanto por ciento para que la barra diga algo: con
     // cuatro pasos, "1 de 3" no se lee de un vistazo.
-    let porciento = (nuevo * 100 / maximo.max(1) as i32) as u8;
+    let porciento = (nuevo * 100 / i64::from(maximo.max(1))) as u8;
     ("teclado", Some(porciento), None)
-}
-
-fn leds_teclado() -> Option<(String, u32)> {
-    let dir = std::fs::read_dir("/sys/class/leds").ok()?;
-    for entrada in dir.filter_map(|e| e.ok()) {
-        let nombre = entrada.file_name().to_string_lossy().to_string();
-        if !nombre.contains("kbd_backlight") {
-            continue;
-        }
-        let max = std::fs::read_to_string(entrada.path().join("max_brightness"))
-            .ok()?
-            .trim()
-            .parse::<u32>()
-            .ok()?;
-        return Some((nombre, max));
-    }
-    None
 }
 
 /// Enciende y apaga el touchpad. El cambio se guarda en el estado para que los

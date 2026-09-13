@@ -18,11 +18,11 @@
 
 use iced_core::alignment::{Horizontal, Vertical};
 use iced_core::{Border, Color, Length};
-use iced_widget::{column, container, row, text, Space};
+use iced_widget::{Space, column, container, row, text};
 
+use crate::Accion;
 use crate::tema::{self, Realce};
 use crate::view::PanelElement;
-use crate::Accion;
 
 use super::{Ancla, Tecla};
 
@@ -56,8 +56,8 @@ fn opciones() -> [Opcion; 5] {
             etiqueta: "Dormir",
             icono: "dormir",
             grave: false,
-            // El mismo comando del menú, con el `-i` que ignora inhibidores.
-            accion: || Accion::Lanzar("systemctl suspend -i".into()),
+            // logind decide si hay un inhibidor válido antes de suspender.
+            accion: || Accion::Lanzar("systemctl suspend".into()),
         },
         Opcion {
             etiqueta: "Bloquear",
@@ -80,13 +80,13 @@ fn opciones() -> [Opcion; 5] {
             etiqueta: "Reiniciar",
             icono: "reiniciar",
             grave: true,
-            accion: || Accion::Lanzar("systemctl reboot -i || systemctl reboot --force".into()),
+            accion: || Accion::Lanzar("systemctl reboot".into()),
         },
         Opcion {
             etiqueta: "Apagar",
             icono: "apagar",
             grave: true,
-            accion: || Accion::Lanzar("systemctl poweroff -i || systemctl poweroff --force".into()),
+            accion: || Accion::Lanzar("systemctl poweroff".into()),
         },
     ]
 }

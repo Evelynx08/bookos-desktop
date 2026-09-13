@@ -131,7 +131,10 @@ pub struct Aplicado {
     pub salidas: Vec<Salida>,
     /// La salida de Smithay de cada pantalla encendida y dónde va en el
     /// escritorio, en píxeles lógicos.
-    pub mapa: Vec<(smithay::output::Output, smithay::utils::Point<i32, smithay::utils::Logical>)>,
+    pub mapa: Vec<(
+        smithay::output::Output,
+        smithay::utils::Point<i32, smithay::utils::Logical>,
+    )>,
     /// Índice dentro de `mapa` de la que lleva el panel y el dock.
     pub principal: usize,
 }
@@ -345,7 +348,9 @@ pub fn validar(actual: &[Salida], peticion: &[Peticion]) -> Result<(), String> {
 
     let activas: Vec<&Peticion> = peticion.iter().filter(|p| p.activa).collect();
     if activas.is_empty() {
-        return Err("una configuración sin ninguna pantalla encendida dejaría la sesión a ciegas".into());
+        return Err(
+            "una configuración sin ninguna pantalla encendida dejaría la sesión a ciegas".into(),
+        );
     }
 
     let principales = activas.iter().filter(|p| p.principal).count();
@@ -374,9 +379,11 @@ pub fn validar(actual: &[Salida], peticion: &[Peticion]) -> Result<(), String> {
                 p.transformacion, p.id
             ));
         }
-        if !salida.modos.iter().any(|m| {
-            m.ancho == p.ancho && m.alto == p.alto && m.refresco_mhz == p.refresco_mhz
-        }) {
+        if !salida
+            .modos
+            .iter()
+            .any(|m| m.ancho == p.ancho && m.alto == p.alto && m.refresco_mhz == p.refresco_mhz)
+        {
             return Err(format!(
                 "«{}» no tiene el modo {}x{}@{}",
                 p.id, p.ancho, p.alto, p.refresco_mhz
@@ -448,12 +455,8 @@ fn salidas_conectadas(a: &Peticion, b: &Peticion) -> bool {
     let (aw, ah) = tamano_logico(a.ancho, a.alto, a.escala, &a.transformacion);
     let (bw, bh) = tamano_logico(b.ancho, b.alto, b.escala, &b.transformacion);
     let clonadas = a.x == b.x && a.y == b.y && aw == bw && ah == bh;
-    let borde_vertical = (a.x + aw == b.x || b.x + bw == a.x)
-        && a.y < b.y + bh
-        && b.y < a.y + ah;
-    let borde_horizontal = (a.y + ah == b.y || b.y + bh == a.y)
-        && a.x < b.x + bw
-        && b.x < a.x + aw;
+    let borde_vertical = (a.x + aw == b.x || b.x + bw == a.x) && a.y < b.y + bh && b.y < a.y + ah;
+    let borde_horizontal = (a.y + ah == b.y || b.y + bh == a.y) && a.x < b.x + bw && b.x < a.x + aw;
     clonadas || borde_vertical || borde_horizontal
 }
 
@@ -542,7 +545,9 @@ pub fn deserializar(texto: &str) -> Vec<Peticion> {
     }
     if !salidas.iter().any(|p| p.activa) {
         if !salidas.is_empty() {
-            tracing::warn!("la configuración guardada no deja ninguna pantalla encendida: se ignora entera");
+            tracing::warn!(
+                "la configuración guardada no deja ninguna pantalla encendida: se ignora entera"
+            );
         }
         return Vec::new();
     }
@@ -551,7 +556,11 @@ pub fn deserializar(texto: &str) -> Vec<Peticion> {
 
 fn linea_a_peticion(linea: &str) -> Option<Peticion> {
     let mut campos = linea.split(';').map(str::trim);
-    let id = campos.next()?.strip_prefix("salida")?.trim_start_matches([' ', '=']).trim();
+    let id = campos
+        .next()?
+        .strip_prefix("salida")?
+        .trim_start_matches([' ', '='])
+        .trim();
     if id.is_empty() {
         return None;
     }
@@ -679,7 +688,10 @@ pub fn peticion_de(salidas: &[Salida]) -> Vec<Peticion> {
 /// Aplica una configuración: valida, la manda al hardware, la persiste y
 /// reajusta lo que ve el usuario. Si el hardware la rechaza, se vuelve a la
 /// anterior y **no** se guarda nada.
-pub fn aplicar(state: &mut crate::state::BookosComp, mut peticion: Vec<Peticion>) -> Result<(), String> {
+pub fn aplicar(
+    state: &mut crate::state::BookosComp,
+    mut peticion: Vec<Peticion>,
+) -> Result<(), String> {
     let censo = state.pantallas.compartido.salidas();
     validar(&censo, &peticion)?;
     normalizar(&mut peticion);
@@ -729,24 +741,35 @@ pub fn aplicar_modo_rapido(
     modo: bookos_shell::ModoProyeccion,
 ) -> Result<(), String> {
     use bookos_shell::ModoProyeccion::*;
-    if modo == SinCambios { return Ok(()); }
+    if modo == SinCambios {
+        return Ok(());
+    }
     let salidas = state.pantallas.compartido.salidas();
-    if salidas.len() < 2 { return Err("No hay otra pantalla conectada".into()); }
+    if salidas.len() < 2 {
+        return Err("No hay otra pantalla conectada".into());
+    }
     let principal = salidas.iter().position(|s| s.principal).unwrap_or(0);
     let externa = (0..salidas.len()).find(|&i| i != principal).unwrap();
     let mut peticiones = peticion_de(&salidas);
     let poner_modo = |p: &mut Peticion, s: &Salida| -> Result<(), String> {
-        let m = s.modos.iter().find(|m| m.actual)
+        let m = s
+            .modos
+            .iter()
+            .find(|m| m.actual)
             .or_else(|| s.modos.iter().find(|m| m.preferido))
             .or_else(|| s.modos.first())
             .ok_or_else(|| format!("«{}» no anuncia ningún modo", s.id))?;
-        p.ancho = m.ancho; p.alto = m.alto; p.refresco_mhz = m.refresco_mhz;
+        p.ancho = m.ancho;
+        p.alto = m.alto;
+        p.refresco_mhz = m.refresco_mhz;
         Ok(())
     };
     for (i, p) in peticiones.iter_mut().enumerate() {
         p.activa = false;
         p.principal = false;
-        if p.ancho == 0 { poner_modo(p, &salidas[i])?; }
+        if p.ancho == 0 {
+            poner_modo(p, &salidas[i])?;
+        }
     }
     match modo {
         Principal => {
@@ -756,29 +779,50 @@ pub fn aplicar_modo_rapido(
         Externa => {
             peticiones[externa].activa = true;
             peticiones[externa].principal = true;
-            peticiones[externa].x = 0; peticiones[externa].y = 0;
+            peticiones[externa].x = 0;
+            peticiones[externa].y = 0;
         }
         Extender => {
             peticiones[principal].activa = true;
             peticiones[principal].principal = true;
-            peticiones[principal].x = 0; peticiones[principal].y = 0;
+            peticiones[principal].x = 0;
+            peticiones[principal].y = 0;
             peticiones[externa].activa = true;
-            let (w, _) = tamano_logico(peticiones[principal].ancho, peticiones[principal].alto,
-                peticiones[principal].escala, &peticiones[principal].transformacion);
-            peticiones[externa].x = w; peticiones[externa].y = 0;
+            let (w, _) = tamano_logico(
+                peticiones[principal].ancho,
+                peticiones[principal].alto,
+                peticiones[principal].escala,
+                &peticiones[principal].transformacion,
+            );
+            peticiones[externa].x = w;
+            peticiones[externa].y = 0;
         }
         Duplicar => {
-            let comun = salidas[principal].modos.iter().find(|a| {
-                salidas[externa].modos.iter().any(|b| a.ancho == b.ancho && a.alto == b.alto)
-            }).ok_or_else(|| "Las pantallas no comparten una resolución para duplicar".to_string())?;
+            let comun = salidas[principal]
+                .modos
+                .iter()
+                .find(|a| {
+                    salidas[externa]
+                        .modos
+                        .iter()
+                        .any(|b| a.ancho == b.ancho && a.alto == b.alto)
+                })
+                .ok_or_else(|| {
+                    "Las pantallas no comparten una resolución para duplicar".to_string()
+                })?;
             for i in [principal, externa] {
                 peticiones[i].activa = true;
                 peticiones[i].ancho = comun.ancho;
                 peticiones[i].alto = comun.alto;
-                let m = salidas[i].modos.iter().find(|m| m.ancho == comun.ancho && m.alto == comun.alto).unwrap();
+                let m = salidas[i]
+                    .modos
+                    .iter()
+                    .find(|m| m.ancho == comun.ancho && m.alto == comun.alto)
+                    .unwrap();
                 peticiones[i].refresco_mhz = m.refresco_mhz;
                 peticiones[i].escala = 1.0;
-                peticiones[i].x = 0; peticiones[i].y = 0;
+                peticiones[i].x = 0;
+                peticiones[i].y = 0;
             }
             peticiones[principal].principal = true;
         }
@@ -825,11 +869,15 @@ pub fn tras_aplicar(state: &mut crate::state::BookosComp, aplicado: Aplicado) {
         }
         state.escala_forzada = Some(escala);
         state.broadcast_preferred_scale(escala);
-        let escala_cursor = mapa.iter()
+        let escala_cursor = mapa
+            .iter()
             .map(|(o, _)| o.current_scale().fractional_scale())
-            .max_by(f64::total_cmp).unwrap_or(escala);
+            .max_by(f64::total_cmp)
+            .unwrap_or(escala);
         state.cursor_theme = Some(crate::cursor::CursorTheme::con_tamano(
-            escala_cursor, state.cursor_nominal));
+            escala_cursor,
+            state.cursor_nominal,
+        ));
     }
 
     state.pantallas.compartido.publicar(salidas);
@@ -951,7 +999,16 @@ mod pruebas {
 
     #[test]
     fn las_escalas_imposibles_no() {
-        for e in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.1, 8.0, 1.7333] {
+        for e in [
+            0.0,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.1,
+            8.0,
+            1.7333,
+        ] {
             assert!(!escala_valida(e), "escala {e} debería rechazarse");
             let mut p = peticion("A");
             p.escala = e;
@@ -999,7 +1056,17 @@ mod pruebas {
         let mut p = peticion("A");
         p.vrr = true;
         assert!(validar(&[s], &[p]).is_err());
-        assert!(validar(&[salida("A")], &[{ let mut p = peticion("A"); p.vrr = true; p }]).is_ok());
+        assert!(
+            validar(
+                &[salida("A")],
+                &[{
+                    let mut p = peticion("A");
+                    p.vrr = true;
+                    p
+                }]
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1052,7 +1119,16 @@ mod pruebas {
         let mut p = peticion("A");
         p.transformacion = "45".into();
         assert!(validar(&[salida("A")], &[p]).is_err());
-        for t in ["normal", "90", "180", "270", "flipped", "flipped-90", "flipped-180", "flipped-270"] {
+        for t in [
+            "normal",
+            "90",
+            "180",
+            "270",
+            "flipped",
+            "flipped-90",
+            "flipped-180",
+            "flipped-270",
+        ] {
             let mut p = peticion("A");
             p.transformacion = t.into();
             assert!(validar(&[salida("A")], &[p]).is_ok(), "{t}");
@@ -1126,16 +1202,19 @@ mod pruebas {
 
     #[test]
     fn la_principal_define_el_origen_del_escritorio() {
-        let mut p = vec![{
-            let mut a = peticion("A");
-            a.x = 1646;
-            a
-        }, {
-            let mut b = peticion("B");
-            b.principal = false;
-            b.x = 0;
-            b
-        }];
+        let mut p = vec![
+            {
+                let mut a = peticion("A");
+                a.x = 1646;
+                a
+            },
+            {
+                let mut b = peticion("B");
+                b.principal = false;
+                b.x = 0;
+                b
+            },
+        ];
         normalizar(&mut p);
         assert_eq!((p[0].x, p[0].y), (0, 0));
         assert_eq!((p[1].x, p[1].y), (-1646, 0));

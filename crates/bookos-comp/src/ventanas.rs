@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use smithay::desktop::Window;
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
-use smithay::utils::{Logical, Point, Rectangle, Scale, Size, SERIAL_COUNTER};
+use smithay::utils::{Logical, Point, Rectangle, SERIAL_COUNTER, Scale, Size};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::shell::xdg::ToplevelSurface;
 
@@ -136,7 +136,12 @@ pub struct Encogido {
 const ENCOGIDO: Duration = tema::D_PAGINA;
 
 /// Empieza el encogido hacia el dock, o el crecimiento de vuelta.
-pub fn encoger(window: &Window, origen: Rectangle<i32, Logical>, destino: Rectangle<i32, Logical>, hacia_el_dock: bool) {
+pub fn encoger(
+    window: &Window,
+    origen: Rectangle<i32, Logical>,
+    destino: Rectangle<i32, Logical>,
+    hacia_el_dock: bool,
+) {
     estado(window).encogido.set(Some(Encogido {
         origen,
         destino,
@@ -179,10 +184,7 @@ fn avance_encogido(t: f32, hacia_el_dock: bool) -> f32 {
 pub fn encogido_ahora(e: Encogido) -> (Point<f64, Logical>, f64, f32) {
     // De ida el tiempo corre hacia delante y de vuelta hacia atrás: es la misma
     // curva recorrida al revés, y por eso no hay dos animaciones que mantener.
-    let s = avance_encogido(
-        tema::avance(e.desde.elapsed(), ENCOGIDO),
-        e.hacia_el_dock,
-    ) as f64;
+    let s = avance_encogido(tema::avance(e.desde.elapsed(), ENCOGIDO), e.hacia_el_dock) as f64;
     let escala = 1.0 + (e.destino.size.w as f64 / e.origen.size.w.max(1) as f64 - 1.0) * s;
     let centro_x = e.origen.loc.x as f64 + e.origen.size.w as f64 / 2.0;
     let centro_y = e.origen.loc.y as f64 + e.origen.size.h as f64 / 2.0;
@@ -416,9 +418,9 @@ pub fn animando(window: &Window) -> bool {
         .get()
         .is_some_and(|e| e.desde.elapsed() < ENCOGIDO)
         || estado
-        .nacida
-        .get()
-        .is_some_and(|t| t.elapsed() < ENTRADA_ZOOM)
+            .nacida
+            .get()
+            .is_some_and(|t| t.elapsed() < ENTRADA_ZOOM)
         || estado
             .desde
             .get()
@@ -438,10 +440,7 @@ pub fn animacion(window: &Window) -> (f32, f64) {
     let t = nacida.elapsed();
     let alfa = tema::C_ENTRADA.eval(tema::avance(t, ENTRADA_ALFA));
     let zoom = tema::C_MUELLE.eval(tema::avance(t, ENTRADA_ZOOM));
-    (
-        alfa,
-        ZOOM_INICIAL + (1.0 - ZOOM_INICIAL) * zoom as f64,
-    )
+    (alfa, ZOOM_INICIAL + (1.0 - ZOOM_INICIAL) * zoom as f64)
 }
 
 /// Dónde hay que dibujar la ventana, contando el movimiento en curso.
@@ -570,10 +569,8 @@ fn confinar(
             area.loc.x - (size.w - asomo).max(0),
             area.loc.x + area.size.w - asomo,
         ),
-        loc.y.clamp(
-            area.loc.y,
-            area.loc.y + area.size.h - VISIBLE.min(size.h),
-        ),
+        loc.y
+            .clamp(area.loc.y, area.loc.y + area.size.h - VISIBLE.min(size.h)),
     )
         .into()
 }
@@ -585,7 +582,10 @@ pub enum Modo {
     /// Redimensionar tirando de un lado. Los dos `bool` son "el borde que se
     /// mueve es el izquierdo / el de arriba": tirar de la izquierda cambia la
     /// posición además del tamaño, y tirar de la derecha no.
-    Redimensionar { izquierda: bool, arriba: bool },
+    Redimensionar {
+        izquierda: bool,
+        arriba: bool,
+    },
 }
 
 impl Modo {
@@ -941,7 +941,8 @@ pub fn hueco(
         }
         sitio.x += CASCADA;
         sitio.y += CASCADA;
-        if sitio.x + tam.w > area.loc.x + area.size.w || sitio.y + tam.h > area.loc.y + area.size.h {
+        if sitio.x + tam.w > area.loc.x + area.size.w || sitio.y + tam.h > area.loc.y + area.size.h
+        {
             return centrada;
         }
     }
@@ -974,21 +975,31 @@ impl BookosComp {
         // El shell vive en la pantalla principal, cuyo origen se normaliza a
         // (0,0). Las secundarias aprovechan toda su altura: reservar allí el
         // panel dejaría una franja vacía que nunca se dibuja.
-        let panel = (pantalla.loc == (0, 0).into())
+        //
+        // **El dock reserva igual que el panel.** Antes solo lo hacía el panel,
+        // y una ventana maximizada llegaba hasta el borde de abajo con el dock
+        // encima tapándole sus últimos píxeles: medido a 1280×800, el área
+        // acababa en y=800 y el dock empezaba en y=712.
+        let (arriba, abajo) = (pantalla.loc == (0, 0).into())
             .then(|| {
                 self.shell
                     .as_ref()
-                    .filter(|s| {
-                        s.visibilidad(crate::shell::Barra::Panel)
-                            == crate::shell::Visibilidad::Siempre
+                    .map(|s| {
+                        (
+                            s.reserva(crate::shell::Barra::Panel).round() as i32,
+                            s.reserva(crate::shell::Barra::Dock).round() as i32,
+                        )
                     })
-                    .map(|s| s.panel_height())
-                    .unwrap_or(0)
+                    .unwrap_or((0, 0))
             })
-            .unwrap_or(0);
+            .unwrap_or((0, 0));
         Rectangle::new(
-            (pantalla.loc.x, pantalla.loc.y + panel).into(),
-            (pantalla.size.w.max(1), (pantalla.size.h - panel).max(1)).into(),
+            (pantalla.loc.x, pantalla.loc.y + arriba).into(),
+            (
+                pantalla.size.w.max(1),
+                (pantalla.size.h - arriba - abajo).max(1),
+            )
+                .into(),
         )
     }
 
@@ -1363,7 +1374,11 @@ impl BookosComp {
         // creció— y devolver la ventana a un sitio inalcanzable es peor que no
         // devolverla del todo.
         let previa = Rectangle::new(
-            confinar(previa.loc, previa.size, crate::decoracion::area_util(self, window)),
+            confinar(
+                previa.loc,
+                previa.size,
+                crate::decoracion::area_util(self, window),
+            ),
             previa.size,
         );
         estado(window).zona.set(None);
@@ -1568,14 +1583,15 @@ impl BookosComp {
     /// Una aplicación fullscreen en el proyector no debe esconder el panel del
     /// portátil ni alterar la composición de los demás monitores.
     pub fn hay_pantalla_completa_en(&self, output: &Output) -> bool {
-        let Some(salida) = self.space.output_geometry(output) else { return false };
+        let Some(salida) = self.space.output_geometry(output) else {
+            return false;
+        };
         self.space.elements().filter(|w| completa(w)).any(|window| {
-            self.space.element_location(window).is_some_and(|loc| {
-                Rectangle::new(loc, window.geometry().size).overlaps(salida)
-            })
+            self.space
+                .element_location(window)
+                .is_some_and(|loc| Rectangle::new(loc, window.geometry().size).overlaps(salida))
         })
     }
-
 }
 
 /// En qué zona está encajada, si lo está.
@@ -1614,8 +1630,7 @@ mod tests {
         // dejar una raya de fondo entre ellos, que es lo que pasa al partir un
         // ancho impar con dos divisiones.
         let a = area();
-        let cuartos = [Zona::SupIzq, Zona::SupDer, Zona::InfIzq, Zona::InfDer]
-            .map(|z| z.rect(a));
+        let cuartos = [Zona::SupIzq, Zona::SupDer, Zona::InfIzq, Zona::InfDer].map(|z| z.rect(a));
         let suma: i32 = cuartos.iter().map(|r| r.size.w * r.size.h).sum();
         assert_eq!(suma, a.size.w * a.size.h);
         // Y los bordes casan: el derecho del izquierdo es el izquierdo del
@@ -1851,7 +1866,10 @@ mod tests {
             let t = i as f32 / 100.0;
             let ida = avance_encogido(t, true);
             let vuelta = avance_encogido(1.0 - t, false);
-            assert!((ida - vuelta).abs() < 1e-5, "los recorridos divergen en t={t}");
+            assert!(
+                (ida - vuelta).abs() < 1e-5,
+                "los recorridos divergen en t={t}"
+            );
         }
         assert_eq!(avance_encogido(0.0, true), 0.0);
         assert_eq!(avance_encogido(1.0, true), 1.0);

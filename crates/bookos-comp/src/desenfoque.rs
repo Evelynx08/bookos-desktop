@@ -30,7 +30,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement};
-use smithay::backend::renderer::gles::{ffi, GlesError, GlesRenderer, GlesTexProgram, GlesTexture, Uniform};
+use smithay::backend::renderer::gles::{
+    GlesError, GlesRenderer, GlesTexProgram, GlesTexture, Uniform, ffi,
+};
 use smithay::backend::renderer::utils::CommitCounter;
 use smithay::utils::{Buffer as BufferCoords, Physical, Rectangle, Scale, Transform};
 
@@ -237,8 +239,16 @@ fn crear_textura(renderer: &mut GlesRenderer, rgba: &[u8], tam: (i32, i32)) -> O
             gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
             // Sin esto, las muestras del borde traen el color del lado contrario
             // y el cristal sale con una raya de otro color en cada canto.
-            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
-            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_WRAP_S,
+                ffi::CLAMP_TO_EDGE as i32,
+            );
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_WRAP_T,
+                ffi::CLAMP_TO_EDGE as i32,
+            );
             gl.TexImage2D(
                 ffi::TEXTURE_2D,
                 0,
@@ -418,4 +428,3 @@ impl RenderElement<GlesRenderer> for Desenfoque {
         )
     }
 }
-

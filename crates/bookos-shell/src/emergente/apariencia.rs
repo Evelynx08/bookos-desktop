@@ -15,11 +15,11 @@
 
 use iced_core::alignment::Vertical;
 use iced_core::{Border, Color, Length};
-use iced_widget::{column, container, row, text, Space};
+use iced_widget::{Space, column, container, row, text};
 
+use crate::Accion;
 use crate::tema::{self, Acento, ModoTema, Realce};
 use crate::view::PanelElement;
-use crate::Accion;
 
 use super::{Ancla, Tecla};
 
@@ -104,7 +104,8 @@ impl Apariencia {
         // apagado y las marcas entrando, como si nadie hubiera elegido nada.
         marca_tema.señalar(MODOS.iter().position(|m| *m == modo));
         marca_color.señalar(indice(acento));
-        let fondos = crate::fondos::instaladas(tema::es_claro());
+        let mut fondos = crate::fondos::instaladas(tema::es_claro());
+        ordenar_por_afinidad(&mut fondos, acento);
         // Cuál marcar. Se compara por **nombre de familia** y no por ruta: con
         // el tema oscuro puesto, el fichero cargado es el `_dark` de la pareja,
         // y comparar rutas no encontraría la miniatura de su propia familia.
@@ -360,6 +361,59 @@ impl Apariencia {
 
         super::control::tarjeta(contenido.into(), ANCHO, MARGEN)
     }
+}
+
+/// Pone delante el fondo que acompaña al acento elegido.
+///
+/// `fondos::instaladas` los devuelve por nombre —blue, ember, pine, purple— y
+/// alfabético no le dice nada al ojo: con el acento en verde, el fondo que le
+/// va queda el tercero de cuatro. Ordenando por cercanía de tono, la primera
+/// miniatura es siempre la pareja natural.
+///
+/// **Ordena, no elige.** El fondo se sigue cambiando a mano y elegir un acento
+/// no lo toca: son dos acciones distintas a propósito, y mover el fondo por
+/// detrás pisaría el que el usuario hubiera puesto. Esto solo pone el candidato
+/// donde se mira primero.
+///
+/// Grafito no tiene tono —es gris— y con él se deja el orden alfabético: no hay
+/// ningún fondo que le pegue más que otro. Lo mismo con las familias sin SVG,
+/// que van al final porque de ellas no se sabe el color sin decodificar el PNG.
+fn ordenar_por_afinidad(fondos: &mut [crate::fondos::Familia], acento: Acento) {
+    let Some(objetivo) = tono_de_acento(acento) else {
+        return;
+    };
+    fondos.sort_by(|a, b| {
+        let d = |f: &crate::fondos::Familia| {
+            crate::fondos::tono(f)
+                .map(|t| crate::fondos::distancia_de_tono(t, objetivo))
+                // Sin vectorial no se sabe el tono: detrás de cualquiera que sí.
+                .unwrap_or(f32::MAX)
+        };
+        d(a).total_cmp(&d(b)).then_with(|| a.nombre.cmp(&b.nombre))
+    });
+}
+
+/// El tono del acento, o `None` si es gris y no tiene.
+///
+/// El umbral es de croma y no de cero exacto: el Grafito oscuro es `#a1a1a6`,
+/// con cinco niveles de diferencia entre canales, y la cuenta le sacaría un
+/// 240° azul perfectamente formal que dejaría el fondo azul el primero por un
+/// gris. Por debajo de 0,08 no hay tono que signifique nada.
+fn tono_de_acento(acento: Acento) -> Option<f32> {
+    let c = acento.color();
+    let (max, min) = (c.r.max(c.g).max(c.b), c.r.min(c.g).min(c.b));
+    let croma = max - min;
+    if croma < 0.08 {
+        return None;
+    }
+    let h = if max == c.r {
+        60.0 * (((c.g - c.b) / croma) % 6.0)
+    } else if max == c.g {
+        60.0 * ((c.b - c.r) / croma + 2.0)
+    } else {
+        60.0 * ((c.r - c.g) / croma + 4.0)
+    };
+    Some((h + 360.0) % 360.0)
 }
 
 fn indice(acento: Acento) -> Option<usize> {
@@ -680,9 +734,45 @@ mod tests {
         assert_eq!(a.marca_color.actual(), Some(2));
     }
 
-    /// La fila de fondos reparte las familias instaladas y cada una responde
-    /// en su sitio. Sin fondos en la máquina no hay nada que comprobar y el
-    /// test se calla: no puede exigir que estén instalados.
+    /// El fondo que acompaña al acento sale el primero, y el gris no reordena.
+    ///
+    /// Se comprueba con los tonos, no con los nombres: si mañana entra un
+    /// fondo nuevo, el test sigue diciendo lo que importa —que el primero es
+    /// el más cercano— en vez de clavar una lista que habría que actualizar.
+    #[test]
+    fn el_fondo_afin_al_acento_sale_el_primero() {
+        let mut fondos = crate::fondos::instaladas(false);
+        if fondos.len() < 2 {
+            return;
+        }
+        for acento in [Acento::Verde, Acento::Rojo, Acento::Morado, Acento::Azul] {
+            let mut orden = fondos.clone();
+            ordenar_por_afinidad(&mut orden, acento);
+            let objetivo = tono_de_acento(acento).expect("estos cuatro tienen tono");
+            let d = |f: &crate::fondos::Familia| {
+                crate::fondos::tono(f).map(|t| crate::fondos::distancia_de_tono(t, objetivo))
+            };
+            let primera = d(&orden[0]).expect("los fondos de BookOS traen SVG");
+            for otra in &orden[1..] {
+                if let Some(x) = d(otra) {
+                    assert!(
+                        primera <= x,
+                        "con {acento:?} sale {} ({primera:.0}°) por delante de {} ({x:.0}°)",
+                        orden[0].nombre,
+                        otra.nombre
+                    );
+                }
+            }
+        }
+
+        // Grafito es gris: no hay fondo que le pegue más que otro, así que se
+        // queda el orden alfabético que trae `instaladas`.
+        let alfabetico: Vec<String> = fondos.iter().map(|f| f.nombre.clone()).collect();
+        ordenar_por_afinidad(&mut fondos, Acento::Grafito);
+        let despues: Vec<String> = fondos.iter().map(|f| f.nombre.clone()).collect();
+        assert_eq!(alfabetico, despues, "el gris no debería reordenar nada");
+    }
+
     #[test]
     fn la_fila_de_fondos_elige_familia() {
         let mut a = Apariencia::new(ModoTema::Oscuro);
@@ -712,7 +802,10 @@ mod tests {
             let calle = MARGEN + a.ancho_fondo() + FONDO_HUECO / 2.0;
             assert_eq!(a.fondo_en(calle, y), None);
         }
-        assert_eq!(a.fondo_en(MARGEN + 1.0, a.y_fondos() + FONDO_ALTO + 5.0), None);
+        assert_eq!(
+            a.fondo_en(MARGEN + 1.0, a.y_fondos() + FONDO_ALTO + 5.0),
+            None
+        );
         // Y la fila entra en la tarjeta: con el alto mal contado, la última
         // quedaría cortada por abajo.
         assert!(a.y_fondos() + FONDO_ALTO <= a.size().1 - MARGEN + 0.01);

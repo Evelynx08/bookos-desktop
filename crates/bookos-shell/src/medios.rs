@@ -33,16 +33,31 @@ pub struct Sonando {
 }
 
 impl Sonando {
-    /// Lo que sonaría en la tarjeta: el primer reproductor que hay en el bus.
-    ///
-    /// Si hay varios se coge el primero por orden alfabético en vez de intentar
-    /// adivinar cuál mira el usuario. Elegir «el que está sonando» exige mirar
-    /// el estado de todos, que son dos procesos más por reproductor.
+    /// Lo que debe salir en la tarjeta. Prefiere lo que esté reproduciendo y
+    /// descarta visores de imágenes que publican MPRIS para una presentación.
     pub fn leer() -> Option<Self> {
-        let bus = primer_reproductor()?;
-        let estado = propiedad(&bus, "PlaybackStatus")?;
-        let metadatos = propiedad(&bus, "Metadata").unwrap_or_default();
-        let titulo = campo(&metadatos, "xesam:title")?;
+        let mut pausado = None;
+        for bus in reproductores() {
+            let Some(estado) = propiedad(&bus, "PlaybackStatus") else {
+                continue;
+            };
+            let metadatos = propiedad(&bus, "Metadata").unwrap_or_default();
+            let Some(actual) = Self::desde_mpris(bus, &estado, &metadatos) else {
+                continue;
+            };
+            if actual.reproduciendo {
+                return Some(actual);
+            }
+            pausado.get_or_insert(actual);
+        }
+        pausado
+    }
+
+    fn desde_mpris(bus: String, estado: &str, metadatos: &str) -> Option<Self> {
+        if es_imagen(&bus, metadatos) {
+            return None;
+        }
+        let titulo = campo(metadatos, "xesam:title")?;
         Some(Self {
             aplicacion: bus
                 .rsplit('.')
@@ -56,7 +71,7 @@ impl Sonando {
                 .and_then(|s| numero(&s))
                 // Los micros del `Position` de MPRIS a segundos.
                 .map(|us| us / 1_000_000),
-            duracion: campo_numero(&metadatos, "mpris:length").map(|us| us / 1_000_000),
+            duracion: campo_numero(metadatos, "mpris:length").map(|us| us / 1_000_000),
             titulo,
             bus,
         })
@@ -127,12 +142,15 @@ pub fn reloj(segundos: u64) -> String {
     format!("{}:{:02}", segundos / 60, segundos % 60)
 }
 
-fn primer_reproductor() -> Option<String> {
+fn reproductores() -> Vec<String> {
     let salida = Command::new("busctl")
         .args(["--user", "list", "--no-legend"])
         .stderr(Stdio::null())
         .output()
-        .ok()?;
+        .ok();
+    let Some(salida) = salida else {
+        return Vec::new();
+    };
     let texto = String::from_utf8_lossy(&salida.stdout);
     let mut nombres: Vec<&str> = texto
         .lines()
@@ -140,7 +158,42 @@ fn primer_reproductor() -> Option<String> {
         .filter(|n| n.starts_with("org.mpris.MediaPlayer2."))
         .collect();
     nombres.sort();
-    nombres.first().map(|s| s.to_string())
+    nombres.into_iter().map(str::to_string).collect()
+}
+
+/// MPRIS también lo implementan algunos visores para avanzar diapositivas.
+/// Eso no convierte una foto en música: se reconoce por el reproductor o por
+/// la URL original, nunca por `mpris:artUrl` porque esa sí es una carátula.
+fn es_imagen(bus: &str, metadatos: &str) -> bool {
+    let bus = bus.to_ascii_lowercase();
+    let visor = [
+        "gwenview",
+        "loupe",
+        "eog",
+        "ristretto",
+        "nomacs",
+        "qimgv",
+        ".imv",
+        ".feh",
+    ]
+    .iter()
+    .any(|nombre| bus.contains(nombre));
+    if visor {
+        return true;
+    }
+    let Some(url) = campo(metadatos, "xesam:url") else {
+        return false;
+    };
+    let ruta = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(&url)
+        .to_ascii_lowercase();
+    [
+        "jpg", "jpeg", "png", "gif", "webp", "avif", "heic", "heif", "bmp", "tif", "tiff", "svg",
+    ]
+    .iter()
+    .any(|extension| ruta.ends_with(&format!(".{extension}")))
 }
 
 fn propiedad(bus: &str, nombre: &str) -> Option<String> {
@@ -232,5 +285,13 @@ mod tests {
         assert_eq!(reloj(43), "0:43");
         assert_eq!(reloj(300), "5:00");
         assert_eq!(reloj(3), "0:03");
+    }
+
+    #[test]
+    fn una_imagen_mpris_no_es_una_cancion() {
+        let imagen = r#"a{sv} 2 "xesam:title" s "Foto" "xesam:url" s "file:///tmp/foto.JPG""#;
+        assert!(es_imagen("org.mpris.MediaPlayer2.Gwenview", VOLCADO));
+        assert!(es_imagen("org.mpris.MediaPlayer2.otro", imagen));
+        assert!(!es_imagen("org.mpris.MediaPlayer2.vlc", VOLCADO));
     }
 }

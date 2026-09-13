@@ -29,21 +29,21 @@ use smithay::backend::drm::output::{DrmOutput, DrmOutputManager, DrmOutputRender
 use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode};
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
-use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::element::default_primary_scanout_output_compare;
+use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
+use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
-use smithay::backend::udev::{all_gpus, primary_gpu, UdevBackend, UdevEvent};
+use smithay::backend::udev::{UdevBackend, UdevEvent, all_gpus, primary_gpu};
 use smithay::desktop::utils::{
-    surface_presentation_feedback_flags_from_states, surface_primary_scanout_output,
-    update_surface_primary_scanout_output, OutputPresentationFeedback,
+    OutputPresentationFeedback, surface_presentation_feedback_flags_from_states,
+    surface_primary_scanout_output, update_surface_primary_scanout_output,
 };
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel};
-use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::EventLoop;
-use smithay::reexports::drm::control::{connector, crtc, Device as _, ModeTypeFlags};
+use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::drm::control::property::Value as PropValue;
+use smithay::reexports::drm::control::{Device as _, ModeTypeFlags, connector, crtc};
 use smithay::reexports::input::{AccelProfile, ClickMethod, Device as InputDevice, Libinput};
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::{DeviceFd, Physical, Point};
@@ -129,7 +129,9 @@ pub fn run(
 
     let fd = session
         .open(
-            gpu.dev_path().as_deref().unwrap_or(std::path::Path::new("")),
+            gpu.dev_path()
+                .as_deref()
+                .unwrap_or(std::path::Path::new("")),
             OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK,
         )
         .map_err(|err| anyhow::anyhow!("no se pudo abrir la GPU: {err}"))?;
@@ -176,11 +178,15 @@ pub fn run(
 
     let salidas = crear_salidas(&mut manager, &mut renderer, state)?;
     let guardadas = pantallas::cargar();
-    let principal = guardadas.iter().find(|p| p.activa && p.principal)
-        .and_then(|p| salidas.iter().find(|s| s.id == p.id))
-        .or_else(|| salidas
+    let principal = guardadas
         .iter()
-        .find(|s| s.output.current_location() == (0, 0).into()))
+        .find(|p| p.activa && p.principal)
+        .and_then(|p| salidas.iter().find(|s| s.id == p.id))
+        .or_else(|| {
+            salidas
+                .iter()
+                .find(|s| s.output.current_location() == (0, 0).into())
+        })
         .unwrap_or(&salidas[0]);
     let principal_id = principal.id.clone();
 
@@ -190,7 +196,11 @@ pub fn run(
     // cuando la pantalla cambia de tamaño, y si no, volvería a la de la
     // configuración vieja.
     state.escala_forzada = Some(escala);
-    let modo = principal.output.current_mode().map(|m| m.size).unwrap_or_default();
+    let modo = principal
+        .output
+        .current_mode()
+        .map(|m| m.size)
+        .unwrap_or_default();
     state.shell = Some(crate::shell::ShellHost::new(
         modo.w.max(1) as u32,
         modo.h.max(1) as u32,
@@ -200,15 +210,20 @@ pub fn run(
     if let Some(shell) = state.shell.as_mut() {
         shell.refresh();
     }
+    state.last_input = Some(std::time::Instant::now());
     // El indicador de escritorios no puede saber cuántos hay: se lo decimos
     // antes del primer frame, para que salga pintado con el resto del panel y
     // no aparezca un instante después.
     crate::escritorios::avisar_al_panel(state);
-    let escala_cursor = salidas.iter()
+    let escala_cursor = salidas
+        .iter()
         .map(|s| s.output.current_scale().fractional_scale())
-        .max_by(f64::total_cmp).unwrap_or(escala);
+        .max_by(f64::total_cmp)
+        .unwrap_or(escala);
     state.cursor_theme = Some(crate::cursor::CursorTheme::con_tamano(
-        escala_cursor, state.cursor_nominal));
+        escala_cursor,
+        state.cursor_nominal,
+    ));
     state.cristal = crate::desenfoque::Cristal::new(&mut renderer);
     state.genio = crate::genio::Genio::new(&mut renderer);
     state.fondo = crate::fondo::Fondo::cargar(&state.fondo_config);
@@ -233,11 +248,45 @@ pub fn run(
         activa: true,
     }));
 
+    // `DrmCompositor::clear` quita el framebuffer del conector y equivale a
+    // DPMS off. El siguiente `queue_frame`, tras resetear los buffers, vuelve
+    // a encenderlo. La operación queda en el hilo del compositor: nunca se
+    // toca KMS desde el temporizador ni desde D-Bus.
+    {
+        let udev = udev.clone();
+        state.aplicar_dpms = Some(Box::new(move |encendido| {
+            let mut u = udev
+                .try_borrow_mut()
+                .map_err(|_| "el backend está ocupado dibujando".to_string())?;
+            for salida in &mut u.salidas {
+                let nombre = salida.output.name();
+                if encendido {
+                    salida.surface.reset_buffers();
+                    salida.en_vuelo = false;
+                    salida.pendiente = true;
+                } else {
+                    salida
+                        .surface
+                        .with_compositor(|compositor| compositor.clear())
+                        .map_err(|err| format!("no se pudo apagar {nombre}: {err}"))?;
+                    salida.en_vuelo = false;
+                    salida.pendiente = false;
+                }
+            }
+            Ok(())
+        }));
+    }
+
     // --- Pantallas ---------------------------------------------------------
     // Los dos cierres que van del hilo del compositor a KMS. Nadie más toca el
     // backend: D-Bus solo empuja peticiones por el canal de calloop, y estas se
     // ejecutan aquí, entre fotogramas.
-    *state.pantallas.compartido.backend.lock().unwrap_or_else(|e| e.into_inner()) = "udev";
+    *state
+        .pantallas
+        .compartido
+        .backend
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = "udev";
     {
         let udev = udev.clone();
         state.censar_pantallas = Some(Box::new(move || match udev.try_borrow() {
@@ -266,11 +315,13 @@ pub fn run(
     // cosa de quien configure.
     match UdevBackend::new(session.seat()) {
         Ok(backend) => {
-            let r = event_loop.handle().insert_source(backend, |evento, _, state| {
-                if let UdevEvent::Changed { .. } = evento {
-                    crate::ajustes::recibir(state, crate::ajustes::Aviso::Redetectar);
-                }
-            });
+            let r = event_loop
+                .handle()
+                .insert_source(backend, |evento, _, state| {
+                    if let UdevEvent::Changed { .. } = evento {
+                        crate::ajustes::recibir(state, crate::ajustes::Aviso::Redetectar);
+                    }
+                });
             if let Err(err) = r {
                 tracing::warn!("sin aviso de conexión de monitores: {err}");
             }
@@ -302,20 +353,23 @@ pub fn run(
         .map_err(|_| anyhow::anyhow!("no se pudo asignar el asiento a libinput"))?;
     event_loop
         .handle()
-        .insert_source(LibinputInputBackend::new(libinput.clone()), move |event, _, state| {
-            // Los ajustes se aplican aquí y no en `input::handle` porque ese
-            // está escrito contra `InputBackend` genérico y no puede tocar la
-            // API de libinput. Llega uno por dispositivo al arrancar y otra
-            // tanda tras cada cambio de TTY, cuando libseat los devuelve.
-            if let smithay::backend::input::InputEvent::DeviceAdded { device } = &event {
-                let mut device = device.clone();
-                configurar_dispositivo(&mut device, &state.entrada, state.touchpad_activo);
-                if device.config_tap_finger_count() > 0 {
-                    touchpads.borrow_mut().push(device);
+        .insert_source(
+            LibinputInputBackend::new(libinput.clone()),
+            move |event, _, state| {
+                // Los ajustes se aplican aquí y no en `input::handle` porque ese
+                // está escrito contra `InputBackend` genérico y no puede tocar la
+                // API de libinput. Llega uno por dispositivo al arrancar y otra
+                // tanda tras cada cambio de TTY, cuando libseat los devuelve.
+                if let smithay::backend::input::InputEvent::DeviceAdded { device } = &event {
+                    let mut device = device.clone();
+                    configurar_dispositivo(&mut device, &state.entrada, state.touchpad_activo);
+                    if device.config_tap_finger_count() > 0 {
+                        touchpads.borrow_mut().push(device);
+                    }
                 }
-            }
-            crate::input::handle(state, event);
-        })
+                crate::input::handle(state, event);
+            },
+        )
         .map_err(|err| anyhow::anyhow!("insert_source(libinput): {err}"))?;
 
     // --- Vblank ------------------------------------------------------------
@@ -401,10 +455,18 @@ pub fn run(
                         libinput.suspend();
                         u.manager.pause();
                         u.activa = false;
-                        for salida in &mut u.salidas { salida.en_vuelo = false; }
+                        for salida in &mut u.salidas {
+                            salida.en_vuelo = false;
+                        }
                     }
                     SessionEvent::ActivateSession => {
                         tracing::info!("sesión reactivada");
+                        // La barrera se instala antes de reactivar KMS: el
+                        // primer fotograma visible tras volver del TTY ya es
+                        // la pantalla de bloqueo, nunca el escritorio previo.
+                        if state.shell.as_ref().is_some_and(|s| !s.esta_bloqueado()) {
+                            crate::keybinds::ejecutar(state, crate::keybinds::Accion::Bloquear);
+                        }
                         if libinput.resume().is_err() {
                             tracing::error!("libinput no pudo reanudar");
                         }
@@ -415,7 +477,10 @@ pub fn run(
                         if let Err(err) = u.manager.activate(false) {
                             tracing::warn!("activate: {err}");
                         }
-                        for salida in &u.salidas { salida.surface.reset_buffers(); }
+                        for salida in &u.salidas {
+                            salida.surface.reset_buffers();
+                        }
+                        state.dpms_encendido = true;
                         state.needs_redraw = true;
                         dibujar_todas(state, &mut u);
                     }
@@ -425,6 +490,7 @@ pub fn run(
     }
 
     crate::backend::schedule_panel_tick(state);
+    crate::backend::programar_bloqueo_inactividad(state);
     // El despertar del tema automático, si está puesto. Con un modo fijo no
     // deja ningún temporizador. Ver `crate::apariencia`.
     crate::apariencia::programar_cambio(state);
@@ -463,10 +529,9 @@ pub fn run(
                 // fuerza otra vuelta.
                 Err(err) => {
                     tracing::warn!("el backend estaba prestado al ir a dibujar: {err}");
-                    let r = state.loop_handle.insert_source(
-                        Timer::immediate(),
-                        |_, _, _| TimeoutAction::Drop,
-                    );
+                    let r = state
+                        .loop_handle
+                        .insert_source(Timer::immediate(), |_, _, _| TimeoutAction::Drop);
                     if let Err(err) = r {
                         tracing::error!("no se pudo reintentar el dibujo: {err}");
                     }
@@ -501,71 +566,125 @@ fn crear_salidas(
 ) -> anyhow::Result<Vec<SalidaKms>> {
     let recursos = manager.device().resource_handles()?;
     let guardadas = pantallas::cargar();
-    let activos = recursos.connectors().iter().filter_map(|handle| {
-        let con = manager.device().get_connector(*handle, true).ok()?;
-        if con.state() != connector::State::Connected { return None; }
-        let id = identificador(manager.device(), &con);
-        (!guardadas.iter().any(|g| g.id == id && !g.activa)).then_some(*handle)
-    }).collect::<Vec<_>>();
-    let opciones = activos.iter().map(|handle| {
-        manager.device().get_connector(*handle, true).ok()
-            .map(|con| crtcs_compatibles(manager, &recursos, &con))
-            .unwrap_or_default()
-    }).collect::<Vec<_>>();
-    let asignados = asignar_crtcs(&opciones)
-        .ok_or_else(|| anyhow::anyhow!("no existe una asignación de CRTC para las pantallas activas"))?;
+    let activos = recursos
+        .connectors()
+        .iter()
+        .filter_map(|handle| {
+            let con = manager.device().get_connector(*handle, true).ok()?;
+            if con.state() != connector::State::Connected {
+                return None;
+            }
+            let id = identificador(manager.device(), &con);
+            (!guardadas.iter().any(|g| g.id == id && !g.activa)).then_some(*handle)
+        })
+        .collect::<Vec<_>>();
+    let opciones = activos
+        .iter()
+        .map(|handle| {
+            manager
+                .device()
+                .get_connector(*handle, true)
+                .ok()
+                .map(|con| crtcs_compatibles(manager, &recursos, &con))
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    let asignados = asignar_crtcs(&opciones).ok_or_else(|| {
+        anyhow::anyhow!("no existe una asignación de CRTC para las pantallas activas")
+    })?;
     let mut salidas = Vec::new();
     let mut siguiente_x = 0;
 
     for handle in recursos.connectors() {
-        let Ok(conector) = manager.device().get_connector(*handle, true) else { continue };
-        if conector.state() != connector::State::Connected { continue; }
+        let Ok(conector) = manager.device().get_connector(*handle, true) else {
+            continue;
+        };
+        if conector.state() != connector::State::Connected {
+            continue;
+        }
         let id = identificador(manager.device(), &conector);
         let guardada = guardadas.iter().find(|g| g.id == id).cloned();
-        if guardada.as_ref().is_some_and(|g| !g.activa) { continue; }
-        let Some(indice) = activos.iter().position(|h| *h == conector.handle()) else { continue };
+        if guardada.as_ref().is_some_and(|g| !g.activa) {
+            continue;
+        }
+        let Some(indice) = activos.iter().position(|h| *h == conector.handle()) else {
+            continue;
+        };
         let crtc = asignados[indice];
-        let modo = guardada.as_ref().and_then(|g| {
-            conector.modes().iter().find(|m| {
-                let (w, h) = m.size();
-                w as u32 == g.ancho && h as u32 == g.alto
-                    && m.vrefresh() * 1000 == g.refresco_mhz
+        let modo = guardada
+            .as_ref()
+            .and_then(|g| {
+                conector.modes().iter().find(|m| {
+                    let (w, h) = m.size();
+                    w as u32 == g.ancho
+                        && h as u32 == g.alto
+                        && m.vrefresh() * 1000 == g.refresco_mhz
+                })
             })
-        }).or_else(|| conector.modes().iter().find(|m| {
-            m.mode_type().contains(ModeTypeFlags::PREFERRED)
-        })).or_else(|| conector.modes().first()).copied();
+            .or_else(|| {
+                conector
+                    .modes()
+                    .iter()
+                    .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
+            })
+            .or_else(|| conector.modes().first())
+            .copied();
         let Some(modo) = modo else { continue };
 
         let nombre = format!("{:?}-{}", conector.interface(), conector.interface_id());
         let (mm_w, mm_h) = conector.size().unwrap_or((0, 0));
         let (w, h) = modo.size();
         let (fabricante, modelo_edid, _) = datos_edid(manager.device(), &conector);
-        let escala = guardada.as_ref().map(|g| g.escala)
+        let escala = guardada
+            .as_ref()
+            .map(|g| g.escala)
             .or_else(|| state.config.as_ref().and_then(|c| c.escala))
-            .unwrap_or_else(|| super::escala_sugerida(
-                (w as i32, h as i32), (mm_w as i32, mm_h as i32)));
-        let transformacion = guardada.as_ref()
+            .unwrap_or_else(|| {
+                super::escala_sugerida((w as i32, h as i32), (mm_w as i32, mm_h as i32))
+            });
+        let transformacion = guardada
+            .as_ref()
             .and_then(|g| pantallas::transformacion(&g.transformacion))
             .unwrap_or(smithay::utils::Transform::Normal);
-        let posicion = guardada.as_ref().map_or((siguiente_x, 0).into(), |g| (g.x, g.y).into());
-        let output = Output::new(nombre.clone(), PhysicalProperties {
-            size: (mm_w as i32, mm_h as i32).into(),
-            subpixel: Subpixel::Unknown,
-            make: if fabricante.is_empty() { "BookOS".into() } else { fabricante },
-            model: if modelo_edid.is_empty() { "KMS".into() } else { modelo_edid },
-        });
+        let posicion = guardada
+            .as_ref()
+            .map_or((siguiente_x, 0).into(), |g| (g.x, g.y).into());
+        let output = Output::new(
+            nombre.clone(),
+            PhysicalProperties {
+                size: (mm_w as i32, mm_h as i32).into(),
+                subpixel: Subpixel::Unknown,
+                make: if fabricante.is_empty() {
+                    "BookOS".into()
+                } else {
+                    fabricante
+                },
+                model: if modelo_edid.is_empty() {
+                    "KMS".into()
+                } else {
+                    modelo_edid
+                },
+            },
+        );
         let output_mode = OutputMode {
             size: (w as i32, h as i32).into(),
             refresh: (modo.vrefresh() * 1000) as i32,
         };
         output.create_global::<BookosComp>(&state.display_handle);
         output.change_current_state(
-            Some(output_mode), Some(transformacion),
-            Some(Scale::Fractional(escala)), Some(posicion),
+            Some(output_mode),
+            Some(transformacion),
+            Some(Scale::Fractional(escala)),
+            Some(posicion),
         );
         output.set_preferred(output_mode);
         let surface = match manager.initialize_output(
-            crtc, modo, &[conector.handle()], &output, None, renderer,
+            crtc,
+            modo,
+            &[conector.handle()],
+            &output,
+            None,
+            renderer,
             &DrmOutputRenderElements::<GlesRenderer, OverlayElement>::default(),
         ) {
             Ok(surface) => surface,
@@ -579,20 +698,30 @@ fn crear_salidas(
                 tracing::warn!(pantalla = %nombre, "no se pudo activar VRR: {err}");
             }
         }
-        let (lw, _) = pantallas::tamano_logico(w as u32, h as u32, escala,
-            pantallas::nombre_transformacion(transformacion));
+        let (lw, _) = pantallas::tamano_logico(
+            w as u32,
+            h as u32,
+            escala,
+            pantallas::nombre_transformacion(transformacion),
+        );
         siguiente_x = posicion.x + lw;
         tracing::info!(pantalla = %nombre, %id, crtc = ?crtc,
             modo = %format!("{}x{}@{}", w, h, modo.vrefresh()),
             escala, x = posicion.x, y = posicion.y, "salida multipantalla activa");
         salidas.push(SalidaKms {
-            output, surface, conector: conector.handle(), id,
-            en_vuelo: false, pendiente: true,
+            output,
+            surface,
+            conector: conector.handle(),
+            id,
+            en_vuelo: false,
+            pendiente: true,
         });
     }
 
     if salidas.is_empty() {
-        return Err(anyhow::anyhow!("no hay ninguna pantalla conectada utilizable"));
+        return Err(anyhow::anyhow!(
+            "no hay ninguna pantalla conectada utilizable"
+        ));
     }
     Ok(salidas)
 }
@@ -714,7 +843,13 @@ fn identificador(device: &DrmDevice, con: &connector::Info) -> String {
     };
     bruto
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -725,7 +860,10 @@ fn identificador(device: &DrmDevice, con: &connector::Info) -> String {
 /// mHz. Es la misma cuenta que ya hacía el `OutputMode` de esta salida, y
 /// mantenerla igual es lo que permite emparejar por número lo que pide Settings
 /// con lo que tiene el conector.
-fn modos_de(con: &connector::Info, actual: Option<&smithay::reexports::drm::control::Mode>) -> Vec<Modo> {
+fn modos_de(
+    con: &connector::Info,
+    actual: Option<&smithay::reexports::drm::control::Mode>,
+) -> Vec<Modo> {
     con.modes()
         .iter()
         .map(|m| {
@@ -735,7 +873,8 @@ fn modos_de(con: &connector::Info, actual: Option<&smithay::reexports::drm::cont
                 alto: h as u32,
                 refresco_mhz: m.vrefresh() * 1000,
                 preferido: m.mode_type().contains(ModeTypeFlags::PREFERRED),
-                actual: actual.is_some_and(|a| a.size() == m.size() && a.vrefresh() == m.vrefresh()),
+                actual: actual
+                    .is_some_and(|a| a.size() == m.size() && a.vrefresh() == m.vrefresh()),
             }
         })
         .collect()
@@ -782,7 +921,9 @@ fn censar(u: &Udev) -> Vec<Salida> {
             let transformacion = activa.map_or("normal", |s| {
                 pantallas::nombre_transformacion(s.output.current_transform())
             });
-            let posicion = activa.map(|s| s.output.current_location()).unwrap_or_default();
+            let posicion = activa
+                .map(|s| s.output.current_location())
+                .unwrap_or_default();
             let vrr = activa.is_some_and(|s| s.surface.with_compositor(|c| c.vrr_enabled()));
             let (logico_ancho, logico_alto) =
                 pantallas::tamano_logico(ancho, alto, escala, transformacion);
@@ -816,91 +957,150 @@ fn censar(u: &Udev) -> Vec<Salida> {
 /// Devuelve el censo releído, no lo que se pidió: si el driver acabó en otro
 /// sitio, lo que gana es lo que hay.
 fn aplicar_en_kms(u: &mut Udev, peticion: &[Peticion]) -> Result<Aplicado, String> {
-    let recursos = u.manager.device().resource_handles()
+    let recursos = u
+        .manager
+        .device()
+        .resource_handles()
         .map_err(|err| format!("no se pudieron enumerar los recursos DRM: {err}"))?;
     // Preflight completo antes de soltar una salida viva. Los modos y la
     // asignación de CRTC se comprueban primero para que una petición inválida
     // no deje la sesión negra a mitad de la reconstrucción.
     let mut opciones_crtc = Vec::new();
     for pedido in peticion.iter().filter(|p| p.activa) {
-        let conector = recursos.connectors().iter()
+        let conector = recursos
+            .connectors()
+            .iter()
             .filter_map(|h| u.manager.device().get_connector(*h, true).ok())
-            .find(|c| c.state() == connector::State::Connected
-                && identificador(u.manager.device(), c) == pedido.id)
+            .find(|c| {
+                c.state() == connector::State::Connected
+                    && identificador(u.manager.device(), c) == pedido.id
+            })
             .ok_or_else(|| format!("la pantalla «{}» ya no está conectada", pedido.id))?;
         if !conector.modes().iter().any(|m| {
             let (w, h) = m.size();
-            w as u32 == pedido.ancho && h as u32 == pedido.alto
+            w as u32 == pedido.ancho
+                && h as u32 == pedido.alto
                 && m.vrefresh() * 1000 == pedido.refresco_mhz
         }) {
-            return Err(format!("«{}» no tiene el modo {}x{}@{}",
-                pedido.id, pedido.ancho, pedido.alto, pedido.refresco_mhz));
+            return Err(format!(
+                "«{}» no tiene el modo {}x{}@{}",
+                pedido.id, pedido.ancho, pedido.alto, pedido.refresco_mhz
+            ));
         }
         opciones_crtc.push(crtcs_compatibles(&u.manager, &recursos, &conector));
     }
-    let asignados = asignar_crtcs(&opciones_crtc)
-        .ok_or_else(|| "no existe una asignación de CRTC compatible para esta combinación".to_string())?;
+    let asignados = asignar_crtcs(&opciones_crtc).ok_or_else(|| {
+        "no existe una asignación de CRTC compatible para esta combinación".to_string()
+    })?;
 
     // Se reconstruyen únicamente las superficies KMS, no el compositor ni la
     // sesión. Soltar `DrmOutput` libera su CRTC y permite encender/apagar o
     // cambiar el cable en caliente sin reiniciar BookOS.
     u.salidas.clear();
     for (pedido, crtc) in peticion.iter().filter(|p| p.activa).zip(asignados) {
-        let conector = recursos.connectors().iter()
+        let conector = recursos
+            .connectors()
+            .iter()
             .filter_map(|h| u.manager.device().get_connector(*h, true).ok())
-            .find(|c| c.state() == connector::State::Connected
-                && identificador(u.manager.device(), c) == pedido.id)
+            .find(|c| {
+                c.state() == connector::State::Connected
+                    && identificador(u.manager.device(), c) == pedido.id
+            })
             .ok_or_else(|| format!("la pantalla «{}» ya no está conectada", pedido.id))?;
-        let modo = conector.modes().iter().find(|m| {
-            let (w, h) = m.size();
-            w as u32 == pedido.ancho && h as u32 == pedido.alto
-                && m.vrefresh() * 1000 == pedido.refresco_mhz
-        }).copied().ok_or_else(|| format!(
-            "«{}» no tiene el modo {}x{}@{}",
-            pedido.id, pedido.ancho, pedido.alto, pedido.refresco_mhz))?;
+        let modo = conector
+            .modes()
+            .iter()
+            .find(|m| {
+                let (w, h) = m.size();
+                w as u32 == pedido.ancho
+                    && h as u32 == pedido.alto
+                    && m.vrefresh() * 1000 == pedido.refresco_mhz
+            })
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "«{}» no tiene el modo {}x{}@{}",
+                    pedido.id, pedido.ancho, pedido.alto, pedido.refresco_mhz
+                )
+            })?;
         let transformacion = pantallas::transformacion(&pedido.transformacion)
             .ok_or_else(|| format!("rotación «{}» desconocida", pedido.transformacion))?;
         let nombre = format!("{:?}-{}", conector.interface(), conector.interface_id());
         let (mm_w, mm_h) = conector.size().unwrap_or((0, 0));
         let (fabricante, modelo, _) = datos_edid(u.manager.device(), &conector);
-        let output = Output::new(nombre, PhysicalProperties {
-            size: (mm_w as i32, mm_h as i32).into(),
-            subpixel: Subpixel::Unknown,
-            make: if fabricante.is_empty() { "BookOS".into() } else { fabricante },
-            model: if modelo.is_empty() { "KMS".into() } else { modelo },
-        });
+        let output = Output::new(
+            nombre,
+            PhysicalProperties {
+                size: (mm_w as i32, mm_h as i32).into(),
+                subpixel: Subpixel::Unknown,
+                make: if fabricante.is_empty() {
+                    "BookOS".into()
+                } else {
+                    fabricante
+                },
+                model: if modelo.is_empty() {
+                    "KMS".into()
+                } else {
+                    modelo
+                },
+            },
+        );
         let output_mode = OutputMode {
             size: (pedido.ancho as i32, pedido.alto as i32).into(),
             refresh: pedido.refresco_mhz as i32,
         };
         output.create_global::<BookosComp>(&u.display_handle);
         output.change_current_state(
-            Some(output_mode), Some(transformacion),
-            Some(Scale::Fractional(pedido.escala)), Some((pedido.x, pedido.y).into()),
+            Some(output_mode),
+            Some(transformacion),
+            Some(Scale::Fractional(pedido.escala)),
+            Some((pedido.x, pedido.y).into()),
         );
         output.set_preferred(output_mode);
-        let surface = u.manager.initialize_output(
-            crtc, modo, &[conector.handle()], &output, None, &mut u.renderer,
-            &DrmOutputRenderElements::<GlesRenderer, OverlayElement>::default(),
-        ).map_err(|err| format!("KMS rechazó «{}»: {err}", pedido.id))?;
+        let surface = u
+            .manager
+            .initialize_output(
+                crtc,
+                modo,
+                &[conector.handle()],
+                &output,
+                None,
+                &mut u.renderer,
+                &DrmOutputRenderElements::<GlesRenderer, OverlayElement>::default(),
+            )
+            .map_err(|err| format!("KMS rechazó «{}»: {err}", pedido.id))?;
         if pedido.vrr {
-            surface.with_compositor(|c| c.use_vrr(true))
+            surface
+                .with_compositor(|c| c.use_vrr(true))
                 .map_err(|err| format!("no se pudo activar VRR en «{}»: {err}", pedido.id))?;
         }
         u.salidas.push(SalidaKms {
-            output, surface, conector: conector.handle(), id: pedido.id.clone(),
-            en_vuelo: false, pendiente: true,
+            output,
+            surface,
+            conector: conector.handle(),
+            id: pedido.id.clone(),
+            en_vuelo: false,
+            pendiente: true,
         });
     }
 
-    let principal = peticion.iter().find(|p| p.activa && p.principal)
-        .and_then(|p| u.salidas.iter().position(|s| s.id == p.id)).unwrap_or(0);
+    let principal = peticion
+        .iter()
+        .find(|p| p.activa && p.principal)
+        .and_then(|p| u.salidas.iter().position(|s| s.id == p.id))
+        .unwrap_or(0);
     u.principal_id = u.salidas[principal].id.clone();
     let salidas = censar(u);
-    let mapa = u.salidas.iter().map(|s| {
-        (s.output.clone(), s.output.current_location())
-    }).collect::<Vec<_>>();
-    Ok(Aplicado { salidas, mapa, principal })
+    let mapa = u
+        .salidas
+        .iter()
+        .map(|s| (s.output.clone(), s.output.current_location()))
+        .collect::<Vec<_>>();
+    Ok(Aplicado {
+        salidas,
+        mapa,
+        principal,
+    })
 }
 
 fn crtcs_compatibles(
@@ -913,7 +1113,9 @@ fn crtcs_compatibles(
         .filter_map(|enc| manager.device().get_encoder(*enc).ok())
         .flat_map(|enc| recursos.filter_crtcs(enc.possible_crtcs()))
         .fold(Vec::new(), |mut lista, crtc| {
-            if !lista.contains(&crtc) { lista.push(crtc); }
+            if !lista.contains(&crtc) {
+                lista.push(crtc);
+            }
             lista
         })
 }
@@ -928,12 +1130,18 @@ fn asignar_crtcs(opciones: &[Vec<crtc::Handle>]) -> Option<Vec<crtc::Handle>> {
         usados: &mut Vec<crtc::Handle>,
         resultado: &mut Vec<crtc::Handle>,
     ) -> bool {
-        if i == opciones.len() { return true; }
+        if i == opciones.len() {
+            return true;
+        }
         for crtc in opciones[i].iter().copied() {
-            if usados.contains(&crtc) { continue; }
+            if usados.contains(&crtc) {
+                continue;
+            }
             usados.push(crtc);
             resultado.push(crtc);
-            if buscar(i + 1, opciones, usados, resultado) { return true; }
+            if buscar(i + 1, opciones, usados, resultado) {
+                return true;
+            }
             resultado.pop();
             usados.pop();
         }
@@ -948,17 +1156,23 @@ fn asignar_crtcs(opciones: &[Vec<crtc::Handle>]) -> Option<Vec<crtc::Handle>> {
 /// pantalla a 144 Hz no espera a otra de 60 Hz y cada swapchain conserva su
 /// propio daño.
 fn dibujar_todas(state: &mut BookosComp, u: &mut Udev) {
-    if !u.activa { return; }
+    if !u.activa {
+        return;
+    }
     // Antes de mirar nada: lo que se mueve solo avanza **una vez** por vuelta,
     // no una por salida. Ver `backend::avanzar_animaciones`.
     crate::backend::avanzar_animaciones(state);
     let animando = state.hay_animacion();
-    let Udev { renderer, salidas, .. } = u;
+    let Udev {
+        renderer, salidas, ..
+    } = u;
     // Antes de componer nada: si el tema cambió, el fondo y el cristal tienen
     // que ser ya los nuevos en este mismo fotograma.
     crate::backend::recargar_fondo(state, renderer);
     if state.needs_redraw || animando {
-        for salida in salidas.iter_mut() { salida.pendiente = true; }
+        for salida in salidas.iter_mut() {
+            salida.pendiente = true;
+        }
     }
     for salida in salidas {
         dibujar_salida(state, renderer, salida, animando);
@@ -1013,15 +1227,24 @@ fn dibujar_salida(
 
     let cronometro = std::time::Instant::now();
     let elementos = crate::backend::escena(state, renderer, &salida.output);
-    let origen: Point<i32, Physical> = salida.output.current_location().to_f64()
+    let origen: Point<i32, Physical> = salida
+        .output
+        .current_location()
+        .to_f64()
         .to_physical_precise_round(escala);
     // `escena` trabaja en el escritorio lógico global. KMS espera coordenadas
     // físicas locales al CRTC; trasladar al final conserva ventanas que cruzan
     // dos salidas incluso cuando cada una usa una escala distinta.
-    let elementos = elementos.into_iter().map(|elemento| {
-        RelocateRenderElement::from_element(
-            elemento, (-origen.x, -origen.y), Relocate::Relative)
-    }).collect::<Vec<_>>();
+    let elementos = elementos
+        .into_iter()
+        .map(|elemento| {
+            RelocateRenderElement::from_element(
+                elemento,
+                (-origen.x, -origen.y),
+                Relocate::Relative,
+            )
+        })
+        .collect::<Vec<_>>();
 
     let t_escena = cronometro.elapsed();
     let cronometro = std::time::Instant::now();
@@ -1074,15 +1297,19 @@ fn dibujar_salida(
     for window in state.space.elements() {
         window.with_surfaces(|surface, data| {
             update_surface_primary_scanout_output(
-                surface, &salida.output, data, &resultado.states,
+                surface,
+                &salida.output,
+                data,
+                &resultado.states,
                 default_primary_scanout_output_compare,
             );
         });
         window.take_presentation_feedback(
             &mut feedback,
             surface_primary_scanout_output,
-            |surface, _| surface_presentation_feedback_flags_from_states(
-                surface, &resultado.states),
+            |surface, _| {
+                surface_presentation_feedback_flags_from_states(surface, &resultado.states)
+            },
         );
     }
 
@@ -1096,7 +1323,9 @@ fn dibujar_salida(
     // El coste se apunta con el encolado dentro: `queue_frame` es donde se
     // paga el atómico de KMS, y dejarlo fuera escondería justo la parte que se
     // come el plazo cuando el driver va apretado.
-    state.metricas.dibujado(&nombre, t_escena, cronometro.elapsed());
+    state
+        .metricas
+        .dibujado(&nombre, t_escena, cronometro.elapsed());
     // Los frame callbacks salen después de encolar: es la señal de "puedes
     // dibujar el siguiente".
     enviar_frames(state, &salida.output, periodo);
@@ -1115,7 +1344,7 @@ fn dibujar_salida(
 fn trasladar_a_monotonico(
     t: std::time::SystemTime,
 ) -> smithay::utils::Time<smithay::utils::Monotonic> {
-    use smithay::reexports::rustix::time::{clock_gettime, ClockId};
+    use smithay::reexports::rustix::time::{ClockId, clock_gettime};
     let ts = clock_gettime(ClockId::Monotonic);
     let mono = Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32);
     // Cuánto hace del flip. `unwrap_or_default` cubre la marca posterior a
@@ -1144,8 +1373,14 @@ fn trasladar_a_monotonico(
 fn enviar_frames(state: &mut BookosComp, output: &Output, periodo: Duration) {
     let tiempo = state.start_time.elapsed();
     for window in state.space.elements() {
-        window.send_frame(output, tiempo, Some(periodo), surface_primary_scanout_output);
+        window.send_frame(
+            output,
+            tiempo,
+            Some(periodo),
+            surface_primary_scanout_output,
+        );
     }
+    crate::backend::enviar_frames_capas(output, tiempo, periodo);
     if state
         .shell
         .as_ref()
@@ -1161,7 +1396,12 @@ fn enviar_frames(state: &mut BookosComp, output: &Output, periodo: Duration) {
                 continue;
             }
             for (window, _) in ventanas {
-                window.send_frame(output, tiempo, Some(periodo), surface_primary_scanout_output);
+                window.send_frame(
+                    output,
+                    tiempo,
+                    Some(periodo),
+                    surface_primary_scanout_output,
+                );
             }
         }
     }

@@ -111,6 +111,68 @@ pub fn instaladas(claro: bool) -> Vec<Familia> {
     familias
 }
 
+/// El tono dominante de una familia, en grados del círculo cromático.
+///
+/// Sale del **SVG**, no de la imagen: decodificar los PNG de 2880×1800 para
+/// esto costaría medio segundo al abrir la tarjeta, y hay un test que lo
+/// prohíbe (`abrir_apariencia_no_decodifica_los_fondos`). Del vectorial basta
+/// con leer la cabecera y quedarse con el color más vivo que declare.
+///
+/// «Más vivo» es saturación por cercanía al gris medio: sin el segundo factor
+/// gana un `#031E10` casi negro, que en tono es verde pero no es el color con
+/// el que nadie reconoce el fondo. Medido contra los cuatro que trae BookOS:
+/// blue 210°, ember 14°, pine 126°, purple 276°, que es lo que se ve.
+///
+/// `None` si la familia no trae vectorial o no declara ningún color.
+pub fn tono(familia: &Familia) -> Option<f32> {
+    // 4 KiB llegan de sobra: en los cuatro fondos de BookOS los colores están
+    // en las primeras doce declaraciones y el resto del fichero son curvas.
+    let vista = familia.vista.as_ref()?;
+    use std::io::Read as _;
+    let fichero = std::fs::File::open(vista).ok()?;
+    let mut cabecera = Vec::new();
+    fichero.take(4096).read_to_end(&mut cabecera).ok()?;
+    let texto = String::from_utf8_lossy(&cabecera);
+
+    let mut mejor: Option<(f32, f32)> = None;
+    for trozo in texto.split('#').skip(1) {
+        let hex = trozo.as_bytes();
+        if hex.len() < 6 || !hex[..6].iter().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let canal = |i: usize| u8::from_str_radix(&trozo[i..i + 2], 16).map(|v| v as f32 / 255.0);
+        let (Ok(r), Ok(g), Ok(b)) = (canal(0), canal(2), canal(4)) else {
+            continue;
+        };
+        let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+        let luz = (max + min) / 2.0;
+        let croma = max - min;
+        if croma <= f32::EPSILON {
+            continue;
+        }
+        let saturacion = croma / (1.0 - (luz * 2.0 - 1.0).abs()).max(f32::EPSILON);
+        let peso = saturacion * (1.0 - (luz * 2.0 - 1.0).abs());
+        if mejor.is_some_and(|(m, _)| peso <= m) {
+            continue;
+        }
+        let h = if max == r {
+            60.0 * (((g - b) / croma) % 6.0)
+        } else if max == g {
+            60.0 * ((b - r) / croma + 2.0)
+        } else {
+            60.0 * ((r - g) / croma + 4.0)
+        };
+        mejor = Some((peso, (h + 360.0) % 360.0));
+    }
+    mejor.map(|(_, h)| h)
+}
+
+/// Cuánto se parecen dos tonos, en grados: de 0 (el mismo) a 180 (opuestos).
+pub fn distancia_de_tono(a: f32, b: f32) -> f32 {
+    let d = (a - b).abs() % 360.0;
+    d.min(360.0 - d)
+}
+
 /// La familia que está puesta, global del proceso.
 ///
 /// Va aquí y no como argumento por lo mismo que el tema y el acento: la tarjeta
@@ -180,9 +242,39 @@ mod tests {
         assert_eq!(f("/"), None);
     }
 
-    /// Si hay fondos instalados en esta máquina, todos vienen emparejados y
-    /// ordenados. Sin ellos el test no puede decir nada y se calla: no puede
-    /// exigir que el desarrollador los tenga.
+    /// El tono sale del SVG y acierta con los cuatro fondos que trae BookOS.
+    ///
+    /// Los grados están medidos sobre los ficheros de `Wallpapers-0.6`. El
+    /// margen es de 15°, que es mucho más fino que la distancia entre dos
+    /// familias cualesquiera —la más corta es blue↔purple, 66°— y a la vez
+    /// tolera que alguien retoque un degradado sin romper la prueba.
+    #[test]
+    fn el_tono_de_cada_familia_es_el_que_se_ve() {
+        let esperados = [
+            ("blue", 210.0),
+            ("ember", 14.0),
+            ("pine", 126.0),
+            ("purple", 276.0),
+        ];
+        let familias = instaladas(false);
+        if familias.is_empty() {
+            return;
+        }
+        for (nombre, grados) in esperados {
+            let Some(f) = familias.iter().find(|f| f.nombre == nombre) else {
+                continue;
+            };
+            let Some(t) = tono(f) else {
+                panic!("{nombre} no dio tono");
+            };
+            let d = distancia_de_tono(t, grados);
+            assert!(
+                d < 15.0,
+                "{nombre}: {t:.0}° contra los {grados:.0}° medidos"
+            );
+        }
+    }
+
     #[test]
     fn las_familias_vienen_completas_y_ordenadas() {
         let familias = instaladas(true);

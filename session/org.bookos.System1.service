@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.bookos.System1
+Exec=/usr/libexec/bookos-system
+SystemdService=bookos-system.service

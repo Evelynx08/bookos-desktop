@@ -91,6 +91,7 @@ pub(crate) fn leer_una(ruta: &std::path::Path) -> Option<App> {
     let texto = std::fs::read_to_string(ruta).ok()?;
 
     let mut nombre = None;
+    let mut nombre_es = None;
     let mut exec = None;
     let mut icono = None;
     let mut oculta = false;
@@ -117,6 +118,7 @@ pub(crate) fn leer_una(ruta: &std::path::Path) -> Option<App> {
             // hasta que el shell tenga idioma propio, para no coger la primera
             // que aparezca en el fichero.
             "Name" => nombre = Some(valor.trim().to_string()),
+            "Name[es]" => nombre_es = Some(valor.trim().to_string()),
             "Exec" => exec = Some(limpiar_exec(valor.trim())),
             "Icon" => icono = Some(valor.trim().to_string()),
             "NoDisplay" | "Hidden" => oculta |= valor.trim() == "true",
@@ -128,7 +130,11 @@ pub(crate) fn leer_una(ruta: &std::path::Path) -> Option<App> {
     if oculta || !es_app {
         return None;
     }
-    let nombre = nombre?;
+    let nombre = if std::env::var("LANG").unwrap_or_default().starts_with("es") {
+        nombre_es.or(nombre)
+    } else {
+        nombre
+    }?;
     let exec = exec.filter(|e| !e.is_empty())?;
     let normalizado = normalizar(&nombre);
     Some(App {

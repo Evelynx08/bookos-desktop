@@ -19,11 +19,11 @@
 use std::path::PathBuf;
 
 use iced_core::{Border, Color, Length};
-use iced_widget::{column, container, image as iced_image, row, svg, text, Space};
+use iced_widget::{Space, column, container, image as iced_image, row, svg, text};
 
 use crate::icono::{self, Icono};
 use crate::tema;
-use crate::view::{PanelElement, ACENTO, TEXT};
+use crate::view::{ACENTO, PanelElement, TEXT};
 
 pub const ICON: f32 = 50.0;
 pub const GAP: f32 = 14.0;
@@ -138,7 +138,45 @@ pub struct Dock {
 }
 
 impl Dock {
-    /// Ancla una aplicación o la desancla si ya estaba.
+    /// Ancla sin alternar. Es lo que hace arrastrar un icono del launchpad
+    /// hasta el dock: soltar algo que ya estaba anclado no puede desanclarlo,
+    /// que es lo que haría [`Self::alternar_anclado`]. `true` si cambió algo.
+    pub fn anclar(&mut self, app_id: &str, exec: &str, icono: &str) -> bool {
+        match self.indice_de(app_id) {
+            Some(i) if self.items[i].anclada => false,
+            Some(i) => {
+                self.items[i].anclada = true;
+                true
+            }
+            None => {
+                self.items.push(DockItem::new(exec, app_id, icono, app_id));
+                true
+            }
+        }
+    }
+
+    /// Desancla sin alternar: sacar un icono del dock arrastrándolo.
+    ///
+    /// El launchpad no se puede sacar —es la única forma de abrir lo que no
+    /// está en el dock— y por eso se comprueba aquí y no en quien llama.
+    pub fn desanclar(&mut self, app_id: &str) -> bool {
+        let Some(i) = self.indice_de(app_id) else {
+            return false;
+        };
+        if self.items[i].exec == crate::config::LAUNCHPAD || !self.items[i].anclada {
+            return false;
+        }
+        if self.items[i].abierta {
+            self.items[i].anclada = false;
+        } else {
+            self.items.remove(i);
+            self.hover.señalar(None);
+        }
+        true
+    }
+
+    /// Ancla una aplicación o la desancla si ya estaba. Es lo del menú del
+    /// clic derecho, donde una sola entrada dice «Fijar» o «Soltar».
     ///
     /// El launchpad no se toca: es parte del escritorio, no un lanzador que se
     /// quita. Y lo anclado se añade al final, que es donde la mano espera
@@ -579,6 +617,38 @@ mod tests {
 mod anclado {
     use super::*;
 
+    /// Anclar y desanclar arrastrando no alternan: soltar dos veces la misma
+    /// aplicación sobre el dock la deja anclada, no la quita.
+    #[test]
+    fn arrastrar_no_alterna() {
+        let mut dock = Dock::from_config(&crate::Config::default().dock);
+        assert!(dock.anclar("org.bookos.prueba", "prueba", "prueba"));
+        assert!(
+            !dock.anclar("org.bookos.prueba", "prueba", "prueba"),
+            "la segunda vez no cambia nada"
+        );
+        assert!(dock.esta_anclada("org.bookos.prueba"));
+
+        assert!(dock.desanclar("org.bookos.prueba"));
+        assert!(!dock.esta_anclada("org.bookos.prueba"));
+        assert!(
+            !dock.desanclar("org.bookos.prueba"),
+            "sacar lo que ya no está no hace nada"
+        );
+    }
+
+    /// El launchpad no se saca del dock por mucho que se arrastre: sin él no
+    /// hay forma de abrir lo que no está anclado.
+    #[test]
+    fn el_launchpad_no_se_arrastra_fuera() {
+        let mut dock = Dock::from_config(&crate::Config::default().dock);
+        let antes = dock.items().len();
+        let id = dock.items()[0].app_id().to_string();
+        assert_eq!(dock.items()[0].exec(), crate::config::LAUNCHPAD);
+        assert!(!dock.desanclar(&id));
+        assert_eq!(dock.items().len(), antes);
+    }
+
     /// El ciclo completo: una ventana sin lanzador entra en el dock, se fija
     /// con el clic derecho, sobrevive al cierre de la ventana y se puede
     /// quitar. Es lo que el usuario pidió como "pin".
@@ -604,10 +674,11 @@ mod anclado {
         // Se cierra la ventana: al estar fijada, se queda.
         dock.set_abiertas(&[]);
         assert!(dock.esta_anclada("org.bookos.prueba"), "se fue al cerrarse");
-        assert!(dock
-            .como_configuracion()
-            .iter()
-            .any(|l| l.contains("prueba")));
+        assert!(
+            dock.como_configuracion()
+                .iter()
+                .any(|l| l.contains("prueba"))
+        );
 
         dock.alternar_anclado("org.bookos.prueba", "prueba", "prueba");
         assert_eq!(dock.items().len(), antes, "no volvió a su estado inicial");

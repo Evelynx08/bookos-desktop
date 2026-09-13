@@ -12,8 +12,7 @@
 use bookos_shell::{Config, Shell};
 
 mod comun;
-use comun::{distinto_del_fondo, fondo_luma, luma, mezclar, pinta, shell, tinta, volcar, ANCHO};
-
+use comun::{ANCHO, distinto_del_fondo, fondo_luma, luma, mezclar, pinta, shell, tinta, volcar};
 
 /// El panel de diagnóstico se pinta y enseña los números que se le pasan.
 ///
@@ -66,10 +65,7 @@ fn el_panel_de_diagnostico_se_pinta() {
 
     // Hay tinta en la mitad de abajo: es donde va el bloque de la segunda
     // salida, o sea que la tarjeta creció con ella en vez de recortarla.
-    assert!(
-        tinta(&buf, w, h, 0, w) > 20,
-        "el panel salió casi vacío"
-    );
+    assert!(tinta(&buf, w, h, 0, w) > 20, "el panel salió casi vacío");
 
     // Los mismos números no repintan: el escritorio quieto no debe despertar
     // para redibujar lo mismo, que es justo lo que este panel sirve para ver.
@@ -82,7 +78,10 @@ fn el_panel_de_diagnostico_se_pinta() {
         }],
     };
     assert!(shell.diagnostico_datos(datos.clone()));
-    assert!(!shell.diagnostico_datos(datos), "sin cambios, no se repinta");
+    assert!(
+        !shell.diagnostico_datos(datos),
+        "sin cambios, no se repinta"
+    );
 
     assert!(!shell.alternar_diagnostico(), "el segundo toque lo quita");
     assert!(shell.diagnostico_buffer_size().is_none());
@@ -96,7 +95,10 @@ fn dibuja_los_estados_en_su_sitio() {
 
     // El nombre va a la izquierda y el reloj al extremo derecho; los estados
     // de en medio dependen de la máquina, así que no se exigen.
-    assert!(tinta(&buf, w, h, 0, 120) > 0, "no se ve el nombre a la izquierda");
+    assert!(
+        tinta(&buf, w, h, 0, 120) > 0,
+        "no se ve el nombre a la izquierda"
+    );
     assert!(
         tinta(&buf, w, h, w - 120, w) > 0,
         "no se ve el reloj a la derecha"
@@ -131,7 +133,10 @@ fn el_sonido_se_abre_y_su_deslizador_arrastra() {
     shell.emergente_pulsar(20.0, 90.0);
     assert!(shell.emergente_agarrada(), "la píldora no quedó agarrada");
     shell.emergente_puntero(Some((10_000.0, 90.0)));
-    assert!(shell.soltar().0, "soltar no devolvió que había algo agarrado");
+    assert!(
+        shell.soltar().0,
+        "soltar no devolvió que había algo agarrado"
+    );
     assert!(!shell.emergente_agarrada(), "sigue agarrada tras soltar");
 }
 
@@ -226,7 +231,10 @@ fn el_buscador_pulsa_donde_dibuja() {
 
     // Cuántas filas hay: lo que sobra del campo y el divisor, en filas de 52.
     let filas = (alto - 60 - 1 - 10) / 52;
-    assert!(filas >= 1, "«sh» tiene que encontrar algo: el alto es {alto}");
+    assert!(
+        filas >= 1,
+        "«sh» tiene que encontrar algo: el alto es {alto}"
+    );
     assert_eq!(
         alto,
         60 + 1 + filas * 52 + 10,
@@ -305,7 +313,10 @@ fn el_panel_a_escala_fraccionaria_se_rasteriza_a_pixeles_reales() {
     volcar("BOOKOS_PANEL_175_PNG", &buf, w, h);
     // El buffer es físico: 1,75 veces el ancho lógico.
     assert_eq!(w, (ANCHO as f32 * 1.75).round() as u32);
-    assert!(h >= 56, "el panel de 32 lógicos son 56 físicos, y salen {h}");
+    assert!(
+        h >= 56,
+        "el panel de 32 lógicos son 56 físicos, y salen {h}"
+    );
 }
 
 /// La otra batería, la de trazo monocromo, en el panel.
@@ -321,7 +332,10 @@ fn la_bateria_simple_se_pinta() {
     let mut buf = vec![0u8; (w * h * 4) as usize];
     shell.draw_panel(&mut buf);
     volcar("BOOKOS_PANEL_SIMPLE_PNG", &buf, w, h);
-    assert!(tinta(&buf, w, h, w / 2, w) > 0, "la mitad derecha sale vacía");
+    assert!(
+        tinta(&buf, w, h, w / 2, w) > 0,
+        "la mitad derecha sale vacía"
+    );
 }
 
 /// Cada widget del panel abre su tarjeta al pulsarlo.
@@ -365,7 +379,10 @@ fn las_tarjetas_de_conectividad_se_pintan() {
     for (emergente, var) in [
         (bookos_shell::Emergente::red(), "BOOKOS_RED_PNG"),
         (bookos_shell::Emergente::bluetooth(), "BOOKOS_BT_PNG"),
-        (bookos_shell::Emergente::notificaciones(), "BOOKOS_NOTIF_PNG"),
+        (
+            bookos_shell::Emergente::notificaciones(),
+            "BOOKOS_NOTIF_PNG",
+        ),
         (bookos_shell::Emergente::centro(), "BOOKOS_CENTRO_PNG"),
         (bookos_shell::Emergente::energia(), "BOOKOS_ENERGIA_PNG"),
     ] {
@@ -406,7 +423,10 @@ fn el_osd_se_pinta() {
     let mut buf = vec![0u8; (w * h * 4) as usize];
     shell.draw_osd(&mut buf);
     volcar("BOOKOS_OSD_ESCRITORIO_PNG", &buf, w, h);
-    assert!(tinta(&buf, w, h, 0, w) > 0, "el aviso del escritorio sale en blanco");
+    assert!(
+        tinta(&buf, w, h, 0, w) > 0,
+        "el aviso del escritorio sale en blanco"
+    );
 }
 
 /// «Acerca de este PC» se dibuja con los datos de esta máquina.
@@ -575,7 +595,10 @@ fn el_menu_se_abre_se_recorre_y_se_cierra() {
 
     // Pulsar el nombre de la izquierda lo abre.
     shell.panel_pulsado(20.0, 16.0);
-    assert!(shell.hay_emergente(), "pulsar el logo tiene que abrir el menú");
+    assert!(
+        shell.hay_emergente(),
+        "pulsar el logo tiene que abrir el menú"
+    );
 
     let ((w, h), _ancla, _) = shell.emergente_geometria().unwrap();
     // Más ancho que los 210 del plasmoide desde que las filas llevan icono.
@@ -592,10 +615,7 @@ fn el_menu_se_abre_se_recorre_y_se_cierra() {
     shell.draw_emergente(&mut buf);
     volcar("BOOKOS_MENU_PNG", &buf, bw, bh);
     // El acento del hover es sólido, así que tiene que haber píxeles azules.
-    assert!(
-        tinta(&buf, bw, bh, 0, bw) > 0,
-        "el menú sale vacío"
-    );
+    assert!(tinta(&buf, bw, bh, 0, bw) > 0, "el menú sale vacío");
 
     // Y Esc lo cierra.
     assert!(shell.emergente_tecla(TeclaPulsada::Escape).0);
@@ -612,12 +632,18 @@ fn elegir_del_menu_lo_cierra() {
     // y mide 26 de alto.
     let accion = shell.emergente_pulsar(100.0, 2.0 + 13.0);
     assert!(accion.is_some(), "el centro de la primera fila no responde");
-    assert!(!shell.hay_emergente(), "elegir algo tiene que cerrar el menú");
+    assert!(
+        !shell.hay_emergente(),
+        "elegir algo tiene que cerrar el menú"
+    );
 
     // Y en un separador no hay nada que elegir, así que el menú sigue abierto.
     shell.panel_pulsado(20.0, 16.0);
     assert_eq!(shell.emergente_pulsar(100.0, 2.0 + 26.0 + 3.0), None);
-    assert!(shell.hay_emergente(), "fallar la puntería no cierra el menú");
+    assert!(
+        shell.hay_emergente(),
+        "fallar la puntería no cierra el menú"
+    );
 }
 
 /// El calendario se abre desde el reloj del centro.
@@ -641,7 +667,7 @@ fn el_calendario_se_abre_desde_el_reloj() {
 
     // Pulsar el logo con el calendario abierto cambia al menú, no lo cierra.
     shell.panel_pulsado(20.0, 16.0);
-    assert_eq!(shell.emergente_geometria().unwrap().0 .0, 236);
+    assert_eq!(shell.emergente_geometria().unwrap().0.0, 236);
 }
 
 /// El compositor compara el nombre de la zona pulsada con el nombre interno
@@ -712,7 +738,15 @@ fn el_launchpad_se_abre_y_se_pinta() {
             (vec![0u8; (w * h * 4) as usize], w, h)
         };
         shell.draw_realce(&mut rbuf, rw, rh, marco);
-        mezclar(&mut compuesto, bw, &rbuf, rw_px, rh_px, rx as u32, ry as u32);
+        mezclar(
+            &mut compuesto,
+            bw,
+            &rbuf,
+            rw_px,
+            rh_px,
+            rx as u32,
+            ry as u32,
+        );
     }
     mezclar(&mut compuesto, bw, &buf, bw, bh, 0, 0);
     volcar("BOOKOS_LAUNCHPAD_PNG", &compuesto, bw, bh);
@@ -721,7 +755,10 @@ fn el_launchpad_se_abre_y_se_pinta() {
     assert!(shell.emergente_tecla(TeclaPulsada::Caracter('k')).0);
     assert!(shell.hay_emergente());
     assert!(shell.emergente_tecla(TeclaPulsada::Escape).0);
-    assert!(shell.hay_emergente(), "el primer Esc solo limpia la búsqueda");
+    assert!(
+        shell.hay_emergente(),
+        "el primer Esc solo limpia la búsqueda"
+    );
     assert!(shell.emergente_tecla(TeclaPulsada::Escape).0);
     assert!(!shell.hay_emergente(), "el segundo Esc sí cierra");
 }
@@ -754,7 +791,10 @@ fn el_icono_señalado_se_ve_distinto() {
     shell.draw_dock(&mut señalado);
     volcar("BOOKOS_DOCK_PNG", &señalado, w, h);
 
-    assert_ne!(apagado, señalado, "el icono señalado sale idéntico al normal");
+    assert_ne!(
+        apagado, señalado,
+        "el icono señalado sale idéntico al normal"
+    );
     assert!(
         !shell.dock_hover(Some((centro, centro))),
         "señalar lo mismo dos veces no puede costar un repintado"
@@ -790,7 +830,9 @@ fn el_bloqueo_enseña_la_foto_de_la_configuracion() {
     let mut shell = Shell::con_config(ANCHO, 1.0, config);
     let pantalla = (1645.0, 1029.0);
     shell.bloquear("12:30".into(), "lunes, 17 de agosto".into(), pantalla);
-    let (w, h) = shell.bloqueo_buffer_size().expect("hay superficie de bloqueo");
+    let (w, h) = shell
+        .bloqueo_buffer_size()
+        .expect("hay superficie de bloqueo");
     let mut buf = vec![0u8; (w * h * 4) as usize];
     shell.draw_bloqueo(&mut buf);
     volcar("BOOKOS_BLOQUEO_FOTO_PNG", &buf, w, h);
@@ -847,7 +889,9 @@ fn el_bloqueo_se_pinta_con_reloj_avatar_y_campo() {
         b.escritos = 6;
     }
 
-    let (w, h) = shell.bloqueo_buffer_size().expect("hay superficie de bloqueo");
+    let (w, h) = shell
+        .bloqueo_buffer_size()
+        .expect("hay superficie de bloqueo");
     let mut buf = vec![0u8; (w * h * 4) as usize];
     shell.draw_bloqueo(&mut buf);
     volcar("BOOKOS_BLOQUEO_PNG", &buf, w, h);
@@ -977,15 +1021,20 @@ fn las_zonas_del_panel_cuadran_con_lo_pintado() {
 
 /// El indicador de escritorios, con el dato que solo el compositor conoce.
 ///
-/// Con `BOOKOS_ESCRITORIOS_PNG=/ruta.png` guarda el panel con él puesto. Sin el
-/// dato el widget no ocupa nada —es lo que hace que no deje un hueco durante el
-/// arranque—, así que hay que dárselo antes de mirar.
+/// Con `BOOKOS_ESCRITORIOS_PNG=/ruta.png` guarda el panel con él puesto.
+///
+/// Antes de que llegue el dato del compositor el widget ya enseña los dos
+/// escritorios de la configuración de BookOS: así el panel no cambia de ancho
+/// al entrar en la sesión.
 #[test]
 fn el_indicador_de_escritorios_se_pinta_y_responde() {
     let mut shell = shell(1.0);
     assert!(
-        shell.zonas_panel().iter().all(|(n, x0, x1)| *n != "escritorios" || x1 - x0 < 0.01),
-        "sin dato del compositor no puede ocupar sitio"
+        shell
+            .zonas_panel()
+            .iter()
+            .any(|(n, x0, x1)| *n == "escritorios" && x1 - x0 > 0.01),
+        "al arrancar ya tiene que enseñar los dos de la configuración"
     );
 
     assert!(shell.escritorios(2, 4), "el dato nuevo pide repintar");
@@ -996,7 +1045,11 @@ fn el_indicador_de_escritorios_se_pinta_y_responde() {
         .into_iter()
         .find(|(n, _, _)| *n == "escritorios")
         .expect("ya tiene zona");
-    assert!(x1 - x0 > 20.0, "cuatro puntos ocupan más de 20 px: {}", x1 - x0);
+    assert!(
+        x1 - x0 > 20.0,
+        "cuatro puntos ocupan más de 20 px: {}",
+        x1 - x0
+    );
 
     let (w, h) = shell.panel_buffer_size();
     let mut buf = vec![0u8; (w * h * 4) as usize];
@@ -1145,7 +1198,9 @@ fn el_menu_del_bloqueo_se_despliega() {
     let pantalla = (1645.0, 1029.0);
     let mut shell = shell(1.0);
     shell.bloquear("12:30".into(), "lunes, 17 de agosto".into(), pantalla);
-    let (w, h) = shell.bloqueo_buffer_size().expect("hay superficie de bloqueo");
+    let (w, h) = shell
+        .bloqueo_buffer_size()
+        .expect("hay superficie de bloqueo");
 
     // El centro del botón de los tres puntos, en la esquina de abajo.
     shell.bloqueo_pulsado(50.0, pantalla.1 - 50.0);
@@ -1162,7 +1217,11 @@ fn el_menu_del_bloqueo_se_despliega() {
         }
     };
 
-    assert_eq!(alto_menu(&mut shell), 0, "el menú ya estaba entero al pulsar");
+    assert_eq!(
+        alto_menu(&mut shell),
+        0,
+        "el menú ya estaba entero al pulsar"
+    );
     std::thread::sleep(std::time::Duration::from_millis(250));
     let final_ = alto_menu(&mut shell);
     assert!(
@@ -1170,7 +1229,6 @@ fn el_menu_del_bloqueo_se_despliega() {
         "el menú no acabó de desplegarse: {final_} px de alto"
     );
 }
-
 
 /// El diálogo del botón de encendido se pinta y sus cinco opciones responden.
 ///
@@ -1214,26 +1272,39 @@ fn el_dialogo_de_energia_se_pinta_y_responde() {
 /// Con `BOOKOS_NOTIF_PNG=/ruta.png` guarda lo que pinta.
 #[test]
 fn las_notificaciones_se_listan_y_se_cierran() {
-    use bookos_shell::notificaciones::Notificacion;
     use bookos_shell::Accion;
+    use bookos_shell::notificaciones::Notificacion;
 
     let mut shell = shell(1.0);
     for (i, (app, resumen, cuerpo, critica)) in [
-        ("Firefox", "Descarga terminada", "bookos-desktop.tar.gz", false),
+        (
+            "Firefox",
+            "Descarga terminada",
+            "bookos-desktop.tar.gz",
+            false,
+        ),
         ("Batería", "Batería baja", "Quedan 7 minutos", true),
-        ("Konsole", "Compilación lista", "cargo build: 0 errores", false),
+        (
+            "Konsole",
+            "Compilación lista",
+            "cargo build: 0 errores",
+            false,
+        ),
     ]
     .into_iter()
     .enumerate()
     {
-        shell.notificar(Notificacion::nueva(
-            i as u32 + 1,
-            app.into(),
-            resumen.into(),
-            cuerpo.into(),
-            "",
-            critica,
-        ), -1);
+        shell.notificar(
+            Notificacion::nueva(
+                i as u32 + 1,
+                app.into(),
+                resumen.into(),
+                cuerpo.into(),
+                "",
+                critica,
+            ),
+            -1,
+        );
     }
     assert_eq!(shell.notificaciones().len(), 3);
 
@@ -1293,7 +1364,9 @@ fn el_aviso_de_notificacion_se_pinta_y_se_descarta() {
     // despedir el aviso no es haberla atendido.
     assert!(shell.descartar_toast());
     assert!(
-        shell.toast_queda().is_some_and(|q| q <= bookos_shell::toast::SALIDA),
+        shell
+            .toast_queda()
+            .is_some_and(|q| q <= bookos_shell::toast::SALIDA),
         "descartar tiene que dejarle solo la salida"
     );
     assert_eq!(shell.notificaciones().len(), 1);
@@ -1318,11 +1391,21 @@ fn el_silencio_sobrevive_y_deja_pasar_lo_critico() {
     // Cerrar la tarjeta no lo olvida: es lo que pasaba cuando el silencio vivía
     // dentro de la emergente, que se destruye al cerrarla.
     shell.cerrar_emergente();
-    assert!(shell.notificaciones_silenciadas(), "el silencio se ha perdido");
+    assert!(
+        shell.notificaciones_silenciadas(),
+        "el silencio se ha perdido"
+    );
 
     // Silenciado, una normal se guarda sin avisar…
     shell.notificar(
-        Notificacion::nueva(1, "Firefox".into(), "Descarga".into(), String::new(), "", false),
+        Notificacion::nueva(
+            1,
+            "Firefox".into(),
+            "Descarga".into(),
+            String::new(),
+            "",
+            false,
+        ),
         -1,
     );
     assert!(!shell.toast_vivo(), "con silencio no debe salir el aviso");
@@ -1330,10 +1413,20 @@ fn el_silencio_sobrevive_y_deja_pasar_lo_critico() {
 
     // …y una crítica sale igual: para eso es crítica.
     shell.notificar(
-        Notificacion::nueva(2, "Batería".into(), "Batería baja".into(), String::new(), "", true),
+        Notificacion::nueva(
+            2,
+            "Batería".into(),
+            "Batería baja".into(),
+            String::new(),
+            "",
+            true,
+        ),
         -1,
     );
-    assert!(shell.toast_vivo(), "una crítica tiene que salir aunque haya silencio");
+    assert!(
+        shell.toast_vivo(),
+        "una crítica tiene que salir aunque haya silencio"
+    );
 }
 
 /// El launchpad con carpetas: la tapa con miniaturas, y entrar y salir.
@@ -1379,18 +1472,33 @@ fn el_launchpad_dibuja_carpetas() {
     volcar("BOOKOS_DENTRO_PNG", &dentro, w, h);
     assert_ne!(buf, dentro, "dentro de la carpeta se ve lo mismo que fuera");
 
-    // Elegir un color de la fila tiñe la carpeta. Se comprueba **fuera**, que
-    // es donde se ve la tapa: se elige, se sale con Esc y se vuelve a pintar.
-    shell.emergente_pulsar(420.0, 78.0);
+    // Elegir un color tiñe la carpeta. El selector nace cerrado, así que hacen
+    // falta dos clics: el chip lo despliega y la tira da el color. Se comprueba
+    // **fuera**, que es donde se ve la tapa: se elige, se sale y se repinta.
+    let (chip, tono) = shell
+        .launchpad_selector(200.0)
+        .expect("dentro de una carpeta hay selector");
+    shell.emergente_pulsar(chip.0, chip.1);
+    let (_, accion) = shell.soltar();
+    assert!(accion.is_none(), "desplegar el selector no es una acción");
+    shell.emergente_pulsar(tono.0, tono.1);
+    let (_, accion) = shell.soltar();
+    assert!(accion.is_none(), "elegir un color tampoco");
     shell.emergente_tecla(bookos_shell::TeclaPulsada::Escape);
     let mut teñida = vec![0u8; (w * h * 4) as usize];
     shell.draw_emergente(&mut teñida);
     volcar("BOOKOS_COLOR_PNG", &teñida, w, h);
-    assert_ne!(buf, teñida, "la carpeta se pinta igual con color que sin él");
+    assert_ne!(
+        buf, teñida,
+        "la carpeta se pinta igual con color que sin él"
+    );
 
     // El Esc de arriba ya sacó de la carpeta —y no cerró el launchpad, que es
     // lo que se comprueba aquí—; el siguiente sí lo cierra.
-    assert!(shell.hay_emergente(), "salir de la carpeta no puede cerrarlo");
+    assert!(
+        shell.hay_emergente(),
+        "salir de la carpeta no puede cerrarlo"
+    );
     shell.emergente_tecla(bookos_shell::TeclaPulsada::Escape);
     assert!(!shell.hay_emergente());
 
@@ -1406,7 +1514,7 @@ fn el_launchpad_dibuja_carpetas() {
 /// mirar los glifos sin arrancar una sesión.
 #[test]
 fn la_barra_de_titulo_pinta_sus_botones() {
-    use bookos_shell::decoracion::{boton_en, Boton, Estado};
+    use bookos_shell::decoracion::{Boton, Estado, boton_en};
 
     const ANCHO_BARRA: f32 = 640.0;
     let mut shell = shell(1.0);
@@ -1420,7 +1528,10 @@ fn la_barra_de_titulo_pinta_sus_botones() {
         señalado: Some(Boton::Cerrar),
         pulsado: None,
     };
-    assert!(shell.barra_preparar(1, ANCHO_BARRA, estado), "hay que pintarla");
+    assert!(
+        shell.barra_preparar(1, ANCHO_BARRA, estado),
+        "hay que pintarla"
+    );
     let (w, h) = shell.barra_buffer_size(1).expect("la barra recién creada");
     let mut buf = vec![0u8; (w * h * 4) as usize];
     let damage = shell.draw_barra(1, &mut buf);
@@ -1465,7 +1576,10 @@ fn la_barra_de_titulo_pinta_sus_botones() {
         señalado: Some(Boton::Cerrar),
         pulsado: None,
     };
-    assert!(!shell.barra_preparar(1, ANCHO_BARRA, igual), "repinta de más");
+    assert!(
+        !shell.barra_preparar(1, ANCHO_BARRA, igual),
+        "repinta de más"
+    );
 
     // Maximizada vuelve a ser rectangular para no enseñar el fondo por las
     // esquinas de la pantalla.
@@ -1493,7 +1607,10 @@ fn el_buscador_busca_y_lanza() {
     shell.abrir(bookos_shell::Emergente::buscador());
     assert!(shell.hay_emergente());
     assert_eq!(shell.emergente_nombre(), Some("buscador"));
-    assert!(shell.emergente_usa_cristal(), "el buscador va sobre cristal");
+    assert!(
+        shell.emergente_usa_cristal(),
+        "el buscador va sobre cristal"
+    );
 
     // Vacío es solo el campo: sin lista, la tarjeta no puede tener el alto de
     // seis filas vacías.
@@ -1576,11 +1693,21 @@ fn la_capa_de_captura_se_pinta() {
     // recuadro con el de una esquina, que sí lleva velo.
     let alfa = |x: u32, y: u32| buf[((y * w + x) * 4 + 3) as usize];
     assert!(alfa(20, 20) > 80, "el velo de fuera no se pintó");
-    assert_eq!(alfa(560, 370), 0, "el hueco del recuadro tiene que ser transparente");
+    assert_eq!(
+        alfa(560, 370),
+        0,
+        "el hueco del recuadro tiene que ser transparente"
+    );
 
     // Y soltar pide la captura de lo marcado, al portapapeles por defecto.
     assert_eq!(
         shell.captura_soltar(),
-        Some(bookos_shell::Accion::Capturar { x: 240, y: 180, ancho: 640, alto: 380, guardar: false })
+        Some(bookos_shell::Accion::Capturar {
+            x: 240,
+            y: 180,
+            ancho: 640,
+            alto: 380,
+            guardar: false
+        })
     );
 }

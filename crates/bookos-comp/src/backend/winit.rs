@@ -11,11 +11,11 @@ use std::time::Duration;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::winit::{self, WinitEvent, WinitGraphicsBackend};
-use smithay::desktop::utils::surface_primary_scanout_output;
 use smithay::desktop::space::render_output;
+use smithay::desktop::utils::surface_primary_scanout_output;
 use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
-use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::EventLoop;
+use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::utils::Transform;
 
 use crate::pantallas::{self, Aplicado, Modo, Salida};
@@ -134,14 +134,19 @@ pub fn run(
     if let Some(shell) = state.shell.as_mut() {
         shell.refresh();
     }
+    state.last_input = Some(std::time::Instant::now());
     crate::backend::schedule_panel_tick(state);
+    crate::backend::programar_bloqueo_inactividad(state);
     // El despertar del tema automático, si está puesto. Con un modo fijo no
     // deja ningún temporizador. Ver `crate::apariencia`.
     crate::apariencia::programar_cambio(state);
     // También anidado: los estados salen de sysfs, no del compositor de debajo,
     // así que aquí se ven igual de vivos que en la sesión real.
     crate::backend::watch_hardware(state);
-    state.cursor_theme = Some(crate::cursor::CursorTheme::con_tamano(scale, state.cursor_nominal));
+    state.cursor_theme = Some(crate::cursor::CursorTheme::con_tamano(
+        scale,
+        state.cursor_nominal,
+    ));
     // dmabuf también anidado: lo que se prueba aquí tiene que ser el mismo
     // camino de buffers que en la sesión real, o lo medido no dice nada del
     // escritorio de verdad. Versión 3 —`create_global` a secas— y no 4: el
@@ -266,9 +271,7 @@ pub fn run(
             // que volver justo cuando toque el siguiente fotograma; ni antes,
             // que sería girar en vacío, ni después, que se vería a saltos.
             if state.needs_redraw && !toca_dibujar {
-                return TimeoutAction::ToDuration(
-                    MIN_FRAME.saturating_sub(ultimo_frame.elapsed()),
-                );
+                return TimeoutAction::ToDuration(MIN_FRAME.saturating_sub(ultimo_frame.elapsed()));
             }
             // `hay_animacion` va aquí porque `needs_redraw` ya se ha limpiado
             // al dibujar: sin preguntarlo, el ritmo se relajaba a 33 ms en
@@ -276,9 +279,7 @@ pub fn run(
             // veintidós que caben en 180 ms. Medido abriendo el launchpad.
             let activo = state.needs_redraw
                 || state.hay_animacion()
-                || state
-                    .last_input
-                    .is_some_and(|t| t.elapsed() < ACTIVE_TAIL);
+                || state.last_input.is_some_and(|t| t.elapsed() < ACTIVE_TAIL);
             // Si esta vuelta trajo eventos, el anfitrión tiene más en camino:
             // esperar 8 ms a preguntar otra vez es exactamente lo que se veía
             // como cursor pastoso sobre el dock. Mientras el ratón se mueve se
@@ -311,50 +312,57 @@ fn pump(winit_loop: &mut winit::WinitEventLoop, state: &mut BookosComp, refresco
     winit_loop.dispatch_new_events(|event| {
         hubo = true;
         match event {
-        WinitEvent::Resized { size, scale_factor } => {
-            // La escala de la configuración vuelve a mandar sobre la del
-            // anfitrión: sin esto, el primer cambio de tamaño —que con
-            // --fullscreen llega siempre— deshacía lo que se pidió.
-            let scale_factor = state.escala_forzada.unwrap_or(scale_factor);
-            tracing::info!(w = size.w, h = size.h, escala = scale_factor, "salida reconfigurada");
-            // Con --fullscreen el tamaño llega después de que el anfitrión
-            // conceda la pantalla completa, así que la salida y el shell se
-            // reconfiguran aquí y no en el arranque.
-            let mode = Mode {
-                size,
-                refresh: refresco,
-            };
-            if let Some(output) = state.space.outputs().next().cloned() {
-                output.change_current_state(
-                    Some(mode),
-                    None,
-                    Some(Scale::Fractional(scale_factor)),
-                    None,
+            WinitEvent::Resized { size, scale_factor } => {
+                // La escala de la configuración vuelve a mandar sobre la del
+                // anfitrión: sin esto, el primer cambio de tamaño —que con
+                // --fullscreen llega siempre— deshacía lo que se pidió.
+                let scale_factor = state.escala_forzada.unwrap_or(scale_factor);
+                tracing::info!(
+                    w = size.w,
+                    h = size.h,
+                    escala = scale_factor,
+                    "salida reconfigurada"
                 );
-                output.set_preferred(mode);
+                // Con --fullscreen el tamaño llega después de que el anfitrión
+                // conceda la pantalla completa, así que la salida y el shell se
+                // reconfiguran aquí y no en el arranque.
+                let mode = Mode {
+                    size,
+                    refresh: refresco,
+                };
+                if let Some(output) = state.space.outputs().next().cloned() {
+                    output.change_current_state(
+                        Some(mode),
+                        None,
+                        Some(Scale::Fractional(scale_factor)),
+                        None,
+                    );
+                    output.set_preferred(mode);
+                }
+                if let Some(shell) = state.shell.as_mut() {
+                    shell.resize(
+                        size.w.max(1) as u32,
+                        size.h.max(1) as u32,
+                        scale_factor as f32,
+                    );
+                    shell.refresh();
+                }
+                // Los clientes ya conectados tienen que enterarse de la escala nueva.
+                state.broadcast_preferred_scale(scale_factor);
+                state.cursor_theme = Some(crate::cursor::CursorTheme::con_tamano(
+                    scale_factor,
+                    state.cursor_nominal,
+                ));
+                state.needs_redraw = true;
             }
-            if let Some(shell) = state.shell.as_mut() {
-                shell.resize(
-                    size.w.max(1) as u32,
-                    size.h.max(1) as u32,
-                    scale_factor as f32,
-                );
-                shell.refresh();
+            WinitEvent::Redraw => {
+                state.needs_redraw = true;
             }
-            // Los clientes ya conectados tienen que enterarse de la escala nueva.
-            state.broadcast_preferred_scale(scale_factor);
-            state.cursor_theme =
-                Some(crate::cursor::CursorTheme::con_tamano(scale_factor, state.cursor_nominal));
-            state.needs_redraw = true;
-        }
-        WinitEvent::Redraw => {
-            state.needs_redraw = true;
-        }
-        WinitEvent::CloseRequested => {
-            state.loop_signal.stop();
-        }
-        WinitEvent::Input(event) => crate::input::handle(state, event),
-        _ => {}
+            WinitEvent::CloseRequested => {
+                state.loop_signal.stop();
+            }
+            WinitEvent::Input(event) => crate::input::handle(state, event),
+            _ => {}
         }
     });
     hubo
@@ -485,6 +493,7 @@ fn draw(
             for window in state.space.elements() {
                 window.send_frame(output, time, Some(periodo), surface_primary_scanout_output);
             }
+            crate::backend::enviar_frames_capas(output, time, periodo);
             // Y las capturas también aquí: componen su propio buffer y no
             // dependen de que este fotograma haya cambiado nada. Sin esto, una
             // captura pedida con el escritorio quieto no se servía nunca —el
@@ -512,6 +521,7 @@ fn draw(
     for window in state.space.elements() {
         window.send_frame(output, time, Some(periodo), surface_primary_scanout_output);
     }
+    crate::backend::enviar_frames_capas(output, time, periodo);
 
     state.metricas.presentado(&nombre);
 
@@ -609,7 +619,9 @@ fn instalar_pantallas(state: &mut BookosComp, output: &Output) {
             // false con este backend).
             let actual = pantallas::nombre_transformacion(output.current_transform());
             if mia.transformacion != actual {
-                return Err("anidado no se puede rotar la pantalla: pruébalo en la sesión real".into());
+                return Err(
+                    "anidado no se puede rotar la pantalla: pruébalo en la sesión real".into(),
+                );
             }
             output.change_current_state(
                 None,

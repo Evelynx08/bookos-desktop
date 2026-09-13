@@ -9,7 +9,7 @@
 use iced_core::theme::Palette;
 use iced_core::{Element, Length, Theme};
 use iced_tiny_skia::Renderer;
-use iced_widget::{container, row, stack, Space};
+use iced_widget::{Space, container, row, stack};
 
 use crate::tema;
 use crate::widget::Panel;
@@ -39,19 +39,25 @@ pub type PanelElement<'a> = Element<'a, (), Theme, Renderer>;
 
 /// Separación entre los estados de la derecha.
 ///
-/// 16 deja respirar cada estado sin que la fila derecha parezca demasiado
-/// dispersa. El hit-test reparte la mitad del hueco a cada vecino, así que
-/// reducirlo no crea franjas muertas entre iconos.
-pub const HUECO: f32 = 16.0;
+/// 20 deja respirar cada estado sin que la fila parezca dispersa. Se comparó
+/// pintado a 16, 20 y 24: con 16 los iconos se tocan de más ahora que los
+/// invisibles ya no cuelan su hueco en el dibujo, y con 24 el reloj se despega
+/// del resto y la fila se lee como cosas sueltas. El hit-test reparte la mitad
+/// del hueco a cada vecino, así que esto no crea franjas muertas entre iconos.
+pub const HUECO: f32 = 20.0;
 /// Margen izquierdo y derecho del panel.
-pub const MARGEN_PANEL: f32 = 12.0;
+///
+/// 16 y no 12: con la separación entre estados en 20, un margen menor dejaba el
+/// reloj más pegado al borde de la pantalla que a su vecino, y se leía como si
+/// estuviera a punto de salirse.
+pub const MARGEN_PANEL: f32 = 16.0;
 /// Lado del logo, en lógicos. 20 sobre un panel de 32 deja 6 de aire arriba y
 /// abajo, que es lo que hace que no parezca metido con calzador.
 pub const LADO_LOGO: f32 = 20.0;
 /// Zona sensible de la marca, a la izquierda: pulsar ahí abre el menú.
 ///
 /// Es un ancho fijo y no el del elemento porque el layout lo calcula iced y
-/// aquí hace falta antes, para el hit-test. Cubre el margen de 12 y el logo de
+/// aquí hace falta antes, para el hit-test. Cubre el margen de 16 y el logo de
 /// 20, más un blanco de cortesía para no fallar el clic por dos píxeles: el
 /// logo va solo, sin el nombre escrito al lado, y una zona de 90 se comía el
 /// hueco de la izquierda sin nada que la justificara.

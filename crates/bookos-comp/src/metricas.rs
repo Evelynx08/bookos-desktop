@@ -187,7 +187,8 @@ impl Metricas {
     /// números dejan de tener sentido, y dejarlos en el panel confunde más que
     /// ayuda: parecería una pantalla congelada a 0 fps.
     pub fn retener(&mut self, vivas: &[String]) {
-        self.salidas.retain(|s| vivas.iter().any(|v| *v == s.nombre));
+        self.salidas
+            .retain(|s| vivas.iter().any(|v| *v == s.nombre));
     }
 
     /// ¿Ha vencido ya la ventana? Se pregunta antes de cerrarla para no armar
@@ -365,8 +366,16 @@ mod tests {
         let mut m = Metricas::new();
         m.modo("eDP-1", 2880, 1800, 1.75, 120.0, false);
         // 8,3 ms de plazo a 120 Hz.
-        m.dibujado("eDP-1", Duration::from_micros(3000), Duration::from_micros(2000));
-        m.dibujado("eDP-1", Duration::from_micros(6000), Duration::from_micros(5000));
+        m.dibujado(
+            "eDP-1",
+            Duration::from_micros(3000),
+            Duration::from_micros(2000),
+        );
+        m.dibujado(
+            "eDP-1",
+            Duration::from_micros(6000),
+            Duration::from_micros(5000),
+        );
         assert_eq!(m.salida("eDP-1").ventana.perdidos, 1);
         assert_eq!(m.salida("eDP-1").ventana.n, 2);
     }

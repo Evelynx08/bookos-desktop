@@ -6,7 +6,7 @@
 //! con tres radios distintos y tres zonas agarrables que no coinciden.
 
 use iced_core::{Border, Length};
-use iced_widget::{container, Space};
+use iced_widget::{Space, container};
 
 use crate::icono::Icono;
 use crate::tema;
@@ -107,10 +107,14 @@ pub fn tarjeta<'a>(contenido: PanelElement<'a>, ancho: f32, margen: f32) -> Pane
     container(contenido)
         .padding(margen)
         .width(Length::Fixed(ancho))
+        // El radio de fondo no recorta a los hijos por sí solo. Sin este clip,
+        // una tarjeta alta podía pintar hasta las esquinas cuadradas del
+        // buffer, especialmente al quedar pegada al borde inferior.
+        .clip(true)
         .style(|_| container::Style {
             background: Some(tema::card().into()),
             border: Border {
-                radius: tema::R_TARJETA.into(),
+                radius: tema::R_POPOVER.into(),
                 ..Default::default()
             },
             ..Default::default()

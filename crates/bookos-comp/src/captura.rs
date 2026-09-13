@@ -181,12 +181,7 @@ impl Dispatch<ZwlrScreencopyManagerV1, ()> for BookosComp {
         );
         // Cuatro bytes por píxel: es lo que mide `Xrgb8888`.
         let stride = region.size.w as u32 * 4;
-        frame.buffer(
-            FORMATO,
-            region.size.w as u32,
-            region.size.h as u32,
-            stride,
-        );
+        frame.buffer(FORMATO, region.size.w as u32, region.size.h as u32, stride);
         if frame.version() >= 3 {
             frame.buffer_done();
         }
@@ -310,7 +305,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, DatosFrame> for BookosComp {
 pub fn el_portapapeles_tiene_imagen(state: &crate::state::BookosComp) -> bool {
     use smithay::reexports::rustix;
     use smithay::wayland::selection::data_device::{
-        request_data_device_client_selection, SelectionRequestError,
+        SelectionRequestError, request_data_device_client_selection,
     };
     let Ok((_lectura, escritura)) = rustix::pipe::pipe() else {
         return false;
@@ -369,7 +364,10 @@ pub fn tamano_de(output: &Output) -> Size<i32, BufferCoord> {
 /// Devuelve `false` si el buffer se murió entre medias, que pasa cuando el
 /// cliente se va justo después de pedir la copia.
 pub fn volcar(pendiente: &Pendiente, pixeles: &[u8], invertida: bool) -> bool {
-    let (ancho, alto) = (pendiente.region.size.w as usize, pendiente.region.size.h as usize);
+    let (ancho, alto) = (
+        pendiente.region.size.w as usize,
+        pendiente.region.size.h as usize,
+    );
     let fila = ancho * 4;
     if pixeles.len() < fila * alto {
         tracing::error!(
@@ -416,7 +414,9 @@ pub fn contestar(pendiente: &Pendiente, tamano: Size<i32, BufferCoord>) {
     // el cliente tiene en el buffer ya está de arriba abajo.
     pendiente.frame.flags(Flags::empty());
     if pendiente.frame.version() >= 2 {
-        pendiente.frame.damage(0, 0, tamano.w.max(0) as u32, tamano.h.max(0) as u32);
+        pendiente
+            .frame
+            .damage(0, 0, tamano.w.max(0) as u32, tamano.h.max(0) as u32);
     }
     let ahora = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

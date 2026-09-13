@@ -3,26 +3,26 @@
 //! Hito H1: arranca, publica el socket, muestra clientes xdg-shell y no gasta
 //! CPU cuando no pasa nada.
 
+mod ajustes;
+mod apariencia;
+mod autenticar;
 mod backend;
-mod cursor;
-mod desenfoque;
+mod captura;
 mod conmutador;
+mod cursor;
 mod decoracion;
+mod desenfoque;
+mod drminfo;
+mod emision;
 mod escritorios;
 mod fondo;
 mod genio;
 mod gestos;
-mod drminfo;
 mod handlers;
 mod input;
 mod keybinds;
 mod metricas;
 mod multimedia;
-mod autenticar;
-mod ajustes;
-mod apariencia;
-mod captura;
-mod emision;
 mod notificaciones;
 mod pantallas;
 mod portal;
@@ -100,8 +100,8 @@ fn main() -> anyhow::Result<()> {
     // conectándose a nuestro propio socket y esperándose a sí mismo. La
     // variable nunca se toca en el entorno del proceso; a los clientes se les
     // pasa con `Command::env`.
-    let anidado = std::env::var_os("WAYLAND_DISPLAY").is_some()
-        || std::env::var_os("DISPLAY").is_some();
+    let anidado =
+        std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some();
 
     let mut event_loop: EventLoop<BookosComp> = EventLoop::try_new()?;
     let display: Display<BookosComp> = Display::new()?;

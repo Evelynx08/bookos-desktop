@@ -22,7 +22,7 @@
 //! solo se dibujan. Este módulo no sabe medir nada.
 
 use iced_core::{Border, Color, Font, Length};
-use iced_widget::{column, container, row, text, Space};
+use iced_widget::{Space, column, container, row, text};
 
 use crate::tema;
 use crate::view::PanelElement;
@@ -98,9 +98,7 @@ impl Hud {
     /// el buffer se rehace cuando cambia — de eso se encarga quien la pinta.
     pub fn size(&self) -> (f32, f32) {
         let salidas = self.datos.salidas.len().max(1) as f32;
-        let alto = MARGEN * 2.0
-            + LINEA
-            + salidas * (LINEAS_SALIDA * LINEA + HUECO);
+        let alto = MARGEN * 2.0 + LINEA + salidas * (LINEAS_SALIDA * LINEA + HUECO);
         (ANCHO, alto)
     }
 

@@ -25,23 +25,24 @@ use iced_graphics::Viewport;
 use iced_runtime::user_interface::{Cache, UserInterface};
 use iced_tiny_skia::Renderer;
 
-mod apps;
 pub mod actividad;
+mod apps;
 pub mod bloqueo;
-mod config;
-pub mod fondos;
 pub mod captura;
+mod config;
 /// El conmutador de Alt+Tab. Público porque el compositor le da la lista de
 /// aplicaciones por orden de uso: el shell no ve el foco.
 pub mod conmutador;
 /// La barra de título que el escritorio dibuja por las ventanas que la aceptan.
 /// Pública porque el compositor decide quién la lleva y qué hace cada botón.
 pub mod decoracion;
+pub mod diagnostico;
 mod dock;
 mod emergente;
 /// Los iconos del escritorio. Público porque el compositor los coloca sobre el
 /// fondo, por debajo de las ventanas, y le da los clics que no son de nadie.
 pub mod escritorio;
+pub mod fondos;
 mod icono;
 /// El logo, incrustado en el binario. Público porque el "Acerca de" del menú
 /// lo pinta grande.
@@ -50,7 +51,6 @@ pub mod medios;
 /// La cola de notificaciones. Pública porque quien las recibe es el compositor:
 /// el shell no habla D-Bus.
 pub mod notificaciones;
-pub mod diagnostico;
 pub mod osd;
 mod state;
 /// Los tokens del sistema de diseño. Público porque el compositor anima con
@@ -63,10 +63,18 @@ mod view;
 mod widget;
 mod widgets;
 
-pub use emergente::{Ancla, Emergente, ModoProyeccion, PantallaCompartible};
 /// Qué hacer con una tecla que llega a una capa del shell. Lo necesita el
 /// compositor para la capa de captura, que gobierna él.
 pub use emergente::Tecla;
+/// Un cambio de vista del launchpad que anima el compositor. Público porque es
+/// él quien tiene las dos superficies que hay que cruzar.
+pub use emergente::launchpad::Transicion as TransicionLaunchpad;
+/// Cuánto hay que mover el ratón para que un clic pase a ser un arrastre. Lo
+/// comparten el launchpad y el dock: el gesto es el mismo y con dos umbrales
+/// distintos sacar un icono del dock respondería antes o después que moverlo
+/// por la rejilla.
+pub use emergente::launchpad::UMBRAL_ARRASTRE;
+pub use emergente::{Ancla, Emergente, ModoProyeccion, PantallaCompartible};
 /// El icono ya cargado de una aplicación. Sale al exterior porque el conmutador
 /// lo arma el compositor, que conoce las ventanas pero no el tema de iconos.
 pub use icono::Icono;
@@ -102,14 +110,13 @@ pub fn entrada_de_ventana(app_id: &str, titulo: &str) -> conmutador::Entrada {
 }
 
 pub use config::{
-    guardar_apariencia, guardar_dock, guardar_efectos, guardar_escritorios, guardar_fondo,
-    olvidar_fondo,
-    Actividades as ConfigActividades, Efectos,
-    Bloqueo as ConfigBloqueo, Config, Entrada, MAXIMO_ESCRITORIOS,
+    Actividades as ConfigActividades, Bloqueo as ConfigBloqueo, Config, Efectos, Entrada,
+    MAXIMO_ESCRITORIOS, guardar_apariencia, guardar_configuracion, guardar_dock, guardar_efectos,
+    guardar_escritorios, guardar_fondo, olvidar_fondo,
 };
 pub use dock::{
-    icon_path as icon_debug, Dock, DockItem, ICON as DOCK_ICON, MARGIN as DOCK_MARGIN,
-    PAD as DOCK_PAD,
+    Dock, DockItem, ICON as DOCK_ICON, MARGIN as DOCK_MARGIN, PAD as DOCK_PAD,
+    icon_path as icon_debug,
 };
 pub use state::PanelData;
 /// La hora local de ahora, en `(hora, minuto)`. La necesita el compositor para
@@ -142,12 +149,20 @@ pub enum Accion {
     /// Abrir o cerrar el launchpad. No es un programa que lanzar: vive dentro
     /// del shell, así que el dock no puede pedirlo con un `exec`.
     Launchpad,
-    /// Fijar la aplicación al dock, o soltarla si ya lo estaba. La escribe el
-    /// compositor en la configuración: el shell no toca el disco.
+    /// Fijar la aplicación al dock o soltarla. La escribe el compositor en la
+    /// configuración: el shell no toca el disco.
     Anclar {
         app_id: String,
         exec: String,
         icono: String,
+        /// `None` alterna, que es lo que quiere el menú del clic derecho: una
+        /// sola entrada que dice «Fijar» o «Soltar» según esté.
+        ///
+        /// Arrastrando **no** vale alternar: soltar sobre el dock algo que ya
+        /// estaba anclado lo desanclaría, que es lo contrario de lo que acaba
+        /// de hacer la mano. Por eso el arrastre manda `Some(true)` o
+        /// `Some(false)` y dice lo que quiere.
+        fijar: Option<bool>,
     },
     /// Abrir «Acerca de este PC», que es una superficie del propio shell.
     Acerca,
@@ -200,6 +215,11 @@ pub enum Accion {
     /// Retirar esa notificación. La lista vive en el shell, pero avisar a la
     /// aplicación de que se cerró es D-Bus, y eso lo hace el compositor.
     CerrarNotificacion(u32),
+    /// Activar un botón ofrecido por una notificación.
+    NotificacionAccion {
+        id: u32,
+        clave: String,
+    },
     /// Vaciar la cola entera.
     BorrarNotificaciones,
     /// Echar la pantalla de bloqueo. La del propio compositor, no la de KDE.
@@ -243,11 +263,16 @@ impl Accion {
                 // seguidas, y que desapareciera al despachar la primera
                 // obligaría a volver a abrirla cada vez.
                 | Self::CerrarNotificacion(_)
+                | Self::NotificacionAccion { .. }
                 | Self::BorrarNotificaciones
                 // Elegir un color es probar: la tarjeta se queda abierta para
                 // ver el resultado y poder cambiar de idea.
                 | Self::Apariencia { .. }
                 | Self::Actividad(_)
+                // Anclar arrastrando **no** cierra el launchpad: la mano está
+                // ahí para poner varias, y cerrarse tras la primera obligaría a
+                // reabrirlo por cada icono.
+                | Self::Anclar { .. }
         )
     }
 }
@@ -300,6 +325,13 @@ fn nombre_emergente_de(nombre: &str) -> Option<&'static str> {
 /// El brillo de la pantalla ahora mismo, en tanto por ciento.
 pub fn brillo_actual() -> Option<u8> {
     state::read_brightness()
+}
+
+pub mod retroiluminacion;
+
+/// Nombre, nivel actual y máximo de la luz de teclado detectada.
+pub fn brillo_teclado_actual() -> Option<(String, u32, u32)> {
+    state::teclado_actual()
 }
 
 /// El dispositivo de retroiluminación y su valor crudo máximo.
@@ -362,6 +394,17 @@ pub enum TeclaPulsada {
     Abajo,
     Izquierda,
     Derecha,
+    /// Inicio y Fin: al principio y al final de lo que se esté viendo.
+    Inicio,
+    Fin,
+    /// RePág y AvPág: una página entera, que en el launchpad es la unidad de
+    /// verdad —las flechas se mueven de icono en icono—.
+    PaginaArriba,
+    PaginaAbajo,
+    /// El tabulador. Lo usa el launchpad para el selector de color de una
+    /// carpeta: es la única tecla libre ahí dentro, porque las letras buscan y
+    /// las flechas recorren la rejilla.
+    Tabulador,
     Retroceso,
     Caracter(char),
 }
@@ -496,6 +539,8 @@ pub struct Shell {
     /// Lo que el usuario ha elegido. El valor **efectivo** puede ser otro: la
     /// batería baja fuerza los efectos reducidos sin tocar esta preferencia.
     efectos_config: config::Efectos,
+    /// ¿El dock se queda a la vista con el launchpad abierto?
+    launchpad_dock: bool,
     bloqueo_config: config::Bloqueo,
     actividades_config: config::Actividades,
 
@@ -582,6 +627,7 @@ impl Shell {
         tema::aplicar(config.tema);
         tema::aplicar_modo(config.modo_tema);
         tema::aplicar_acento(config.acento);
+        tema::aplicar_alto_contraste(config.alto_contraste);
         // Cuál de las familias instaladas está puesta, para que la tarjeta de
         // Apariencia pueda marcarla. Se mira la del tema que toca y, si esa
         // clave no está, el `fondo` común; sin ninguna no hay nada que marcar y
@@ -596,7 +642,9 @@ impl Shell {
             puesto
                 .map(std::path::Path::new)
                 .and_then(fondos::familia_de)
-                .or_else(|| fondos::por_defecto(config.tema == tema::Tema::Claro).map(|f| f.nombre)),
+                .or_else(|| {
+                    fondos::por_defecto(config.tema == tema::Tema::Claro).map(|f| f.nombre)
+                }),
         );
         tema::aplicar_efectos_reducidos(config.efectos == config::Efectos::Reducidos);
         // Un nombre que no existe en la configuración se ignora y se avisa: el
@@ -626,6 +674,7 @@ impl Shell {
             dock_items,
             avatar: config.avatar.clone(),
             efectos_config: config.efectos,
+            launchpad_dock: config.launchpad_dock,
             bloqueo_config: config.bloqueo,
             actividades_config: config.actividades,
             emergente: None,
@@ -712,10 +761,8 @@ impl Shell {
     pub fn escritorio_pantalla(&mut self, pantalla: (f32, f32), scale: f32) {
         self.escritorio.recolocar(PANEL_HEIGHT as f32, pantalla);
         if self.escritorio_canvas.scale != scale {
-            self.escritorio_canvas = Canvas::new(
-                Size::new(escritorio::CELDA.0, escritorio::CELDA.1),
-                scale,
-            );
+            self.escritorio_canvas =
+                Canvas::new(Size::new(escritorio::CELDA.0, escritorio::CELDA.1), scale);
         }
     }
 
@@ -757,15 +804,24 @@ impl Shell {
     /// tiene que ser barata y no dar por hecho cada cuánto la llaman.
     pub fn refresh(&mut self) -> bool {
         let cambio = self.widgets.refrescar();
+        let cambio_emergente = self.refresh_emergente();
+        cambio || cambio_emergente || !self.panel.painted_once
+    }
+
+    /// Relee solo la tarjeta abierta; no consulta batería ni carpetas.
+    pub fn refresh_emergente(&mut self) -> bool {
+        let mut cambio_emergente = false;
         // La emergente abierta también relee lo suyo: la lista de redes cambia
         // mientras la tienes delante, y sin esto se quedaría con la foto del
         // instante en que se abrió.
         if let Some((e, canvas)) = self.emergente.as_mut() {
             if e.refrescar() {
+                cambio_emergente = true;
+                Self::ajustar(e, canvas);
                 canvas.painted_once = false;
             }
         }
-        cambio || !self.panel.painted_once
+        cambio_emergente
     }
 
     // --- Notificaciones ----------------------------------------------------
@@ -781,7 +837,8 @@ impl Shell {
         // La portada pesa cientos de KB. El Player solo la reenvía al cambiar
         // de canción y las actualizaciones de posición llegan vacías.
         if estado.portada.is_none() {
-            estado.portada = self.actividades
+            estado.portada = self
+                .actividades
                 .get(&estado.app_id)
                 .and_then(|anterior| anterior.portada.clone());
         }
@@ -790,10 +847,14 @@ impl Shell {
     }
 
     fn sincronizar_actividad(&mut self) {
-        let estado = self.actividades.values()
-            .filter(|e| e.clase != actividad::Clase::Timer
-                || self.actividades_config.temporizador_siempre
-                || e.restante_ms <= 60_000)
+        let estado = self
+            .actividades
+            .values()
+            .filter(|e| {
+                e.clase != actividad::Clase::Timer
+                    || self.actividades_config.temporizador_siempre
+                    || e.restante_ms <= 60_000
+            })
             .max_by_key(|e| match e.clase {
                 actividad::Clase::Recorder => 40,
                 actividad::Clase::Timer if e.restante_ms < 0 => 30,
@@ -801,7 +862,10 @@ impl Shell {
                 actividad::Clase::Player => 10,
             })
             .cloned();
-        let Some(estado) = estado else { self.actividad = None; return; };
+        let Some(estado) = estado else {
+            self.actividad = None;
+            return;
+        };
         let escala = self.panel.scale;
         match self.actividad.as_mut() {
             Some((actual, canvas)) if actual.app_id() == estado.app_id => {
@@ -815,10 +879,8 @@ impl Shell {
                 }
             }
             _ => {
-                let actividad = actividad::Actividad::nueva(
-                    estado,
-                    self.actividades_config.animaciones,
-                );
+                let actividad =
+                    actividad::Actividad::nueva(estado, self.actividades_config.animaciones);
                 let (w, h) = actividad.size();
                 self.actividad = Some((actividad, Canvas::new(Size::new(w, h), escala)));
             }
@@ -826,7 +888,9 @@ impl Shell {
     }
 
     pub fn cerrar_actividad(&mut self, app_id: &str) -> bool {
-        if self.actividades.remove(app_id).is_none() { return false; }
+        if self.actividades.remove(app_id).is_none() {
+            return false;
+        }
         self.sincronizar_actividad();
         true
     }
@@ -858,7 +922,9 @@ impl Shell {
     }
 
     pub fn actividad_logical_size(&self) -> Option<(f32, f32)> {
-        self.actividad.as_ref().map(|(_, c)| (c.size.width, c.size.height))
+        self.actividad
+            .as_ref()
+            .map(|(_, c)| (c.size.width, c.size.height))
     }
 
     pub fn actividad_needs_paint(&self) -> bool {
@@ -872,13 +938,20 @@ impl Shell {
     }
 
     pub fn actividad_entrada(&self) -> (f32, f32, f32) {
-        self.actividad.as_ref().map_or((0.0, 1.0, 0.0), |(a, _)| a.entrada())
+        self.actividad
+            .as_ref()
+            .map_or((0.0, 1.0, 0.0), |(a, _)| a.entrada())
     }
 
     pub fn actividad_puntero(&mut self, punto: Option<(f32, f32)>) -> bool {
-        let cambio = self.actividad.as_mut().is_some_and(|(a, _)| a.puntero(punto));
+        let cambio = self
+            .actividad
+            .as_mut()
+            .is_some_and(|(a, _)| a.puntero(punto));
         if cambio {
-            if let Some((_, c)) = self.actividad.as_mut() { c.painted_once = false; }
+            if let Some((_, c)) = self.actividad.as_mut() {
+                c.painted_once = false;
+            }
         }
         cambio
     }
@@ -892,14 +965,19 @@ impl Shell {
         let escala = self.panel.scale;
         if let Some((_, canvas)) = self.actividad.as_mut() {
             let objetivo = Size::new(size.0, size.1);
-            if canvas.size != objetivo { *canvas = Canvas::new(objetivo, escala); }
-            else { canvas.painted_once = false; }
+            if canvas.size != objetivo {
+                *canvas = Canvas::new(objetivo, escala);
+            } else {
+                canvas.painted_once = false;
+            }
         }
         accion
     }
 
     pub fn abrir_actividad_previsualizacion(&mut self, app_id: &str) -> bool {
-        let Some((actividad, canvas)) = self.actividad.as_mut() else { return false; };
+        let Some((actividad, canvas)) = self.actividad.as_mut() else {
+            return false;
+        };
         if actividad.app_id() != app_id || !actividad.abrir_previsualizacion() {
             return false;
         }
@@ -909,7 +987,9 @@ impl Shell {
     }
 
     pub fn draw_actividad(&mut self, buf: &mut [u8]) -> Vec<Damage> {
-        let Some((actividad, canvas)) = self.actividad.as_mut() else { return Vec::new(); };
+        let Some((actividad, canvas)) = self.actividad.as_mut() else {
+            return Vec::new();
+        };
         let vista = actividad.view();
         let damage = Self::paint(canvas, &mut self.renderer, &self.theme, vista, buf);
         actividad.marcar_ondas_pintadas();
@@ -989,6 +1069,14 @@ impl Shell {
         self.toast.as_ref().is_some_and(|(_, c)| !c.painted_once)
     }
 
+    pub fn toast_id(&self) -> Option<u32> {
+        self.toast.as_ref().map(|(t, _)| t.id())
+    }
+
+    pub fn toast_accion_relativa(&self, x: f32, y: f32) -> Option<String> {
+        self.toast.as_ref().and_then(|(t, _)| t.accion_en(x, y))
+    }
+
     pub fn toast_buffer_size(&self) -> Option<(u32, u32)> {
         self.toast.as_ref().map(|(_, c)| c.buffer_size())
     }
@@ -1055,7 +1143,13 @@ impl Shell {
             return Vec::new();
         };
         let vista = decoracion::vista(&barra.estado, barra.canvas.size.width);
-        Self::paint(&mut barra.canvas, &mut self.renderer, &self.theme, vista, buf)
+        Self::paint(
+            &mut barra.canvas,
+            &mut self.renderer,
+            &self.theme,
+            vista,
+            buf,
+        )
     }
 
     /// Tira las barras de las ventanas que ya no están. Sin esto, cada ventana
@@ -1092,6 +1186,15 @@ impl Shell {
         ids
     }
 
+    /// Marca como leídas las notificaciones al abrir su historial.
+    pub fn marcar_notificaciones_leidas(&mut self) -> bool {
+        if !self.notificaciones.marcar_leidas() {
+            return false;
+        }
+        self.sincronizar_notificaciones();
+        true
+    }
+
     pub fn notificaciones(&self) -> &[notificaciones::Notificacion] {
         self.notificaciones.lista()
     }
@@ -1101,6 +1204,15 @@ impl Shell {
     /// Se calcula en vez de guardarse porque **caduca solo**: un temporizador
     /// que despierte al shell a la hora en punto para apagar un booleano es
     /// justo el despertar de más que este compositor evita.
+    pub fn poner_no_molestar(&mut self, enabled: bool) {
+        self.silencio = enabled.then(|| (std::time::Instant::now(), None));
+        if let Some((Emergente::Notificaciones(n), canvas)) = self.emergente.as_mut() {
+            n.poner_silencio(self.silencio);
+            n.actualizar(self.notificaciones.lista().to_vec());
+            canvas.painted_once = false;
+        }
+    }
+
     pub fn notificaciones_silenciadas(&self) -> bool {
         match self.silencio {
             None => false,
@@ -1163,7 +1275,12 @@ impl Shell {
 
     /// Subsistemas de udev que hay que vigilar para este panel.
     pub fn subsistemas(&self) -> Vec<&'static str> {
-        self.widgets.subsistemas()
+        let mut subsistemas = self.widgets.subsistemas();
+        // También los usan las tarjetas y las teclas, aunque el widget no esté fijado.
+        subsistemas.extend(["backlight", "leds"]);
+        subsistemas.sort_unstable();
+        subsistemas.dedup();
+        subsistemas
     }
 
     /// ¿Hace falta pintar el dock? Su contenido solo cambia al señalar un
@@ -1208,6 +1325,9 @@ impl Shell {
     /// Abre la tarjeta de un widget del panel por su nombre. No hace nada si
     /// ese widget no tiene ninguna.
     pub fn abrir_de_widget(&mut self, widget: &str) {
+        if widget == "notificaciones" {
+            self.marcar_notificaciones_leidas();
+        }
         let Some(constructor) = emergente_de(widget) else {
             return;
         };
@@ -1430,6 +1550,32 @@ impl Shell {
         cambio
     }
 
+    /// El cambio de vista del launchpad que el compositor todavía no ha
+    /// animado, si lo hay. Se lo lleva quien pregunta.
+    ///
+    /// El launchpad no anima nada por su cuenta —rasterizar la rejilla cuesta
+    /// 11 ms— y esto es cómo lo pide: el compositor guarda la superficie de
+    /// antes, deja que se pinte la de después y cruza las dos en la GPU.
+    pub fn launchpad_transicion(&mut self) -> Option<emergente::launchpad::Transicion> {
+        match self.emergente.as_mut() {
+            Some((Emergente::Launchpad(l), _)) => l.tomar_transicion(),
+            _ => None,
+        }
+    }
+
+    /// ¿El realce tiene que ir **por delante** del buffer de la emergente?
+    ///
+    /// Solo dentro de una carpeta del launchpad: su panel es opaco —es un
+    /// diálogo— y detrás de él el realce no se ve. Por delante se cuela un 6 %
+    /// de tinta sobre el icono señalado, que no se nota; detrás, no hay
+    /// realce que valga.
+    pub fn realce_delante(&self) -> bool {
+        matches!(
+            self.emergente.as_ref(),
+            Some((Emergente::Launchpad(l), _)) if l.en_carpeta()
+        )
+    }
+
     /// Pinta el realce en `buf`, que debe medir lo que diga
     /// [`Shell::emergente_realce`].
     ///
@@ -1437,7 +1583,7 @@ impl Shell {
     /// no lo que la rejilla entera, y mover el ratón solo cambia su posición.
     pub fn draw_realce(&mut self, buf: &mut [u8], ancho: f32, alto: f32, marco: bool) {
         use iced_core::{Border, Length};
-        use iced_widget::{container, Space};
+        use iced_widget::{Space, container};
 
         let vista: view::PanelElement<'_> = container(Space::new())
             .width(Length::Fill)
@@ -1592,6 +1738,77 @@ impl Shell {
             self.emergente = None;
         }
         (repintar, accion)
+    }
+
+    /// ¿Se enseña el dock con el launchpad abierto? Lo decide la configuración.
+    pub fn dock_en_launchpad(&self) -> bool {
+        self.launchpad_dock
+    }
+
+    /// Le dice al launchpad dónde está el dock, en coordenadas de pantalla.
+    ///
+    /// `None` mientras no se vea: sin esto, con el dock oculto se seguiría
+    /// anclando al soltar un icono en la franja de abajo, donde no hay nada.
+    pub fn launchpad_zona_dock(&mut self, zona: Option<(f32, f32, f32, f32)>) {
+        if let Some((Emergente::Launchpad(l), _)) = self.emergente.as_mut() {
+            l.poner_zona_dock(zona.map(|(x, y, w, h)| iced_core::Rectangle {
+                x,
+                y,
+                width: w,
+                height: h,
+            }));
+        }
+    }
+
+    /// Los primeros elementos visibles del launchpad. Para el autotest.
+    pub fn launchpad_primeros(&self, n: usize) -> Vec<String> {
+        match self.emergente.as_ref() {
+            Some((Emergente::Launchpad(l), _)) => l.primeros(n),
+            _ => Vec::new(),
+        }
+    }
+
+    /// El icono que se arrastra por el launchpad: `(x, y, lado)` lógicos
+    /// relativos a su esquina. `None` si no hay ninguno en el aire.
+    pub fn launchpad_agarrado(&self) -> Option<(f32, f32, f32)> {
+        match self.emergente.as_ref() {
+            Some((Emergente::Launchpad(l), _)) => l.rect_agarrado().map(|r| (r.x, r.y, r.width)),
+            _ => None,
+        }
+    }
+
+    /// Pinta el icono agarrado. `buf` debe tener el tamaño que corresponde a
+    /// `lado` con la escala del shell.
+    pub fn draw_agarrado(&mut self, buf: &mut [u8], lado: f32) {
+        let Some((Emergente::Launchpad(l), _)) = self.emergente.as_ref() else {
+            return;
+        };
+        let Some(vista) = l.vista_agarrado() else {
+            return;
+        };
+        let escala = self.panel.scale;
+        let mut canvas = Canvas::new(Size::new(lado, lado), escala);
+        Self::paint(&mut canvas, &mut self.renderer, &self.theme, vista, buf);
+    }
+
+    /// El centro de una celda del launchpad, en coordenadas de pantalla. Para
+    /// el autotest.
+    pub fn launchpad_celda(&self, i: usize) -> Option<(f32, f32)> {
+        match self.emergente.as_ref() {
+            Some((Emergente::Launchpad(l), _)) => l.centro_de_celda(i),
+            _ => None,
+        }
+    }
+
+    /// El chip del selector de color de la carpeta abierta y un tono de su
+    /// tira, en coordenadas del launchpad. Para el autotest.
+    pub fn launchpad_selector(&self, grados: f32) -> Option<((f32, f32), (f32, f32))> {
+        match self.emergente.as_ref() {
+            Some((Emergente::Launchpad(l), _)) => {
+                Some((l.centro_selector(), l.centro_tono(grados)))
+            }
+            _ => None,
+        }
     }
 
     /// Alterna el modo edición del launchpad, si es lo que está abierto.
@@ -1749,6 +1966,11 @@ impl Shell {
         self.efectos_config
     }
 
+    pub fn aplicar_efectos_config(&mut self, efectos: config::Efectos) -> bool {
+        self.efectos_config = efectos;
+        self.revisar_efectos()
+    }
+
     /// Recalcula si tocan efectos reducidos y lo aplica. Devuelve si cambió,
     /// que es cuando hay que repintar.
     ///
@@ -1758,8 +1980,8 @@ impl Shell {
     /// Leer la batería aquí cuesta 0,02 ms —`capacity` y `status`, sin
     /// `current_now`— y se hace solo cuando el panel ya se estaba refrescando.
     pub fn revisar_efectos(&self) -> bool {
-        let bateria_baja = state::Battery::read(false)
-            .is_some_and(|b| !b.plugged && b.percent <= 20);
+        let bateria_baja =
+            state::Battery::read(false).is_some_and(|b| !b.plugged && b.percent <= 20);
         tema::aplicar_efectos_reducidos(
             self.efectos_config == config::Efectos::Reducidos || bateria_baja,
         )
@@ -1816,7 +2038,9 @@ impl Shell {
     }
 
     pub fn diagnostico_needs_paint(&self) -> bool {
-        self.diagnostico.as_ref().is_some_and(|(_, c)| !c.painted_once)
+        self.diagnostico
+            .as_ref()
+            .is_some_and(|(_, c)| !c.painted_once)
     }
 
     pub fn draw_diagnostico(&mut self, buf: &mut [u8]) -> Vec<Damage> {
@@ -1997,9 +2221,7 @@ impl Shell {
 
     /// ¿Hay que repintar su buffer?
     pub fn captura_needs_paint(&self) -> bool {
-        self.captura
-            .as_ref()
-            .is_some_and(|(_, c)| !c.painted_once)
+        self.captura.as_ref().is_some_and(|(_, c)| !c.painted_once)
     }
 
     /// Pinta la capa de captura. Sale **transparente** donde no hay velo: el
@@ -2064,6 +2286,17 @@ impl Shell {
         true
     }
 
+    pub fn bloqueo_caps_lock(&mut self, activo: bool) -> bool {
+        let Some((b, canvas)) = self.bloqueo.as_mut() else {
+            return false;
+        };
+        if !b.actualizar_caps_lock(activo) {
+            return false;
+        }
+        canvas.painted_once = false;
+        true
+    }
+
     /// Entrega al bloqueo la lectura de MPRIS hecha fuera del hilo de dibujo.
     pub fn bloqueo_medio(&mut self, sonando: Option<medios::Sonando>) -> bool {
         let Some((b, canvas)) = self.bloqueo.as_mut() else {
@@ -2105,6 +2338,22 @@ impl Shell {
         Self::paint(canvas, &mut self.renderer, &self.theme, vista, buf)
     }
 
+    /// Qué aplicación hay en ese punto del dock: `(app_id, exec, icono)`.
+    ///
+    /// El launchpad no cuenta: no se saca del dock ni se ancla, así que quien
+    /// pregunte por él recibe `None` y trata el clic como lo que es, abrir.
+    pub fn dock_item_en(&self, x: f32, y: f32) -> Option<(String, String, String)> {
+        let i = self.dock_items.item_en(x, y)?;
+        let item = &self.dock_items.items()[i];
+        (item.exec() != config::LAUNCHPAD).then(|| {
+            (
+                item.app_id().to_string(),
+                item.exec().to_string(),
+                item.icono_nombre().to_string(),
+            )
+        })
+    }
+
     /// Abre el menú contextual del icono que haya en ese punto del dock, en
     /// coordenadas lógicas relativas al dock. `true` si se abrió.
     pub fn dock_menu(&mut self, x: f32, y: f32) -> bool {
@@ -2134,8 +2383,22 @@ impl Shell {
     ///
     /// Devuelve la lista de anclados que hay que guardar, para que el
     /// compositor la escriba en `panel.conf`: el shell no toca el disco.
-    pub fn anclar(&mut self, app_id: &str, exec: &str, icono: &str) -> Vec<String> {
-        self.dock_items.alternar_anclado(app_id, exec, icono);
+    pub fn anclar(
+        &mut self,
+        app_id: &str,
+        exec: &str,
+        icono: &str,
+        fijar: Option<bool>,
+    ) -> Vec<String> {
+        match fijar {
+            None => self.dock_items.alternar_anclado(app_id, exec, icono),
+            Some(true) => {
+                self.dock_items.anclar(app_id, exec, icono);
+            }
+            Some(false) => {
+                self.dock_items.desanclar(app_id);
+            }
+        }
         self.dock.painted_once = false;
         let (dw, dh) = self.dock_items.size();
         self.dock = Canvas::new(Size::new(dw, dh), self.dock.scale);

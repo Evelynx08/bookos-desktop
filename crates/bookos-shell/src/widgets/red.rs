@@ -13,26 +13,26 @@ pub struct Red {
 
 impl Red {
     pub fn new() -> Self {
-        let dato = Network::read();
-        let icono = icono::cargar(nombre_icono(dato));
+        let dato = estado_red();
+        let icono = icono::propio(nombre_icono(dato));
         Self { dato, icono }
     }
 }
 
-/// El icono de Breeze que toca. Wi-Fi caído sale con el icono de
+/// El icono de BookOS que toca. Wi-Fi caído sale con el icono de
 /// desconectado en vez de con el de señal, que sería mentir.
 fn nombre_icono(dato: Option<Network>) -> &'static str {
     match dato {
         Some(Network {
             kind: Link::Wifi,
             up: true,
-        }) => "network-wireless-connected-100",
+        }) => "wifi",
         Some(Network {
             kind: Link::Cable,
             up: true,
-        }) => "network-wired-activated",
-        Some(_) => "network-disconnect",
-        None => "network-disconnect",
+        }) => "cable",
+        Some(_) => "sin-red",
+        None => "sin-red",
     }
 }
 
@@ -41,17 +41,21 @@ impl Widget for Red {
         "red"
     }
 
+    fn ancho(&self) -> f32 {
+        if self.dato.is_some() && self.icono.is_some() {tema::ICONO_PANEL} else {0.0}
+    }
+
     fn subsistemas(&self) -> &'static [&'static str] {
         &["net"]
     }
 
     fn refrescar(&mut self) -> bool {
-        let fresco = Network::read();
+        let fresco = estado_red();
         if fresco == self.dato {
             return false;
         }
         self.dato = fresco;
-        self.icono = icono::cargar(nombre_icono(self.dato));
+        self.icono = icono::propio(nombre_icono(self.dato));
         true
     }
 
@@ -72,4 +76,11 @@ impl Widget for Red {
             None => crate::widget::vacio(),
         }
     }
+}
+
+fn estado_red() -> Option<Network> {
+    let s = bookos_system::snapshot().network;
+    if s.is_null() { return None; }
+    if s["ethernet"]["connected"] == true { return Some(Network { kind: Link::Cable, up: true }); }
+    Some(Network { kind: Link::Wifi, up: s["ssid"].as_str().is_some_and(|s| !s.is_empty()) })
 }

@@ -333,7 +333,11 @@ mod tests {
         // Cuatro eventos de 40 px: hasta pasar de 120 no cuenta.
         assert_eq!(g.deslizamiento_avance(-40.0, 0.0), None);
         assert_eq!(g.deslizamiento_avance(-40.0, 0.0), None);
-        assert_eq!(g.deslizamiento_avance(-40.0, 0.0), None, "120 justos no bastan");
+        assert_eq!(
+            g.deslizamiento_avance(-40.0, 0.0),
+            None,
+            "120 justos no bastan"
+        );
         assert_eq!(
             g.deslizamiento_avance(-40.0, 0.0),
             Some(Gesto::Escritorio(1)),
@@ -348,7 +352,10 @@ mod tests {
     fn el_deslizamiento_a_la_derecha_trae_el_anterior() {
         let mut g = Gestos::default();
         g.deslizamiento_inicio(4);
-        assert_eq!(g.deslizamiento_avance(200.0, 0.0), Some(Gesto::Escritorio(-1)));
+        assert_eq!(
+            g.deslizamiento_avance(200.0, 0.0),
+            Some(Gesto::Escritorio(-1))
+        );
     }
 
     /// Cada dirección hace lo suyo: bajar aparta las ventanas y subir las

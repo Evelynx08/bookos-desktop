@@ -19,11 +19,11 @@ use std::io::Read;
 use std::rc::Rc;
 
 use smithay::backend::allocator::Fourcc;
-use smithay::backend::renderer::element::solid::SolidColorRenderElement;
+use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::memory::{
     MemoryRenderBuffer, MemoryRenderBufferRenderElement,
 };
-use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::utils::{
     CropRenderElement, RelocateRenderElement, RescaleRenderElement,
@@ -227,10 +227,34 @@ pub fn info() -> anyhow::Result<()> {
 
     // Los nombres tal y como los piden los clientes, no los del tema.
     const USADOS: &[&str] = &[
-        "default", "left_ptr", "text", "xterm", "pointer", "hand2", "wait", "watch", "progress",
-        "move", "fleur", "ew-resize", "sb_h_double_arrow", "ns-resize", "sb_v_double_arrow",
-        "nwse-resize", "nesw-resize", "top_left_corner", "help", "not-allowed", "grab", "grabbing",
-        "crosshair", "copy", "col-resize", "row-resize", "zoom-in", "pencil",
+        "default",
+        "left_ptr",
+        "text",
+        "xterm",
+        "pointer",
+        "hand2",
+        "wait",
+        "watch",
+        "progress",
+        "move",
+        "fleur",
+        "ew-resize",
+        "sb_h_double_arrow",
+        "ns-resize",
+        "sb_v_double_arrow",
+        "nwse-resize",
+        "nesw-resize",
+        "top_left_corner",
+        "help",
+        "not-allowed",
+        "grab",
+        "grabbing",
+        "crosshair",
+        "copy",
+        "col-resize",
+        "row-resize",
+        "zoom-in",
+        "pencil",
     ];
     let (mut hallados, mut faltan) = (0, Vec::new());
     for nombre in USADOS {
@@ -301,12 +325,17 @@ fn cargar(tema: &str, nombre: &str, objetivo: u32, nominal: u32) -> Option<Image
     let path = xcursor::CursorTheme::load(tema).load_icon(nombre)?;
 
     let mut bytes = Vec::new();
-    std::fs::File::open(path).ok()?.read_to_end(&mut bytes).ok()?;
+    std::fs::File::open(path)
+        .ok()?
+        .read_to_end(&mut bytes)
+        .ok()?;
     let images = xcursor::parser::parse_xcursor(&bytes)?;
 
     // La imagen cuyo tamaño se acerque más al que queremos: ampliar un cursor
     // pequeño en una pantalla de 2880×1800 se ve fatal.
-    let image = images.iter().min_by_key(|img| img.size.abs_diff(objetivo))?;
+    let image = images
+        .iter()
+        .min_by_key(|img| img.size.abs_diff(objetivo))?;
 
     // XCursor entrega ARGB premultiplicado en orden nativo, que en
     // little-endian son bytes B,G,R,A: eso es Argb8888.

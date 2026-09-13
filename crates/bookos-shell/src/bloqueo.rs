@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use iced_core::alignment::{Horizontal, Vertical};
 use iced_core::{Border, Color, Length};
-use iced_widget::{column, container, row, text, Space};
+use iced_widget::{Space, column, container, row, text};
 
 use crate::tema;
 use crate::view::PanelElement;
@@ -49,12 +49,7 @@ const MEDIOS_ALTO: f32 = 102.0;
 
 /// Fondo del campo y del botón: casi negro y translúcido, para que se vea el
 /// fondo por debajo sin perder el contraste de los puntos.
-const FONDO_CAMPO: Color = Color {
-    r: 0.09,
-    g: 0.10,
-    b: 0.12,
-    a: 0.82,
-};
+const FONDO_CAMPO: Color = tema::hexa(0x16191e, 0.82);
 
 /// Separación del botón de apagado respecto al borde de la pantalla.
 pub const MARGEN_ENERGIA: f32 = 28.0;
@@ -92,6 +87,8 @@ pub enum Estado {
     Comprobando,
     /// La contraseña no era. El campo se pinta en rojo.
     Fallo,
+    /// Demora local tras varios fallos consecutivos.
+    Espera(u32),
 }
 
 /// Una tarjeta de "esto está sonando", tal cual la enseña el diseño.
@@ -249,6 +246,9 @@ pub struct Bloqueo {
     /// Cuántos caracteres lleva la contraseña. El texto no se guarda aquí.
     pub escritos: usize,
     pub estado: Estado,
+    /// Estado de Bloq Mayús. No forma parte de la contraseña, pero explicarlo
+    /// evita intentos fallidos que parecen una clave incorrecta.
+    pub caps_lock: bool,
     /// Si el menú de apagado está desplegado.
     pub menu: bool,
     /// Cuándo empezó a abrirse o a cerrarse, para animarlo.
@@ -281,6 +281,7 @@ impl Bloqueo {
             fecha,
             escritos: 0,
             estado: Estado::Escribiendo,
+            caps_lock: false,
             menu: false,
             menu_desde: None,
             medios: Vec::new(),
@@ -305,14 +306,16 @@ impl Bloqueo {
         let medios_avance = self.medio_avance();
         let energia_avance = self.entrada_avance(320, 360);
 
-        let mut reloj = column![text(self.hora.clone())
-            .size(self.config.reloj_tamano)
-            .color(Color {
-                a: reloj_avance,
-                ..Color::WHITE
-            })
-            .align_x(Horizontal::Center)
-            .width(Length::Fill)]
+        let mut reloj = column![
+            text(self.hora.clone())
+                .size(self.config.reloj_tamano)
+                .color(Color {
+                    a: reloj_avance,
+                    ..Color::WHITE
+                })
+                .align_x(Horizontal::Center)
+                .width(Length::Fill)
+        ]
         .align_x(Horizontal::Center);
         if self.config.fecha {
             reloj = reloj.push(
@@ -445,6 +448,14 @@ impl Bloqueo {
         true
     }
 
+    pub fn actualizar_caps_lock(&mut self, activo: bool) -> bool {
+        if self.caps_lock == activo {
+            return false;
+        }
+        self.caps_lock = activo;
+        true
+    }
+
     /// Actualiza la tarjeta multimedia cuando termina la consulta asíncrona.
     pub fn poner_medio(&mut self, sonando: Option<crate::medios::Sonando>) -> bool {
         let nuevos = if self.config.medios {
@@ -469,21 +480,36 @@ impl Bloqueo {
     fn mensaje<'a>(&self, alfa: f32) -> PanelElement<'a> {
         let (texto_estado, color) = match self.estado {
             Estado::Comprobando => (
-                "Comprobando…",
+                "Comprobando…".to_string(),
                 Color {
                     a: 0.75,
                     ..Color::WHITE
                 },
             ),
-            Estado::Fallo => ("Contraseña incorrecta", tema::rojo()),
+            Estado::Fallo => ("Contraseña incorrecta".to_string(), tema::rojo()),
+            Estado::Espera(segundos) => (
+                if segundos == 1 {
+                    "Espera un segundo para volver a intentarlo".to_string()
+                } else {
+                    format!("Espera {segundos} segundos para volver a intentarlo")
+                },
+                tema::rojo(),
+            ),
+            Estado::Escribiendo if self.caps_lock => (
+                "Bloq Mayús está activado".to_string(),
+                Color {
+                    a: 0.82,
+                    ..tema::amarillo()
+                },
+            ),
             Estado::Escribiendo if self.escritos == 0 => (
-                "Introduce tu contraseña para desbloquear",
+                "Introduce tu contraseña para desbloquear".to_string(),
                 Color {
                     a: 0.55,
                     ..Color::WHITE
                 },
             ),
-            Estado::Escribiendo => ("", Color::TRANSPARENT),
+            Estado::Escribiendo => ("".to_string(), Color::TRANSPARENT),
         };
         container(
             text(texto_estado)
@@ -861,7 +887,7 @@ impl Bloqueo {
         // no se puede mover a ninguna otra parte, y sin borde no había nada que
         // dijera dónde va lo que escribes. En rojo cuando la contraseña no era.
         let mut borde = match self.estado {
-            Estado::Fallo => tema::rojo(),
+            Estado::Fallo | Estado::Espera(_) => tema::rojo(),
             Estado::Comprobando => Color {
                 a: 0.35,
                 ..Color::WHITE
@@ -1206,6 +1232,20 @@ mod tests {
         // no lo verá; queda como recordatorio de dónde está la frontera.
         assert_eq!(b.escritos, 0);
         assert_eq!(b.estado, Estado::Escribiendo);
+    }
+
+    #[test]
+    fn bloq_mayus_solo_repinta_cuando_cambia() {
+        let mut b = Bloqueo::new(
+            "12:30".into(),
+            "lunes".into(),
+            None,
+            crate::config::Bloqueo::default(),
+        );
+        assert!(b.actualizar_caps_lock(true));
+        assert!(b.caps_lock);
+        assert!(!b.actualizar_caps_lock(true));
+        assert!(b.actualizar_caps_lock(false));
     }
 
     #[test]

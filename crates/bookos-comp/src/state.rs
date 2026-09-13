@@ -21,16 +21,25 @@ use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction};
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
+use smithay::utils::IsAlive;
 use smithay::wayland::compositor::{CompositorClientState, CompositorState};
-use smithay::wayland::fractional_scale::FractionalScaleManagerState;
-use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
+use smithay::wayland::foreign_toplevel_list::{ForeignToplevelHandle, ForeignToplevelListState};
+use smithay::wayland::fractional_scale::FractionalScaleManagerState;
+use smithay::wayland::idle_inhibit::IdleInhibitManagerState;
+use smithay::wayland::idle_notify::IdleNotifierState;
+use smithay::wayland::input_method::InputMethodManagerState;
+use smithay::wayland::output::OutputManagerState;
+use smithay::wayland::pointer_constraints::PointerConstraintsState;
 use smithay::wayland::presentation::PresentationState;
+use smithay::wayland::relative_pointer::RelativePointerManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::selection::primary_selection::PrimarySelectionState;
 use smithay::wayland::selection::wlr_data_control::DataControlState;
+use smithay::wayland::shell::wlr_layer::WlrLayerShellState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
+use smithay::wayland::text_input::TextInputManagerState;
 use smithay::wayland::viewporter::ViewporterState;
 
 /// Lo que se está escribiendo en la pantalla de bloqueo.
@@ -45,6 +54,19 @@ pub struct Bloqueo {
     pub comprobando: Option<crate::autenticar::Comprobacion>,
     /// El último intento falló y aún no se ha vuelto a escribir.
     pub fallo: bool,
+    /// Fallos consecutivos y barrera local adicional a la que aplique PAM.
+    /// Evita fuerza bruta incluso con una pila PAM sin `pam_faillock`.
+    pub fallos: u32,
+    pub reintentar_desde: Option<Instant>,
+}
+
+/// Correspondencia entre una ventana viva y el identificador estable que ven
+/// barras de tareas y herramientas externas mediante foreign-toplevel-list.
+pub struct ToplevelPublicado {
+    pub window: Window,
+    pub handle: ForeignToplevelHandle,
+    pub titulo: String,
+    pub app_id: String,
 }
 
 /// Un gesto en curso sobre el escritorio.
@@ -72,6 +94,7 @@ pub enum ArrastreEscritorio {
 /// que no hay camino por el que el portal se quede colgado.
 pub struct Consentimiento {
     pub sesion: u32,
+    pub ruta: zbus::zvariant::OwnedObjectPath,
     pub respuesta: crate::portal::Emisario<(u32, u32)>,
     pub nodo: crate::portal::Emisario<u32>,
     /// Las salidas que se le enseñaron, en el mismo orden que las celdas de la
@@ -100,11 +123,28 @@ pub struct BookosComp {
     /// Marca de trabajo pendiente para el backend. El backend la consulta en
     /// su punto de dibujo y la limpia; nadie dibuja "por si acaso".
     pub needs_redraw: bool,
+    pub brillo_poll_activo: bool,
     /// Lo que se lleva escrito en la pantalla de bloqueo.
     pub bloqueo: Bloqueo,
     /// Cuándo llegó el último evento de entrada. Decide si el backend anidado
     /// sondea rápido o se relaja.
     pub last_input: Option<Instant>,
+    /// Tiempo de inactividad configurado para el bloqueo automático.
+    pub bloqueo_inactividad: std::time::Duration,
+    /// Tiempo bloqueado antes de pedir a logind una suspensión automática.
+    pub suspension_inactividad: std::time::Duration,
+    /// Alarma de una sola ejecución para bloquear al vencer la inactividad.
+    /// No se usa un tick periódico: cuando no hay entrada, el proceso duerme
+    /// hasta la fecha exacta del bloqueo.
+    pub tick_bloqueo: Option<smithay::reexports::calloop::RegistrationToken>,
+    pub tick_suspension: Option<smithay::reexports::calloop::RegistrationToken>,
+    /// Alarma que apaga físicamente las salidas unos segundos después de
+    /// echar el bloqueo.
+    pub tick_dpms: Option<smithay::reexports::calloop::RegistrationToken>,
+    pub dpms_encendido: bool,
+    /// Backend real: apagar o reactivar las superficies KMS. Anidado queda en
+    /// `None`, porque la energía de la pantalla pertenece al anfitrión.
+    pub aplicar_dpms: Option<Box<dyn FnMut(bool) -> Result<(), String>>>,
     /// El ritmo de dibujo: qué cuesta cada fotograma y cuántos se pierden.
     pub metricas: crate::metricas::Metricas,
     /// Un despertar por segundo mientras el panel de diagnóstico esté puesto.
@@ -114,6 +154,8 @@ pub struct BookosComp {
     pub tick_diagnostico: Option<smithay::reexports::calloop::RegistrationToken>,
 
     pub space: Space<Window>,
+    pub foreign_toplevel_list_state: ForeignToplevelListState,
+    pub toplevels_publicados: Vec<ToplevelPublicado>,
     pub seat: Seat<Self>,
     pub pointer: PointerHandle<Self>,
     /// Qué cursor toca pintar: el del tema, o una superficie del cliente.
@@ -242,7 +284,10 @@ pub struct BookosComp {
     /// proceso; esto es lo otro, lo elegido, y de los dos sale el que se pinta.
     pub modo_tema: bookos_shell::tema::ModoTema,
     /// Las dos horas del modo automático.
-    pub horas_tema: (bookos_shell::tema::HoraDelDia, bookos_shell::tema::HoraDelDia),
+    pub horas_tema: (
+        bookos_shell::tema::HoraDelDia,
+        bookos_shell::tema::HoraDelDia,
+    ),
     /// El despertar del próximo cambio automático. `None` con un modo fijo: sin
     /// nada que esperar no se deja ningún temporizador puesto.
     pub tick_tema: Option<smithay::reexports::calloop::RegistrationToken>,
@@ -389,6 +434,14 @@ pub struct BookosComp {
     /// contestar sí o no a una pregunta que `EGLDisplay` ya sabe contestar:
     /// si sabe hacer la `EGLImage`, el import del fotograma también podrá.
     pub egl_display: Option<smithay::backend::egl::EGLDisplay>,
+    /// `xdg_activation_v1`: cómo una aplicación pide el foco sin robarlo.
+    ///
+    /// Sin esto, una ventana recién mapeada o se lleva el foco siempre —y te lo
+    /// quita de donde estabas escribiendo— o no se lo lleva nunca, y lanzar
+    /// algo desde el dock te deja mirando una ventana que no escribe. Con el
+    /// protocolo hay una tercera vía: el compositor **le da un vale** a quien
+    /// lanza, y la ventana que llega con ese vale es la que se enfoca.
+    pub activacion_state: smithay::wayland::xdg_activation::XdgActivationState,
     #[allow(dead_code)]
     pub viewporter_state: ViewporterState,
     /// `wp_cursor_shape_v1`: el cliente dice **qué forma** quiere —"texto",
@@ -402,6 +455,27 @@ pub struct BookosComp {
     /// pedir `Named(Text)` y lo dibujamos nosotros.
     #[allow(dead_code)]
     pub cursor_shape_state: smithay::wayland::cursor_shape::CursorShapeManagerState,
+    /// `zwp_idle_inhibit_v1`: superficies de vídeo/presentación que piden que
+    /// no se apague la pantalla mientras están activas.
+    #[allow(dead_code)]
+    pub idle_inhibit_state: IdleInhibitManagerState,
+    pub idle_inhibidores: Vec<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
+    /// `ext_idle_notifier_v1`: permite que salvapantallas y agentes de sesión
+    /// conozcan el idle sin sondear dispositivos ni despertar el proceso.
+    pub idle_notifier_state: IdleNotifierState<Self>,
+    /// Protocolos que necesitan juegos y aplicaciones 3D para ocultar o
+    /// confinar el puntero y recibir movimiento relativo.
+    #[allow(dead_code)]
+    pub pointer_constraints_state: PointerConstraintsState,
+    #[allow(dead_code)]
+    pub relative_pointer_state: RelativePointerManagerState,
+    /// Entrada de texto v3 y canal para métodos de entrada (IBus/Fcitx).
+    #[allow(dead_code)]
+    pub text_input_state: TextInputManagerState,
+    #[allow(dead_code)]
+    pub input_method_state: InputMethodManagerState,
+    /// Paneles, fondos y overlays externos compatibles con wlroots.
+    pub layer_shell_state: WlrLayerShellState,
     /// El globales `xwayland_shell_v1`, por el que XWayland asocia cada ventana
     /// X11 con su `wl_surface`. Sin él las ventanas X11 nunca se emparejan con
     /// un buffer y se ven como huecos negros.
@@ -517,6 +591,7 @@ impl BookosComp {
         let data_control_state =
             DataControlState::new::<Self, _>(&dh, Some(&primary_selection_state), |_| true);
         let fractional_scale_state = FractionalScaleManagerState::new::<Self>(&dh);
+        let foreign_toplevel_list_state = ForeignToplevelListState::new::<Self>(&dh);
         // Linux CLOCK_MONOTONIC. DRM usa este mismo reloj cuando el driver
         // anuncia timestamps monotónicos para los page-flips.
         let presentation_state = PresentationState::new::<Self>(&dh, 1);
@@ -525,9 +600,18 @@ impl BookosComp {
         // anunciar nada.
         let dmabuf_state = DmabufState::new();
         let captura_state = crate::captura::CapturaState::new(&dh);
+        let activacion_state =
+            smithay::wayland::xdg_activation::XdgActivationState::new::<Self>(&dh);
         let viewporter_state = ViewporterState::new::<Self>(&dh);
         let cursor_shape_state =
             smithay::wayland::cursor_shape::CursorShapeManagerState::new::<Self>(&dh);
+        let idle_inhibit_state = IdleInhibitManagerState::new::<Self>(&dh);
+        let idle_notifier_state = IdleNotifierState::new(&dh, loop_handle.clone());
+        let pointer_constraints_state = PointerConstraintsState::new::<Self>(&dh);
+        let relative_pointer_state = RelativePointerManagerState::new::<Self>(&dh);
+        let text_input_state = TextInputManagerState::new::<Self>(&dh);
+        let input_method_state = InputMethodManagerState::new::<Self, _>(&dh, |_| true);
+        let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
         let xwayland_shell_state =
             smithay::wayland::xwayland_shell::XWaylandShellState::new::<Self>(&dh);
 
@@ -562,6 +646,16 @@ impl BookosComp {
             })
             .map_err(|err| anyhow::anyhow!("insert_source(notificaciones): {err}"))?;
         let bus_notificaciones = crate::notificaciones::arrancar(avisos);
+
+        let (system_events, system_source) = smithay::reexports::calloop::channel::channel();
+        loop_handle.insert_source(system_source, |event, _, state| {
+            if let smithay::reexports::calloop::channel::Event::Msg(()) = event {
+                if let Some(shell) = state.shell.as_mut() { shell.refresh(); }
+                crate::multimedia::recibir_sistema(state);
+                state.needs_redraw = true;
+            }
+        }).map_err(|e| anyhow::anyhow!("system events: {e}"))?;
+        bookos_system::start(move || { let _ = system_events.send(()); });
 
         // Settings escribe el fichero y solo manda una orden pequeña por
         // D-Bus. La lectura y aplicación se hacen aquí, en el hilo dueño del
@@ -611,6 +705,8 @@ impl BookosComp {
 
         let entrada = std::mem::take(&mut config.entrada);
         let cursor_nominal = config.cursor;
+        let bloqueo_inactividad = std::time::Duration::from_secs(config.bloqueo_inactividad);
+        let suspension_inactividad = std::time::Duration::from_secs(config.suspension_inactividad);
         let modo_tema = config.modo_tema;
         let horas_tema = (config.tema_claro_desde, config.tema_oscuro_desde);
         let fondo_config = crate::fondo::Eleccion {
@@ -626,11 +722,21 @@ impl BookosComp {
             start_time: Instant::now(),
             socket_name,
             needs_redraw: true,
+            brillo_poll_activo: false,
             bloqueo: Bloqueo::default(),
             last_input: None,
+            bloqueo_inactividad,
+            suspension_inactividad,
+            tick_bloqueo: None,
+            tick_suspension: None,
+            tick_dpms: None,
+            dpms_encendido: true,
+            aplicar_dpms: None,
             metricas: crate::metricas::Metricas::new(),
             tick_diagnostico: None,
             space: Space::default(),
+            foreign_toplevel_list_state,
+            toplevels_publicados: Vec::new(),
             seat,
             pointer,
             cursor_status: smithay::input::pointer::CursorImageStatus::default_named(),
@@ -705,8 +811,17 @@ impl BookosComp {
             dmabuf_state,
             dmabuf_global: None,
             egl_display: None,
+            activacion_state,
             viewporter_state,
             cursor_shape_state,
+            idle_inhibit_state,
+            idle_inhibidores: Vec::new(),
+            idle_notifier_state,
+            pointer_constraints_state,
+            relative_pointer_state,
+            text_input_state,
+            input_method_state,
+            layer_shell_state,
             xwayland_shell_state,
         })
     }
@@ -780,7 +895,35 @@ impl BookosComp {
         smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
         smithay::utils::Point<f64, smithay::utils::Logical>,
     )> {
-        use smithay::desktop::WindowSurfaceType;
+        use smithay::desktop::{WindowSurfaceType, layer_map_for_output};
+        use smithay::wayland::shell::wlr_layer::Layer;
+
+        // Overlay y paneles layer-shell reciben entrada según el mismo orden
+        // en que se dibujan. Durante el bloqueo no se consulta ninguna capa de
+        // cliente: además de ocultarlas, hay que cortarles también la entrada.
+        let bloqueado = self.shell.as_ref().is_some_and(|s| s.esta_bloqueado());
+        if !bloqueado {
+            for output in self.space.output_under(point) {
+                let Some(output_geo) = self.space.output_geometry(output) else {
+                    continue;
+                };
+                let local = point - output_geo.loc.to_f64();
+                let map = layer_map_for_output(output);
+                for capa in [Layer::Overlay, Layer::Top, Layer::Bottom, Layer::Background] {
+                    let Some(layer) = map.layer_under(capa, local) else {
+                        continue;
+                    };
+                    let Some(geo) = map.layer_geometry(layer) else {
+                        continue;
+                    };
+                    if let Some((surface, offset)) =
+                        layer.surface_under(local - geo.loc.to_f64(), WindowSurfaceType::ALL)
+                    {
+                        return Some((surface, (output_geo.loc + geo.loc + offset).to_f64()));
+                    }
+                }
+            }
+        }
         // El panel y el dock se dibujan encima de las ventanas: mientras el
         // puntero esté sobre ellos, para los clientes no hay nada bajo el
         // cursor. Sin esto la ventana de debajo se cree señalada y cambia la
@@ -809,6 +952,12 @@ impl BookosComp {
     }
 
     pub fn post_dispatch(&mut self) {
+        self.actualizar_foreign_toplevels();
+        // Retira layer-surfaces cuyo cliente desapareció sin dejar residuos
+        // en la zona exclusiva ni en el recorrido de render.
+        for output in self.space.outputs().cloned().collect::<Vec<_>>() {
+            smithay::desktop::layer_map_for_output(&output).cleanup();
+        }
         // Si la tarjeta del permiso se cerró sin contestar —un clic fuera—, el
         // hilo del portal sigue bloqueado. Se le manda la negativa.
         crate::portal::denegar_si_se_cerro(self);
@@ -859,6 +1008,65 @@ impl BookosComp {
         }
         self.space.refresh();
         self.display_handle.flush_clients().ok();
+    }
+
+    /// Publica altas, cambios de metadatos y cierres sin sondeo: se llama al
+    /// final de la misma vuelta que procesó el commit o la destrucción.
+    fn actualizar_foreign_toplevels(&mut self) {
+        let vivas: Vec<_> = self
+            .space
+            .elements()
+            .filter(|window| window.alive())
+            .cloned()
+            .collect();
+
+        let mut i = 0;
+        while i < self.toplevels_publicados.len() {
+            if vivas
+                .iter()
+                .any(|window| *window == self.toplevels_publicados[i].window)
+            {
+                i += 1;
+            } else {
+                let publicado = self.toplevels_publicados.remove(i);
+                self.foreign_toplevel_list_state
+                    .remove_toplevel(&publicado.handle);
+            }
+        }
+
+        for window in vivas {
+            let titulo = crate::handlers::titulo(&window).unwrap_or_default();
+            let app_id = crate::handlers::app_id(&window).unwrap_or_default();
+            if let Some(publicado) = self
+                .toplevels_publicados
+                .iter_mut()
+                .find(|publicado| publicado.window == window)
+            {
+                let cambio = publicado.titulo != titulo || publicado.app_id != app_id;
+                if publicado.titulo != titulo {
+                    publicado.handle.send_title(&titulo);
+                    publicado.titulo = titulo;
+                }
+                if publicado.app_id != app_id {
+                    publicado.handle.send_app_id(&app_id);
+                    publicado.app_id = app_id;
+                }
+                if cambio {
+                    publicado.handle.send_done();
+                }
+            } else {
+                let handle = self
+                    .foreign_toplevel_list_state
+                    .new_toplevel::<Self>(&titulo, &app_id);
+                self.toplevels_publicados.push(ToplevelPublicado {
+                    window,
+                    handle,
+                    titulo,
+                    app_id,
+                });
+            }
+        }
+        self.foreign_toplevel_list_state.cleanup_closed_handles();
     }
 }
 

@@ -16,10 +16,10 @@ use iced_core::alignment::{Horizontal, Vertical};
 use iced_core::{Border, Color, Length};
 use iced_widget::{column, container, row, text};
 
+use crate::Accion;
 use crate::state::Fecha;
 use crate::tema;
 use crate::view::PanelElement;
-use crate::Accion;
 
 use super::{Ancla, Tecla};
 

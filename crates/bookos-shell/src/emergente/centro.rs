@@ -4,14 +4,19 @@
 //! lado, las dos tarjetas de conectividad, la rejilla de ocho conmutadores, los
 //! deslizadores de volumen y brillo, y lo que esté sonando.
 //!
-//! **Los colores son los del plasmoide**, no los del resto del shell: un
-//! conmutador apagado va en azul claro (`#AECAFF`) y no en gris. Es lo que hace
-//! que la rejilla se lea como una fila de botones apagados en vez de como
-//! botones deshabilitados, y era la diferencia que se veía de un vistazo entre
-//! esto y el diseño.
+//! **El acento significa «encendido» y nada más.** Un conmutador apagado va en
+//! `--surface`, el velo neutro del sistema de diseño, con el glifo en texto
+//! secundario. Antes iba en acento aclarado, y el resultado se ve en cuanto se
+//! mira la rejilla entera: ocho círculos azules de los que ninguno dice si está
+//! activo, porque el único color que quedaba libre para decirlo era ese mismo
+//! azul. La regla es del sistema de diseño —el acento es lo único que significa
+//! «esto está activo»— y aquí no se cumplía.
+//!
+//! **Cada baldosa lleva su nombre debajo.** Ocho círculos mudos obligan a
+//! aprenderse cuál es el ojo y cuál el rombo.
 //!
 //! **Todo lo que se dibuja hace algo.** Los estados que se pueden leer se leen
-//! al abrir la tarjeta —`nmcli`, `bluetoothctl`, `rfkill`— y los que no tienen
+//! desde la caché compartida para red, Bluetooth y audio; los que no tienen
 //! forma de consultarse son acciones, no interruptores. Mantener la pantalla
 //! encendida es la excepción: su estado **es** un proceso hijo vivo, y por eso
 //! lo guarda el shell.
@@ -20,14 +25,14 @@ use std::process::{Child, Command, Stdio};
 
 use iced_core::alignment::{Horizontal, Vertical};
 use iced_core::{Border, Color, Length};
-use iced_widget::{column, container, row, text, Space};
+use iced_widget::{Space, column, container, row, text};
 
+use crate::Accion;
 use crate::bloqueo::Usuario;
 use crate::icono;
 use crate::medios::{self, Sonando};
 use crate::tema;
 use crate::view::PanelElement;
-use crate::Accion;
 
 use super::control;
 use super::{Ancla, Tecla};
@@ -49,10 +54,11 @@ const ICONO_CONEXION: f32 = 44.0;
 const COLUMNAS: usize = 4;
 const BOTON: f32 = 52.0;
 const REJILLA_MARGEN: f32 = 12.0;
-/// Alto de un deslizador.
-const PILDORA: f32 = 34.0;
-/// Lado del botón redondo que va a la derecha de cada deslizador.
-const BOTON_PILDORA: f32 = 40.0;
+/// Alto de una celda de la rejilla: el círculo, un hueco y el rótulo.
+const CELDA: f32 = BOTON + 4.0 + 14.0 + 6.0;
+/// Alto de un deslizador. El icono y el porcentaje van **dentro**, así que
+/// tiene que caber un glifo de 18 con aire.
+const PILDORA: f32 = 42.0;
 /// Alto de la tarjeta de medios.
 const MEDIOS: f32 = 132.0;
 
@@ -65,68 +71,47 @@ const MEDIOS: f32 = 132.0;
 fn acento_centro() -> Color {
     tema::acento()
 }
-const APAGADO_OSCURO: Color = Color {
-    r: 0.682,
-    g: 0.792,
-    b: 1.0,
-    a: 1.0,
-};
-/// El círculo de un conmutador apagado.
+/// El círculo de un conmutador apagado: otro escalón de `--surface`.
 ///
-/// En oscuro es el azul claro del plasmoide. En claro ese azul sobre una
-/// tarjeta blanca deja de significar «apagado» —se parece demasiado al
-/// encendido— y pasa a ser el gris `#e5e5ea` del sistema, que es lo que usan
-/// los controles apagados de la paleta clara.
+/// Neutro a propósito. Pasó por el `#AECAFF` del plasmoide y luego por
+/// `acento_suave()`, que al menos seguía al acento elegido, pero las dos
+/// versiones tenían el mismo fallo de fondo: con siete baldosas apagadas en
+/// acento claro y una encendida en acento sólido, lo que se ve es una rejilla
+/// de un solo color. El estado tiene que leerse antes que la marca.
+///
+/// Es un velo sobre lo que hay detrás y no un color fijo porque el círculo va
+/// **dentro** de una tarjeta que ya es `--surface`: los dos alfas se acumulan,
+/// el círculo se separa de su tarjeta y la tarjeta del panel.
 fn apagado() -> Color {
-    if tema::es_claro() {
-        Color {
-            r: 0.898,
-            g: 0.898,
-            b: 0.918,
-            a: 1.0,
-        }
-    } else {
-        APAGADO_OSCURO
-    }
+    tema::superficie()
 }
 
-/// La tinta del icono dentro de un círculo apagado.
+/// La tinta del icono dentro de un círculo apagado: el texto secundario.
 ///
-/// Sobre el azul claro va **blanca**, encendida o apagada: con tinta oscura el
-/// botón se leía como deshabilitado, que es justo lo contrario de «apagado pero
-/// disponible». Sobre el gris del tema claro un icono blanco no se vería, y ahí
-/// sí es oscura.
+/// El mismo gris en los dos temas —lo fija así el sistema de diseño—, y por eso
+/// no se calcula contra el fondo como cuando el círculo era de acento: sobre
+/// `--surface`, que es casi el fondo, sale igual en claro y en oscuro.
 fn tinta_apagado() -> Color {
-    if tema::es_claro() {
-        tema::texto()
-    } else {
-        Color::WHITE
-    }
+    tema::TEXTO2
 }
 
-/// Fondo de las tarjetas interiores: la superficie del tema al 80 %.
+/// Fondo de las tarjetas interiores: el `--surface` del sistema de diseño.
+///
+/// Antes era `alfa(card(), 0.80)` en oscuro, o sea el mismo token que pinta el
+/// panel que las contiene: `#1c1c1e` al 80 % **sobre** `#1c1c1e` da otra vez
+/// `#1c1c1e`. Las cuatro subdivisiones existían en el árbol de widgets y no se
+/// veía ninguna. En claro pasaba lo mismo de forma más suave: `bg` al 80 %
+/// sobre la tarjeta blanca deja `#f5f5f9`, tres puntos por canal.
 fn contenedor() -> Color {
-    if tema::es_claro() {
-        Color {
-            r: 0.949,
-            g: 0.949,
-            b: 0.968,
-            a: 0.80,
-        }
-    } else {
-        Color {
-            r: 0.16,
-            g: 0.16,
-            b: 0.17,
-            a: 0.80,
-        }
-    }
+    tema::superficie()
 }
 
 /// Un conmutador o una acción de la rejilla.
 struct Baldosa {
     icono: &'static str,
-    /// Encendida: círculo en acento sólido. Apagada: azul claro.
+    /// El rótulo de debajo. Es lo que hace, no cómo se llama el icono.
+    nombre: &'static str,
+    /// Encendida: círculo en acento sólido. Apagada: el acento aclarado.
     activa: bool,
     /// Qué ejecuta. `None` = lo resuelve el propio shell.
     accion: Option<Accion>,
@@ -154,8 +139,19 @@ pub struct Centro {
     baldosas: Vec<Baldosa>,
     señalada: tema::Realce,
     wifi: bool,
+    /// El servicio puede tardar en aparecer o estar reiniciándose. Se separa
+    /// de `wifi` para no pintar «apagado» cuando todavía no hay estado.
+    wifi_disponible: bool,
     bluetooth: bool,
+    bluetooth_disponible: bool,
+    /// La red a la que se está conectado, si hay alguna. La radio encendida no
+    /// basta: `nmcli radio wifi` dice `enabled` con la antena buscando y sin
+    /// haber llegado a ninguna parte.
+    red: Option<String>,
+    /// El dispositivo Bluetooth conectado, si hay alguno.
+    dispositivo: Option<String>,
     volumen: u8,
+    audio_disponible: bool,
     brillo: u8,
     agarre: Agarre,
     backlight: Option<(String, u32)>,
@@ -166,9 +162,48 @@ pub struct Centro {
 }
 
 impl Centro {
+    pub fn refrescar(&mut self) -> bool {
+        let state = bookos_system::snapshot();
+        let wifi_disponible = !state.network.is_null();
+        let bluetooth_disponible = !state.bluetooth.is_null();
+        let audio_disponible = !state.audio.is_null();
+        let wifi = wifi_disponible && state.network["enabled"] == true;
+        let bluetooth = bluetooth_disponible && state.bluetooth["enabled"] == true;
+        let red = wifi_disponible.then(conectado_a).flatten();
+        let dispositivo = bluetooth_disponible.then(emparejado_con).flatten();
+        let volumen = if self.agarre == Agarre::Volumen { self.volumen } else { bookos_system::volume(false).map(|v|v.0).unwrap_or(self.volumen) };
+        let changed = self.wifi != wifi || self.wifi_disponible != wifi_disponible
+            || self.bluetooth != bluetooth || self.bluetooth_disponible != bluetooth_disponible
+            || self.audio_disponible != audio_disponible
+            || self.red != red || self.dispositivo != dispositivo || self.volumen != volumen;
+        self.wifi = wifi; self.wifi_disponible = wifi_disponible;
+        self.bluetooth = bluetooth; self.bluetooth_disponible = bluetooth_disponible;
+        self.audio_disponible = audio_disponible;
+        self.red = red; self.dispositivo = dispositivo; self.volumen = volumen;
+        let mut changed = changed;
+        if self.agarre != Agarre::Brillo {
+            let backlight = crate::backlight();
+            let brillo = crate::brillo_actual().unwrap_or(0);
+            changed |= self.backlight != backlight || self.brillo != brillo;
+            self.backlight = backlight; self.brillo = brillo;
+        }
+        if let Some(tile) = self.baldosas.iter_mut().find(|b| b.icono == "avion") {
+            let active = wifi_disponible && bluetooth_disponible
+                && state.network["enabled"] == false && state.bluetooth["enabled"] == false;
+            changed |= tile.activa != active; tile.activa = active;
+        }
+        changed
+    }
+
     pub fn new() -> Self {
-        let wifi = orden("nmcli radio wifi").contains("enabled");
-        let bluetooth = orden("bluetoothctl show").contains("Powered: yes");
+        let state = bookos_system::snapshot();
+        let wifi_disponible = !state.network.is_null();
+        let bluetooth_disponible = !state.bluetooth.is_null();
+        let audio_disponible = !state.audio.is_null();
+        let wifi = wifi_disponible && state.network["enabled"] == true;
+        let bluetooth = bluetooth_disponible && state.bluetooth["enabled"] == true;
+        let red = wifi_disponible.then(conectado_a).flatten();
+        let dispositivo = bluetooth_disponible.then(emparejado_con).flatten();
         let mut c = Self {
             // El centro de control no ve la configuración: la foto de `panel.conf`
             // la resuelve el bloqueo, y aquí basta con las de siempre.
@@ -176,13 +211,18 @@ impl Centro {
             baldosas: Vec::new(),
             señalada: tema::Realce::nuevo(),
             wifi,
+            wifi_disponible,
             bluetooth,
-            // El nivel de partida se lee de golpe: `wpctl` cuesta 21 ms
+            bluetooth_disponible,
+            red,
+            dispositivo,
+            // El nivel de partida viene de la caché compartida.
             // medidos, pero esto ocurre al abrir la tarjeta y no en el refresco
             // del panel.
             volumen: crate::widgets::volumen::consultar("@DEFAULT_AUDIO_SINK@")
                 .map(|(n, _)| n)
                 .unwrap_or(0),
+            audio_disponible,
             brillo: crate::brillo_actual().unwrap_or(0),
             agarre: Agarre::Nada,
             backlight: crate::backlight(),
@@ -210,11 +250,11 @@ impl Centro {
 
     fn alto_rejilla(&self) -> f32 {
         let filas = self.baldosas.len().div_ceil(COLUMNAS) as f32;
-        REJILLA_MARGEN * 2.0 + filas * (BOTON + 8.0)
+        REJILLA_MARGEN * 2.0 + filas * CELDA
     }
 
     fn alto_deslizadores(&self) -> f32 {
-        REJILLA_MARGEN * 2.0 + BOTON_PILDORA * 2.0 + 10.0
+        REJILLA_MARGEN * 2.0 + PILDORA * 2.0 + 10.0
     }
 
     pub fn ancla(&self) -> Ancla {
@@ -242,7 +282,7 @@ impl Centro {
         let x0 = MARGEN + REJILLA_MARGEN;
         let y0 = self.y_rejilla() + REJILLA_MARGEN;
         let ancho_celda = (ANCHO - x0 * 2.0) / COLUMNAS as f32;
-        let alto_celda = BOTON + 8.0;
+        let alto_celda = CELDA;
         if x < x0 || y < y0 {
             return None;
         }
@@ -265,19 +305,24 @@ impl Centro {
         Some(x > ANCHO / 2.0)
     }
 
+    /// Las píldoras ocupan la tarjeta entera de lado a lado: sin el botón
+    /// redondo de al lado, los 50 px que se comía vuelven al recorrido. Con el
+    /// volumen al 3 % eso son 9 px de relleno en vez de 7, pero lo que importa
+    /// es que **toda** la píldora es agarrable, así que un nivel bajo se sigue
+    /// pudiendo coger.
     fn ancho_pildora(&self) -> f32 {
-        ANCHO - (MARGEN + REJILLA_MARGEN) * 2.0 - BOTON_PILDORA - 10.0
+        ANCHO - (MARGEN + REJILLA_MARGEN) * 2.0
     }
 
     fn rect_pildora(&self, cual: Agarre) -> iced_core::Rectangle {
         let y0 = self.y_deslizadores() + REJILLA_MARGEN;
         let y = match cual {
-            Agarre::Brillo => y0 + BOTON_PILDORA + 10.0,
+            Agarre::Brillo => y0 + PILDORA + 10.0,
             _ => y0,
         };
         iced_core::Rectangle {
             x: MARGEN + REJILLA_MARGEN,
-            y: y + (BOTON_PILDORA - PILDORA) / 2.0,
+            y,
             width: self.ancho_pildora(),
             height: PILDORA,
         }
@@ -354,18 +399,16 @@ impl Centro {
             // que se piden de un vistazo: apagar el Wi-Fi rápido, o elegir a
             // qué red conectarse.
             let mitad = if bluetooth { ANCHO / 2.0 } else { MARGEN };
+            let disponible = if bluetooth { self.bluetooth_disponible } else { self.wifi_disponible };
             if x < mitad + 8.0 + ICONO_CONEXION {
-                let encendido = if bluetooth { self.bluetooth } else { self.wifi };
-                if bluetooth {
-                    self.bluetooth = !encendido;
-                } else {
-                    self.wifi = !encendido;
+                if !disponible {
+                    return None;
                 }
-                return Some(Accion::Lanzar(if bluetooth {
-                    format!("bluetoothctl power {}", si_no(!encendido))
-                } else {
-                    format!("nmcli radio wifi {}", si_no(!encendido))
-                }));
+                let encendido = if bluetooth { self.bluetooth } else { self.wifi };
+                bookos_system::request(if bluetooth {
+                    bookos_system::Operation::BluetoothPower { enabled: !encendido }
+                } else { bookos_system::Operation::WifiPower { enabled: !encendido } });
+                return None;
             }
             return Some(Accion::Emergente(if bluetooth {
                 "bluetooth"
@@ -382,6 +425,10 @@ impl Centro {
             // «No molestar» vive en su propia tarjeta, que es donde están las
             // duraciones; desde aquí solo se abre.
             return Some(Accion::Emergente("notificaciones"));
+        }
+        if self.baldosas[i].icono == "avion" {
+            bookos_system::request(bookos_system::Operation::Airplane { enabled: !self.baldosas[i].activa });
+            return None;
         }
         // El estado se da por cambiado sin releerlo: `rfkill` y compañía tardan
         // en aplicarlo y la baldosa se quedaría como estaba hasta la siguiente
@@ -425,21 +472,14 @@ impl Centro {
             return false;
         }
         self.volumen = nivel;
-        let _ = Command::new("wpctl")
-            .args([
-                "set-volume",
-                "@DEFAULT_AUDIO_SINK@",
-                &format!("{:.2}", nivel as f32 / 100.0),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+        bookos_system::request(bookos_system::Operation::Volume { target: "output".into(), value: nivel as u32 });
         true
     }
 
     fn poner_brillo(&mut self, nivel: u8) -> bool {
         // Mismo suelo que el emergente del brillo: a cero no se ve ni el
         // deslizador con el que volver a subirlo.
+        if self.backlight.is_none() { return false; }
         let nivel = nivel.clamp(5, 100);
         if nivel == self.brillo {
             return false;
@@ -447,21 +487,7 @@ impl Centro {
         self.brillo = nivel;
         if let Some((dispositivo, maximo)) = &self.backlight {
             let crudo = (*maximo as f64 * nivel as f64 / 100.0).round() as u32;
-            let _ = Command::new("busctl")
-                .args([
-                    "call",
-                    "org.freedesktop.login1",
-                    "/org/freedesktop/login1/session/auto",
-                    "org.freedesktop.login1.Session",
-                    "SetBrightness",
-                    "ssu",
-                    "backlight",
-                    dispositivo,
-                    &crudo.to_string(),
-                ])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn();
+            crate::retroiluminacion::solicitar("backlight", dispositivo, crudo);
         }
         true
     }
@@ -532,6 +558,8 @@ impl Centro {
             });
         let pildora = container(
             row![
+                redondo,
+                Space::new().width(Length::Fixed(10.0)),
                 column![
                     text(self.usuario.nombre.clone())
                         .size(15.0)
@@ -540,8 +568,6 @@ impl Centro {
                         .size(11.0)
                         .color(tema::TEXTO2),
                 ],
-                Space::new().width(Length::Fill),
-                redondo,
             ]
             .align_y(Vertical::Center),
         )
@@ -560,14 +586,18 @@ impl Centro {
             ..Default::default()
         });
 
+        // Apagar va el último y con el glifo en rojo. Es la única acción de la
+        // tarjeta que se lleva la sesión por delante, y estaba en medio de las
+        // otras dos pintada igual que ellas: la esquina y el color son lo que
+        // impide darle queriendo abrir Preferencias.
         row![
             pildora,
             Space::new().width(Length::Fixed(8.0)),
             Self::circulo("editar", BOTON_CABECERA, contenedor(), tema::texto()),
             Space::new().width(Length::Fixed(8.0)),
-            Self::circulo("apagar", BOTON_CABECERA, contenedor(), tema::texto()),
-            Space::new().width(Length::Fixed(8.0)),
             Self::circulo("preferencias", BOTON_CABECERA, contenedor(), tema::texto()),
+            Space::new().width(Length::Fixed(8.0)),
+            Self::circulo("apagar", BOTON_CABECERA, contenedor(), tema::rojo()),
         ]
         .align_y(Vertical::Center)
         .into()
@@ -575,11 +605,18 @@ impl Centro {
 
     /// Una de las dos tarjetas de conectividad.
     fn conexion(&self, bluetooth: bool) -> PanelElement<'_> {
-        let (nombre, encendido, icono) = if bluetooth {
+        // El círculo va en acento cuando hay **conexión**, no cuando la radio
+        // está encendida. Es la misma regla que la rejilla: el acento dice que
+        // algo está funcionando. Con la antena encendida y sin red, la tarjeta
+        // se queda apagada y el subtítulo dice «Sin conexión», que es lo que
+        // hay que ver cuando algo no va.
+        let disponible = if bluetooth { self.bluetooth_disponible } else { self.wifi_disponible };
+        let (nombre, encendido, conectado, icono) = if bluetooth {
             (
                 "Bluetooth",
                 self.bluetooth,
-                if self.bluetooth {
+                self.dispositivo.as_deref(),
+                if self.bluetooth && disponible {
                     "bluetooth"
                 } else {
                     "bluetooth-apagado"
@@ -589,20 +626,30 @@ impl Centro {
             (
                 "Wi-Fi",
                 self.wifi,
-                if self.wifi { "wifi" } else { "sin-red" },
+                self.red.as_deref(),
+                if self.wifi && disponible { "wifi" } else { "sin-red" },
             )
         };
+        // El subtítulo se corta a lo que cabe en una línea. La tarjeta mide
+        // 154 de ancho y el círculo con su hueco se lleva 54, así que quedan
+        // 84 px: «Wifi Recamales-5G» a 11 px ocupa 89 y bajaba a una segunda
+        // línea que se salía de la tarjeta por abajo, porque el alto es fijo.
+        let estado = if !disponible { "Servicio no disponible".to_owned() } else { match (encendido, conectado) {
+            (_, Some(donde)) => recortar(donde, 15),
+            (true, None) => "Sin conexión".to_owned(),
+            (false, None) => "Desactivado".to_owned(),
+        }};
         container(
             row![
                 Self::circulo(
                     icono,
                     ICONO_CONEXION,
-                    if encendido {
+                    if conectado.is_some() {
                         acento_centro()
                     } else {
                         apagado()
                     },
-                    if encendido {
+                    if conectado.is_some() {
                         tema::sobre_acento()
                     } else {
                         tinta_apagado()
@@ -610,10 +657,18 @@ impl Centro {
                 ),
                 Space::new().width(Length::Fixed(10.0)),
                 column![
-                    text(nombre).size(15.0).color(tema::texto()),
-                    text(if encendido { "Activado" } else { "Desactivado" })
+                    text(nombre)
+                        .size(15.0)
+                        .color(tema::texto())
+                        .wrapping(iced_core::text::Wrapping::None),
+                    // Sin envolver: el SSID recortado sigue teniendo espacios
+                    // y iced parte por ellos antes que desbordar. «Wifi
+                    // Recamales…» bajaba a dos líneas y la segunda se salía de
+                    // la tarjeta, que tiene el alto fijo.
+                    text(estado)
                         .size(11.0)
-                        .color(tema::TEXTO2),
+                        .color(tema::TEXTO2)
+                        .wrapping(iced_core::text::Wrapping::None),
                 ],
             ]
             .align_y(Vertical::Center),
@@ -654,12 +709,32 @@ impl Centro {
             tinta_apagado()
         };
         let celda = (ANCHO - (MARGEN + REJILLA_MARGEN) * 2.0) / COLUMNAS as f32;
-        container(Self::circulo(baldosa.icono, BOTON, fondo, tinta))
-            .width(Length::Fixed(celda))
-            .height(Length::Fixed(BOTON + 8.0))
-            .center_x(Length::Fixed(celda))
-            .center_y(Length::Fixed(BOTON + 8.0))
-            .into()
+        // El rótulo de una baldosa encendida va en texto pleno y el de una
+        // apagada en secundario: el estado se lee dos veces, en el círculo y
+        // en la palabra, que es lo que necesita quien no distingue el acento
+        // del gris de al lado.
+        let rotulo = text(baldosa.nombre)
+            .size(11.0)
+            .color(if baldosa.activa {
+                tema::texto()
+            } else {
+                tema::TEXTO2
+            })
+            .align_x(Horizontal::Center)
+            .width(Length::Fixed(celda));
+        container(
+            column![
+                Self::circulo(baldosa.icono, BOTON, fondo, tinta),
+                Space::new().height(Length::Fixed(4.0)),
+                rotulo,
+            ]
+            .align_x(Horizontal::Center),
+        )
+        .width(Length::Fixed(celda))
+        .height(Length::Fixed(CELDA))
+        .center_x(Length::Fixed(celda))
+        .center_y(Length::Fixed(CELDA))
+        .into()
     }
 
     fn deslizador(&self, cual: Agarre) -> PanelElement<'_> {
@@ -675,12 +750,87 @@ impl Centro {
                 },
             ),
         };
-        row![
-            control::pildora(self.ancho_pildora(), nivel, false),
-            Space::new().width(Length::Fixed(10.0)),
-            Self::circulo(icono, BOTON_PILDORA, apagado(), tinta_apagado()),
+        let ancho = self.ancho_pildora();
+        // El relleno nunca es más estrecho que alto. Con 6 px de ancho, iced
+        // recorta su radio a 3 —min(w,h)/2— y sale una barrita casi recta,
+        // mientras que el surco de detrás sigue curvándose con radio 21: el
+        // relleno del volumen al 2 % asomaba por encima y por debajo del surco
+        // en las dos esquinas. El radio del contenedor no recorta a los hijos,
+        // así que no hay forma de meterlo dentro de la curva.
+        //
+        // El precio es que por debajo del 14 % —42 de 293— la barra enseña más
+        // de lo que hay. Es lo que hacen los deslizadores de iOS y de One UI, y
+        // se prefiere a un relleno roto: el número exacto está escrito al lado.
+        let lleno = match nivel.min(100) {
+            0 => 0.0,
+            n => (ancho * n as f32 / 100.0).max(PILDORA),
+        };
+
+        // El icono y el porcentaje viran cuando el relleno los alcanza, y cada
+        // uno decide por su cuenta: sobre el acento va la tinta que se lea
+        // encima, sobre el surco va la del tema. Fijarlos a blanco no vale —el
+        // surco en claro es negro al 12 %, o sea un gris de luminancia 0,83, y
+        // un glifo blanco encima da 1,2:1 y desaparece. Se vio en el volcado de
+        // `--example acento` con el volumen al 2 %.
+        //
+        // Los umbrales son dónde acaba cada elemento, no el centro de la
+        // píldora: el icono ocupa de 14 a 32 y el porcentaje los 44 últimos.
+        let tinta_de = |pisado: bool| {
+            if pisado {
+                tema::sobre_acento()
+            } else {
+                tema::texto()
+            }
+        };
+        let dentro = row![
+            match icono::propio(icono) {
+                Some(ic) => icono::ver_teñido_propio(&ic, 18.0, tinta_de(lleno >= 32.0)),
+                None => Space::new().width(Length::Fixed(18.0)).into(),
+            },
+            Space::new().width(Length::Fill),
+            text(format!("{nivel}%"))
+                .size(12.0)
+                .color(tema::alfa(tinta_de(lleno >= ancho - 44.0), 0.75)),
         ]
-        .align_y(Vertical::Center)
+        .align_y(Vertical::Center);
+
+        let relleno = container(Space::new())
+            .width(Length::Fixed(lleno))
+            .height(Length::Fixed(PILDORA))
+            .style(|_theme: &iced_widget::Theme| container::Style {
+                background: Some(acento_centro().into()),
+                border: Border {
+                    radius: (PILDORA / 2.0).into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+
+        // El `Stack` mide por su **primer** hijo: con el relleno delante, la
+        // capa del icono se recortaba a lo que midiera el relleno y el «50 %»
+        // salía pegado al borde del azul en vez de al de la píldora. Por eso
+        // el relleno va envuelto en una capa del ancho completo.
+        container(iced_widget::stack![
+            container(relleno)
+                .width(Length::Fixed(ancho))
+                .height(Length::Fixed(PILDORA)),
+            container(dentro)
+                .width(Length::Fixed(ancho))
+                .height(Length::Fixed(PILDORA))
+                .padding([0, 14])
+                .center_y(Length::Fixed(PILDORA)),
+        ])
+        .width(Length::Fixed(ancho))
+        .height(Length::Fixed(PILDORA))
+        .clip(true)
+        .style(|_theme: &iced_widget::Theme| container::Style {
+            background: Some(tema::surco().into()),
+            border: Border {
+                radius: (PILDORA / 2.0).into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
         .into()
     }
 
@@ -853,26 +1003,28 @@ impl Centro {
 fn baldosas() -> Vec<Baldosa> {
     // `rfkill list` dice si hay algo bloqueado por software; el modo avión es
     // exactamente eso.
-    let avion = orden("rfkill list").contains("Soft blocked: yes");
-    let ahorro = orden("cat /sys/firmware/acpi/platform_profile").contains("low-power");
+    let state = bookos_system::snapshot();
+    let avion = !state.network.is_null() && !state.bluetooth.is_null()
+        && state.network["enabled"] == false && state.bluetooth["enabled"] == false;
+    let ahorro = std::fs::read_to_string("/sys/firmware/acpi/platform_profile").unwrap_or_default().contains("low-power");
     vec![
         Baldosa {
             icono: "avion",
+            nombre: "Avión",
             activa: avion,
-            accion: Some(Accion::Lanzar(format!(
-                "rfkill {} all",
-                if avion { "unblock" } else { "block" }
-            ))),
+            accion: None,
             interna: None,
         },
         Baldosa {
             icono: "notificaciones",
+            nombre: "Avisos",
             activa: false,
             accion: None,
             interna: None,
         },
         Baldosa {
             icono: "ahorro",
+            nombre: "Ahorro",
             activa: ahorro,
             accion: Some(Accion::Lanzar(format!(
                 "busctl --system set-property net.hadess.PowerProfiles \
@@ -883,12 +1035,14 @@ fn baldosas() -> Vec<Baldosa> {
         },
         Baldosa {
             icono: "mantener",
+            nombre: "Despierta",
             activa: false,
             accion: None,
             interna: Some(Interna::Mantener),
         },
         Baldosa {
             icono: "noche",
+            nombre: "Noche",
             activa: false,
             // La luz nocturna la aplica el compositor cambiando la curva de
             // color de la salida, y eso todavía no existe: de momento abre
@@ -898,18 +1052,21 @@ fn baldosas() -> Vec<Baldosa> {
         },
         Baldosa {
             icono: "compartir",
+            nombre: "Compartir",
             activa: false,
             accion: Some(Accion::Lanzar("bookos-share || kdeconnect-app".into())),
             interna: None,
         },
         Baldosa {
             icono: "captura",
+            nombre: "Captura",
             activa: false,
             accion: Some(Accion::Lanzar("bookos-captura || spectacle".into())),
             interna: None,
         },
         Baldosa {
             icono: "bloquear",
+            nombre: "Bloquear",
             activa: false,
             accion: Some(Accion::Lanzar(
                 "loginctl lock-session || qdbus6 org.freedesktop.ScreenSaver /ScreenSaver Lock"
@@ -920,24 +1077,26 @@ fn baldosas() -> Vec<Baldosa> {
     ]
 }
 
-/// `on`/`off`, que es lo que entienden `nmcli` y `bluetoothctl`.
-fn si_no(encendido: bool) -> &'static str {
-    if encendido {
-        "on"
-    } else {
-        "off"
+/// Corta un nombre a `max` caracteres y le pone puntos suspensivos.
+///
+/// Por caracteres y no por píxeles: medir el texto pide el `Renderer`, que aquí
+/// no está, y el error de contar caracteres solo se nota con un SSID lleno de
+/// emes. El corte es por `char` y no por byte para no partir una letra acentuada
+/// en dos.
+fn recortar(texto: &str, max: usize) -> String {
+    if texto.chars().count() <= max {
+        return texto.to_owned();
     }
+    texto.chars().take(max - 1).collect::<String>() + "…"
 }
 
-/// Ejecuta una orden corta y devuelve su salida. Vacío si falla.
-fn orden(cmd: &str) -> String {
-    Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .stderr(Stdio::null())
-        .output()
-        .map(|s| String::from_utf8_lossy(&s.stdout).into_owned())
-        .unwrap_or_default()
+fn conectado_a() -> Option<String> {
+    let s = bookos_system::snapshot();
+    s.network["ssid"].as_str().filter(|s| !s.is_empty()).map(str::to_owned)
+}
+fn emparejado_con() -> Option<String> {
+    let s = bookos_system::snapshot();
+    s.bluetooth["devices"].as_array()?.iter().find(|d| d["connected"] == true)?["name"].as_str().map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -956,7 +1115,16 @@ mod tests {
             c.baldosa_en(x0 + ancho_celda * 3.0 + 5.0, y0 + 5.0),
             Some(3)
         );
-        assert_eq!(c.baldosa_en(x0 + 5.0, y0 + BOTON + 12.0), Some(4));
+        assert_eq!(
+            c.baldosa_en(x0 + 5.0, y0 + CELDA + 5.0),
+            Some(4),
+            "la segunda fila empieza tras la celda entera, rótulo incluido"
+        );
+        assert_eq!(
+            c.baldosa_en(x0 + 5.0, y0 + BOTON + 12.0),
+            Some(0),
+            "el rótulo de la primera fila sigue siendo su baldosa"
+        );
         assert_eq!(
             c.baldosa_en(2.0, y0 + 5.0),
             None,
@@ -998,12 +1166,8 @@ mod tests {
         let y = c.y_conexiones() + CONEXION / 2.0;
         let antes = c.wifi;
         let accion = c.pulsar(MARGEN + ICONO_CONEXION / 2.0, y);
-        assert_ne!(c.wifi, antes, "el estado no cambió");
-        let esperado = if antes { "off" } else { "on" };
-        assert_eq!(
-            accion,
-            Some(Accion::Lanzar(format!("nmcli radio wifi {esperado}")))
-        );
+        assert_eq!(c.wifi, antes, "el estado solo cambia al confirmarlo el servicio");
+        assert_eq!(accion, None);
     }
 
     /// «Mantener la pantalla encendida» es un proceso vivo: encenderlo lo

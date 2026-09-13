@@ -24,6 +24,23 @@ export QT_QPA_PLATFORM=wayland
 export GDK_BACKEND=wayland,x11
 export MOZ_ENABLE_WAYLAND=1
 
+# Cursores. Sin XCURSOR_THEME el compositor cae a "BookOS-Dark", que es un tema
+# de ICONOS: bookos-icons instala apps y lugares, no cursores, así que salía la
+# flecha de reserva y encima cada aplicación elegía el suyo por su cuenta. Se
+# coge el primero que esté instalado de verdad y se exporta para toda la sesión,
+# compositor y clientes. BookOS-Dark se mira primero por si algún día los trae.
+if [ -z "${XCURSOR_THEME:-}" ]; then
+    for tema in BookOS-Dark breeze_cursors Breeze_Light Adwaita; do
+        for base in "$HOME/.local/share/icons" /usr/share/icons; do
+            if [ -d "$base/$tema/cursors" ]; then
+                export XCURSOR_THEME="$tema"
+                break 2
+            fi
+        done
+    done
+fi
+export XCURSOR_SIZE="${XCURSOR_SIZE:-24}"
+
 # El binario: primero el instalado, y si no, el del árbol de desarrollo.
 #
 # Entre `release` y `debug` gana **el más reciente**, no `release` por delante
@@ -31,7 +48,13 @@ export MOZ_ENABLE_WAYLAND=1
 # compilan en `debug`, así que quien tocaba el código y se iba al TTY seguía
 # arrancando el `release` de la última vez y probaba una versión vieja sin
 # enterarse. Costó una tarde de "esto no funciona" que sí funcionaba.
-binario=/usr/local/bin/bookos-comp
+# Dos rutas instaladas: /usr/local/bin es la de session/instalar.sh (desarrollo)
+# y /usr/libexec la del RPM. Se miran las dos: mirando solo la primera, con el
+# paquete instalado no se encontraba el compositor y la sesión moría al entrar.
+binario=""
+for instalado in /usr/local/bin/bookos-comp /usr/libexec/bookos-comp; do
+    [ -x "$instalado" ] && { binario="$instalado"; break; }
+done
 if [ ! -x "$binario" ]; then
     raiz="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
     binario=""
@@ -47,6 +70,14 @@ if [ ! -x "$binario" ]; then
     exit 1
 fi
 
+# El servicio compartido se activa por D-Bus cuando hace falta, pero el gestor
+# de usuario puede no haber recargado todavía la unidad recién instalada.
+# Recargarla y arrancarla aquí evita que el primer widget vea un estado vacío y
+# también permite que systemd la reinicie si NetworkManager, BlueZ o PipeWire
+# aparecen después de la sesión.
+systemctl --user daemon-reload >/dev/null 2>&1 || true
+systemctl --user start bookos-system.service >/dev/null 2>&1 || true
+
 # El registro va a un fichero y no a la salida estándar porque SDDM se la come:
 # cuando la sesión no arranca, esto es lo único que queda para saber por qué.
 registro="${XDG_RUNTIME_DIR:-/tmp}/bookos-session.log"
@@ -56,4 +87,63 @@ registro="${XDG_RUNTIME_DIR:-/tmp}/bookos-session.log"
     echo "bookos-session: $binario"
     echo "compilado: $(date -r "$binario" '+%d/%m %H:%M' 2>/dev/null || echo '?')"
 } >"$registro"
-exec "$binario" >>"$registro" 2>&1
+
+# ── Autoarranque XDG ───────────────────────────────────────────────────────
+# Lanzar lo de /etc/xdg/autostart y ~/.config/autostart es cosa del escritorio.
+# Plasma lo hace y BookOS cuenta con ello: por ahí salen el refresco de primer
+# inicio y la ventana de novedades. El compositor no lo implementa, así que se
+# hace aquí, que es donde está el ciclo de vida de la sesión.
+#
+# Del estándar se respeta lo que decide si una entrada corre o no: Hidden,
+# OnlyShowIn/NotShowIn contra el nombre de esta sesión, y TryExec. De Exec se
+# quitan los códigos %f %u %U… , que solo tienen sentido al abrir ficheros.
+lanzar_autostart() {
+    local vistos=" " entrada nombre valor orden
+    for dir in "${XDG_CONFIG_HOME:-$HOME/.config}/autostart" /etc/xdg/autostart; do
+        [ -d "$dir" ] || continue
+        for entrada in "$dir"/*.desktop; do
+            [ -f "$entrada" ] || continue
+            nombre=$(basename "$entrada")
+            # El del usuario gana sobre el del sistema con el mismo nombre.
+            case "$vistos" in *" $nombre "*) continue ;; esac
+            vistos="$vistos$nombre "
+            [ "$(sed -n 's/^Hidden=//p' "$entrada" | head -n1)" = true ] && continue
+            valor=$(sed -n 's/^OnlyShowIn=//p' "$entrada" | head -n1)
+            if [ -n "$valor" ]; then
+                case ";$valor" in *";BookOS;"*) ;; *) continue ;; esac
+            fi
+            valor=$(sed -n 's/^NotShowIn=//p' "$entrada" | head -n1)
+            if [ -n "$valor" ]; then
+                case ";$valor" in *";BookOS;"*) continue ;; esac
+            fi
+            valor=$(sed -n 's/^TryExec=//p' "$entrada" | head -n1)
+            if [ -n "$valor" ] && ! command -v "$valor" >/dev/null 2>&1; then
+                continue
+            fi
+            orden=$(sed -n 's/^Exec=//p' "$entrada" | head -n1)
+            [ -n "$orden" ] || continue
+            orden=$(printf '%s' "$orden" | sed 's/%[fFuUdDnNickvm]//g')
+            echo "autostart: $nombre" >>"$registro"
+            setsid sh -c "$orden" >>"$registro" 2>&1 &
+        done
+    done
+}
+
+# El compositor va en segundo plano, no con exec, para poder lanzar el
+# autoarranque cuando su socket ya existe: sin WAYLAND_DISPLAY apuntando a él,
+# lo que se lance no tiene a qué conectarse.
+"$binario" >>"$registro" 2>&1 &
+comp=$!
+socket=""
+for _ in $(seq 100); do
+    socket=$(ls -t "${XDG_RUNTIME_DIR:-/tmp}"/wayland-[0-9]* 2>/dev/null | grep -v '\.lock$' | head -n1)
+    [ -n "$socket" ] && break
+    sleep 0.05
+done
+if [ -n "$socket" ]; then
+    export WAYLAND_DISPLAY="$(basename "$socket")"
+    lanzar_autostart
+else
+    echo "aviso: no apareció el socket wayland; sin autoarranque" >>"$registro"
+fi
+wait "$comp"

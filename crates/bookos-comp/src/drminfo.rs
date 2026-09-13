@@ -10,8 +10,8 @@ use std::fs::File;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::path::Path;
 
-use smithay::reexports::drm::control::{connector, Device as ControlDevice};
 use smithay::reexports::drm::Device as BasicDevice;
+use smithay::reexports::drm::control::{Device as ControlDevice, connector};
 
 /// Envoltorio mínimo: los traits de `drm` solo piden el descriptor.
 struct Card(File);

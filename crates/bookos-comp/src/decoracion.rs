@@ -78,10 +78,7 @@ pub fn id(window: &Window) -> Option<u64> {
 
 /// El rectángulo de la barra, en lógicos: los [`ALTO`] píxeles justo encima de
 /// la ventana. `None` si esa ventana no lleva.
-pub fn barra_rect(
-    state: &BookosComp,
-    window: &Window,
-) -> Option<Rectangle<i32, Logical>> {
+pub fn barra_rect(state: &BookosComp, window: &Window) -> Option<Rectangle<i32, Logical>> {
     if !decorada(window) {
         return None;
     }
@@ -101,29 +98,22 @@ pub fn barra_rect(
 /// Se recorre de delante hacia atrás —`elements()` va de atrás a adelante— para
 /// que la barra de una ventana tapada no se lleve el clic de la que está
 /// encima.
-pub fn barra_en(
-    state: &BookosComp,
-    punto: Point<f64, Logical>,
-) -> Option<(Window, Option<Boton>)> {
-    state
-        .space
-        .elements()
-        .rev()
-        .find_map(|window| {
-            let rect = barra_rect(state, window)?;
-            let dentro = punto.x >= rect.loc.x as f64
-                && punto.x < (rect.loc.x + rect.size.w) as f64
-                && punto.y >= rect.loc.y as f64
-                && punto.y < (rect.loc.y + rect.size.h) as f64;
-            dentro.then(|| {
-                let boton = bookos_shell::decoracion::boton_en(
-                    rect.size.w as f32,
-                    (punto.x - rect.loc.x as f64) as f32,
-                    (punto.y - rect.loc.y as f64) as f32,
-                );
-                (window.clone(), boton)
-            })
+pub fn barra_en(state: &BookosComp, punto: Point<f64, Logical>) -> Option<(Window, Option<Boton>)> {
+    state.space.elements().rev().find_map(|window| {
+        let rect = barra_rect(state, window)?;
+        let dentro = punto.x >= rect.loc.x as f64
+            && punto.x < (rect.loc.x + rect.size.w) as f64
+            && punto.y >= rect.loc.y as f64
+            && punto.y < (rect.loc.y + rect.size.h) as f64;
+        dentro.then(|| {
+            let boton = bookos_shell::decoracion::boton_en(
+                rect.size.w as f32,
+                (punto.x - rect.loc.x as f64) as f32,
+                (punto.y - rect.loc.y as f64) as f32,
+            );
+            (window.clone(), boton)
         })
+    })
 }
 
 /// El área donde cabe una ventana **con** su barra: la útil, sin la franja de
@@ -163,9 +153,7 @@ pub fn accionar(state: &mut BookosComp, window: &Window, boton: Boton) {
 
 /// Lo que el shell necesita saber para dibujar la barra de esta ventana.
 pub fn estado_de(state: &BookosComp, window: &Window) -> bookos_shell::decoracion::Estado {
-    let activa = state
-        .ventana_con_foco()
-        .is_some_and(|f| f == *window);
+    let activa = state.ventana_con_foco().is_some_and(|f| f == *window);
     let mio = |guardado: &Option<(u64, Boton)>| {
         guardado
             .filter(|(quien, _)| Some(*quien) == id(window))
@@ -190,8 +178,7 @@ pub struct Interaccion {
 
 /// Apunta qué botón hay bajo el cursor. `true` si cambió y hay que repintar.
 pub fn señalar(state: &mut BookosComp, punto: Point<f64, Logical>) -> bool {
-    let nuevo = barra_en(state, punto)
-        .and_then(|(w, boton)| Some((id(&w)?, boton?)));
+    let nuevo = barra_en(state, punto).and_then(|(w, boton)| Some((id(&w)?, boton?)));
     if state.decoracion.señalado == nuevo {
         return false;
     }

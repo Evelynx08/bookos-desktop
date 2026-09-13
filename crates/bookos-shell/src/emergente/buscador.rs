@@ -28,12 +28,12 @@
 
 use iced_core::alignment::Vertical;
 use iced_core::{Border, Length};
-use iced_widget::{column, container, row, text, Space};
+use iced_widget::{Space, column, container, row, text};
 
 use crate::icono::{self, Icono};
 use crate::tema;
 use crate::view::PanelElement;
-use crate::{apps, Accion, PanelData};
+use crate::{Accion, PanelData, apps};
 
 use super::{Ancla, Tecla};
 
@@ -530,9 +530,15 @@ fn accion_sistema(consulta: &str) -> Option<Resultado> {
         )
     } else if coincide(&["efectos", "animaciones", "desenfoque"]) {
         let (nombre, detalle) = if crate::tema::efectos_reducidos() {
-            ("Efectos completos", "Devolver el desenfoque y las animaciones")
+            (
+                "Efectos completos",
+                "Devolver el desenfoque y las animaciones",
+            )
         } else {
-            ("Reducir efectos", "Quitar el desenfoque y las animaciones de ventana")
+            (
+                "Reducir efectos",
+                "Quitar el desenfoque y las animaciones de ventana",
+            )
         };
         (nombre, detalle, "apariencia", Accion::AlternarEfectos)
     } else if coincide(&["energia", "energía", "power"]) {

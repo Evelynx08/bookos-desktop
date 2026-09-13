@@ -21,7 +21,7 @@
 
 use iced_core::alignment::{Horizontal, Vertical};
 use iced_core::{Border, Length};
-use iced_widget::{column, container, row, text, Space};
+use iced_widget::{Space, column, container, row, text};
 
 use image::ImageEncoder as _;
 
@@ -344,8 +344,15 @@ impl Captura {
                 }
             },
             TeclaPulsada::Izquierda | TeclaPulsada::Derecha => {
-                let i = Modo::TODOS.iter().position(|m| *m == self.modo).unwrap_or(0);
-                let paso = if matches!(tecla, TeclaPulsada::Derecha) { 1 } else { Modo::TODOS.len() - 1 };
+                let i = Modo::TODOS
+                    .iter()
+                    .position(|m| *m == self.modo)
+                    .unwrap_or(0);
+                let paso = if matches!(tecla, TeclaPulsada::Derecha) {
+                    1
+                } else {
+                    Modo::TODOS.len() - 1
+                };
                 self.modo = Modo::TODOS[(i + paso) % Modo::TODOS.len()];
                 Tecla::Consumida
             }
@@ -412,7 +419,8 @@ impl Captura {
             } else {
                 (r.y + r.h - PASTILLA_ALTO - PASTILLA_HUECO).max(0.0)
             };
-            let px = (r.x + (r.w - PASTILLA_ANCHO) / 2.0).clamp(0.0, (pw - PASTILLA_ANCHO).max(0.0));
+            let px =
+                (r.x + (r.w - PASTILLA_ANCHO) / 2.0).clamp(0.0, (pw - PASTILLA_ANCHO).max(0.0));
             let pastilla = container(
                 text(format!("{} × {}", r.w as i32, r.h as i32))
                     .size(tema::T_PEQUENO)
@@ -433,12 +441,10 @@ impl Captura {
                 },
                 ..Default::default()
             });
-            capas = capas.push(
-                column![
-                    Space::new().height(Length::Fixed(py)),
-                    row![Space::new().width(Length::Fixed(px)), pastilla],
-                ]
-            );
+            capas = capas.push(column![
+                Space::new().height(Length::Fixed(py)),
+                row![Space::new().width(Length::Fixed(px)), pastilla],
+            ]);
         }
 
         capas = capas.push(self.barra());
@@ -472,15 +478,14 @@ impl Captura {
                     )
                     .push(Space::new().width(Length::Fixed(DIVISOR_AIRE)));
             }
-            let (simbolo, nombre, activa) = match Destino::TODOS
-                .get(i.wrapping_sub(Modo::TODOS.len()))
-            {
-                Some(d) => (d.simbolo(), d.nombre(), *d == self.destino),
-                None => {
-                    let m = Modo::TODOS[i];
-                    (m.simbolo(), m.nombre(), m == self.modo)
-                }
-            };
+            let (simbolo, nombre, activa) =
+                match Destino::TODOS.get(i.wrapping_sub(Modo::TODOS.len())) {
+                    Some(d) => (d.simbolo(), d.nombre(), *d == self.destino),
+                    None => {
+                        let m = Modo::TODOS[i];
+                        (m.simbolo(), m.nombre(), m == self.modo)
+                    }
+                };
             let señalada = self.señalada == Some(i);
             celdas = celdas.push(
                 container(
@@ -542,10 +547,7 @@ impl Captura {
 
         column![
             Space::new().height(Length::Fixed(self.y_barra())),
-            row![
-                Space::new().width(Length::Fixed(self.x_barra())),
-                tarjeta,
-            ],
+            row![Space::new().width(Length::Fixed(self.x_barra())), tarjeta,],
         ]
         .into()
     }
@@ -673,7 +675,13 @@ mod tests {
         assert_eq!((r.w, r.h), (400.0, 300.0));
         assert_eq!(
             c.soltar(),
-            Some(Accion::Capturar { x: 200, y: 150, ancho: 400, alto: 300, guardar: false })
+            Some(Accion::Capturar {
+                x: 200,
+                y: 150,
+                ancho: 400,
+                alto: 300,
+                guardar: false
+            })
         );
     }
 
@@ -723,7 +731,13 @@ mod tests {
         c.puntero(600.0, 450.0);
         assert_eq!(
             c.soltar(),
-            Some(Accion::Capturar { x: 200, y: 150, ancho: 400, alto: 300, guardar: true })
+            Some(Accion::Capturar {
+                x: 200,
+                y: 150,
+                ancho: 400,
+                alto: 300,
+                guardar: true
+            })
         );
     }
 
@@ -736,7 +750,13 @@ mod tests {
         assert_eq!(c.celda_en(x, y), Some(0));
         assert_eq!(
             c.pulsar(x, y),
-            Some(Accion::Capturar { x: 0, y: 0, ancho: 1920, alto: 1080, guardar: false })
+            Some(Accion::Capturar {
+                x: 0,
+                y: 0,
+                ancho: 1920,
+                alto: 1080,
+                guardar: false
+            })
         );
     }
 
@@ -750,6 +770,9 @@ mod tests {
         let y = c.y_barra() + 2.0;
         assert_eq!(c.celda_en(x, y), None);
         assert_eq!(c.pulsar(x, y), None);
-        assert!(c.arrastre.is_none(), "la barra no puede empezar un arrastre");
+        assert!(
+            c.arrastre.is_none(),
+            "la barra no puede empezar un arrastre"
+        );
     }
 }

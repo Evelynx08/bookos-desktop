@@ -51,7 +51,10 @@ fn medir(veces: u32, mut f: impl FnMut()) -> f64 {
 }
 
 fn main() {
-    println!("{:<16} {:>10} {:>10} {:>10}", "widget", "crear", "refrescar", "zonas");
+    println!(
+        "{:<16} {:>10} {:>10} {:>10}",
+        "widget", "crear", "refrescar", "zonas"
+    );
     println!("{}", "-".repeat(50));
 
     for nombre in TODOS {
@@ -75,7 +78,10 @@ fn main() {
     // entre arrancar la sesión y el primer frame.
     let t = Instant::now();
     let _ = Shell::con_config(ANCHO, ESCALA, Config::default());
-    println!("\narranque del panel completo: {:.2} ms", t.elapsed().as_secs_f64() * 1000.0);
+    println!(
+        "\narranque del panel completo: {:.2} ms",
+        t.elapsed().as_secs_f64() * 1000.0
+    );
 
     // Y el panel completo de serie, para comparar con la suma.
     let mut shell = Shell::con_config(ANCHO, ESCALA, Config::default());
@@ -86,5 +92,8 @@ fn main() {
         std::hint::black_box(shell.zonas_panel());
     });
     println!("{}", "-".repeat(50));
-    println!("{:<16} {:>10} {refresco:>9.3}ms {zonas:>9.3}ms", "panel entero", "");
+    println!(
+        "{:<16} {:>10} {refresco:>9.3}ms {zonas:>9.3}ms",
+        "panel entero", ""
+    );
 }

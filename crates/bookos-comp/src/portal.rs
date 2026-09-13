@@ -33,6 +33,10 @@
 //! esperan sobre [`Promesa`], que es un `Future` de verdad: mientras el
 //! usuario mira el diálogo, la conexión sigue atendiendo lo demás.
 //!
+//! También sirve `org.freedesktop.impl.portal.Settings`, que es por donde las
+//! aplicaciones **de fuera** —GTK, Qt, Tauri— se enteran del tema, del acento y
+//! de los efectos reducidos de BookOS. Ver [`Ajustes`].
+//!
 //! ## Lo que todavía no hay
 //!
 //! - **Solo pantallas enteras**, no ventanas sueltas: compartir una ventana
@@ -41,20 +45,15 @@
 //! - **El puntero siempre sale.** `escena()` lo pinta como un elemento más;
 //!   quitarlo obligaría a componer la salida dos veces. `AvailableCursorModes`
 //!   anuncia solo `EMBEDDED`, que es la verdad.
-//! - **No se exporta un objeto `Request`** en la ruta del `handle`, así que si
-//!   la aplicación cancela mientras el diálogo está abierto, el portal se
-//!   entera al vencer el plazo y no en el momento.
-//! - **No se emite `Session.Closed`.** Si el compositor corta la emisión por su
-//!   cuenta —la pantalla cambia de modo—, el consumidor lo ve como que el nodo
-//!   de PipeWire se acaba, pero `xdg-desktop-portal` no se entera hasta que la
-//!   aplicación pregunta.
+//! - La interacción de `ScreenCast.Start` publica un objeto `Request`: cerrar
+//!   la petición retira inmediatamente el diálogo y el nodo en preparación.
 
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use smithay::reexports::calloop::channel::Sender;
@@ -91,7 +90,10 @@ impl<T> Emisario<T> {
         // El bloque cierra el préstamo antes de que corra el `Drop` de `self`,
         // que vuelve a coger el mismo mutex.
         {
-            let mut buzon = self.0.lock().expect("el buzón no se comparte con nada que entre en pánico");
+            let mut buzon = self
+                .0
+                .lock()
+                .expect("el buzón no se comparte con nada que entre en pánico");
             buzon.valor = Some(valor);
             if let Some(waker) = buzon.waker.take() {
                 waker.wake();
@@ -102,7 +104,10 @@ impl<T> Emisario<T> {
 
 impl<T> Drop for Emisario<T> {
     fn drop(&mut self) {
-        let mut buzon = self.0.lock().expect("el buzón no se comparte con nada que entre en pánico");
+        let mut buzon = self
+            .0
+            .lock()
+            .expect("el buzón no se comparte con nada que entre en pánico");
         buzon.cerrado = true;
         if let Some(waker) = buzon.waker.take() {
             waker.wake();
@@ -117,7 +122,10 @@ impl<T> std::future::Future for Promesa<T> {
     type Output = Option<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
-        let mut buzon = self.0.lock().expect("el buzón no se comparte con nada que entre en pánico");
+        let mut buzon = self
+            .0
+            .lock()
+            .expect("el buzón no se comparte con nada que entre en pánico");
         if let Some(valor) = buzon.valor.take() {
             return Poll::Ready(Some(valor));
         }
@@ -130,7 +138,11 @@ impl<T> std::future::Future for Promesa<T> {
 }
 
 pub fn promesa<T>() -> (Emisario<T>, Promesa<T>) {
-    let buzon = Arc::new(Mutex::new(Buzon { valor: None, cerrado: false, waker: None }));
+    let buzon = Arc::new(Mutex::new(Buzon {
+        valor: None,
+        cerrado: false,
+        waker: None,
+    }));
     (Emisario(buzon.clone()), Promesa(buzon))
 }
 
@@ -139,6 +151,7 @@ pub enum Aviso {
     /// Enseña el diálogo de permiso y, si el usuario acepta, abre el nodo.
     Consentir {
         sesion: u32,
+        ruta: OwnedObjectPath,
         app: String,
         /// El tamaño en píxeles del buffer de la salida elegida. Soltarlo sin
         /// contestar es la negativa.
@@ -148,6 +161,8 @@ pub enum Aviso {
     },
     /// La aplicación cerró la sesión.
     Cerrar { sesion: u32 },
+    /// El portal canceló la interacción antes de que `Start` terminara.
+    Cancelar { sesion: u32 },
     /// Un socket de PipeWire ya conectado para dárselo al cliente.
     Descriptor { respuesta: Emisario<OwnedFd> },
     /// Una captura de la pantalla entera a un fichero.
@@ -214,7 +229,10 @@ impl ScreenCast {
 
         // La tarjeta `Session` vive en la ruta que manda el portal; es por
         // donde llega el `Close` cuando la aplicación termina la llamada.
-        let tarjeta = Sesion { estado: self.estado.clone(), ruta: ruta.clone() };
+        let tarjeta = Sesion {
+            estado: self.estado.clone(),
+            ruta: ruta.clone(),
+        };
         if let Err(err) = servidor.at(ruta.as_str(), tarjeta).await {
             tracing::warn!("no se pudo publicar la sesión del portal: {err}");
             return (FALLO, HashMap::new());
@@ -237,11 +255,12 @@ impl ScreenCast {
 
     async fn start(
         &self,
-        _handle: ObjectPath<'_>,
+        handle: ObjectPath<'_>,
         session_handle: ObjectPath<'_>,
         app_id: &str,
         _parent_window: &str,
         _options: HashMap<String, OwnedValue>,
+        #[zbus(object_server)] servidor: &zbus::ObjectServer,
     ) -> (u32, HashMap<String, OwnedValue>) {
         let ruta: OwnedObjectPath = session_handle.to_owned().into();
         let Some(sesion) = self
@@ -256,41 +275,64 @@ impl ScreenCast {
             return (FALLO, HashMap::new());
         };
 
+        let ruta_solicitud: OwnedObjectPath = handle.to_owned().into();
+        let cancelada = Arc::new(AtomicBool::new(false));
+        let solicitud = Solicitud {
+            estado: self.estado.clone(),
+            ruta: ruta_solicitud.clone(),
+            sesion,
+            cancelada: cancelada.clone(),
+        };
+        if let Err(err) = servidor.at(ruta_solicitud.as_str(), solicitud).await {
+            tracing::warn!(%ruta_solicitud, "no se pudo publicar Request: {err}");
+            return (FALLO, HashMap::new());
+        }
+
         let (respuesta, espera) = promesa();
         let (nodo, espera_nodo) = promesa();
         let app = nombre_legible(app_id);
-        if !self.estado.avisar(Aviso::Consentir { sesion, app, respuesta, nodo }) {
+        if !self.estado.avisar(Aviso::Consentir {
+            sesion,
+            ruta,
+            app,
+            respuesta,
+            nodo,
+        }) {
+            let _ = servidor
+                .remove::<Solicitud, _>(ruta_solicitud.as_str())
+                .await;
             return (FALLO, HashMap::new());
         }
 
-        let Some((ancho, alto)) = espera.await else {
-            return (CANCELADO, HashMap::new());
-        };
-        let Some(node_id) = espera_nodo.await else {
-            tracing::warn!(sesion, "PipeWire no dio identificador de nodo");
-            self.estado.avisar(Aviso::Cerrar { sesion });
-            return (FALLO, HashMap::new());
+        let respuesta_usuario = espera.await;
+        let resultado = if cancelada.load(Ordering::Acquire) {
+            (CANCELADO, HashMap::new())
+        } else if let Some((ancho, alto)) = respuesta_usuario {
+            match espera_nodo.await {
+                Some(node_id) if !cancelada.load(Ordering::Acquire) => {
+                    respuesta_start(sesion, node_id, ancho, alto)
+                }
+                Some(_) => {
+                    self.estado.avisar(Aviso::Cerrar { sesion });
+                    (CANCELADO, HashMap::new())
+                }
+                None => {
+                    tracing::warn!(sesion, "PipeWire no dio identificador de nodo");
+                    self.estado.avisar(Aviso::Cerrar { sesion });
+                    (FALLO, HashMap::new())
+                }
+            }
+        } else {
+            (CANCELADO, HashMap::new())
         };
 
-        // `streams` es `a(ua{sv})`: una tupla por flujo con su nodo y sus
-        // propiedades. `source_type = 1` es MONITOR.
-        let mut props: HashMap<String, Value<'_>> = HashMap::new();
-        props.insert("size".into(), Value::from((ancho as i32, alto as i32)));
-        props.insert("source_type".into(), Value::from(1u32));
-        let flujos = vec![(node_id, props)];
-
-        let mut resultados = HashMap::new();
-        match OwnedValue::try_from(Value::from(flujos)) {
-            Ok(v) => {
-                resultados.insert("streams".to_string(), v);
-            }
-            Err(err) => {
-                tracing::warn!("no se pudo empaquetar la lista de flujos: {err}");
-                return (FALLO, HashMap::new());
-            }
+        if let Err(err) = servidor
+            .remove::<Solicitud, _>(ruta_solicitud.as_str())
+            .await
+        {
+            tracing::debug!(%ruta_solicitud, "Request ya retirado: {err}");
         }
-        tracing::info!(sesion, node_id, ancho, alto, "compartiendo pantalla");
-        (CORRECTO, resultados)
+        resultado
     }
 
     async fn open_pipe_wire_remote(
@@ -301,13 +343,63 @@ impl ScreenCast {
     ) -> zbus::fdo::Result<zbus::zvariant::OwnedFd> {
         let (respuesta, espera) = promesa();
         if !self.estado.avisar(Aviso::Descriptor { respuesta }) {
-            return Err(zbus::fdo::Error::Failed("el compositor se está cerrando".into()));
+            return Err(zbus::fdo::Error::Failed(
+                "el compositor se está cerrando".into(),
+            ));
         }
         match espera.await {
             Some(fd) => Ok(fd.into()),
             None => Err(zbus::fdo::Error::Failed(
                 "no se pudo abrir una conexión a PipeWire".into(),
             )),
+        }
+    }
+}
+
+fn respuesta_start(
+    sesion: u32,
+    node_id: u32,
+    ancho: u32,
+    alto: u32,
+) -> (u32, HashMap<String, OwnedValue>) {
+    // `streams` es `a(ua{sv})`: una tupla por flujo con su nodo y sus
+    // propiedades. `source_type = 1` es MONITOR.
+    let mut props: HashMap<String, Value<'_>> = HashMap::new();
+    props.insert("size".into(), Value::from((ancho as i32, alto as i32)));
+    props.insert("source_type".into(), Value::from(1u32));
+    let flujos = vec![(node_id, props)];
+    let mut resultados = HashMap::new();
+    match OwnedValue::try_from(Value::from(flujos)) {
+        Ok(v) => {
+            resultados.insert("streams".to_string(), v);
+        }
+        Err(err) => {
+            tracing::warn!("no se pudo empaquetar la lista de flujos: {err}");
+            return (FALLO, HashMap::new());
+        }
+    }
+    tracing::info!(sesion, node_id, ancho, alto, "compartiendo pantalla");
+    (CORRECTO, resultados)
+}
+
+/// Objeto efímero que permite a xdg-desktop-portal cancelar el diálogo de
+/// `Start` mientras su llamada asíncrona sigue esperando.
+struct Solicitud {
+    estado: Arc<Estado>,
+    ruta: OwnedObjectPath,
+    sesion: u32,
+    cancelada: Arc<AtomicBool>,
+}
+
+#[zbus::interface(name = "org.freedesktop.impl.portal.Request")]
+impl Solicitud {
+    async fn close(&self, #[zbus(object_server)] servidor: &zbus::ObjectServer) {
+        self.cancelada.store(true, Ordering::Release);
+        self.estado.avisar(Aviso::Cancelar {
+            sesion: self.sesion,
+        });
+        if let Err(err) = servidor.remove::<Solicitud, _>(self.ruta.as_str()).await {
+            tracing::debug!(ruta = %self.ruta, "Request ya retirado: {err}");
         }
     }
 }
@@ -340,6 +432,158 @@ impl Sesion {
         // ruta —el portal las reutiliza— chocaría con esta.
         if let Err(err) = servidor.remove::<Sesion, _>(self.ruta.as_str()).await {
             tracing::warn!(ruta = %self.ruta, "no se pudo retirar la sesión del portal: {err}");
+        }
+    }
+}
+
+/// El aspecto del sistema, para las aplicaciones que no son de BookOS.
+///
+/// Es lo que hace que una app **GTK o Tauri** siga el tema y el acento del
+/// escritorio sin instalarle nada: GTK 4 y libadwaita ≥ 1.6 preguntan aquí al
+/// arrancar y se quedan escuchando la señal, así que cambiar el acento en
+/// Apariencia les llega en caliente. Tauri va sobre WebKitGTK, o sea que
+/// también le llega —su CSS ve el `prefers-color-scheme` correcto—.
+///
+/// Es mejor que el tema GTK de `BookOS-GTK-Theme`, que se instala copiando
+/// ficheros y solo trae dos acentos fijos: aquí van los diez y cambian sin
+/// reiniciar la aplicación.
+///
+/// **Los valores no se guardan aquí.** El tema, el acento, el contraste y los efectos
+/// reducidos son estáticos atómicos del proceso (`tema::actual()`,
+/// `tema::acento()`, `tema::efectos_reducidos()`), así que este hilo los lee
+/// directamente sin canal ni copia que se pueda quedar vieja.
+struct Ajustes;
+
+/// El espacio de nombres que miran GTK, Qt y quien siga la especificación.
+const APARIENCIA: &str = "org.freedesktop.appearance";
+
+impl Ajustes {
+    /// `color-scheme`: 0 sin preferencia, 1 oscuro, 2 claro.
+    fn color_scheme() -> u32 {
+        if bookos_shell::tema::es_claro() { 2 } else { 1 }
+    }
+
+    /// `accent-color` es una tupla de tres dobles de 0 a 1, no un entero de 32
+    /// bits: comprobado contra lo que sirve el portal de KDE en esta máquina.
+    fn accent_color() -> (f64, f64, f64) {
+        let c = bookos_shell::tema::acento();
+        (c.r as f64, c.g as f64, c.b as f64)
+    }
+
+    /// `reduced-motion`: 0 no, 1 sí. Sale de los efectos reducidos de BookOS,
+    /// así que apagarlos en el escritorio también calma las animaciones de las
+    /// aplicaciones que lo respetan.
+    fn reduced_motion() -> u32 {
+        u32::from(bookos_shell::tema::efectos_reducidos())
+    }
+
+    fn valores() -> HashMap<String, OwnedValue> {
+        let mut m = HashMap::new();
+        let mete = |m: &mut HashMap<String, OwnedValue>, k: &str, v: Value<'_>| {
+            match OwnedValue::try_from(v) {
+                Ok(v) => {
+                    m.insert(k.to_string(), v);
+                }
+                Err(err) => tracing::warn!(k, "no se pudo empaquetar el ajuste: {err}"),
+            }
+        };
+        mete(&mut m, "color-scheme", Value::from(Self::color_scheme()));
+        mete(&mut m, "accent-color", Value::from(Self::accent_color()));
+        mete(
+            &mut m,
+            "reduced-motion",
+            Value::from(Self::reduced_motion()),
+        );
+        mete(
+            &mut m,
+            "contrast",
+            Value::from(u32::from(bookos_shell::tema::alto_contraste())),
+        );
+        m
+    }
+
+    fn uno(clave: &str) -> Option<OwnedValue> {
+        let v = match clave {
+            "color-scheme" => Value::from(Self::color_scheme()),
+            "accent-color" => Value::from(Self::accent_color()),
+            "reduced-motion" => Value::from(Self::reduced_motion()),
+            "contrast" => Value::from(u32::from(bookos_shell::tema::alto_contraste())),
+            _ => return None,
+        };
+        OwnedValue::try_from(v).ok()
+    }
+}
+
+#[zbus::interface(name = "org.freedesktop.impl.portal.Settings")]
+impl Ajustes {
+    #[zbus(property, name = "version")]
+    fn version(&self) -> u32 {
+        2
+    }
+
+    fn read_all(&self, namespaces: Vec<String>) -> HashMap<String, HashMap<String, OwnedValue>> {
+        // La lista admite comodines por prefijo y la vacía significa «todo».
+        let quiere = namespaces.is_empty()
+            || namespaces
+                .iter()
+                .any(|n| n.is_empty() || APARIENCIA.starts_with(n.trim_end_matches('*')));
+        let mut fuera = HashMap::new();
+        if quiere {
+            fuera.insert(APARIENCIA.to_string(), Self::valores());
+        }
+        fuera
+    }
+
+    /// `ReadOne` es la de la versión 2. `Read` hace lo mismo y sigue viva
+    /// porque las aplicaciones antiguas solo conocen esa.
+    fn read_one(&self, namespace: &str, key: &str) -> zbus::fdo::Result<OwnedValue> {
+        if namespace != APARIENCIA {
+            return Err(zbus::fdo::Error::UnknownProperty(format!(
+                "BookOS no sirve el espacio «{namespace}»"
+            )));
+        }
+        Self::uno(key)
+            .ok_or_else(|| zbus::fdo::Error::UnknownProperty(format!("no hay ajuste «{key}»")))
+    }
+
+    fn read(&self, namespace: &str, key: &str) -> zbus::fdo::Result<OwnedValue> {
+        self.read_one(namespace, key)
+    }
+
+    #[zbus(signal)]
+    async fn setting_changed(
+        emisor: &zbus::object_server::SignalEmitter<'_>,
+        namespace: &str,
+        key: &str,
+        value: Value<'_>,
+    ) -> zbus::Result<()>;
+}
+
+/// Avisa a las aplicaciones de que el aspecto ha cambiado.
+///
+/// Se llama desde el bucle de frames al aplicar apariencia o efectos. Sin la
+/// señal, una app GTK ya abierta se queda con el tema con el que arrancó.
+pub fn apariencia_cambiada(conexion: Option<&zbus::blocking::Connection>) {
+    let Some(conexion) = conexion else {
+        return;
+    };
+    for (clave, valor) in [
+        ("color-scheme", Value::from(Ajustes::color_scheme())),
+        ("accent-color", Value::from(Ajustes::accent_color())),
+        ("reduced-motion", Value::from(Ajustes::reduced_motion())),
+        (
+            "contrast",
+            Value::from(u32::from(bookos_shell::tema::alto_contraste())),
+        ),
+    ] {
+        if let Err(err) = conexion.emit_signal(
+            None::<&str>,
+            RUTA,
+            "org.freedesktop.impl.portal.Settings",
+            "SettingChanged",
+            &(APARIENCIA, clave, valor),
+        ) {
+            tracing::warn!(clave, "no se pudo avisar del cambio de aspecto: {err}");
         }
     }
 }
@@ -413,8 +657,23 @@ pub fn arrancar(canal: Sender<Aviso>) -> Option<zbus::blocking::Connection> {
         siguiente: AtomicU32::new(1),
     });
     let conexion = zbus::blocking::connection::Builder::session()
-        .and_then(|b| b.serve_at(RUTA, ScreenCast { estado: estado.clone() }))
-        .and_then(|b| b.serve_at(RUTA, Screenshot { estado: estado.clone() }))
+        .and_then(|b| {
+            b.serve_at(
+                RUTA,
+                ScreenCast {
+                    estado: estado.clone(),
+                },
+            )
+        })
+        .and_then(|b| {
+            b.serve_at(
+                RUTA,
+                Screenshot {
+                    estado: estado.clone(),
+                },
+            )
+        })
+        .and_then(|b| b.serve_at(RUTA, Ajustes))
         // El nombre se pide **al final**: hasta que las dos interfaces están
         // publicadas, un `xdg-desktop-portal` que ya estuviera esperando podría
         // preguntar por una que todavía no existe.
@@ -435,12 +694,19 @@ pub fn arrancar(canal: Sender<Aviso>) -> Option<zbus::blocking::Connection> {
 /// Lo que llega del hilo del portal, ya en el hilo del compositor.
 pub fn recibir(state: &mut crate::state::BookosComp, aviso: Aviso) {
     match aviso {
-        Aviso::Consentir { sesion, app, respuesta, nodo } => {
-            consentir(state, sesion, app, respuesta, nodo);
+        Aviso::Consentir {
+            sesion,
+            ruta,
+            app,
+            respuesta,
+            nodo,
+        } => {
+            consentir(state, sesion, ruta, app, respuesta, nodo);
         }
         Aviso::Cerrar { sesion } => {
             state.emisiones.quitar(sesion);
         }
+        Aviso::Cancelar { sesion } => cancelar(state, sesion),
         Aviso::Descriptor { respuesta } => {
             // Si el hilo de PipeWire no arranca, el portal se queda sin
             // respuesta y vence su plazo: mejor eso que contestarle con un
@@ -453,9 +719,26 @@ pub fn recibir(state: &mut crate::state::BookosComp, aviso: Aviso) {
     }
 }
 
+fn cancelar(state: &mut crate::state::BookosComp, sesion: u32) {
+    if state
+        .consentimiento
+        .as_ref()
+        .is_some_and(|consentimiento| consentimiento.sesion == sesion)
+    {
+        // Soltar los emisarios despierta `Start` con cancelación.
+        state.consentimiento = None;
+        if let Some(shell) = state.shell.as_mut() {
+            shell.cerrar_emergente();
+        }
+        state.needs_redraw = true;
+    }
+    state.emisiones.quitar(sesion);
+}
+
 fn consentir(
     state: &mut crate::state::BookosComp,
     sesion: u32,
+    ruta: OwnedObjectPath,
     app: String,
     respuesta: Emisario<(u32, u32)>,
     nodo: Emisario<u32>,
@@ -484,7 +767,13 @@ fn consentir(
         return;
     };
     shell.abrir_compartir(sesion, app, pantallas);
-    state.consentimiento = Some(crate::state::Consentimiento { sesion, respuesta, nodo, salidas });
+    state.consentimiento = Some(crate::state::Consentimiento {
+        sesion,
+        ruta,
+        respuesta,
+        nodo,
+        salidas,
+    });
     state.needs_redraw = true;
 }
 
@@ -533,6 +822,7 @@ pub fn responder(state: &mut crate::state::BookosComp, sesion: u32, pantalla: Op
     });
     state.emisiones.anadir(crate::emision::Emision {
         sesion,
+        ruta: consentimiento.ruta,
         output,
         tamano,
         periodo,
@@ -541,6 +831,22 @@ pub fn responder(state: &mut crate::state::BookosComp, sesion: u32, pantalla: Op
         ultimo: std::time::Instant::now() - periodo,
     });
     consentimiento.respuesta.entregar((ancho, alto));
+}
+
+/// Avisa al portal cuando el compositor tiene que cortar una sesión por su
+/// cuenta, por ejemplo porque el modo de la salida ya no coincide con el
+/// formato negociado con PipeWire.
+pub fn sesion_cerrada(conexion: Option<&zbus::blocking::Connection>, ruta: &OwnedObjectPath) {
+    let Some(conexion) = conexion else { return };
+    if let Err(err) = conexion.emit_signal(
+        None::<&str>,
+        ruta.as_str(),
+        "org.freedesktop.impl.portal.Session",
+        "Closed",
+        &(),
+    ) {
+        tracing::warn!(%ruta, "no se pudo emitir Session.Closed: {err}");
+    }
 }
 
 /// La red de seguridad: si la tarjeta ya no está pero nadie contestó, se
@@ -595,6 +901,56 @@ fn capturar(state: &mut crate::state::BookosComp, respuesta: Emisario<PathBuf>) 
 #[cfg(test)]
 mod pruebas {
     use super::*;
+
+    /// Lo que se le sirve a GTK es lo que el escritorio está pintando.
+    ///
+    /// Los números son los del propio tema, no una copia: si alguien cambia el
+    /// azul de BookOS, esto lo sigue. Lo que se fija aquí es la **forma**, que
+    /// es lo que la especificación obliga y lo que se comprobó contra el portal
+    /// de KDE de esta máquina: `color-scheme` entero con 1 oscuro y 2 claro, y
+    /// `accent-color` tres dobles de 0 a 1.
+    #[test]
+    fn el_aspecto_que_se_sirve_es_el_del_escritorio() {
+        use bookos_shell::tema::{self, Acento, Tema};
+
+        let antes = (tema::actual(), tema::acento_actual());
+
+        tema::aplicar(Tema::Oscuro);
+        tema::aplicar_acento(Acento::Verde);
+        assert_eq!(Ajustes::color_scheme(), 1, "oscuro es 1");
+        let c = tema::acento();
+        assert_eq!(
+            Ajustes::accent_color(),
+            (c.r as f64, c.g as f64, c.b as f64),
+            "el acento servido no es el del tema"
+        );
+
+        tema::aplicar(Tema::Claro);
+        assert_eq!(Ajustes::color_scheme(), 2, "claro es 2");
+        assert_ne!(
+            Ajustes::accent_color(),
+            (c.r as f64, c.g as f64, c.b as f64),
+            "el verde claro y el oscuro son colores distintos"
+        );
+
+        // Las cuatro claves están y `ReadOne` da lo mismo que `ReadAll`.
+        let todo = Ajustes::valores();
+        for clave in ["color-scheme", "accent-color", "reduced-motion", "contrast"] {
+            let uno = Ajustes::uno(clave).unwrap_or_else(|| panic!("falta «{clave}»"));
+            assert_eq!(
+                todo.get(clave),
+                Some(&uno),
+                "«{clave}» no cuadra entre las dos"
+            );
+        }
+        assert!(
+            Ajustes::uno("lo-que-sea").is_none(),
+            "una clave que no existe no puede dar valor"
+        );
+
+        tema::aplicar(antes.0);
+        tema::aplicar_acento(antes.1);
+    }
 
     #[test]
     fn el_nombre_de_la_aplicacion_sale_legible() {

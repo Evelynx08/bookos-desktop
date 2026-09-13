@@ -10,13 +10,13 @@
 //! pero no se comportan igual.
 
 use iced_core::{Border, Length};
-use iced_widget::{column, container, Space};
+use iced_widget::{Space, column, container};
 
+use crate::Accion;
 use crate::tema;
 use crate::view::PanelElement;
-use crate::Accion;
 
-use super::menu::{divisor, fila, DIVISOR, FILA};
+use super::menu::{DIVISOR, FILA, divisor, fila};
 use super::{Ancla, Tecla};
 
 /// Más ancho que el del logo: "Quitar del dock" con su icono no cabía en 210.
@@ -70,6 +70,7 @@ impl MenuDock {
                 app_id: objetivo.app_id.clone(),
                 exec: objetivo.exec.clone(),
                 icono: objetivo.icono.clone(),
+                fijar: None,
             },
         });
         // Cerrar solo aparece si hay algo que cerrar: una entrada permanente

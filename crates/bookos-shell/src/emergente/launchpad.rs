@@ -1,14 +1,27 @@
 //! El launchpad: la rejilla de aplicaciones a pantalla completa.
 //!
 //! Es la versión propia del plasmoide `bookos-launchpad`: rejilla de **6×5**,
-//! barra de búsqueda en píldora arriba del todo, puntos de página abajo, y la
-//! misma puntuación de búsqueda (exacto, prefijo, prefijo de palabra,
-//! iniciales, substring, subsecuencia difusa).
+//! campo de búsqueda arriba del todo, puntos de página abajo, y la misma
+//! puntuación de búsqueda (exacto, prefijo, prefijo de palabra, iniciales,
+//! substring, subsecuencia difusa).
+//!
+//! # La rejilla
+//!
+//! **El paso es cuadrado.** El 0,72 de la pantalla se reparte tomando el eje
+//! que menos sitio deja, y no cada eje por su cuenta: aplicado a lo ancho y a
+//! lo alto por separado, a 1440×900 la celda salía 173×130 y el icono se
+//! quedaba en 57 px con 116 de aire a los lados, con lo que las filas se leían
+//! como bandas sueltas. Con el paso cuadrado el icono sube a 76 px.
+//!
+//! El campo de búsqueda es un input del sistema de diseño —radio 14, §2.3— y
+//! su borde solo se vuelve de acento cuando hay algo escrito: el campo no se
+//! puede desenfocar, y un borde de acento permanente hace que el azul deje de
+//! significar «esto está activo», que es lo único que §2.1 le deja significar.
 //!
 //! # Carpetas
 //!
-//! Una carpeta es un nombre y una lista de aplicaciones, y se guarda en
-//! `~/.config/bookos/launchpad.conf` —una línea por carpeta— en vez de en el
+//! Una carpeta es un nombre, un color y una lista de aplicaciones, y se guarda
+//! en `~/.config/bookos/launchpad.conf` —una línea por carpeta— en vez de en el
 //! `foldersJson` del plasmoide: leer JSON aquí sería una dependencia nueva para
 //! guardar dos listas de nombres.
 //!
@@ -18,11 +31,25 @@
 //! deducible de lo que hay instalado: nada de un fichero que decide dónde va
 //! cada cosa y que se desincroniza en cuanto instalas algo.
 //!
+//! Abierta, una carpeta es un **panel** —un diálogo: radio 26, sombra de modal,
+//! teñido de su color— con su propia rejilla de 4×3. Antes reusaba la de 6×5
+//! entera, y ocho aplicaciones repartidas en treinta huecos no se leen como un
+//! grupo. Su tapa en la rejilla enseña cuatro miniaturas en 2×2 y cuenta el
+//! resto: con las placas del pack de iconos de BookOS, que traen su propio
+//! fondo, las nueve de antes eran nueve manchas y dos carpetas distintas se
+//! veían iguales a un metro de la pantalla.
+//!
+//! El color se elige en un selector que nace **cerrado** —un círculo con el
+//! color puesto— y se despliega al pulsarlo: diez puntos permanentes en la
+//! cabecera pesan más que el nombre de la carpeta, que es lo que hay que leer
+//! ahí. Dentro están los diez acentos de Apariencia y una tira de tono para
+//! quien quiera el suyo; de la tira sale el **tono** y nada más, porque la
+//! saturación y la luminosidad las pone [`de_tono`] y son las que mantienen el
+//! contraste que el resto de la paleta da por hecho.
+//!
 //! Buscando **no hay carpetas**: se busca entre todas las aplicaciones, estén
 //! dentro de una o no. Quien escribe «kate» quiere Kate, no que le recuerden
 //! dónde lo guardó.
-//!
-//! Lo que **no** está, y por qué:
 //!
 //! # Lo que cuesta
 //!
@@ -32,31 +59,42 @@
 //! Recorrerlo con el ratón cuesta **cero**: el realce va en su propia
 //! superficie. Filtrar por texto, 0,09 ms; lo caro nunca es la búsqueda.
 //!
+//! Por eso **aquí dentro no se anima nada**: hacerlo en el buffer es rasterizar
+//! la rejilla entera en cada fotograma. Lo que sí sale barato es rasterizar dos
+//! veces —el estado de antes y el de después— y dejar que el compositor cruce
+//! las dos superficies en la GPU, que es lo que ya hacía el cambio de página.
+//! Los cambios de vista se anuncian con [`Transicion`] y el compositor pone la
+//! curva y la duración de §2.7; el movimiento es solo escala y opacidad, que es
+//! lo único que el sistema de diseño permite animar.
+//!
+//! # Lo que **no** está, y por qué
+//!
 //! - **El fondo de pantalla borroso.** El plasmoide saca el wallpaper de la
 //!   configuración de plasmashell y lo desenfoca llamando a `magick` por un
 //!   `DataSource` de tipo "executable". Aquí no hay plasmashell de quien
 //!   heredarlo, y lanzar ImageMagick desde el compositor para pintar un fondo
-//!   es exactamente lo que este proceso no debe hacer. Se pinta el velo opaco,
-//!   que es lo que el propio plasmoide usa cuando no hay wallpaper.
-
+//!   es exactamente lo que este proceso no debe hacer. El desenfoque lo hace el
+//!   compositor y encima va el velo, teñido del tono del fondo elegido —que
+//!   sale del SVG de la familia, sin decodificar el PNG—: ver
+//!   [`Launchpad::velo`].
+//!
 use std::collections::HashMap;
 
 use iced_core::alignment::Horizontal;
 use iced_core::{Border, Color, Length};
-use iced_widget::{column, container, image as iced_image, row, svg, text, Space};
+use iced_widget::{Space, column, container, image as iced_image, row, svg, text};
 
+use crate::Accion;
 use crate::apps::{self, App};
 use crate::icono::{self, Icono};
 use crate::tema;
 use crate::view::PanelElement;
-use crate::Accion;
 
 use super::{Ancla, Tecla};
 
 /// La rejilla del plasmoide.
 const COLUMNAS: usize = 6;
 const FILAS: usize = 5;
-const POR_PAGINA: usize = COLUMNAS * FILAS;
 
 /// La unidad de rejilla de Plasma, de la que salen todos los espaciados del
 /// plasmoide. Con la fuente por defecto son 18 px.
@@ -74,18 +112,50 @@ const ETIQUETA: f32 = UNIDAD * 2.0;
 /// Qué fracción de la pantalla ocupa la rejilla. Es el 0,72 del plasmoide: el
 /// resto es aire, y ese aire es la mitad del aspecto.
 const FRACCION: f32 = 0.72;
-/// Lado de cada punto de color de la fila que sale dentro de una carpeta, y su
-/// paso. Diez colores en una fila que no puede robarle alto a la rejilla.
+/// Lado de cada punto de color del selector de la carpeta abierta, y su paso.
+/// El punto es el radio-circle de 18 px que el sistema de diseño le da al
+/// selector de un popover (§4).
 const COLOR_PUNTO: f32 = 18.0;
 const COLOR_PASO: f32 = 28.0;
-/// Lo que ocupa la fila de colores con su aire.
-const COLORES_ALTO: f32 = 30.0;
+/// La ranura de cada punto: el punto más el aire que necesita el anillo del
+/// elegido, que va **fuera** y separado. Pegado al punto no se distingue de un
+/// borde del propio color.
+const COLOR_SLOT: f32 = COLOR_PUNTO + 6.0;
+/// El círculo cerrado que enseña el color puesto y abre el selector.
+const CHIP_COLOR: f32 = 26.0;
+/// Márgenes del popover del selector y alto de su tira de tono libre.
+const PALETA_PAD: f32 = 10.0;
+const TONO_ANCHO: f32 = 10.0 * COLOR_PASO - (COLOR_PASO - COLOR_SLOT);
+const TONO_ALTO: f32 = 16.0;
+/// Cuántos trozos tiene la tira de tono. Treinta y seis —uno cada diez
+/// grados— es donde el degradado deja de verse a bandas a este ancho, y son
+/// treinta y seis rectángulos, no un shader que aquí no hay.
+const TONO_TROZOS: usize = 36;
+/// Cuántos tonos de la tira recorre el teclado. Ver `colores_del_teclado`.
+const TONOS_TECLADO: usize = 6;
 /// Lado de la ✕ que quita una aplicación, en la esquina de su icono.
 const CIERRE: f32 = 22.0;
 
-/// Cuántas miniaturas caben en el icono de una carpeta: la rejilla de 3×3 de
-/// siempre. La décima aplicación existe, pero en la tapa no se ve.
-const MINIATURAS: usize = 9;
+/// Cuántas miniaturas caben en la tapa de una carpeta.
+///
+/// Cuatro, en 2×2, y no las nueve de antes: con las placas del pack de iconos
+/// —que traen su propio fondo— nueve miniaturas de 20 px son nueve manchas y
+/// dos carpetas distintas se ven iguales a un metro de la pantalla. Con más de
+/// cuatro dentro se pintan tres y el resto va contado.
+const MINIATURAS: usize = 4;
+
+/// La rejilla de dentro de una carpeta: 4×3 y no las 6×5 de fuera.
+///
+/// Una carpeta tiene menos cosas, y darles el mismo paso que a la rejilla
+/// grande dejaba ocho aplicaciones repartidas en treinta huecos, que no se leen
+/// como un grupo.
+const COLUMNAS_CARPETA: usize = 4;
+const FILAS_CARPETA: usize = 3;
+
+/// Márgenes del panel de la carpeta abierta y alto de su cabecera —el nombre,
+/// la cuenta y el selector de color—.
+const PANEL_PAD: f32 = UNIDAD * 1.5;
+const PANEL_CABECERA: f32 = UNIDAD * 3.0;
 
 /// Lo que ocupa una celda de la rejilla: una aplicación o una carpeta.
 ///
@@ -117,19 +187,125 @@ struct Arrastre {
 ///
 /// Doce y no dos: pulsar un icono con el ratón siempre lo mueve un poco, y con
 /// un umbral pequeño lanzar una aplicación se convertía en arrastrarla.
-const UMBRAL_ARRASTRE: f32 = 12.0;
+pub const UMBRAL_ARRASTRE: f32 = 12.0;
+
+/// El color de una carpeta: uno de los diez de Apariencia, o uno libre.
+///
+/// Los diez siguen siendo lo que se ofrece primero, por lo mismo que el acento
+/// del sistema: son pares calibrados para leerse en claro y en oscuro. El
+/// libre existe porque se pidió, y para que no se salga del contraste que el
+/// resto da por hecho **no es un `#rrggbb` cualquiera**: se elige un tono en la
+/// tira y la saturación y la luminosidad las pone [`de_tono`], las mismas para
+/// todos. Lo que el usuario controla es el tono; lo que hace legible el color,
+/// no.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ColorCarpeta {
+    Acento(tema::Acento),
+    /// Un tono libre en grados del círculo cromático.
+    Tono(f32),
+}
+
+impl ColorCarpeta {
+    pub fn color(self) -> Color {
+        match self {
+            ColorCarpeta::Acento(a) => a.color(),
+            ColorCarpeta::Tono(grados) => de_tono(grados),
+        }
+    }
+
+    /// Cómo se escribe en `launchpad.conf`: el nombre del acento, o el tono en
+    /// grados con una `t` delante. No es un `#rrggbb` porque lo que se guarda
+    /// es el tono, no el color: el par claro/oscuro lo decide el tema al
+    /// dibujar, igual que con los acentos.
+    fn guardado(self) -> String {
+        match self {
+            ColorCarpeta::Acento(a) => a.nombre().to_string(),
+            ColorCarpeta::Tono(grados) => format!("t{}", grados.round() as i32),
+        }
+    }
+
+    fn desde_guardado(texto: &str) -> Option<Self> {
+        if let Some(grados) = texto.strip_prefix('t') {
+            return grados.parse::<f32>().ok().map(ColorCarpeta::Tono);
+        }
+        tema::Acento::desde_nombre(texto).map(ColorCarpeta::Acento)
+    }
+}
+
+/// Un color de la tira de tono libre, en grados.
+///
+/// Saturación y luminosidad fijas, y distintas por tema: son las del par
+/// calibrado del que salen los acentos —el azul es `#007aff` en claro y
+/// `#5c95ff` en oscuro—, así que un tono libre cae en la misma familia que los
+/// diez de la tabla en vez de en cualquier sitio.
+fn de_tono(grados: f32) -> Color {
+    let (s, l): (f32, f32) = if tema::es_claro() {
+        (1.0, 0.50)
+    } else {
+        (1.0, 0.68)
+    };
+    let h = grados.rem_euclid(360.0) / 60.0;
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
+    let (r, g, b) = match h as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    Color::from_rgb(r + m, g + m, b + m)
+}
+
+/// El tono dominante del fondo de pantalla elegido, como color.
+///
+/// Sale del **SVG** de la familia, que es lo que `fondos::tono` ya sabe leer sin
+/// decodificar el PNG de 2880×1800. Aquí no se puede hacer lo que hace Ajustes
+/// —sacar el color dominante con ImageMagick—: esto corre dentro del proceso
+/// del compositor y lanzar procesos para pintar un velo es exactamente lo que
+/// no debe hacer.
+fn tinte_del_fondo() -> Option<Color> {
+    let elegida = crate::fondos::elegida();
+    let familias = crate::fondos::instaladas(tema::es_claro());
+    let familia = match elegida {
+        Some(nombre) => familias.iter().find(|f| f.nombre == nombre)?,
+        None => familias
+            .iter()
+            .find(|f| f.nombre == crate::fondos::POR_DEFECTO)
+            .or(familias.first())?,
+    };
+    crate::fondos::tono(familia).map(de_tono)
+}
+
+/// Un cambio de vista del launchpad que **el compositor tiene que animar**.
+///
+/// Aquí dentro no se puede animar nada: rasterizar la rejilla cuesta 11 ms
+/// medidos, así que hacerlo por fotograma es exactamente lo que el módulo lleva
+/// evitando desde el principio. Lo que sí sale barato es rasterizar **dos
+/// veces** —el estado de antes y el de después— y dejar que el compositor
+/// cruce las dos superficies en la GPU, que es lo que ya hace con el cambio de
+/// página. Esto es el aviso de «acabo de cambiar de estado, guarda lo que había
+/// y crúzalo así».
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Transicion {
+    /// Se ha entrado en una carpeta: el panel crece y la rejilla se aparta.
+    AbrirCarpeta,
+    /// Se ha salido: al revés y sin muelle, que rebotar al salir se lee como
+    /// que la carpeta no quería cerrarse.
+    CerrarCarpeta,
+    /// Lo de dentro ha cambiado sin cambiar de vista —el color de la carpeta,
+    /// una aplicación que se quita, el modo edición—: fundido y nada más.
+    Fundido,
+}
 
 /// Un grupo de aplicaciones con su nombre.
 #[derive(Clone, Debug)]
 pub struct Carpeta {
     pub nombre: String,
-    /// Su color, de la paleta de acentos. `None` = el gris de siempre.
-    ///
-    /// Se guarda el [`tema::Acento`] y no un `#rrggbb` por lo mismo que el
-    /// acento del sistema: un color libre se sale del contraste que el resto
-    /// de la paleta da por hecho, y aquí además tiene que leerse contra el velo
-    /// del launchpad.
-    pub color: Option<tema::Acento>,
+    /// Su color. `None` = el gris de siempre.
+    pub color: Option<ColorCarpeta>,
     /// Los `exec` de sus aplicaciones, en el orden en que se metieron.
     ///
     /// Se guardan por `exec` y no por índice en `apps` porque el índice cambia
@@ -157,6 +333,15 @@ pub struct Launchpad {
     editando: bool,
     /// La carpeta abierta, si se está viendo una por dentro.
     dentro: Option<usize>,
+    /// Qué color del selector tiene el foco del teclado, si se abrió con
+    /// Tabulador. Con el ratón no hay foco: se pulsa y ya.
+    foco_paleta: Option<usize>,
+    /// Si el selector de color de la carpeta abierta está desplegado.
+    ///
+    /// Cerrado es un círculo con el color puesto y nada más: diez puntos
+    /// permanentes en la cabecera del panel pesan más que el nombre de la
+    /// carpeta, que es lo que hay que leer ahí.
+    paleta_abierta: bool,
     /// El nombre que se está escribiendo, si se está renombrando la carpeta
     /// abierta. Una carpeta nace llamándose «Carpeta» y hay que poder
     /// cambiarlo sin editar el fichero a mano.
@@ -173,6 +358,24 @@ pub struct Launchpad {
     ultimo_paso: Option<std::time::Instant>,
     /// El icono que se está arrastrando, si hay alguno.
     arrastre: Option<Arrastre>,
+    /// Dónde está el dock en la pantalla, si se está viendo debajo.
+    ///
+    /// El launchpad ocupa la pantalla entera, así que sus coordenadas y las de
+    /// la pantalla son las mismas y el rectángulo llega tal cual. Se necesita
+    /// para dos cosas: no agarrar iconos de la rejilla al pulsar ahí, y saber
+    /// que soltar encima significa anclar.
+    zona_dock: Option<iced_core::Rectangle>,
+    /// El cambio de vista que el compositor todavía no se ha llevado. Ver
+    /// [`Transicion`].
+    transicion: Option<Transicion>,
+    /// El tono dominante del fondo de pantalla, si se pudo saber. Tiñe el
+    /// velo; ver [`Launchpad::velo`].
+    ///
+    /// Se calcula **una vez, al abrir**: leerlo cuesta un `read_dir` y 4 KiB de
+    /// SVG, y el velo se pregunta en cada fotograma. El launchpad se construye
+    /// cada vez que se abre, así que cambiar de fondo en Ajustes se nota a la
+    /// siguiente.
+    tinte_fondo: Option<Color>,
     /// Iconos ya resueltos, por índice en `apps`. El `None` de dentro es "se
     /// buscó y no está", que no es lo mismo que "todavía no se ha buscado" —sin
     /// esa distinción se repetiría la búsqueda fallida en cada repintado, que
@@ -189,7 +392,7 @@ impl Launchpad {
             .into_iter()
             .map(|(nombre, color, apps)| Carpeta {
                 nombre,
-                color: color.as_deref().and_then(tema::Acento::desde_nombre),
+                color: color.as_deref().and_then(ColorCarpeta::desde_guardado),
                 apps,
             })
             .collect();
@@ -206,6 +409,8 @@ impl Launchpad {
             ocultas,
             editando: false,
             dentro: None,
+            paleta_abierta: false,
+            foco_paleta: None,
             renombrando: None,
             visibles: Vec::new(),
             consulta: String::new(),
@@ -214,6 +419,9 @@ impl Launchpad {
             acumulado: 0.0,
             ultimo_paso: None,
             arrastre: None,
+            zona_dock: None,
+            transicion: None,
+            tinte_fondo: tinte_del_fondo(),
             iconos: HashMap::new(),
         };
         lp.rehacer_visibles();
@@ -269,7 +477,69 @@ impl Launchpad {
             .collect()
     }
 
+    /// Se lleva el cambio de vista pendiente, si lo hay. Lo llama el
+    /// compositor justo antes de repintar: quien se lo lleva es quien tiene la
+    /// superficie de antes.
+    pub fn tomar_transicion(&mut self) -> Option<Transicion> {
+        self.transicion.take()
+    }
+
+    /// Apunta un cambio de vista para el compositor. El fundido no pisa a una
+    /// transición de carpeta: entrar en una carpeta cambia además el color del
+    /// panel, y el fundido de después se comería el gesto.
+    fn animar(&mut self, transicion: Transicion) {
+        if self.transicion.is_some() && transicion == Transicion::Fundido {
+            return;
+        }
+        self.transicion = Some(transicion);
+    }
+
     /// ¿Se está viendo una carpeta por dentro?
+    /// Le dice dónde queda el dock, o que no se está viendo.
+    pub fn poner_zona_dock(&mut self, zona: Option<iced_core::Rectangle>) {
+        self.zona_dock = zona;
+    }
+
+    /// El icono que se está arrastrando: dónde va y de qué tamaño, en
+    /// coordenadas del launchpad. `None` si no hay arrastre o si todavía no ha
+    /// pasado el umbral, que es lo que separa un clic de un arrastre.
+    ///
+    /// Va **centrado en el cursor** y no anclado por donde se agarró: la mano
+    /// apunta con la punta del puntero y esperar que el icono la siga por su
+    /// centro es lo que hacen macOS y One UI.
+    pub fn rect_agarrado(&self) -> Option<iced_core::Rectangle> {
+        let a = self.arrastre.filter(|a| a.movido)?;
+        let px = self.icono_px();
+        Some(iced_core::Rectangle {
+            x: a.actual.0 - px / 2.0,
+            y: a.actual.1 - px / 2.0,
+            width: px,
+            height: px,
+        })
+    }
+
+    /// El icono agarrado, para pintarlo en su propia superficie.
+    ///
+    /// Aparte de la rejilla porque moverlo tiene que ser gratis: repintar el
+    /// launchpad entero cuesta 11 ms medidos, y a cada movimiento del ratón eso
+    /// es un arrastre a tirones. Como superficie propia solo cambia de sitio.
+    pub fn vista_agarrado(&self) -> Option<PanelElement<'_>> {
+        let a = self.arrastre.filter(|a| a.movido)?;
+        let px = self.icono_px();
+        match *self.visibles.get(a.origen)? {
+            // Al 85 %: el icono va «en el aire» y tiene que verse que no está
+            // posado en su celda.
+            Item::App(app) => Some(self.baldosa_app(app, px, 0.85)),
+            Item::Carpeta(c) => Some(self.tapa_carpeta(c, px, 0.85)),
+        }
+    }
+
+    /// ¿Cae el punto sobre el dock que se ve debajo?
+    fn sobre_el_dock(&self, x: f32, y: f32) -> bool {
+        self.zona_dock
+            .is_some_and(|r| r.contains(iced_core::Point::new(x, y)))
+    }
+
     pub fn en_carpeta(&self) -> bool {
         self.dentro.is_some()
     }
@@ -279,7 +549,9 @@ impl Launchpad {
         if self.dentro.take().is_none() {
             return false;
         }
+        self.animar(Transicion::CerrarCarpeta);
         self.renombrando = None;
+        self.paleta_abierta = false;
         self.consulta.clear();
         self.pagina = 0;
         self.seleccion = None;
@@ -288,33 +560,174 @@ impl Launchpad {
         true
     }
 
-    /// Dónde empieza la fila de colores de la carpeta abierta.
+    /// El campo de búsqueda, y la ✕ que lo limpia cuando hay algo escrito.
     ///
-    /// Va **entre** el título y la rejilla y le come su alto al hueco que ya
-    /// había: sin eso, la rejilla de dentro de una carpeta tendría una fila
-    /// menos que la de fuera y los iconos bailarían al entrar.
-    fn rect_colores(&self) -> iced_core::Rectangle {
-        let ancho = COLOR_PASO * tema::Acento::TODOS.len() as f32;
+    /// La ✕ mide 24 y no los 14 del dibujo: el glifo es la señal, pero lo que
+    /// se pulsa tiene que caber debajo de un dedo.
+    fn rect_busqueda(&self) -> iced_core::Rectangle {
         iced_core::Rectangle {
-            x: (self.size().0 - ancho) / 2.0,
-            y: self.margen_y() + BUSQUEDA + (HUECO - COLORES_ALTO) / 2.0,
-            width: ancho,
-            height: COLORES_ALTO,
+            x: (self.size().0 - BUSQUEDA_ANCHO) / 2.0,
+            y: self.margen_y(),
+            width: BUSQUEDA_ANCHO,
+            height: BUSQUEDA,
         }
     }
 
-    /// Qué color de la fila cae en un punto. El último es «sin color».
-    fn color_en(&self, x: f32, y: f32) -> Option<Option<tema::Acento>> {
-        let r = self.rect_colores();
-        if !r.contains(iced_core::Point::new(x, y)) {
+    fn rect_limpiar(&self) -> Option<iced_core::Rectangle> {
+        if self.consulta.is_empty() || self.dentro.is_some() {
             return None;
         }
-        let i = ((x - r.x) / COLOR_PASO) as usize;
-        // El hueco entre puntos no es de nadie.
-        if x - r.x - i as f32 * COLOR_PASO > COLOR_PUNTO {
+        let campo = self.rect_busqueda();
+        Some(iced_core::Rectangle {
+            x: campo.x + campo.width - 16.0 - 24.0,
+            y: campo.y + (campo.height - 24.0) / 2.0,
+            width: 24.0,
+            height: 24.0,
+        })
+    }
+
+    /// El círculo que enseña el color de la carpeta abierta y despliega el
+    /// selector. Va a la derecha de su cabecera, donde no compite con el
+    /// nombre.
+    fn rect_chip_color(&self) -> iced_core::Rectangle {
+        let panel = self.rect_panel();
+        iced_core::Rectangle {
+            x: panel.x + panel.width - PANEL_PAD - CHIP_COLOR,
+            y: panel.y + PANEL_PAD + (PANEL_CABECERA - CHIP_COLOR) / 2.0,
+            width: CHIP_COLOR,
+            height: CHIP_COLOR,
+        }
+    }
+
+    /// El popover del selector, cuando está desplegado: los diez acentos en
+    /// fila y debajo la tira de tono libre.
+    fn rect_paleta(&self) -> iced_core::Rectangle {
+        let chip = self.rect_chip_color();
+        let ancho = TONO_ANCHO + PALETA_PAD * 2.0;
+        iced_core::Rectangle {
+            // Alineado por la derecha con el chip: crece hacia dentro del
+            // panel, que es donde hay sitio.
+            x: (chip.x + CHIP_COLOR - ancho).max(0.0),
+            y: chip.y + CHIP_COLOR + 6.0,
+            width: ancho,
+            height: PALETA_PAD * 3.0 + COLOR_SLOT + TONO_ALTO,
+        }
+    }
+
+    /// La fila de los diez acentos dentro del popover.
+    fn rect_acentos(&self) -> iced_core::Rectangle {
+        let p = self.rect_paleta();
+        iced_core::Rectangle {
+            x: p.x + PALETA_PAD,
+            y: p.y + PALETA_PAD,
+            width: TONO_ANCHO,
+            height: COLOR_SLOT,
+        }
+    }
+
+    /// La tira de tono libre, debajo de los diez.
+    fn rect_tono(&self) -> iced_core::Rectangle {
+        let p = self.rect_paleta();
+        iced_core::Rectangle {
+            x: p.x + PALETA_PAD,
+            y: p.y + PALETA_PAD * 2.0 + COLOR_SLOT,
+            width: TONO_ANCHO,
+            height: TONO_ALTO,
+        }
+    }
+
+    /// Qué color del selector cae en un punto, si es que hay alguno.
+    ///
+    /// El `Option` de dentro es el color elegido: los diez de la tabla y los
+    /// 360 tonos de la tira. Volver a pulsar el que ya está puesto es lo que
+    /// devuelve la carpeta al gris, y eso lo decide quien llama.
+    fn color_en(&self, x: f32, y: f32) -> Option<ColorCarpeta> {
+        if !self.paleta_abierta {
             return None;
         }
-        tema::Acento::TODOS.get(i).map(|a| Some(*a))
+        let punto = iced_core::Point::new(x, y);
+        let acentos = self.rect_acentos();
+        if acentos.contains(punto) {
+            let i = ((x - acentos.x) / COLOR_PASO) as usize;
+            // El hueco entre ranuras no es de nadie.
+            if x - acentos.x - i as f32 * COLOR_PASO > COLOR_SLOT {
+                return None;
+            }
+            return tema::Acento::TODOS
+                .get(i)
+                .copied()
+                .map(ColorCarpeta::Acento);
+        }
+        let tono = self.rect_tono();
+        if tono.contains(punto) {
+            let grados = (x - tono.x) / tono.width * 360.0;
+            return Some(ColorCarpeta::Tono(grados.clamp(0.0, 359.0)));
+        }
+        None
+    }
+
+    /// Cierra el selector. `true` si estaba abierto, para saber si hay que
+    /// repintar —y para que Esc lo cierre antes que la carpeta—.
+    fn cerrar_paleta(&mut self) -> bool {
+        self.foco_paleta = None;
+        std::mem::take(&mut self.paleta_abierta)
+    }
+
+    /// Los colores del selector en el orden en que los recorre el teclado: los
+    /// diez de la tabla y luego seis tonos de la tira, uno cada 60°.
+    ///
+    /// Seis y no los 360 que se pueden pulsar con el ratón: recorrer una tira
+    /// continua a golpe de flecha son doce pulsaciones para cruzar el rojo, y
+    /// quien elige con el teclado quiere un color, no afinar el tono.
+    fn colores_del_teclado() -> Vec<ColorCarpeta> {
+        tema::Acento::TODOS
+            .into_iter()
+            .map(ColorCarpeta::Acento)
+            .chain((0..TONOS_TECLADO).map(|i| {
+                ColorCarpeta::Tono(i as f32 * 360.0 / TONOS_TECLADO as f32)
+            }))
+            .collect()
+    }
+
+    /// Abre el selector con el foco puesto en el color que tenga la carpeta, o
+    /// lo cierra si ya estaba. Es lo que hace el tabulador.
+    fn alternar_paleta_con_teclado(&mut self, carpeta: usize) {
+        if self.paleta_abierta {
+            self.cerrar_paleta();
+            return;
+        }
+        self.paleta_abierta = true;
+        let puesto = self.carpetas[carpeta].color;
+        self.foco_paleta = Some(
+            Self::colores_del_teclado()
+                .iter()
+                .position(|c| Some(*c) == puesto)
+                .unwrap_or(0),
+        );
+    }
+
+    /// Mueve el foco del selector. Se queda en los extremos en vez de dar la
+    /// vuelta: pasar del gris al azul de un salto se lee como un fallo.
+    fn mover_foco_paleta(&mut self, paso: isize) {
+        let colores = Self::colores_del_teclado();
+        let actual = self.foco_paleta.unwrap_or(0) as isize;
+        let nuevo = (actual + paso).clamp(0, colores.len() as isize - 1) as usize;
+        self.foco_paleta = Some(nuevo);
+    }
+
+    /// Pone el color que tenga el foco. Como con el ratón, repetir el que ya
+    /// está devuelve la carpeta al gris.
+    fn aplicar_foco_paleta(&mut self) {
+        let (Some(carpeta), Some(i)) = (self.dentro, self.foco_paleta) else {
+            return;
+        };
+        let Some(color) = Self::colores_del_teclado().get(i).copied() else {
+            return;
+        };
+        self.carpetas[carpeta].color = (self.carpetas[carpeta].color != Some(color)).then_some(color);
+        self.cerrar_paleta();
+        self.animar(Transicion::Fundido);
+        self.guardar();
     }
 
     /// El rectángulo de la ✕ de la celda `i`, si el modo edición está puesto.
@@ -337,6 +750,7 @@ impl Launchpad {
     /// Alterna el modo edición: con él salen las ✕. Lo abre el botón derecho.
     pub fn alternar_edicion(&mut self) -> bool {
         self.editando = !self.editando;
+        self.animar(Transicion::Fundido);
         true
     }
 
@@ -352,19 +766,25 @@ impl Launchpad {
         if !self.ocultas.contains(&exec) {
             self.ocultas.push(exec);
         }
+        // La rejilla se recoloca entera al quitar algo: sin fundido, los iconos
+        // de detrás dan un salto de una celda.
+        self.animar(Transicion::Fundido);
         self.tras_cambiar_carpetas();
     }
 
-    /// El rectángulo del título de la carpeta abierta, que es donde se pulsa
+    /// El rectángulo del nombre de la carpeta abierta, que es donde se pulsa
     /// para renombrarla.
+    ///
+    /// Es la mitad izquierda de la cabecera del panel: el nombre está ahí, y a
+    /// la derecha vive el chip del color, que tiene su propio hit-test y manda
+    /// sobre este porque se comprueba antes.
     fn rect_titulo(&self) -> iced_core::Rectangle {
-        // Centrado arriba, del ancho de la barra de búsqueda: es el sitio que
-        // ocupa el buscador cuando no estás dentro de una carpeta.
+        let panel = self.rect_panel();
         iced_core::Rectangle {
-            x: (self.size().0 - BUSQUEDA_ANCHO) / 2.0,
-            y: self.margen_y(),
-            width: BUSQUEDA_ANCHO,
-            height: BUSQUEDA,
+            x: panel.x + PANEL_PAD,
+            y: panel.y + PANEL_PAD,
+            width: panel.width - PANEL_PAD * 2.0 - CHIP_COLOR,
+            height: PANEL_CABECERA,
         }
     }
 
@@ -400,7 +820,7 @@ impl Launchpad {
                 .map(|c| {
                     (
                         c.nombre.clone(),
-                        c.color.map(|a| a.nombre().to_string()),
+                        c.color.map(ColorCarpeta::guardado),
                         c.apps.clone(),
                     )
                 })
@@ -414,6 +834,7 @@ impl Launchpad {
 
     /// Entra en una carpeta.
     fn abrir_carpeta(&mut self, carpeta: usize) {
+        self.animar(Transicion::AbrirCarpeta);
         self.dentro = Some(carpeta);
         self.pagina = 0;
         self.seleccion = None;
@@ -429,8 +850,8 @@ impl Launchpad {
     /// tamaños por categorías— y el launchpad tardaría en salir justo lo que no
     /// puede tardar.
     fn preparar_pagina(&mut self) {
-        let desde = self.pagina * POR_PAGINA;
-        let hasta = (desde + POR_PAGINA).min(self.visibles.len());
+        let desde = self.pagina * self.por_pagina();
+        let hasta = (desde + self.por_pagina()).min(self.visibles.len());
         // Los de la página, y además los de dentro de las carpetas que se ven:
         // el icono de una carpeta **son** las miniaturas de lo que guarda, así
         // que sin ellos se dibujaría una caja vacía.
@@ -478,9 +899,24 @@ impl Launchpad {
         // separaba los iconos de lo que hubiera detrás. Ahora el compositor
         // desenfoca la pantalla entera bajo el launchpad y el velo vuelve a su
         // valor; con 0,82 encima, el desenfoque no se veía.
+        let Some(tinte) = self.tinte_fondo else {
+            return Color {
+                a: 0.45,
+                ..tema::bg()
+            };
+        };
+        // Con el tono del fondo encima al 10 %. §2.6 fija el scrim en negro y
+        // punto, y esto se aparta a sabiendas: sin el tinte, el launchpad se
+        // lee como una lámina gris pegada sobre cualquier escritorio en vez de
+        // como parte del que hay debajo.
+        //
+        // Los números salen de componer las dos capas en una, que es lo único
+        // que el compositor sabe pintar aquí: un tinte al 10 % sobre el velo al
+        // 45 % tapa 0,10 + 0,45 × 0,90 = 0,505, y de ese total el tinte pone
+        // 0,10/0,505 ≈ 0,20.
         Color {
-            a: 0.45,
-            ..tema::bg()
+            a: 0.505,
+            ..tema::mezclar(tema::bg(), tinte, 0.20)
         }
     }
 
@@ -492,7 +928,29 @@ impl Launchpad {
     /// es mover un rectángulo de 200 px: gratis.
     pub fn realce(&self) -> Option<(iced_core::Rectangle, bool)> {
         let rect = self.rect_celda(self.seleccion?)?;
-        Some((rect, !self.consulta.is_empty()))
+        // El marco de acento dice «soltar aquí hace algo». Arrastrando eso es
+        // el destino sobre el que nacería la carpeta, y sin él el gesto no
+        // tenía **ninguna** señal: el icono no sigue al cursor y el realce del
+        // destino era el mismo gris que el de pasar el ratón por encima, así
+        // que arrastrar y no arrastrar se veían igual y parecía que juntar dos
+        // iconos no estuviera implementado.
+        let soltando = self
+            .arrastre
+            .filter(|a| a.movido && Some(a.origen) != self.seleccion)
+            .is_some_and(|_| self.destino_valido());
+        Some((rect, soltando || !self.consulta.is_empty()))
+    }
+
+    /// ¿Lo señalado ahora mismo acepta que le suelten un icono encima?
+    ///
+    /// Una carpeta siempre; otra aplicación solo fuera de una carpeta, porque
+    /// no hay carpetas dentro de carpetas.
+    fn destino_valido(&self) -> bool {
+        match self.seleccion.and_then(|i| self.visibles.get(i)) {
+            Some(Item::Carpeta(_)) => true,
+            Some(Item::App(_)) => self.dentro.is_none(),
+            None => false,
+        }
     }
 
     /// Tamaño lógico del realce: siempre el de una celda.
@@ -513,19 +971,150 @@ impl Launchpad {
         )
     }
 
+    /// El paso **vertical**: lo que mide una fila.
+    ///
+    /// Sale del alto, con el ancho de tope por si la pantalla es vertical. De
+    /// aquí salen también el tamaño del icono y el aire de la celda, y por eso
+    /// no es simplemente `alto / FILAS`: es el eje que manda.
+    fn paso(&self) -> f32 {
+        let (ancho, alto) = self.area();
+        (alto / FILAS as f32).min(ancho / COLUMNAS as f32).max(80.0)
+    }
+
+    /// El paso **horizontal**: lo que mide una columna.
+    ///
+    /// Más ancho que alto, hasta un tercio más. Los dos extremos ya se han
+    /// visto en pantalla y los dos están mal: con el 0,72 aplicado a cada eje
+    /// por su cuenta —lo que había— la columna sale 1,33 veces la fila **y** el
+    /// icono se encoge al mínimo de los dos ejes, o sea 57 px con 116 de aire a
+    /// los lados, y las filas se leen como bandas; con la celda cuadrada la
+    /// rejilla se queda en la mitad central de una pantalla ancha y sobra medio
+    /// escritorio a los lados.
+    ///
+    /// Aquí el icono lo fija el paso vertical —así no se encoge— y la columna
+    /// se estira hasta donde da el 0,72 del ancho, con el tope de 1,35 para que
+    /// el hueco horizontal no llegue a doblar al vertical, que es cuando
+    /// vuelven las bandas.
+    fn paso_x(&self) -> f32 {
+        let paso = self.paso();
+        (self.area().0 / COLUMNAS as f32).clamp(paso, paso * 1.35)
+    }
+
     fn celda_ancho(&self) -> f32 {
-        (self.area().0 / COLUMNAS as f32).max(80.0)
+        self.paso_x()
     }
 
     fn celda_alto(&self) -> f32 {
-        (self.area().1 / FILAS as f32).max(80.0)
+        self.paso()
     }
 
-    /// El icono, tan grande como quepa en su celda dejando sitio a la etiqueta.
+    /// El icono: **el 58 % del paso vertical**, no todo lo que quepa.
+    ///
+    /// Con «todo lo que quepa» —el paso menos las tres unidades de la etiqueta y
+    /// su aire— el icono se come la celda: a 2000×1250 el paso es 180, el icono
+    /// sale 126 y con el rótulo de dos líneas quedan **6 px** por arriba y por
+    /// abajo. Visto en pantalla: las filas se tocan y la rejilla se lee
+    /// apelmazada. Con el 58 % el icono baja a 104 y el aire sube a 16, que es
+    /// la proporción de los mockups y la que deja respirar a las etiquetas de
+    /// dos líneas —«KDE Partition Manager» y compañía—.
+    ///
+    /// El mínimo de las tres unidades sigue estando de tope: en una pantalla
+    /// muy baja el 58 % no cabría con la etiqueta.
     fn icono_px(&self) -> f32 {
-        (self.celda_ancho() - UNIDAD * 3.0)
-            .min(self.celda_alto() - ETIQUETA - UNIDAD * 2.0)
+        (self.paso() * 0.58)
+            .min(self.paso() - UNIDAD * 3.0)
             .max(48.0)
+    }
+
+    /// Columnas y filas de la rejilla que se está viendo. Dentro de una
+    /// carpeta son las del panel, que tiene las suyas.
+    fn columnas(&self) -> usize {
+        match self.dentro {
+            // Las que ocupe lo que hay dentro, hasta cuatro: con cuatro
+            // siempre, una carpeta de dos aplicaciones es un panel con media
+            // fila vacía y las dos pegadas a la izquierda.
+            Some(_) => self.visibles.len().clamp(1, COLUMNAS_CARPETA),
+            None => COLUMNAS,
+        }
+    }
+
+    fn filas(&self) -> usize {
+        if self.dentro.is_some() {
+            FILAS_CARPETA
+        } else {
+            FILAS
+        }
+    }
+
+    fn por_pagina(&self) -> usize {
+        self.columnas() * self.filas()
+    }
+
+    /// La esquina de la rejilla que se está viendo, en el buffer.
+    ///
+    /// Fuera de una carpeta empieza en el borde. Dentro, en el panel — que va
+    /// centrado— pero **a la misma altura**: si la rejilla de dentro no
+    /// arrancara donde la de fuera, los iconos saltarían al entrar y al salir.
+    fn origen_rejilla(&self) -> (f32, f32) {
+        match self.dentro {
+            Some(_) => {
+                let panel = self.rect_panel();
+                (panel.x + PANEL_PAD, panel.y + PANEL_PAD + PANEL_CABECERA)
+            }
+            None => (self.margen_x(), self.margen_y() + BUSQUEDA + HUECO),
+        }
+    }
+
+    /// Lo que se aparta una fila para quedar centrada, dentro de una carpeta.
+    ///
+    /// Solo la afecta a la última, que es la única que puede ir a medias. Fuera
+    /// de la carpeta es siempre cero: la rejilla grande se lee como una tabla y
+    /// centrar su última fila descolocaría las columnas.
+    fn hueco_fila(&self, fila: usize) -> f32 {
+        if self.dentro.is_none() {
+            return 0.0;
+        }
+        let columnas = self.columnas();
+        let primero = self.pagina * self.por_pagina() + fila * columnas;
+        let quedan = self.visibles.len().saturating_sub(primero).min(columnas);
+        if quedan == 0 {
+            return 0.0;
+        }
+        (columnas - quedan) as f32 * self.celda_ancho() / 2.0
+    }
+
+    /// Cuántas filas de alto tiene el panel de la carpeta abierta.
+    ///
+    /// Las que ocupe lo que hay dentro, hasta el máximo de la página. Con las
+    /// tres siempre, una carpeta de dos aplicaciones es un panel con dos
+    /// tercios de vacío. Se cuenta sobre el **total** y no sobre la página que
+    /// se ve, para que pasar de página no cambie el tamaño del panel.
+    fn filas_panel(&self) -> usize {
+        self.visibles
+            .len()
+            .div_ceil(self.columnas().max(1))
+            .clamp(1, FILAS_CARPETA)
+    }
+
+    /// El panel de la carpeta abierta: la tarjeta que envuelve la cabecera y su
+    /// rejilla. Es un diálogo, así que lleva el radio y la sombra de uno.
+    fn rect_panel(&self) -> iced_core::Rectangle {
+        let paso = self.paso();
+        let ancho = self.columnas() as f32 * self.celda_ancho() + PANEL_PAD * 2.0;
+        // Con más de una página, dentro caben también sus puntos.
+        let puntos = if self.paginas() > 1 { PUNTOS } else { 0.0 };
+        let alto = PANEL_CABECERA + self.filas_panel() as f32 * paso + PANEL_PAD * 2.0 + puntos;
+        // Centrado en los dos ejes. Estuvo colgado de la altura de la rejilla
+        // —para que los iconos de dentro empezaran donde los de fuera— y el
+        // resultado era un panel pequeño pegado al borde de arriba con media
+        // pantalla vacía debajo: una carpeta abierta es un diálogo, y un
+        // diálogo va en el centro.
+        iced_core::Rectangle {
+            x: (self.size().0 - ancho) / 2.0,
+            y: ((self.size().1 - alto) / 2.0).max(0.0),
+            width: ancho,
+            height: alto,
+        }
     }
 
     /// La rejilla empieza en el borde del buffer: el centrado en la pantalla lo
@@ -539,7 +1128,7 @@ impl Launchpad {
     }
 
     fn paginas(&self) -> usize {
-        self.visibles.len().div_ceil(POR_PAGINA).max(1)
+        self.visibles.len().div_ceil(self.por_pagina()).max(1)
     }
 
     /// Rehace la lista visible tras cambiar la búsqueda.
@@ -571,18 +1160,24 @@ impl Launchpad {
 
     /// Qué celda de la página cae en un punto lógico.
     fn celda_en(&self, x: f32, y: f32) -> Option<usize> {
-        let x0 = self.margen_x();
-        let y0 = self.margen_y() + BUSQUEDA + HUECO;
-        if x < x0 || y < y0 {
+        let (x0, y0) = self.origen_rejilla();
+        if y < y0 {
+            return None;
+        }
+        // La fila primero: dentro de una carpeta, cuánto se aparta la fila
+        // depende de cuántos iconos le queden, así que sin saber la fila no se
+        // puede saber la columna.
+        let fila = ((y - y0) / self.celda_alto()) as usize;
+        let x0 = x0 + self.hueco_fila(fila);
+        if x < x0 {
             return None;
         }
         let col = ((x - x0) / self.celda_ancho()) as usize;
-        let fila = ((y - y0) / self.celda_alto()) as usize;
-        if col >= COLUMNAS || fila >= FILAS {
+        if col >= self.columnas() || fila >= self.filas() {
             return None;
         }
-        let en_pagina = fila * COLUMNAS + col;
-        let indice = self.pagina * POR_PAGINA + en_pagina;
+        let en_pagina = fila * self.columnas() + col;
+        let indice = self.pagina * self.por_pagina() + en_pagina;
         (indice < self.visibles.len()).then_some(indice)
     }
 
@@ -593,15 +1188,23 @@ impl Launchpad {
             if !arrastre.movido && dx.hypot(dy) > UMBRAL_ARRASTRE {
                 arrastre.movido = true;
             }
+            let movido = arrastre.movido;
             // Mientras se arrastra, lo señalado es **el destino**: es lo que
             // dice sobre qué se va a soltar. El realce va en su propia
             // superficie, así que moverlo no repinta la rejilla.
-            let destino = self.celda_en(x, y);
+            let destino = (!self.sobre_el_dock(x, y))
+                .then(|| self.celda_en(x, y))
+                .flatten();
             if destino.is_some() && destino != self.seleccion {
                 self.seleccion = destino;
                 return true;
             }
-            return false;
+            // Con el icono en el aire se contesta que sí aunque no cambie el
+            // destino: hay que recolocarlo en cada movimiento. No repinta la
+            // rejilla —`emergente_needs_paint` sigue diciendo que no—, solo
+            // mueve su superficie, que es lo que hace que seguir al cursor sea
+            // gratis.
+            return movido;
         }
         let seleccion = punto.and_then(|(x, y)| self.celda_en(x, y));
         // Sin puntero encima se conserva la selección del teclado: si el ratón
@@ -614,16 +1217,52 @@ impl Launchpad {
         true
     }
 
+    /// Los nombres de los primeros elementos visibles. Para el autotest: es lo
+    /// que dice si una carpeta ha nacido y dónde.
+    pub fn primeros(&self, n: usize) -> Vec<String> {
+        self.visibles
+            .iter()
+            .take(n)
+            .map(|i| match *i {
+                Item::App(a) => self.apps[a].nombre.clone(),
+                Item::Carpeta(c) => self.carpetas[c].nombre.clone(),
+            })
+            .collect()
+    }
+
+    /// El centro de una celda de la página actual, para el autotest: sin esto
+    /// no hay forma de decir «pulsa el primer icono» desde fuera.
+    pub fn centro_de_celda(&self, i: usize) -> Option<(f32, f32)> {
+        self.rect_celda(i).map(|r| (r.center_x(), r.center_y()))
+    }
+
+    /// El centro del chip del selector de color, y el de un tono de la tira.
+    /// Para el autotest: sin esto no hay forma de pulsar el selector desde
+    /// fuera, y sus dos rectángulos dependen del tamaño de la pantalla.
+    pub fn centro_selector(&self) -> (f32, f32) {
+        let r = self.rect_chip_color();
+        (r.center_x(), r.center_y())
+    }
+
+    pub fn centro_tono(&self, grados: f32) -> (f32, f32) {
+        let r = self.rect_tono();
+        (
+            r.x + r.width * grados.clamp(0.0, 359.0) / 360.0,
+            r.center_y(),
+        )
+    }
+
     /// El rectángulo lógico de una celda de la página actual.
     fn rect_celda(&self, indice: usize) -> Option<iced_core::Rectangle> {
-        let en_pagina = indice.checked_sub(self.pagina * POR_PAGINA)?;
-        if en_pagina >= POR_PAGINA {
+        let en_pagina = indice.checked_sub(self.pagina * self.por_pagina())?;
+        if en_pagina >= self.por_pagina() {
             return None;
         }
-        let (fila, col) = (en_pagina / COLUMNAS, en_pagina % COLUMNAS);
+        let (fila, col) = (en_pagina / self.columnas(), en_pagina % self.columnas());
+        let (x0, y0) = self.origen_rejilla();
         Some(iced_core::Rectangle {
-            x: self.margen_x() + col as f32 * self.celda_ancho(),
-            y: self.margen_y() + BUSQUEDA + HUECO + fila as f32 * self.celda_alto(),
+            x: x0 + self.hueco_fila(fila) + col as f32 * self.celda_ancho(),
+            y: y0 + fila as f32 * self.celda_alto(),
             width: self.celda_ancho(),
             height: self.celda_alto(),
         })
@@ -653,17 +1292,34 @@ impl Launchpad {
                 return None;
             }
         }
-        // Dentro de una carpeta se puede elegir su color en la fila de puntos.
-        if let (Some(c), Some(color)) = (self.dentro, self.color_en(x, y)) {
-            {
+        // La ✕ del buscador limpia lo escrito. Va antes que la rejilla porque
+        // está encima de ella —el campo, no—.
+        if self
+            .rect_limpiar()
+            .is_some_and(|r| r.contains(iced_core::Point::new(x, y)))
+        {
+            self.consulta.clear();
+            self.filtrar();
+            return None;
+        }
+        // El selector de color de la carpeta abierta, en tres pasos: el chip
+        // lo despliega, un color de dentro lo elige, y pulsar fuera lo cierra
+        // sin tocar nada —que es lo que hace cualquier popover—.
+        if let Some(c) = self.dentro {
+            if self.rect_chip_color().contains(iced_core::Point::new(x, y)) {
+                self.paleta_abierta = !self.paleta_abierta;
+                return None;
+            }
+            if let Some(color) = self.color_en(x, y) {
                 // Volver a pulsar el color que ya tiene lo quita: es la forma
                 // de devolverla al gris sin un botón de «ninguno».
-                self.carpetas[c].color = if self.carpetas[c].color == color {
-                    None
-                } else {
-                    color
-                };
+                self.carpetas[c].color = (self.carpetas[c].color != Some(color)).then_some(color);
+                self.paleta_abierta = false;
+                self.animar(Transicion::Fundido);
                 self.guardar();
+                return None;
+            }
+            if self.cerrar_paleta() {
                 return None;
             }
         }
@@ -677,6 +1333,13 @@ impl Launchpad {
                 self.renombrar();
                 return None;
             }
+        }
+        // Sobre el dock no se agarra nada de la rejilla: ese clic es del dock,
+        // y quien lo enruta es el compositor, que es el único que tiene las dos
+        // superficies. Sin esto, pulsar un icono del dock con el launchpad
+        // abierto empezaba un arrastre de la celda que hubiera detrás.
+        if self.sobre_el_dock(x, y) {
+            return None;
         }
         let i = self.celda_en(x, y)?;
         self.seleccion = Some(i);
@@ -706,6 +1369,12 @@ impl Launchpad {
             return (true, self.activar(arrastre.origen));
         }
         let (x, y) = arrastre.actual;
+        // Soltar sobre el dock ancla, y se mira **antes** que la rejilla: el
+        // dock queda fuera de ella, y sin esta rama lo que pasaría es que el
+        // icono se saliera de su carpeta, que es lo que significa soltar fuera.
+        if self.sobre_el_dock(x, y) {
+            return (true, self.anclar_en_el_dock(arrastre.origen));
+        }
         let destino = self.celda_en(x, y);
         (self.soltar_en(arrastre.origen, destino), None)
     }
@@ -763,6 +1432,19 @@ impl Launchpad {
             apps: vec![primera.to_string(), segunda.to_string()],
         });
         self.tras_cambiar_carpetas();
+        // Y se va a verla. Las carpetas se ordenan las primeras, así que crear
+        // una desde la tercera página reordena la rejilla entera y deja al
+        // usuario mirando un sitio donde no ha cambiado nada: el gesto parecía
+        // no haber hecho nada cuando en realidad había funcionado.
+        if let Some(i) = self
+            .visibles
+            .iter()
+            .position(|v| matches!(v, Item::Carpeta(c) if self.carpetas[*c].apps.iter().any(|a| a == primera)))
+        {
+            self.pagina = i / self.por_pagina();
+            self.seleccion = Some(i);
+            self.preparar_pagina();
+        }
     }
 
     fn meter_en_carpeta(&mut self, carpeta: usize, exec: &str) {
@@ -809,6 +1491,28 @@ impl Launchpad {
     /// Lo que hace pulsar la celda `i`: lanzar la aplicación, o entrar en la
     /// carpeta —que no es una acción para el compositor, sino un cambio de
     /// vista aquí dentro—.
+    /// Lo que hay en `i`, listo para fijarlo al dock.
+    ///
+    /// Una carpeta no se ancla: no es un programa, y el dock no sabe abrir algo
+    /// que solo existe dentro del launchpad.
+    ///
+    /// El `app_id` es el `exec`. Es lo mismo que hace la configuración cuando
+    /// la línea del dock no lo trae —`firefox` a secas ya acierta—, y aquí no
+    /// hay nada mejor: el `.desktop` no lleva el `app_id` de Wayland, lo lleva
+    /// la ventana cuando aparece.
+    fn anclar_en_el_dock(&self, i: usize) -> Option<Accion> {
+        let Item::App(a) = *self.visibles.get(i)? else {
+            return None;
+        };
+        let app = self.apps.get(a)?;
+        Some(Accion::Anclar {
+            app_id: app.exec.clone(),
+            exec: app.exec.clone(),
+            icono: app.icono.clone(),
+            fijar: Some(true),
+        })
+    }
+
     fn activar(&mut self, i: usize) -> Option<Accion> {
         match *self.visibles.get(i)? {
             Item::App(a) => Some(Accion::Lanzar(self.apps[a].exec.clone())),
@@ -901,8 +1605,10 @@ impl Launchpad {
                 self.filtrar();
                 Tecla::Consumida
             }
-            // Esc deshace lo último que hayas hecho, en orden: primero el modo
-            // edición, luego la carpeta abierta, y solo entonces cierra.
+            // Esc deshace lo último que hayas hecho, en orden: primero el
+            // selector de color, luego el modo edición, luego la carpeta
+            // abierta, y solo entonces cierra.
+            T::Escape if self.cerrar_paleta() => Tecla::Consumida,
             T::Escape if self.editando => {
                 self.editando = false;
                 Tecla::Consumida
@@ -923,10 +1629,40 @@ impl Launchpad {
                 self.filtrar();
                 Tecla::Consumida
             }
+            // Con el selector desplegado, las flechas y el Intro son suyos: es
+            // lo que hay delante, y mover la rejilla por detrás mientras se
+            // elige un color no lo espera nadie.
+            T::Izquierda if self.paleta_abierta => {
+                self.mover_foco_paleta(-1);
+                Tecla::Consumida
+            }
+            T::Derecha if self.paleta_abierta => {
+                self.mover_foco_paleta(1);
+                Tecla::Consumida
+            }
+            T::Intro if self.paleta_abierta => {
+                self.aplicar_foco_paleta();
+                Tecla::Consumida
+            }
             T::Izquierda => self.mover(-1),
             T::Derecha => self.mover(1),
-            T::Arriba => self.mover(-(COLUMNAS as isize)),
-            T::Abajo => self.mover(COLUMNAS as isize),
+            T::Arriba => self.mover(-(self.columnas() as isize)),
+            T::Abajo => self.mover(self.columnas() as isize),
+            // Inicio y Fin van al primero y al último de todo, no de la página:
+            // lo que se busca con Fin es lo último que hay instalado.
+            T::Inicio => self.mover(-(self.visibles.len() as isize)),
+            T::Fin => self.mover(self.visibles.len() as isize),
+            T::PaginaArriba => self.pasar_pagina(-1),
+            T::PaginaAbajo => self.pasar_pagina(1),
+            // El tabulador despliega el selector de color de la carpeta
+            // abierta. Es la única tecla libre ahí: las letras buscan, las
+            // flechas recorren la rejilla y Esc va deshaciendo.
+            T::Tabulador => {
+                if let Some(c) = self.dentro {
+                    self.alternar_paleta_con_teclado(c);
+                }
+                Tecla::Consumida
+            }
             T::Intro => match self.seleccionado() {
                 Some(accion) => Tecla::Hacer(accion),
                 None => Tecla::Consumida,
@@ -940,6 +1676,23 @@ impl Launchpad {
         self.activar(i)
     }
 
+    /// Cambia de página con el teclado y se lleva la selección con ella: sin
+    /// eso, Intro después de AvPág lanzaría algo de la página anterior, que ya
+    /// no se está viendo.
+    fn pasar_pagina(&mut self, hacia: isize) -> Tecla {
+        let destino = self.pagina as isize + hacia;
+        if destino < 0 || destino >= self.paginas() as isize {
+            return Tecla::Consumida;
+        }
+        self.pagina = destino as usize;
+        if self.seleccion.is_some() {
+            let primera = self.pagina * self.por_pagina();
+            self.seleccion = Some(primera.min(self.visibles.len().saturating_sub(1)));
+        }
+        self.preparar_pagina();
+        Tecla::Consumida
+    }
+
     fn mover(&mut self, paso: isize) -> Tecla {
         if self.visibles.is_empty() {
             return Tecla::Consumida;
@@ -949,7 +1702,7 @@ impl Launchpad {
         self.seleccion = Some(nuevo);
         // Salirse de la página la pasa: la selección manda sobre la página, no
         // al revés.
-        self.pagina = nuevo / POR_PAGINA;
+        self.pagina = nuevo / self.por_pagina();
         self.preparar_pagina();
         Tecla::Consumida
     }
@@ -961,35 +1714,60 @@ impl Launchpad {
         if let Some(c) = self.dentro {
             return self.view_carpeta(c);
         }
-        let texto_busqueda = if self.consulta.is_empty() {
-            text("Buscar aplicaciones…").size(15).color(tema::TEXTO2)
-        } else {
+        let escribiendo = !self.consulta.is_empty();
+        let texto_busqueda = if escribiendo {
             text(self.consulta.clone()).size(15).color(tema::texto())
+        } else {
+            text("Buscar aplicaciones…").size(15).color(tema::TEXTO2)
         };
-        // Píldora: radio la mitad del alto. Con foco el borde pasa a acento,
-        // que aquí es siempre porque el campo no se puede desenfocar.
+        // La lupa dice para qué es el campo sin gastar una palabra, y es lo que
+        // permite que el borde deje de gritarlo.
+        let lupa: PanelElement<'_> = match icono::propio("buscar") {
+            Some(ic) => icono::ver_teñido_propio(
+                &ic,
+                18.0,
+                if escribiendo {
+                    tema::acento()
+                } else {
+                    tema::TEXTO2
+                },
+            ),
+            None => Space::new().into(),
+        };
+        // Radio 14 —el de los inputs (§2.3)— y no píldora, y el borde de acento
+        // solo cuando hay algo escrito: el campo no se puede desenfocar, así
+        // que un borde de acento permanente hace que el azul deje de significar
+        // «esto está activo», que es lo único que el sistema le deja significar.
+        let mut fila = row![lupa, texto_busqueda]
+            .spacing(10)
+            .align_y(iced_core::alignment::Vertical::Center);
+        if escribiendo {
+            // La ✕ solo aparece con algo escrito: es lo único que puede
+            // limpiar, y vacía no tendría nada que hacer.
+            fila = fila.push(Space::new().width(Length::Fill));
+            if let Some(ic) = icono::propio("cerrar") {
+                fila = fila.push(icono::ver_teñido_propio(&ic, 14.0, tema::TEXTO2));
+            }
+        }
         let busqueda = container(
-            container(texto_busqueda)
+            container(fila)
                 .padding([0, 16])
                 .height(Length::Fill)
                 .center_y(Length::Fill),
         )
         .width(Length::Fixed(BUSQUEDA_ANCHO))
         .height(Length::Fixed(BUSQUEDA))
-        .style(|_theme| container::Style {
+        .style(move |_theme| container::Style {
             background: Some(
-                Color {
-                    a: 0.12,
-                    ..tema::tinta()
-                }
-                .into(),
+                tema::alfa(tema::tinta(), if escribiendo { 0.14 } else { 0.10 }).into(),
             ),
             border: Border {
-                radius: tema::R_PILL.into(),
-                width: 2.0,
-                color: Color {
-                    a: 0.7,
-                    ..tema::acento()
+                radius: tema::R_CONTROL.into(),
+                width: if escribiendo { 2.0 } else { 1.0 },
+                color: if escribiendo {
+                    tema::acento()
+                } else {
+                    tema::alfa(tema::tinta(), 0.16)
                 },
             },
             ..Default::default()
@@ -1013,43 +1791,10 @@ impl Launchpad {
             .into()
     }
 
-    fn celda_view(&self, indice: usize) -> PanelElement<'_> {
-        let (cw, ch) = (self.celda_ancho(), self.celda_alto());
-        let hueco = || -> PanelElement<'_> {
-            Space::new()
-                .width(Length::Fixed(cw))
-                .height(Length::Fixed(ch))
-                .into()
-        };
-        let Some(item) = self.visibles.get(indice).copied() else {
-            return hueco();
-        };
-        let px = self.icono_px();
-        let alfa = 1.0;
-
-        // La carpeta tiene su propia baldosa —la rejilla de miniaturas— y su
-        // propio rótulo; el resto de la celda es idéntico.
-        let (indice_app, nombre) = match item {
-            Item::App(a) => (a, self.apps[a].nombre.clone()),
-            Item::Carpeta(c) => {
-                let interior = column![
-                    self.tapa_carpeta(c, px, alfa),
-                    Space::new().height(Length::Fixed(6.0)),
-                    self.rotulo(&self.carpetas[c].nombre, cw, alfa),
-                ]
-                .align_x(Horizontal::Center);
-                return container(interior)
-                    .width(Length::Fixed(cw))
-                    .height(Length::Fixed(ch))
-                    .center_x(Length::Fixed(cw))
-                    .center_y(Length::Fixed(ch))
-                    .into();
-            }
-        };
-        let app = &self.apps[indice_app];
-        let _ = &nombre;
-        let baldosa: PanelElement<'_> = match self.iconos.get(&indice_app).and_then(Option::as_ref)
-        {
+    /// El icono de una aplicación, sin rótulo. Está aparte de [`Self::celda_view`]
+    /// porque el arrastre lo pinta también, en su propia superficie.
+    fn baldosa_app(&self, indice_app: usize, px: f32, alfa: f32) -> PanelElement<'_> {
+        match self.iconos.get(&indice_app).and_then(Option::as_ref) {
             Some(Icono::Svg(handle)) => svg(handle.clone())
                 .width(Length::Fixed(px))
                 .height(Length::Fixed(px))
@@ -1063,7 +1808,7 @@ impl Launchpad {
             // Baldosa con la inicial, igual que en el dock: un icono que falta
             // no puede dejar un hueco en la rejilla.
             None => {
-                let inicial = app
+                let inicial = self.apps[indice_app]
                     .nombre
                     .chars()
                     .next()
@@ -1095,7 +1840,54 @@ impl Launchpad {
                     })
                     .into()
             }
+        }
+    }
+
+    fn celda_view(&self, indice: usize) -> PanelElement<'_> {
+        let (cw, ch) = (self.celda_ancho(), self.celda_alto());
+        let hueco = || -> PanelElement<'_> {
+            Space::new()
+                .width(Length::Fixed(cw))
+                .height(Length::Fixed(ch))
+                .into()
         };
+        let Some(item) = self.visibles.get(indice).copied() else {
+            return hueco();
+        };
+        let px = self.icono_px();
+        let alfa = 1.0;
+
+        // La carpeta tiene su propia baldosa —la rejilla de miniaturas— y su
+        // propio rótulo; el resto de la celda es idéntico.
+        let (indice_app, nombre) = match item {
+            Item::App(a) => (a, self.apps[a].nombre.clone()),
+            Item::Carpeta(c) => {
+                let interior = column![
+                    self.tapa_carpeta(c, px, alfa),
+                    Space::new().height(Length::Fixed(8.0)),
+                    self.rotulo(&self.carpetas[c].nombre, cw, alfa),
+                ]
+                .align_x(Horizontal::Center);
+                return container(interior)
+                    .width(Length::Fixed(cw))
+                    .height(Length::Fixed(ch))
+                    .center_x(Length::Fixed(cw))
+                    .center_y(Length::Fixed(ch))
+                    .into();
+            }
+        };
+        let app = &self.apps[indice_app];
+        let _ = &nombre;
+        // Editando, el icono baja al 88 % dentro de la misma celda: la ✕ va en
+        // su esquina y sin encoger le tapa el dibujo. La celda no cambia de
+        // tamaño, así que la etiqueta no salta al entrar y salir del modo.
+        let px_icono = if self.editando { px * 0.88 } else { px };
+        let baldosa = container(self.baldosa_app(indice_app, px_icono, alfa))
+            .width(Length::Fixed(px))
+            .height(Length::Fixed(px))
+            .center_x(Length::Fixed(px))
+            .center_y(Length::Fixed(px))
+            .into();
 
         let etiqueta = self.rotulo(&app.nombre, cw, alfa);
 
@@ -1106,7 +1898,7 @@ impl Launchpad {
         } else {
             baldosa
         };
-        let interior = column![baldosa, Space::new().height(Length::Fixed(6.0)), etiqueta]
+        let interior = column![baldosa, Space::new().height(Length::Fixed(8.0)), etiqueta]
             .align_x(Horizontal::Center);
 
         // El realce de la celda señalada **no** se dibuja aquí: va en su propia
@@ -1122,108 +1914,320 @@ impl Launchpad {
     /// La rejilla de la página actual.
     fn rejilla_view(&self) -> PanelElement<'_> {
         let mut rejilla = column![];
-        for fila in 0..FILAS {
+        // Dentro de una carpeta se dibujan solo las filas que ocupa lo que hay:
+        // el resto son celdas vacías que estirarían el panel.
+        let filas = match self.dentro {
+            Some(_) => self.filas_panel(),
+            None => self.filas(),
+        };
+        for fila in 0..filas {
             let mut linea = row![];
-            for col in 0..COLUMNAS {
-                let en_pagina = fila * COLUMNAS + col;
-                linea = linea.push(self.celda_view(self.pagina * POR_PAGINA + en_pagina));
+            let hueco = self.hueco_fila(fila);
+            if hueco > 0.0 {
+                linea = linea.push(Space::new().width(Length::Fixed(hueco)));
+            }
+            for col in 0..self.columnas() {
+                let en_pagina = fila * self.columnas() + col;
+                linea = linea.push(self.celda_view(self.pagina * self.por_pagina() + en_pagina));
             }
             rejilla = rejilla.push(linea);
         }
         rejilla.into()
     }
 
-    /// La vista de dentro de una carpeta: su nombre arriba y su rejilla.
+    /// La vista de dentro de una carpeta: el panel con su nombre y su rejilla.
+    ///
+    /// El panel es un **diálogo** —radio 26 y sombra de modal— teñido del color
+    /// de la carpeta. Antes esto reusaba la rejilla de 6×5 entera y una fila de
+    /// diez colores suelta bajo el título: ocho aplicaciones repartidas en
+    /// treinta huecos no se leen como un grupo, y los diez puntos pesaban más
+    /// que el nombre.
     fn view_carpeta(&self, carpeta: usize) -> PanelElement<'_> {
+        let panel = self.rect_panel();
         // Editando se enseña el cursor con el mismo carácter que la vista de
         // escritorios, para que renombrar se vea igual en los dos sitios.
         let (nombre, pista) = match &self.renombrando {
-            Some(escrito) => (format!("{escrito}│"), "Intro para guardar"),
-            // La pista es corta a propósito: en dos líneas se comía el alto de
-            // la barra y empujaba la rejilla. Que el nombre se pulse para
-            // cambiarlo se descubre pulsándolo, que es donde se busca.
-            None => (self.carpetas[carpeta].nombre.clone(), "Esc para volver"),
+            Some(escrito) => (format!("{escrito}│"), "Intro para guardar".to_string()),
+            None => (
+                self.carpetas[carpeta].nombre.clone(),
+                match self.apps_de(carpeta).len() {
+                    1 => "1 aplicación".to_string(),
+                    n => format!("{n} aplicaciones"),
+                },
+            ),
         };
-        let titulo = container(
-            row![
-                text(nombre).size(20).color(tema::texto()),
-                Space::new().width(Length::Fixed(12.0)),
-                // Sin botón de cerrar: se sale con Esc o pulsando fuera, igual
-                // que se cierra el launchpad entero. Un botón más aquí sería el
-                // único de toda la pantalla.
-                text(pista).size(12).color(tema::TEXTO2),
-            ]
-            .align_y(iced_core::alignment::Vertical::Center),
-        )
-        .width(Length::Fixed(BUSQUEDA_ANCHO))
-        .height(Length::Fixed(BUSQUEDA))
-        .center_y(Length::Fixed(BUSQUEDA));
 
-        let contenido = column![
-            container(titulo)
-                .width(Length::Fill)
-                .align_x(Horizontal::Center),
-            // La fila de colores le come su alto al hueco que ya había: la
-            // rejilla de dentro tiene que empezar donde la de fuera.
-            container(self.colores_view(carpeta))
-                .width(Length::Fill)
-                .height(Length::Fixed(HUECO))
-                .center_x(Length::Fill)
-                .center_y(Length::Fixed(HUECO)),
-            self.rejilla_view(),
-            self.puntos_view(),
+        // Cabecera: el nombre es a la vez el campo —se pulsa y se escribe— y a
+        // la derecha el chip del color. Sin botón de cerrar: se sale con Esc o
+        // pulsando fuera, igual que se cierra el launchpad entero.
+        let cabecera = row![
+            column![
+                text(nombre).size(20).color(tema::texto()),
+                text(pista).size(11).color(tema::TEXTO2),
+            ],
+            Space::new().width(Length::Fill),
+            self.chip_color_view(carpeta),
         ]
-        .align_x(Horizontal::Center);
+        .align_y(iced_core::alignment::Vertical::Center);
+
+        let (fondo, borde) = self.tinte_panel(carpeta);
+        let contenido = column![
+            container(cabecera)
+                .width(Length::Fill)
+                .height(Length::Fixed(PANEL_CABECERA))
+                .center_y(Length::Fixed(PANEL_CABECERA)),
+            self.rejilla_view(),
+        ];
+        // Los puntos solo si hay más de una página: una carpeta de ocho
+        // aplicaciones no tiene de qué informar.
+        let contenido = if self.paginas() > 1 {
+            contenido.push(self.puntos_view())
+        } else {
+            contenido
+        };
+        let tarjeta = container(contenido)
+            .width(Length::Fixed(panel.width))
+            .height(Length::Fixed(panel.height))
+            .padding(PANEL_PAD)
+            .style(move |_theme| container::Style {
+                background: Some(fondo.into()),
+                border: Border {
+                    radius: tema::R_DIALOGO.into(),
+                    width: 1.0,
+                    color: borde,
+                },
+                // La sombra de modal de §2.5. Es la única que se dibuja en todo
+                // el launchpad: en oscuro las tarjetas no llevan, pero esto no
+                // es una tarjeta fija, es un diálogo sobre el velo.
+                shadow: iced_core::Shadow {
+                    color: Color {
+                        a: 0.30,
+                        ..Color::BLACK
+                    },
+                    offset: iced_core::Vector::new(0.0, 20.0),
+                    blur_radius: 56.0,
+                },
+                ..Default::default()
+            });
+
+        // El panel va colocado a mano y no centrado por el layout: sus
+        // coordenadas tienen que ser **las mismas** que las de `rect_panel`,
+        // que es lo que usa el hit-test del chip y de la rejilla de dentro.
+        let colocado = column![
+            Space::new().height(Length::Fixed(panel.y)),
+            row![Space::new().width(Length::Fixed(panel.x)), tarjeta],
+        ];
+
+        let contenido: PanelElement<'_> = if self.paleta_abierta {
+            let hueco = self.rect_paleta();
+            iced_widget::stack![
+                colocado,
+                column![
+                    Space::new().height(Length::Fixed(hueco.y)),
+                    row![
+                        Space::new().width(Length::Fixed(hueco.x)),
+                        self.paleta_view(carpeta),
+                    ],
+                ],
+            ]
+            .into()
+        } else {
+            colocado.into()
+        };
+
         container(contenido)
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
     }
 
-    /// Los diez colores de la paleta, para teñir la carpeta abierta.
+    /// El relleno y el filo del panel de una carpeta, según su color.
     ///
-    /// Los mismos que el acento del sistema y en el mismo orden: dos paletas
-    /// distintas en el mismo escritorio se notan aunque no se sepa decir por
-    /// qué. El que ya está puesto lleva un anillo, y volver a pulsarlo devuelve
-    /// la carpeta al gris.
-    fn colores_view(&self, carpeta: usize) -> PanelElement<'_> {
-        let puesto = self.carpetas[carpeta].color;
-        let mut fila = row![].spacing(COLOR_PASO - COLOR_PUNTO);
-        for acento in tema::Acento::TODOS {
-            let color = acento.color();
-            let elegido = puesto == Some(acento);
-            fila = fila.push(
-                container(
-                    container(Space::new())
-                        .width(Length::Fixed(COLOR_PUNTO))
-                        .height(Length::Fixed(COLOR_PUNTO))
-                        .style(move |_theme| container::Style {
-                            background: Some(color.into()),
-                            border: Border {
-                                radius: tema::R_PILL.into(),
-                                ..Default::default()
-                            },
-                            ..Default::default()
-                        }),
-                )
+    /// El tinte va **sobre** la tarjeta del sistema y no en vez de ella: el
+    /// color que el usuario le puso tiene que reconocerse al abrirla, pero el
+    /// fondo sigue siendo `card`.
+    fn tinte_panel(&self, carpeta: usize) -> (Color, Color) {
+        match self.carpetas[carpeta].color.map(ColorCarpeta::color) {
+            Some(color) => (
+                tema::mezclar(tema::card(), color, 0.26),
+                tema::alfa(color, 0.55),
+            ),
+            None => (tema::card(), tema::alfa(tema::tinta(), 0.10)),
+        }
+    }
+
+    /// El chip cerrado del selector: un círculo con el color puesto.
+    ///
+    /// Sin color es un círculo hueco con el filo de la tinta, no un punto gris
+    /// relleno: relleno se lee como un color más —el gris— y no como «esta
+    /// carpeta no tiene».
+    fn chip_color_view(&self, carpeta: usize) -> PanelElement<'_> {
+        let puesto = self.carpetas[carpeta].color.map(ColorCarpeta::color);
+        let abierta = self.paleta_abierta;
+        container(
+            container(Space::new())
                 .width(Length::Fixed(COLOR_PUNTO))
-                .height(Length::Fixed(COLORES_ALTO))
-                .center_y(Length::Fixed(COLORES_ALTO))
+                .height(Length::Fixed(COLOR_PUNTO))
                 .style(move |_theme| container::Style {
+                    background: puesto.map(Into::into),
                     border: Border {
                         radius: tema::R_PILL.into(),
-                        width: if elegido { 2.0 } else { 0.0 },
-                        color: if elegido {
-                            tema::texto()
-                        } else {
-                            Color::TRANSPARENT
-                        },
+                        width: if puesto.is_some() { 0.0 } else { 1.5 },
+                        color: tema::alfa(tema::tinta(), 0.35),
                     },
                     ..Default::default()
                 }),
+        )
+        .width(Length::Fixed(CHIP_COLOR))
+        .height(Length::Fixed(CHIP_COLOR))
+        .center_x(Length::Fixed(CHIP_COLOR))
+        .center_y(Length::Fixed(CHIP_COLOR))
+        // Desplegado, el chip lleva anillo: es lo que dice que el popover de
+        // debajo sale de aquí y no de cualquier sitio.
+        .style(move |_theme| container::Style {
+            border: Border {
+                radius: tema::R_PILL.into(),
+                width: if abierta { 2.0 } else { 0.0 },
+                color: tema::alfa(tema::tinta(), 0.5),
+            },
+            ..Default::default()
+        })
+        .into()
+    }
+
+    /// El popover del selector: los diez acentos y la tira de tono libre.
+    ///
+    /// Los diez van primero porque son pares calibrados; la tira está debajo
+    /// para quien quiera el suyo. Lo que se elige ahí es el **tono**: la
+    /// saturación y la luminosidad las pone [`de_tono`], que es lo que impide
+    /// que un color libre se salga del contraste del resto de la paleta.
+    fn paleta_view(&self, carpeta: usize) -> PanelElement<'_> {
+        let puesto = self.carpetas[carpeta].color;
+        let rect = self.rect_paleta();
+
+        let mut acentos = row![].spacing(COLOR_PASO - COLOR_SLOT);
+        for acento in tema::Acento::TODOS {
+            acentos = acentos.push(
+                self.punto_color_view(acento.color(), puesto == Some(ColorCarpeta::Acento(acento))),
             );
         }
-        fila.into()
+
+        // La tira es un degradado hecho a trozos: iced pinta gradientes
+        // lineales, pero uno de 360° pasa por seis paradas y sale más código
+        // que treinta y seis rectángulos de color plano.
+        let mut tira = row![];
+        for i in 0..TONO_TROZOS {
+            let grados = i as f32 * 360.0 / TONO_TROZOS as f32;
+            let color = de_tono(grados);
+            // Las esquinas solo en los extremos, para que la tira entera tenga
+            // forma de píldora sin dibujar una máscara.
+            let radios = iced_core::border::Radius::default()
+                .top_left(if i == 0 { TONO_ALTO / 2.0 } else { 0.0 })
+                .bottom_left(if i == 0 { TONO_ALTO / 2.0 } else { 0.0 })
+                .top_right(if i + 1 == TONO_TROZOS {
+                    TONO_ALTO / 2.0
+                } else {
+                    0.0
+                })
+                .bottom_right(if i + 1 == TONO_TROZOS {
+                    TONO_ALTO / 2.0
+                } else {
+                    0.0
+                });
+            tira = tira.push(
+                container(Space::new())
+                    .width(Length::Fixed(TONO_ANCHO / TONO_TROZOS as f32))
+                    .height(Length::Fixed(TONO_ALTO))
+                    .style(move |_theme| container::Style {
+                        background: Some(color.into()),
+                        border: Border {
+                            radius: radios,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+            );
+        }
+
+        // El tono elegido lleva su marca encima de la tira, en su sitio: sin
+        // ella, un color libre puesto no se distingue de ninguno puesto.
+        let tira: PanelElement<'_> = match puesto {
+            Some(ColorCarpeta::Tono(grados)) => {
+                let x = (grados / 360.0 * TONO_ANCHO - TONO_ALTO / 2.0).max(0.0);
+                iced_widget::stack![
+                    tira,
+                    row![
+                        Space::new().width(Length::Fixed(x)),
+                        container(Space::new())
+                            .width(Length::Fixed(TONO_ALTO))
+                            .height(Length::Fixed(TONO_ALTO))
+                            .style(|_theme| container::Style {
+                                border: Border {
+                                    radius: tema::R_PILL.into(),
+                                    width: 2.5,
+                                    color: tema::texto(),
+                                },
+                                ..Default::default()
+                            }),
+                    ],
+                ]
+                .into()
+            }
+            _ => tira.into(),
+        };
+
+        container(column![acentos, tira].spacing(PALETA_PAD))
+            .width(Length::Fixed(rect.width))
+            .height(Length::Fixed(rect.height))
+            .padding(PALETA_PAD)
+            .style(|_theme| container::Style {
+                background: Some(tema::card().into()),
+                border: Border {
+                    radius: tema::R_POPOVER.into(),
+                    width: 1.0,
+                    color: tema::alfa(tema::tinta(), 0.09),
+                },
+                shadow: iced_core::Shadow {
+                    color: Color {
+                        a: 0.18,
+                        ..Color::BLACK
+                    },
+                    offset: iced_core::Vector::new(0.0, 6.0),
+                    blur_radius: 22.0,
+                },
+                ..Default::default()
+            })
+            .into()
+    }
+
+    /// Un punto de color del selector, con su anillo si es el puesto.
+    fn punto_color_view<'a>(&self, color: Color, elegido: bool) -> PanelElement<'a> {
+        container(
+            container(Space::new())
+                .width(Length::Fixed(COLOR_PUNTO))
+                .height(Length::Fixed(COLOR_PUNTO))
+                .style(move |_theme| container::Style {
+                    background: Some(color.into()),
+                    border: Border {
+                        radius: tema::R_PILL.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+        )
+        .width(Length::Fixed(COLOR_SLOT))
+        .height(Length::Fixed(COLOR_SLOT))
+        .center_x(Length::Fixed(COLOR_SLOT))
+        .center_y(Length::Fixed(COLOR_SLOT))
+        .style(move |_theme| container::Style {
+            border: Border {
+                radius: tema::R_PILL.into(),
+                width: if elegido { 2.0 } else { 0.0 },
+                color: tema::texto(),
+            },
+            ..Default::default()
+        })
+        .into()
     }
 
     /// La ✕ que quita una aplicación de la rejilla, en la esquina de su icono.
@@ -1275,6 +2279,11 @@ impl Launchpad {
         .width(Length::Fixed(cw - UNIDAD))
         .height(Length::Fixed(ETIQUETA))
         .center_x(Length::Fixed(cw - UNIDAD))
+        // Recortado a las dos líneas que la celda reserva. «KDE Partition
+        // Manager» ocupa tres y sin recorte se metía en la fila de abajo,
+        // encima de la etiqueta del icono siguiente: dos nombres pisados no se
+        // leen ninguno de los dos.
+        .clip(true)
         .into()
     }
 
@@ -1289,20 +2298,49 @@ impl Launchpad {
         // Con color, la caja se tiñe de él y le sale un filo del mismo tono:
         // el relleno solo ya se pierde contra el velo, y el filo es lo que la
         // hace reconocible de una página a otra.
-        let (fondo_tapa, borde_tapa) = match self.carpetas[carpeta].color {
-            Some(acento) => (
-                tema::alfa(acento.color(), 0.28 * alfa),
-                tema::alfa(acento.color(), alfa),
-            ),
+        let (fondo_tapa, borde_tapa) = match self.carpetas[carpeta].color.map(ColorCarpeta::color) {
+            Some(color) => (tema::alfa(color, 0.28 * alfa), tema::alfa(color, alfa)),
             None => (tema::alfa(tema::tinta(), 0.18 * alfa), Color::TRANSPARENT),
         };
-        let hueco = px * 0.06;
-        let mini = (px - hueco * 4.0) / 3.0;
+        let hueco = px * 0.08;
+        let mini = (px - hueco * 3.0) / 2.0;
+        // Con más de cuatro dentro, la cuarta casilla es la cuenta de lo que no
+        // se ve: la novena aplicación de una carpeta nunca fue reconocible a
+        // 20 px, y el número sí dice algo.
+        let de_mas = dentro.len().saturating_sub(MINIATURAS - 1);
+        let cuantas = if de_mas > 1 {
+            MINIATURAS - 1
+        } else {
+            MINIATURAS
+        };
         let mut rejilla = column![].spacing(hueco);
-        for fila in 0..3 {
+        for fila in 0..2 {
             let mut linea = row![].spacing(hueco);
-            for col in 0..3 {
-                let i = fila * 3 + col;
+            for col in 0..2 {
+                let i = fila * 2 + col;
+                if i >= cuantas {
+                    let texto = format!("+{de_mas}");
+                    linea = linea.push(
+                        container(
+                            text(texto)
+                                .size(mini * 0.42)
+                                .color(tema::alfa(tema::texto(), alfa)),
+                        )
+                        .width(Length::Fixed(mini))
+                        .height(Length::Fixed(mini))
+                        .center_x(Length::Fixed(mini))
+                        .center_y(Length::Fixed(mini))
+                        .style(move |_theme| container::Style {
+                            background: Some(tema::alfa(tema::tinta(), 0.14 * alfa).into()),
+                            border: Border {
+                                radius: (mini * 0.22).into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }),
+                    );
+                    continue;
+                }
                 let celda: PanelElement<'a> = match dentro
                     .get(i)
                     .and_then(|a| self.iconos.get(a))
@@ -1338,10 +2376,12 @@ impl Launchpad {
             .style(move |_theme| container::Style {
                 background: Some(fondo_tapa.into()),
                 border: Border {
-                    // Caja redondeada, no círculo: es lo que la distingue de un
-                    // icono de aplicación, que el sistema de diseño define como
-                    // círculo (§3.1).
-                    radius: (px * 0.22).into(),
+                    // Caja redondeada con el radio de la placa del pack de
+                    // BookOS: `rx 80` sobre un lienzo de 512, el 15,6 % del
+                    // lado. La tapa tiene que leerse como de la misma familia
+                    // que lo que guarda, y con 0,22 —lo que había— se veía
+                    // más redonda que los iconos de dentro.
+                    radius: (px * 0.156).into(),
                     width: borde_tapa.a,
                     color: borde_tapa,
                 },
@@ -1405,6 +2445,54 @@ impl Launchpad {
 mod tests {
     use super::*;
 
+    /// Arrastrar un icono hasta el dock lo fija, y lo fija **siempre**: la
+    /// acción lleva `Some(true)` y no la alternancia del menú contextual, que
+    /// soltando sobre algo ya anclado lo quitaría.
+    #[test]
+    fn soltar_un_icono_sobre_el_dock_lo_ancla() {
+        let mut l = con_apps(&["Kate", "Konsole"]);
+        l.poner_zona_dock(Some(iced_core::Rectangle {
+            x: 600.0,
+            y: 960.0,
+            width: 400.0,
+            height: 60.0,
+        }));
+        let celda = l.rect_celda(0).expect("la primera celda está en la página");
+        l.pulsar(celda.center_x(), celda.center_y());
+        l.puntero(Some((800.0, 990.0)));
+        let (_, accion) = l.soltar();
+        assert!(
+            matches!(accion, Some(Accion::Anclar { fijar: Some(true), ref exec, .. }) if exec == "kate"),
+            "se esperaba anclar Kate y salió {accion:?}"
+        );
+    }
+
+    /// Sin dock a la vista, la misma franja es rejilla: soltar ahí saca la
+    /// aplicación de su carpeta, que es lo que significa soltar fuera.
+    #[test]
+    fn sin_dock_soltar_abajo_no_ancla() {
+        let mut l = con_apps(&["Kate", "Konsole"]);
+        let celda = l.rect_celda(0).expect("la primera celda está en la página");
+        l.pulsar(celda.center_x(), celda.center_y());
+        l.puntero(Some((800.0, 990.0)));
+        assert!(l.soltar().1.is_none());
+    }
+
+    /// Pulsar sobre el dock no agarra nada de la rejilla: ese clic no es suyo.
+    #[test]
+    fn pulsar_en_el_dock_no_agarra_la_rejilla() {
+        let mut l = con_apps(&["Kate"]);
+        l.poner_zona_dock(Some(iced_core::Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 1646.0,
+            height: 1029.0,
+        }));
+        let celda = l.rect_celda(0).expect("la primera celda está en la página");
+        l.pulsar(celda.center_x(), celda.center_y());
+        assert!(!l.agarrado());
+    }
+
     fn con_apps(nombres: &[&str]) -> Launchpad {
         con_apps_y_carpetas(nombres, Vec::new())
     }
@@ -1431,6 +2519,8 @@ mod tests {
             ocultas: Vec::new(),
             editando: false,
             dentro: None,
+            paleta_abierta: false,
+            foco_paleta: None,
             renombrando: None,
             visibles: Vec::new(),
             consulta: String::new(),
@@ -1439,6 +2529,9 @@ mod tests {
             acumulado: 0.0,
             ultimo_paso: None,
             arrastre: None,
+            zona_dock: None,
+            transicion: None,
+            tinte_fondo: tinte_del_fondo(),
             iconos: HashMap::new(),
         };
         l.rehacer_visibles();
@@ -1539,8 +2632,8 @@ mod tests {
         assert_eq!(l.visibles.len(), 3, "las tres vuelven a estar sueltas");
     }
 
-    /// El color se elige de la misma paleta que el acento del sistema, y
-    /// volver a pulsar el que ya está puesto devuelve la carpeta al gris.
+    /// El selector nace cerrado: se despliega con su chip, se elige un color, y
+    /// volver a pulsar el que está puesto devuelve la carpeta al gris.
     #[test]
     fn la_carpeta_se_tiñe_y_se_destiñe() {
         sin_tocar_el_disco();
@@ -1552,19 +2645,108 @@ mod tests {
         let mut l = con_apps_y_carpetas(&["Firefox", "Kate", "Konsole"], vec![carpeta]);
         l.abrir_carpeta(0);
 
+        // Cerrado, pulsar donde estarían los colores no elige nada: ahí no hay
+        // nada que pulsar.
+        let acentos = l.rect_acentos();
+        l.pulsar(acentos.x + 2.0, acentos.center_y());
+        assert_eq!(
+            l.carpetas[0].color, None,
+            "con el selector cerrado no hay colores"
+        );
+
+        let chip = l.rect_chip_color();
+        l.pulsar(chip.center_x(), chip.center_y());
+        assert!(l.paleta_abierta, "el chip despliega el selector");
+
         // El tercer punto de la fila es el tercer acento de la tabla.
-        let fila = l.rect_colores();
-        let x = fila.x + COLOR_PASO * 2.0 + 2.0;
-        l.pulsar(x, fila.y + fila.height / 2.0);
-        assert_eq!(l.carpetas[0].color, Some(tema::Acento::TODOS[2]));
+        let x = acentos.x + COLOR_PASO * 2.0 + 2.0;
+        l.pulsar(x, acentos.center_y());
+        assert_eq!(
+            l.carpetas[0].color,
+            Some(ColorCarpeta::Acento(tema::Acento::TODOS[2]))
+        );
+        assert!(!l.paleta_abierta, "elegir un color cierra el selector");
 
         // Otra vez el mismo: vuelve al gris.
-        l.pulsar(x, fila.y + fila.height / 2.0);
+        l.pulsar(chip.center_x(), chip.center_y());
+        l.pulsar(x, acentos.center_y());
         assert_eq!(l.carpetas[0].color, None);
 
-        // Y la calle entre dos puntos no elige nada.
-        l.pulsar(fila.x + COLOR_PUNTO + 3.0, fila.y + fila.height / 2.0);
+        // Y la calle entre dos ranuras no elige nada, pero sí cierra: pulsar
+        // fuera de un popover es lo que lo cierra.
+        l.pulsar(chip.center_x(), chip.center_y());
+        l.pulsar(acentos.x + COLOR_SLOT + 2.0, acentos.center_y());
         assert_eq!(l.carpetas[0].color, None);
+        assert!(!l.paleta_abierta);
+    }
+
+    /// Entrar y salir de una carpeta deja apuntada su transición, y solo se
+    /// puede recoger una vez: quien se la lleva es quien tiene la superficie de
+    /// antes, y dos veces sería animar dos veces lo mismo.
+    #[test]
+    fn abrir_y_cerrar_una_carpeta_pide_su_transicion() {
+        sin_tocar_el_disco();
+        let carpeta = Carpeta {
+            nombre: "Utilidades".into(),
+            color: None,
+            apps: vec!["kate".into(), "konsole".into()],
+        };
+        let mut l = con_apps_y_carpetas(&["Firefox", "Kate", "Konsole"], vec![carpeta]);
+        assert_eq!(l.tomar_transicion(), None, "abrir el launchpad no es una");
+
+        l.abrir_carpeta(0);
+        assert_eq!(l.tomar_transicion(), Some(Transicion::AbrirCarpeta));
+        assert_eq!(l.tomar_transicion(), None, "solo se recoge una vez");
+
+        assert!(l.salir_de_carpeta());
+        assert_eq!(l.tomar_transicion(), Some(Transicion::CerrarCarpeta));
+
+        // Salir sin estar dentro no anima nada: no ha cambiado la vista.
+        assert!(!l.salir_de_carpeta());
+        assert_eq!(l.tomar_transicion(), None);
+    }
+
+    /// La tira da un color propio, y lo que se guarda es el **tono**: así el
+    /// color de una carpeta sigue cambiando con el tema, como los acentos.
+    #[test]
+    fn la_tira_de_tono_da_un_color_propio_y_sobrevive_al_disco() {
+        sin_tocar_el_disco();
+        let carpeta = Carpeta {
+            nombre: "Utilidades".into(),
+            color: None,
+            apps: vec!["kate".into(), "konsole".into()],
+        };
+        let mut l = con_apps_y_carpetas(&["Firefox", "Kate", "Konsole"], vec![carpeta]);
+        l.abrir_carpeta(0);
+
+        let chip = l.rect_chip_color();
+        l.pulsar(chip.center_x(), chip.center_y());
+        let tira = l.rect_tono();
+        // Un cuarto de la tira son 90°, el verde amarillento.
+        l.pulsar(tira.x + tira.width / 4.0, tira.center_y());
+        let Some(ColorCarpeta::Tono(grados)) = l.carpetas[0].color else {
+            panic!(
+                "se esperaba un tono libre y salió {:?}",
+                l.carpetas[0].color
+            );
+        };
+        assert!(
+            (grados - 90.0).abs() < 6.0,
+            "{grados}° no son los 90 de un cuarto de tira"
+        );
+
+        // Ida y vuelta por el formato de `launchpad.conf`.
+        let guardado = ColorCarpeta::Tono(grados).guardado();
+        assert_eq!(
+            ColorCarpeta::desde_guardado(&guardado),
+            Some(ColorCarpeta::Tono(grados.round()))
+        );
+        // Y lo de siempre se sigue leyendo igual: un fichero escrito antes de
+        // que existieran los tonos no puede perder los colores.
+        assert_eq!(
+            ColorCarpeta::desde_guardado("verde"),
+            Some(ColorCarpeta::Acento(tema::Acento::Verde))
+        );
     }
 
     /// La ✕ quita la aplicación de la rejilla —y de su carpeta— pero **no la

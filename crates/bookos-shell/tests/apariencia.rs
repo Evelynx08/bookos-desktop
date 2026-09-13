@@ -52,7 +52,10 @@ fn la_apariencia_elige_acento_y_repinta_el_shell() {
     shell.aplicar_apariencia(tema::actual(), Acento::Verde);
     assert_eq!(tema::acento_actual(), Acento::Verde);
     assert_eq!(tema::acento(), tema::Acento::Verde.color());
-    assert!(shell.refresh(), "cambiar de acento tiene que repintar el panel");
+    assert!(
+        shell.refresh(),
+        "cambiar de acento tiene que repintar el panel"
+    );
 
     // Cambiar de tema es lo mismo por el otro camino, y lo que se pinta con la
     // otra paleta tiene que ser **otro dibujo**: es la comprobación de que el

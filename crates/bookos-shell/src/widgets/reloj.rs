@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use iced_widget::text;
 
-use crate::state::{local_hhmm, Fecha};
+use crate::state::{Fecha, local_hhmm};
 use crate::tema;
 use crate::view::{PanelElement, TEXT};
 use crate::widget::Widget;

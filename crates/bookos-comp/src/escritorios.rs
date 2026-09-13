@@ -129,7 +129,11 @@ impl Escritorios {
     /// El escritorio activo de una salida. Una que nunca se haya movido está en
     /// el primero.
     pub fn activo_en(&self, salida: &str) -> usize {
-        self.activo.get(salida).copied().unwrap_or(0).min(self.cuantos - 1)
+        self.activo
+            .get(salida)
+            .copied()
+            .unwrap_or(0)
+            .min(self.cuantos - 1)
     }
 
     /// Las guardadas de una salida, creándole su hueco si es la primera vez.
@@ -210,7 +214,10 @@ pub fn ventanas_para_vista(state: &BookosComp, salida: &str) -> Vec<Vec<Apartada
             if i == activo {
                 ventanas_de(state, salida)
             } else {
-                guardadas.and_then(|g| g.get(i)).cloned().unwrap_or_default()
+                guardadas
+                    .and_then(|g| g.get(i))
+                    .cloned()
+                    .unwrap_or_default()
             }
         })
         .collect()
@@ -325,7 +332,8 @@ pub fn eliminar(state: &mut BookosComp, indice: usize) -> bool {
             indice - 1
         };
         if destino == nuevo_activo {
-            let mut a_mapear = std::mem::take(&mut state.escritorios.guardadas_de(&salida)[destino]);
+            let mut a_mapear =
+                std::mem::take(&mut state.escritorios.guardadas_de(&salida)[destino]);
             a_mapear.extend(borradas);
             for (window, posicion) in a_mapear {
                 state.space.map_element(window, posicion, false);
@@ -791,7 +799,11 @@ mod tests {
     /// vuelta: con un gesto, aparecer al otro lado es desorientador.
     #[test]
     fn los_extremos_no_dan_la_vuelta() {
-        assert_eq!(destino(0, -1, 4), 0, "a la izquierda del primero, el primero");
+        assert_eq!(
+            destino(0, -1, 4),
+            0,
+            "a la izquierda del primero, el primero"
+        );
         assert_eq!(destino(0, 1, 4), 1);
         assert_eq!(destino(3, 1, 4), 3, "y del último, el último");
         assert_eq!(destino(1, -1, 4), 0);
@@ -838,7 +850,11 @@ mod tests {
     #[test]
     fn cada_salida_lleva_su_escritorio() {
         let mut e = Escritorios::new(4, Vec::new());
-        assert_eq!(e.activo_en("eDP-1"), 0, "una salida nueva empieza en el primero");
+        assert_eq!(
+            e.activo_en("eDP-1"),
+            0,
+            "una salida nueva empieza en el primero"
+        );
         assert_eq!(e.activo_en("HDMI-1"), 0);
 
         e.activo.insert("eDP-1".into(), 2);
@@ -894,10 +910,17 @@ mod tests {
         let (sale_ancha, entra_ancha) = e.tira_fondo("ancha").expect("hay cambio en la ancha");
         let (sale_est, entra_est) = e.tira_fondo("estrecha").expect("hay cambio en la estrecha");
         assert_eq!(entra_ancha - sale_ancha, 1920, "la ancha desliza lo suyo");
-        assert_eq!(entra_est - sale_est, -1280, "y la estrecha lo suyo, al revés");
+        assert_eq!(
+            entra_est - sale_est,
+            -1280,
+            "y la estrecha lo suyo, al revés"
+        );
         // Y una salida sin cambio no dibuja tira ninguna.
         assert_eq!(e.tira_fondo("quieta"), None);
-        assert!(e.deslizando(), "con cambios en marcha el bucle no puede dormirse");
+        assert!(
+            e.deslizando(),
+            "con cambios en marcha el bucle no puede dormirse"
+        );
     }
 
     /// Quieto no hay tira que dibujar. Es la comprobación de que esto no
@@ -916,7 +939,9 @@ mod tests {
         for direccion in [1.0, -1.0] {
             for paso in 0..=10 {
                 let t = paso as f32 / 10.0;
-                let (sale, entra) = a_medias(direccion, t).tira_fondo(SALIDA).expect("hay cambio");
+                let (sale, entra) = a_medias(direccion, t)
+                    .tira_fondo(SALIDA)
+                    .expect("hay cambio");
                 assert_eq!(
                     (entra - sale) as f64,
                     2000.0 * direccion,
@@ -951,6 +976,9 @@ mod tests {
         cerca(a_medias(-1.0, 1.0).tira_fondo(SALIDA), (2000, 0));
         // Y a mitad de camino va por en medio, no en un extremo.
         let (sale, _) = a_medias(1.0, 0.5).tira_fondo(SALIDA).unwrap();
-        assert!(sale < -100 && sale > -1900, "a mitad el fondo está en {sale}");
+        assert!(
+            sale < -100 && sale > -1900,
+            "a mitad el fondo está en {sale}"
+        );
     }
 }

@@ -15,7 +15,7 @@ impl Brillo {
     pub fn new() -> Self {
         Self {
             dato: read_brightness(),
-            icono: icono::cargar("brightness-high"),
+            icono: icono::propio("brillo"),
         }
     }
 }
@@ -41,18 +41,13 @@ impl Widget for Brillo {
     /// Solo el icono: el porcentaje ya se ve en la tarjeta al pulsarlo. Además
     /// así el panel no cambia de anchura al pasar de 9 a 100.
     fn ancho(&self) -> f32 {
-        (self.dato.is_some() && self.icono.is_some())
-            .then_some(tema::ICONO_PANEL)
-            .unwrap_or(0.0)
+        tema::ICONO_PANEL
     }
 
     fn ver(&self) -> PanelElement<'_> {
-        if self.dato.is_none() {
-            return crate::widget::vacio();
-        }
         self.icono
             .as_ref()
-            .map(|ic| icono::ver_teñido(ic, tema::ICONO_PANEL, Some(TEXT())))
+            .map(|ic| icono::ver_teñido(ic, tema::ICONO_PANEL, Some(if self.dato.is_some() { TEXT() } else { tema::TEXTO2 })))
             .unwrap_or_else(crate::widget::vacio)
     }
 }

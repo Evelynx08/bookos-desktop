@@ -6,7 +6,7 @@
 //! pantalla**: si el nombre se lee o no es la única pregunta que importa aquí,
 //! y no se contesta leyendo el árbol de widgets.
 
-use bookos_shell::{escritorio::CELDA, Config, Shell};
+use bookos_shell::{Config, Shell, escritorio::CELDA};
 
 const ESCALA: f32 = 2.0;
 /// Tamaño lógico de la pantalla de mentira.
@@ -18,13 +18,17 @@ fn main() {
 
     use bookos_shell::tema::Tema::*;
     for (etiqueta, tema) in [("oscuro", Oscuro), ("claro", Claro)] {
-        let (fw, fh) = (
-            (PANTALLA.0 * ESCALA) as u32,
-            (PANTALLA.1 * ESCALA) as u32,
-        );
+        let (fw, fh) = ((PANTALLA.0 * ESCALA) as u32, (PANTALLA.1 * ESCALA) as u32);
         let mut lienzo = fondo(fw, fh);
 
-        let mut shell = Shell::con_config(PANTALLA.0 as u32, ESCALA, Config { tema, ..Config::default() });
+        let mut shell = Shell::con_config(
+            PANTALLA.0 as u32,
+            ESCALA,
+            Config {
+                tema,
+                ..Config::default()
+            },
+        );
         shell.escritorio_pantalla(PANTALLA, ESCALA);
         // Dos seleccionados, para ver la pastilla de acento junto a la normal.
         shell.escritorio_mut().seleccionar(Some(1), false);
@@ -101,7 +105,10 @@ fn fondo(w: u32, h: u32) -> Vec<u8> {
         std::path::PathBuf::from(home)
             .join("Descargas/BookOS/BookOS-Wallpapers/Wallpapers-0.6/Dark/blue_dark.png")
     });
-    if let Some((pixeles, iw, ih)) = candidato.as_deref().and_then(bookos_shell::decodificar_rgba) {
+    if let Some((pixeles, iw, ih)) = candidato
+        .as_deref()
+        .and_then(bookos_shell::decodificar_rgba)
+    {
         for y in 0..h {
             for x in 0..w {
                 // Vecino más próximo: es una previa, no una imagen final.

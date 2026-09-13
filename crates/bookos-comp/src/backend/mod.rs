@@ -13,18 +13,20 @@ pub mod udev;
 #[cfg(feature = "winit")]
 pub mod winit;
 
-use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+use smithay::backend::renderer::element::AsRenderElements;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
+use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::utils::{
     ConstrainAlign, ConstrainScaleBehavior, RescaleRenderElement,
 };
 use smithay::backend::renderer::element::{Id, Kind};
-use smithay::backend::renderer::element::AsRenderElements;
 use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::desktop::space::{constrain_space_element, ConstrainBehavior, ConstrainReference};
+use smithay::desktop::layer_map_for_output;
+use smithay::desktop::space::{ConstrainBehavior, ConstrainReference, constrain_space_element};
 use smithay::output::Output;
-use smithay::utils::{Logical, Point, Rectangle, Scale};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+use smithay::utils::{Logical, Point, Rectangle, Scale};
+use smithay::wayland::shell::wlr_layer::Layer;
 
 use crate::cursor::OverlayElement;
 use crate::state::BookosComp;
@@ -45,6 +47,23 @@ use crate::state::BookosComp;
 /// dos pantallas deslizaban desfasadas entre sí. Se llama una sola vez por
 /// vuelta, antes de componer ninguna salida.
 pub fn avanzar_animaciones(state: &mut BookosComp) {
+    if !state.brillo_poll_activo && tarjeta_brillo_abierta(state) {
+        state.brillo_poll_activo = true;
+        let result = state.loop_handle.insert_source(
+            Timer::from_duration(std::time::Duration::from_millis(500)),
+            |_, _, state| {
+                if !tarjeta_brillo_abierta(state) {
+                    state.brillo_poll_activo = false;
+                    return TimeoutAction::Drop;
+                }
+                if state.shell.as_mut().is_some_and(|s| s.refresh_emergente()) {
+                    state.needs_redraw = true;
+                }
+                TimeoutAction::ToDuration(std::time::Duration::from_millis(500))
+            },
+        );
+        if result.is_err() { state.brillo_poll_activo = false; }
+    }
     let app_en_foco = state
         .seat
         .get_keyboard()
@@ -137,6 +156,16 @@ pub fn escena(
         .as_ref()
         .is_some_and(|s| s.vista_escritorios_abierta());
 
+    // Capas externas por encima de las ventanas. El bloqueo siempre manda:
+    // ninguna superficie de cliente puede cubrirlo.
+    if !bloqueado {
+        elementos.extend(elementos_capas(
+            renderer,
+            output,
+            &[Layer::Overlay, Layer::Top],
+        ));
+    }
+
     // Meta+Tab reutiliza directamente las superficies de los clientes. No se
     // captura ningún bitmap ni se abre un temporizador: Smithay las escala con
     // la GPU y su damage normal mantiene vivas las miniaturas.
@@ -144,8 +173,8 @@ pub fn escena(
     // Van **delante** de la tarjeta del conmutador, no detrás: con las celdas
     // detrás no podían tener fondo propio —cualquier relleno tapaba la ventana
     // viva— y una celda sin fondo es un marco vacío flotando.
-    let mostrando_ventanas = state.conmutador_modo
-        == Some(bookos_shell::conmutador::Modo::Ventanas);
+    let mostrando_ventanas =
+        state.conmutador_modo == Some(bookos_shell::conmutador::Modo::Ventanas);
     if mostrando_ventanas {
         let huecos = state
             .shell
@@ -267,8 +296,14 @@ pub fn escena(
     if bloqueado && output.current_location() != (0, 0).into() {
         static BLOQUEO_SECUNDARIO: std::sync::OnceLock<Id> = std::sync::OnceLock::new();
         let escala = output.current_scale().fractional_scale();
-        let origen = output.current_location().to_f64().to_physical_precise_round(escala);
-        let tamano = output.current_mode().map(|m| m.size).unwrap_or((1, 1).into());
+        let origen = output
+            .current_location()
+            .to_f64()
+            .to_physical_precise_round(escala);
+        let tamano = output
+            .current_mode()
+            .map(|m| m.size)
+            .unwrap_or((1, 1).into());
         elementos.push(OverlayElement::Color(SolidColorRenderElement::new(
             BLOQUEO_SECUNDARIO.get_or_init(Id::new).clone(),
             Rectangle::new(origen, tamano),
@@ -352,24 +387,23 @@ pub fn escena(
             // Sin fondo subido no hay nada que desenfocar: el panel y el dock
             // se dibujan con su color, que es lo que hacían antes del cristal.
             if let Some((textura, fondo_tam)) = cristal.borrow().textura() {
-            let pantalla = (ancho_pantalla, alto_pantalla);
-            for (i, (rect, radio, fuerza)) in zonas.into_iter().enumerate() {
-                elementos.push(OverlayElement::Cristal(crate::desenfoque::Desenfoque::new(
-                    id_cristal(i),
-                    state.cristal_commit,
-                    rect,
-                    radio,
-                    fondo_tam,
-                    pantalla,
-                    textura.clone(),
-                    cristal.clone(),
-                    fuerza,
-                )));
-            }
+                let pantalla = (ancho_pantalla, alto_pantalla);
+                for (i, (rect, radio, fuerza)) in zonas.into_iter().enumerate() {
+                    elementos.push(OverlayElement::Cristal(crate::desenfoque::Desenfoque::new(
+                        id_cristal(i),
+                        state.cristal_commit,
+                        rect,
+                        radio,
+                        fondo_tam,
+                        pantalla,
+                        textura.clone(),
+                        cristal.clone(),
+                        fuerza,
+                    )));
+                }
             }
         }
     }
-
 
     // Con el bloqueo echado no se dibuja ninguna ventana. No es cosmética: si
     // se dibujan, el escritorio se ve por debajo de la pantalla de bloqueo y
@@ -475,8 +509,7 @@ pub fn escena(
         // exactamente el rectángulo intermedio. La entrada de una ventana sí
         // nace desde el centro, que es un gesto distinto.
         let ancla_ventana = if redimensionando {
-            Point::<f64, Logical>::from((animada.x, animada.y))
-                .to_physical_precise_round(scale)
+            Point::<f64, Logical>::from((animada.x, animada.y)).to_physical_precise_round(scale)
         } else {
             centro
         };
@@ -551,6 +584,10 @@ pub fn escena(
         }));
     }
 
+    if !bloqueado {
+        elementos.extend(elementos_capas(renderer, output, &[Layer::Bottom]));
+    }
+
     // Los iconos del escritorio, entre el fondo y las ventanas: son parte del
     // escritorio, no de lo que va por encima. Con el bloqueo echado no se
     // dibujan por lo mismo que las ventanas — enseñarían qué hay en la carpeta
@@ -560,7 +597,12 @@ pub fn escena(
     // por encima de los nombres, no por debajo.
     if !bloqueado && !completa {
         if let Some(shell) = state.shell.as_ref() {
-            elementos.extend(shell.banda_elementos().into_iter().map(OverlayElement::Color));
+            elementos.extend(
+                shell
+                    .banda_elementos()
+                    .into_iter()
+                    .map(OverlayElement::Color),
+            );
         }
         let iconos = state
             .shell
@@ -570,6 +612,10 @@ pub fn escena(
         elementos.extend(iconos.into_iter().map(OverlayElement::Memory));
     }
 
+    if !bloqueado {
+        elementos.extend(elementos_capas(renderer, output, &[Layer::Background]));
+    }
+
     // El fondo va el último de la lista, o sea el más atrás de todo: detrás de
     // las ventanas, del shell y del cristal.
     // El avance del fundido se pide **antes** del `if`: es también quien suelta
@@ -577,9 +623,10 @@ pub fn escena(
     // que no hay fondo nuevo.
     let fundido = avance_fundido(state);
     if let Some(fondo) = state.fondo.as_ref() {
-        let geo = state.space.output_geometry(output).unwrap_or_else(|| {
-            Rectangle::new((0, 0).into(), (1, 1).into())
-        });
+        let geo = state
+            .space
+            .output_geometry(output)
+            .unwrap_or_else(|| Rectangle::new((0, 0).into(), (1, 1).into()));
         let (lw, lh) = (geo.size.w, geo.size.h);
         // Mientras se cambia de escritorio el fondo no se queda quieto: se
         // agranda un poco y se corre en sentido contrario a la vista. Fuera de
@@ -595,8 +642,8 @@ pub fn escena(
             None => (0, None),
         };
         if let Some(x) = entrante {
-            if let Some(elemento) = fondo.elemento_gemelo_en(
-                renderer, (geo.loc.x + x, geo.loc.y), (lw, lh))
+            if let Some(elemento) =
+                fondo.elemento_gemelo_en(renderer, (geo.loc.x + x, geo.loc.y), (lw, lh))
             {
                 elementos.push(OverlayElement::Memory(elemento));
             }
@@ -627,11 +674,9 @@ pub fn escena(
             // que los identificadores ya son distintos y el seguimiento de daño
             // los ve como dos rectángulos. Pedir el gemelo aquí sería una
             // segunda copia de veinte megas para nada.
-            if let Some(elemento) = saliente.elemento_en(
-                renderer,
-                (geo.loc.x, geo.loc.y),
-                (geo.size.w, geo.size.h),
-            ) {
+            if let Some(elemento) =
+                saliente.elemento_en(renderer, (geo.loc.x, geo.loc.y), (geo.size.w, geo.size.h))
+            {
                 elementos.push(OverlayElement::Memory(elemento));
             }
         }
@@ -649,6 +694,54 @@ pub fn escena(
         }
     }
     elementos
+}
+
+/// Convierte las layer-surfaces de una salida en elementos GLES. La posición
+/// se expresa en el escritorio global; KMS traslada luego toda la escena al
+/// origen local del CRTC correspondiente.
+fn elementos_capas(
+    renderer: &mut GlesRenderer,
+    output: &Output,
+    capas: &[Layer],
+) -> Vec<OverlayElement> {
+    let scale = output.current_scale().fractional_scale();
+    let origen_salida = output.current_location();
+    let map = layer_map_for_output(output);
+    capas
+        .iter()
+        .flat_map(|capa| map.layers_on(*capa).rev())
+        .filter_map(|surface| map.layer_geometry(surface).map(|geo| (surface, geo.loc)))
+        .flat_map(|(surface, loc)| {
+            surface.render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
+                renderer,
+                (loc + origen_salida)
+                    .to_f64()
+                    .to_physical_precise_round(scale),
+                Scale::from(scale),
+                1.0,
+            )
+        })
+        .map(OverlayElement::Surface)
+        .collect()
+}
+
+/// Entrega el reloj de frame también a paneles y fondos layer-shell. Sin este
+/// callback la primera imagen aparece, pero el cliente queda esperando para
+/// siempre antes de producir la siguiente.
+pub fn enviar_frames_capas(
+    output: &Output,
+    tiempo: std::time::Duration,
+    periodo: std::time::Duration,
+) {
+    let map = layer_map_for_output(output);
+    for layer in map.layers() {
+        layer.send_frame(
+            output,
+            tiempo,
+            Some(periodo),
+            smithay::desktop::utils::surface_primary_scanout_output,
+        );
+    }
 }
 
 /// El identificador estable de cada zona de cristal.
@@ -721,18 +814,19 @@ pub fn servir_capturas(state: &mut BookosComp, renderer: &mut GlesRenderer, outp
     }
 
     let tamano = crate::captura::tamano_de(output);
-    let mut destino = match Offscreen::<smithay::backend::renderer::gles::GlesRenderbuffer>::create_buffer(
-        renderer,
-        smithay::backend::allocator::Fourcc::Abgr8888,
-        tamano,
-    ) {
-        Ok(b) => b,
-        Err(err) => {
-            tracing::warn!("no se pudo crear el buffer de la captura: {err}");
-            fallar(state, &mias);
-            return;
-        }
-    };
+    let mut destino =
+        match Offscreen::<smithay::backend::renderer::gles::GlesRenderbuffer>::create_buffer(
+            renderer,
+            smithay::backend::allocator::Fourcc::Abgr8888,
+            tamano,
+        ) {
+            Ok(b) => b,
+            Err(err) => {
+                tracing::warn!("no se pudo crear el buffer de la captura: {err}");
+                fallar(state, &mias);
+                return;
+            }
+        };
     // El buffer donde se compone va en `Abgr8888` —es el formato natural del
     // renderizador—; la conversión al que espera el cliente la hace
     // `copy_framebuffer` al leerlo.
@@ -816,7 +910,11 @@ pub fn servir_capturas(state: &mut BookosComp, renderer: &mut GlesRenderer, outp
                         // la salida cambió de tamaño, y eso movería los índices
                         // que quedan por mirar.
                         for i in emisiones.into_iter().rev() {
-                            state.emisiones.emitir(i, pixeles, tamano, invertida, ahora);
+                            if let Some(ruta) =
+                                state.emisiones.emitir(i, pixeles, tamano, invertida, ahora)
+                            {
+                                crate::portal::sesion_cerrada(state.bus_portal.as_ref(), &ruta);
+                            }
                         }
                     }
                     Err(err) => tracing::warn!("no se pudo mapear el fotograma a compartir: {err}"),
@@ -877,17 +975,18 @@ pub fn servir_captura_propia(state: &mut BookosComp, renderer: &mut GlesRenderer
         return;
     };
 
-    let mut destino = match Offscreen::<smithay::backend::renderer::gles::GlesRenderbuffer>::create_buffer(
-        renderer,
-        smithay::backend::allocator::Fourcc::Abgr8888,
-        tamano,
-    ) {
-        Ok(b) => b,
-        Err(err) => {
-            tracing::error!("no se pudo crear el buffer de la captura: {err}");
-            return;
-        }
-    };
+    let mut destino =
+        match Offscreen::<smithay::backend::renderer::gles::GlesRenderbuffer>::create_buffer(
+            renderer,
+            smithay::backend::allocator::Fourcc::Abgr8888,
+            tamano,
+        ) {
+            Ok(b) => b,
+            Err(err) => {
+                tracing::error!("no se pudo crear el buffer de la captura: {err}");
+                return;
+            }
+        };
     let elementos = escena(state, renderer, output);
     let mut seguimiento = OutputDamageTracker::from_output(output);
     let mut framebuffer = match smithay::backend::renderer::Bind::bind(renderer, &mut destino) {
@@ -978,11 +1077,9 @@ pub fn servir_captura_propia(state: &mut BookosComp, renderer: &mut GlesRenderer
                 match state.captura_portal.take() {
                     // Soltarlo sin entregar nada ya es el «no se pudo».
                     Some(_) => {}
-                    None => notificar_captura(
-                        state,
-                        "No se pudo guardar la captura",
-                        &err.to_string(),
-                    ),
+                    None => {
+                        notificar_captura(state, "No se pudo guardar la captura", &err.to_string())
+                    }
                 }
             }
         }
@@ -1297,7 +1394,190 @@ pub fn schedule_panel_tick(state: &mut BookosComp) {
     }
 }
 
+/// Programa el bloqueo automático como una alarma única.
+///
+/// La alarma se calcula desde `last_input`, pero no se reinicia con cada
+/// movimiento del ratón: hacerlo convertiría la entrada a 1 kHz en una
+/// sucesión de altas y bajas de fuentes de calloop. Cuando vence, se comprueba
+/// de nuevo la edad de la última entrada y se ajusta la alarma si el usuario
+/// acaba de interactuar.
+pub fn programar_bloqueo_inactividad(state: &mut BookosComp) {
+    if let Some(token) = state.tick_bloqueo.take() {
+        state.loop_handle.remove(token);
+    }
+    if state.bloqueo_inactividad.is_zero()
+        || !state.idle_inhibidores.is_empty()
+        || state
+            .shell
+            .as_ref()
+            .is_none_or(|shell| shell.esta_bloqueado())
+    {
+        return;
+    }
+    let desde_entrada = state
+        .last_input
+        .map(|instante| instante.elapsed())
+        .unwrap_or_default();
+    let espera = state
+        .bloqueo_inactividad
+        .saturating_sub(desde_entrada)
+        .max(std::time::Duration::from_millis(50));
+    let result = state
+        .loop_handle
+        .insert_source(Timer::from_duration(espera), |_, _, state| {
+            state.tick_bloqueo = None;
+            if state
+                .shell
+                .as_ref()
+                .is_some_and(|shell| shell.esta_bloqueado())
+            {
+                return TimeoutAction::Drop;
+            }
+            if !state.idle_inhibidores.is_empty() {
+                return TimeoutAction::Drop;
+            }
+            let inactivo = state
+                .last_input
+                .map(|instante| instante.elapsed() >= state.bloqueo_inactividad)
+                .unwrap_or(false);
+            if inactivo {
+                crate::keybinds::ejecutar(state, crate::keybinds::Accion::Bloquear);
+                tracing::info!(
+                    segundos = state.bloqueo_inactividad.as_secs(),
+                    "bloqueo automático por inactividad"
+                );
+                TimeoutAction::Drop
+            } else {
+                programar_bloqueo_inactividad(state);
+                TimeoutAction::Drop
+            }
+        });
+    match result {
+        Ok(token) => state.tick_bloqueo = Some(token),
+        Err(err) => tracing::error!("no se pudo programar el bloqueo automático: {err}"),
+    }
+}
+
+/// Cancela la alarma de suspensión sin alterar la política configurada.
+pub fn cancelar_suspension_inactividad(state: &mut BookosComp) {
+    if let Some(token) = state.tick_suspension.take() {
+        state.loop_handle.remove(token);
+    }
+}
+
+/// Programa una única suspensión tras permanecer bloqueado.
+///
+/// Cero la desactiva. Los inhibidores Wayland cancelan la alarma y, al
+/// liberarse el último, el plazo empieza de nuevo. La orden final pasa por
+/// logind, que conserva la última palabra sobre sus propios inhibidores.
+pub fn programar_suspension_inactividad(state: &mut BookosComp) {
+    cancelar_suspension_inactividad(state);
+    if state.suspension_inactividad.is_zero()
+        || !state.idle_inhibidores.is_empty()
+        || state
+            .shell
+            .as_ref()
+            .is_none_or(|shell| !shell.esta_bloqueado())
+    {
+        return;
+    }
+    let espera = state.suspension_inactividad;
+    let resultado = state
+        .loop_handle
+        .insert_source(Timer::from_duration(espera), |_, _, state| {
+            state.tick_suspension = None;
+            let bloqueado = state
+                .shell
+                .as_ref()
+                .is_some_and(|shell| shell.esta_bloqueado());
+            if bloqueado && state.idle_inhibidores.is_empty() {
+                tracing::info!(
+                    segundos = state.suspension_inactividad.as_secs(),
+                    "suspensión automática tras bloqueo"
+                );
+                crate::keybinds::ejecutar(
+                    state,
+                    crate::keybinds::Accion::Energia(bookos_shell::bloqueo::Peticion::Suspender),
+                );
+            }
+            TimeoutAction::Drop
+        });
+    match resultado {
+        Ok(token) => state.tick_suspension = Some(token),
+        Err(err) => tracing::error!("no se pudo programar la suspensión automática: {err}"),
+    }
+}
+
+/// Apaga KMS diez segundos después de mostrar el bloqueo.
+pub fn programar_dpms_bloqueo(state: &mut BookosComp) {
+    if let Some(token) = state.tick_dpms.take() {
+        state.loop_handle.remove(token);
+    }
+    if state.aplicar_dpms.is_none()
+        || state
+            .shell
+            .as_ref()
+            .is_none_or(|shell| !shell.esta_bloqueado())
+    {
+        return;
+    }
+    let resultado = state.loop_handle.insert_source(
+        Timer::from_duration(std::time::Duration::from_secs(10)),
+        |_, _, state| {
+            state.tick_dpms = None;
+            if state
+                .shell
+                .as_ref()
+                .is_some_and(|shell| shell.esta_bloqueado())
+            {
+                cambiar_dpms(state, false);
+            }
+            TimeoutAction::Drop
+        },
+    );
+    match resultado {
+        Ok(token) => state.tick_dpms = Some(token),
+        Err(err) => tracing::error!("no se pudo programar DPMS: {err}"),
+    }
+}
+
+/// Reactiva las salidas ante la primera entrada tras DPMS.
+pub fn despertar_dpms(state: &mut BookosComp) {
+    if !state.dpms_encendido {
+        cambiar_dpms(state, true);
+        state.needs_redraw = true;
+    }
+    if state
+        .shell
+        .as_ref()
+        .is_some_and(|shell| shell.esta_bloqueado())
+    {
+        programar_dpms_bloqueo(state);
+    }
+}
+
+fn cambiar_dpms(state: &mut BookosComp, encendido: bool) {
+    if state.dpms_encendido == encendido {
+        return;
+    }
+    let Some(mut aplicar) = state.aplicar_dpms.take() else {
+        return;
+    };
+    match aplicar(encendido) {
+        Ok(()) => {
+            state.dpms_encendido = encendido;
+            tracing::info!(encendido, "estado DPMS");
+        }
+        Err(err) => tracing::warn!(encendido, "no se pudo cambiar DPMS: {err}"),
+    }
+    state.aplicar_dpms = Some(aplicar);
+}
+
 /// Relee los estados y marca repintado **solo** si algo cambió de verdad.
+fn tarjeta_brillo_abierta(state: &BookosComp) -> bool {
+    state.shell.as_ref().is_some_and(|s| matches!(s.emergente_nombre(), Some("brillo" | "centro")))
+}
+
 fn refresh_panel(state: &mut BookosComp) {
     if state.shell.as_mut().is_some_and(|s| s.refresh()) {
         state.needs_redraw = true;
@@ -1334,9 +1614,7 @@ pub fn watch_hardware(state: &mut BookosComp) {
     // brillo, el kernel no nos despierta al mover la tecla. Antes la lista
     // estaba a fuego y cualquier evento releía las cuatro fuentes de sysfs.
     //
-    // `backlight` no incluye el brillo del teclado (`leds`) a propósito: no se
-    // enseña, y despertar por cada pulsación de la tecla de retroiluminación
-    // sería trabajo para nada.
+    // El shell incluye también `leds`: la tarjeta de brillo muestra el teclado.
     let subsistemas = state
         .shell
         .as_ref()
@@ -1347,7 +1625,11 @@ pub fn watch_hardware(state: &mut BookosComp) {
         return;
     }
     let monitor = MonitorBuilder::new()
-        .and_then(|m| subsistemas.iter().try_fold(m, |m, sub| m.match_subsystem(sub)))
+        .and_then(|m| {
+            subsistemas
+                .iter()
+                .try_fold(m, |m, sub| m.match_subsystem(sub))
+        })
         .and_then(|m| m.listen());
     let monitor = match monitor {
         Ok(monitor) => monitor,

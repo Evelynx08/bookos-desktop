@@ -87,5 +87,8 @@ pub fn aplicar_el_que_toca(state: &mut BookosComp) {
         state.recargar_fondo = true;
     }
     tracing::info!(?tema, "tema automático");
+    // El cambio de las ocho de la tarde también tiene que llegarle a las
+    // aplicaciones de fuera, no solo al escritorio.
+    crate::portal::apariencia_cambiada(state.bus_portal.as_ref());
     state.needs_redraw = true;
 }

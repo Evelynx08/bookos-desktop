@@ -91,7 +91,12 @@ impl ModoTema {
     /// trabaja de noche y quiere el tema claro de madrugada—, y entonces el
     /// tramo cruza la medianoche; de ahí que la comparación no sea un simple
     /// `a <= x && x < b`.
-    pub fn resolver(self, claro_desde: HoraDelDia, oscuro_desde: HoraDelDia, ahora: HoraDelDia) -> Tema {
+    pub fn resolver(
+        self,
+        claro_desde: HoraDelDia,
+        oscuro_desde: HoraDelDia,
+        ahora: HoraDelDia,
+    ) -> Tema {
         match self {
             Self::Claro => Tema::Claro,
             Self::Oscuro => Tema::Oscuro,
@@ -199,6 +204,7 @@ pub fn es_claro() -> bool {
 /// animación de ventana son 260 ms de GPU y de repintados que en el 15 % de
 /// batería no compensan.
 static REDUCIDOS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ALTO_CONTRASTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Devuelve si el valor **cambió**, que es lo que decide si hay que repintar.
 pub fn aplicar_efectos_reducidos(reducidos: bool) -> bool {
@@ -207,6 +213,43 @@ pub fn aplicar_efectos_reducidos(reducidos: bool) -> bool {
 
 pub fn efectos_reducidos() -> bool {
     REDUCIDOS.load(Ordering::Relaxed)
+}
+
+/// Activa la paleta de accesibilidad. Devuelve si el valor cambió para que el
+/// compositor pueda invalidar todas las superficies en caliente.
+pub fn aplicar_alto_contraste(activo: bool) -> bool {
+    ALTO_CONTRASTE.swap(activo, Ordering::Relaxed) != activo
+}
+
+pub fn alto_contraste() -> bool {
+    ALTO_CONTRASTE.load(Ordering::Relaxed)
+}
+
+fn token(nombre: &str, claro: Color, oscuro: Color) -> Color {
+    let normal = if es_claro() { claro } else { oscuro };
+    if !alto_contraste() {
+        return normal;
+    }
+    match nombre {
+        "bg" => {
+            if es_claro() { Color::WHITE } else { Color::BLACK }
+        }
+        "card" => {
+            if es_claro() { Color::WHITE } else { hex(0x101010) }
+        }
+        "texto" => {
+            if es_claro() { Color::BLACK } else { Color::WHITE }
+        }
+        "divisor" => hexa(if es_claro() { 0x000000 } else { 0xffffff }, 0.42),
+        "hover" => hexa(if es_claro() { 0x000000 } else { 0xffffff }, 0.16),
+        "surco" => hexa(if es_claro() { 0x000000 } else { 0xffffff }, 0.30),
+        "control_apagado" => {
+            if es_claro() { hex(0xb8b8b8) } else { hex(0x5a5a5a) }
+        }
+        "borde" => hexa(if es_claro() { 0x000000 } else { 0xffffff }, 0.55),
+        "panel" => hexa(if es_claro() { 0xffffff } else { 0x000000 }, 0.90),
+        _ => normal,
+    }
 }
 
 /// Declara un color del tema como función, con su valor en cada uno.
@@ -218,7 +261,7 @@ macro_rules! tokens {
         $(
             $(#[$att])*
             pub fn $nombre() -> Color {
-                if es_claro() { $claro } else { $oscuro }
+                token(stringify!($nombre), $claro, $oscuro)
             }
         )*
     };
@@ -227,7 +270,12 @@ macro_rules! tokens {
 /// De `#rrggbb` a color. En tiempo de compilación, para poder escribir los
 /// tokens con el mismo hex que el sistema de diseño y no con decimales que ya
 /// nadie sabe de dónde salen.
-const fn hex(v: u32) -> Color {
+///
+/// Es pública para los pocos colores que **no** son tokens y viven fuera de
+/// aquí con su motivo escrito —el surco del OSD, el campo del bloqueo—: en
+/// decimales nadie los reconoce y el comentario acaba diciendo otro valor que
+/// el código. Pasó: el surco decía `#c7c7cc` y era `#c6c6cc`.
+pub const fn hex(v: u32) -> Color {
     Color::from_rgb(
         ((v >> 16) & 0xff) as f32 / 255.0,
         ((v >> 8) & 0xff) as f32 / 255.0,
@@ -235,7 +283,7 @@ const fn hex(v: u32) -> Color {
     )
 }
 
-const fn hexa(v: u32, a: f32) -> Color {
+pub const fn hexa(v: u32, a: f32) -> Color {
     let c = hex(v);
     Color { a, ..c }
 }
@@ -431,6 +479,20 @@ pub fn alfa(c: Color, a: f32) -> Color {
 /// de diseño— y por eso sigue siendo constante.
 pub const TEXTO2: Color = hex(0x8e8e93);
 
+/// Una superficie **por encima** de la que hay debajo: el `--surface` del
+/// sistema de diseño, un velo del color del texto (blanco al 8 % en oscuro,
+/// negro al 6 % en claro).
+///
+/// Es un alfa sobre lo que haya detrás y no un color fijo a propósito: sirve
+/// igual dentro de un popover que sobre el escritorio, y es la única forma de
+/// que un contenedor se vea **dentro** de otro. Dar el mismo token del padre
+/// con alfa —lo que hacía el centro de control con `alfa(card(), 0.80)`— no
+/// pinta nada: `#1c1c1e` al 80 % sobre `#1c1c1e` es `#1c1c1e`, y por eso las
+/// cuatro tarjetas interiores no se distinguían del fondo del panel.
+pub fn superficie() -> Color {
+    alfa(texto(), if es_claro() { 0.06 } else { 0.08 })
+}
+
 /// El color de la tinta, para rellenos y bordes con muy poco alfa.
 ///
 /// Es lo que había escrito como `Color { a: 0.12, ..Color::WHITE }` por todo el
@@ -489,11 +551,7 @@ pub fn tinta_sobre(fondo: Color) -> Color {
         }
     };
     let l = 0.2126 * lin(fondo.r) + 0.7152 * lin(fondo.g) + 0.0722 * lin(fondo.b);
-    if l > 0.45 {
-        Color::BLACK
-    } else {
-        Color::WHITE
-    }
+    if l > 0.45 { Color::BLACK } else { Color::WHITE }
 }
 
 // Los cuatro rellenos de encima de una superficie son el **mismo color de la
@@ -507,6 +565,14 @@ tokens! {
     /// El canal vacío de un deslizador. Es el `trough` de los plasmoides, que se
     /// ve sin competir con la parte llena.
     surco: claro hexa(0x000000, 0.12), oscuro hexa(0xffffff, 0.14);
+    /// El relleno de un control que está pero no está encendido: el
+    /// `--toggle-off` del sistema de diseño (§2.1).
+    ///
+    /// Es **opaco y neutro**, no el acento aclarado: sobre una tarjeta blanca
+    /// un acento suave se confunde con el encendido de al lado. Donde sí se
+    /// quiere el acento aclarado —los conmutadores del centro de control en
+    /// tema oscuro— se pide [`acento_suave`] a propósito.
+    control_apagado: claro hex(0xe0e0e0), oscuro hex(0x48484a);
     /// Borde de un popup.
     borde: claro hexa(0x000000, 0.10), oscuro hexa(0xffffff, 0.09);
 
@@ -812,7 +878,7 @@ impl Realce {
 
     /// Cuánto realce le toca a la fila `i`, entre 0 y 1.
     pub fn intensidad(&self, i: usize) -> f32 {
-        let t = C_SUAVE.eval(fraccion(self.desde.elapsed(), D_HOVER));
+        let t = C_SUAVE.eval(avance(self.desde.elapsed(), D_HOVER));
         if self.actual == Some(i) {
             t
         } else if self.previa == Some(i) {
@@ -837,7 +903,7 @@ impl Realce {
     }
 
     pub fn animando(&self) -> bool {
-        self.actual != self.previa && self.desde.elapsed() < D_HOVER
+        !efectos_reducidos() && self.actual != self.previa && self.desde.elapsed() < D_HOVER
     }
 }
 
@@ -853,10 +919,19 @@ mod tema_automatico {
     #[test]
     fn los_modos_fijos_ignoran_la_hora() {
         for hora in [(3, 0), (12, 0), (23, 59)] {
-            assert_eq!(ModoTema::Claro.resolver(AMANECE, ANOCHECE, hora), Tema::Claro);
-            assert_eq!(ModoTema::Oscuro.resolver(AMANECE, ANOCHECE, hora), Tema::Oscuro);
+            assert_eq!(
+                ModoTema::Claro.resolver(AMANECE, ANOCHECE, hora),
+                Tema::Claro
+            );
+            assert_eq!(
+                ModoTema::Oscuro.resolver(AMANECE, ANOCHECE, hora),
+                Tema::Oscuro
+            );
         }
-        assert_eq!(ModoTema::Claro.minutos_al_cambio(AMANECE, ANOCHECE, (12, 0)), None);
+        assert_eq!(
+            ModoTema::Claro.minutos_al_cambio(AMANECE, ANOCHECE, (12, 0)),
+            None
+        );
     }
 
     /// El día es claro y la noche oscura, con los bordes en su sitio: la hora
@@ -864,7 +939,10 @@ mod tema_automatico {
     #[test]
     fn el_automatico_sigue_al_sol() {
         let claro = |h, m| ModoTema::Automatico.resolver(AMANECE, ANOCHECE, (h, m)) == Tema::Claro;
-        assert!(!claro(6, 59), "un minuto antes de amanecer todavía es de noche");
+        assert!(
+            !claro(6, 59),
+            "un minuto antes de amanecer todavía es de noche"
+        );
         assert!(claro(7, 0), "la hora del amanecer ya es de día");
         assert!(claro(19, 59));
         assert!(!claro(20, 0), "la hora del anochecer ya es de noche");
@@ -901,10 +979,18 @@ mod tema_automatico {
         let falta = |h, m| ModoTema::Automatico.minutos_al_cambio(AMANECE, ANOCHECE, (h, m));
         assert_eq!(falta(6, 0), Some(60), "una hora para amanecer");
         assert_eq!(falta(12, 0), Some(8 * 60), "ocho horas para anochecer");
-        assert_eq!(falta(21, 0), Some(10 * 60), "diez horas hasta el amanecer de mañana");
+        assert_eq!(
+            falta(21, 0),
+            Some(10 * 60),
+            "diez horas hasta el amanecer de mañana"
+        );
         // Justo en la hora del cambio, el siguiente es el **otro**: si no,
         // el temporizador saltaría cada cero minutos y giraría en vacío.
-        assert_eq!(falta(7, 0), Some(13 * 60), "en el amanecer, toca esperar al anochecer");
+        assert_eq!(
+            falta(7, 0),
+            Some(13 * 60),
+            "en el amanecer, toca esperar al anochecer"
+        );
         assert_eq!(falta(20, 0), Some(11 * 60));
     }
 
@@ -917,7 +1003,10 @@ mod tema_automatico {
                 let falta = ModoTema::Automatico
                     .minutos_al_cambio(AMANECE, ANOCHECE, (h, m))
                     .expect("en automático siempre hay un próximo cambio");
-                assert!(falta > 0, "a las {h}:{m} el próximo cambio salía en {falta}");
+                assert!(
+                    falta > 0,
+                    "a las {h}:{m} el próximo cambio salía en {falta}"
+                );
                 assert!(falta <= 24 * 60, "a las {h}:{m} salía en {falta} minutos");
             }
         }

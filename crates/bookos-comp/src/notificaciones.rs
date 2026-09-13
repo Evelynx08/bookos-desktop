@@ -14,15 +14,12 @@
 //! `GetCapabilities`, `GetServerInformation`) y la señal `NotificationClosed`,
 //! que es la que espera una aplicación para saber que su aviso ya no está.
 //!
-//! **Las acciones no**: `ActionInvoked` exige botones en la notificación, y el
-//! diseño de la tarjeta no los tiene. Por eso `GetCapabilities` **no** anuncia
-//! `actions`: una aplicación que pregunte antes de poner botones —y las buenas
-//! preguntan— sabrá que aquí no sirven de nada, en vez de dibujarlos y quedarse
-//! esperando a que alguien los pulse.
+//! Las acciones se dibujan en el toast y vuelven por `ActionInvoked`. El
+//! progreso estándar (`value`) también se conserva para descargas y copias.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use smithay::reexports::calloop::channel::Sender;
 use zbus::zvariant::OwnedValue;
@@ -64,7 +61,7 @@ impl Servidor {
         app_icon: String,
         summary: String,
         body: String,
-        _actions: Vec<String>,
+        actions: Vec<String>,
         hints: HashMap<String, OwnedValue>,
         expire_timeout: i32,
     ) -> u32 {
@@ -83,8 +80,19 @@ impl Servidor {
             .get("urgency")
             .and_then(|v| u8::try_from(v).ok())
             .is_some_and(|u| u >= 2);
-        let notificacion = bookos_shell::notificaciones::Notificacion::nueva(
-            id, app_name, summary, body, &app_icon, critica,
+        let acciones = actions
+            .chunks_exact(2)
+            .map(|par| bookos_shell::notificaciones::Accion {
+                clave: par[0].clone(),
+                etiqueta: par[1].clone(),
+            })
+            .collect();
+        let progreso = hints
+            .get("value")
+            .and_then(|v| i32::try_from(v).ok())
+            .map(|v| v.clamp(0, 100) as u8);
+        let notificacion = bookos_shell::notificaciones::Notificacion::nueva_con_datos(
+            id, app_name, summary, body, &app_icon, critica, acciones, progreso, false,
         );
         // Si el canal está roto es que el compositor se está cerrando; se
         // contesta igual con el identificador para no dejar colgada a la
@@ -99,10 +107,14 @@ impl Servidor {
         let _ = self.canal.send(Aviso::Cerrar(id));
     }
 
-    /// Lo que este servidor sabe hacer. Ver la cabecera del módulo: sin
-    /// `actions` a propósito.
+    /// Capacidades que se pueden usar sin quedarse esperando una respuesta.
     fn get_capabilities(&self) -> Vec<String> {
-        vec!["body".into(), "persistence".into(), "icon-static".into()]
+        vec![
+            "body".into(),
+            "persistence".into(),
+            "icon-static".into(),
+            "actions".into(),
+        ]
     }
 
     fn get_server_information(&self) -> (String, String, String, String) {
@@ -122,6 +134,13 @@ impl Servidor {
         emisor: &zbus::object_server::SignalEmitter<'_>,
         id: u32,
         motivo: u32,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn action_invoked(
+        emisor: &zbus::object_server::SignalEmitter<'_>,
+        id: u32,
+        accion: &str,
     ) -> zbus::Result<()>;
 }
 
@@ -151,11 +170,7 @@ pub fn recibir(state: &mut crate::state::BookosComp, aviso: Aviso) {
         }
     };
     if let Some(id) = confirmar_cierre {
-        cerrada(
-            state.bus_notificaciones.as_ref(),
-            id,
-            CERRADA_POR_LA_APP,
-        );
+        cerrada(state.bus_notificaciones.as_ref(), id, CERRADA_POR_LA_APP);
     }
     if repintar {
         state.needs_redraw = true;
@@ -174,12 +189,13 @@ fn despertar_para_la_salida(state: &mut crate::state::BookosComp) {
         return;
     };
     let hasta_la_salida = queda.saturating_sub(bookos_shell::toast::SALIDA);
-    let resultado = state
-        .loop_handle
-        .insert_source(Timer::from_duration(hasta_la_salida), |_, _, state| {
-            state.needs_redraw = true;
-            TimeoutAction::Drop
-        });
+    let resultado =
+        state
+            .loop_handle
+            .insert_source(Timer::from_duration(hasta_la_salida), |_, _, state| {
+                state.needs_redraw = true;
+                TimeoutAction::Drop
+            });
     if let Err(err) = resultado {
         tracing::error!("no se pudo programar la salida del aviso: {err}");
     }
@@ -228,5 +244,16 @@ pub fn cerrada(conexion: Option<&zbus::blocking::Connection>, id: u32, motivo: u
         &(id, motivo),
     ) {
         tracing::warn!(id, "no se pudo avisar del cierre: {err}");
+    }
+}
+
+pub fn accion_invocada(conexion: Option<&zbus::blocking::Connection>, id: u32, accion: &str) {
+    let Some(conexion) = conexion else {
+        return;
+    };
+    if let Err(err) =
+        conexion.emit_signal(None::<&str>, RUTA, INTERFAZ, "ActionInvoked", &(id, accion))
+    {
+        tracing::warn!(id, %accion, "no se pudo avisar de la acción de notificación: {err}");
     }
 }

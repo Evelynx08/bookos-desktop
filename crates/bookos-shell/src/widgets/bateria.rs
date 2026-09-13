@@ -16,7 +16,7 @@ use iced_widget::{row, text};
 use crate::icono::{self, Icono};
 use crate::state::Battery;
 use crate::tema;
-use crate::view::{PanelElement, PELIGRO, TEXT};
+use crate::view::{PELIGRO, PanelElement, TEXT};
 use crate::widget::Widget;
 
 /// Medidas del pictograma.
@@ -67,6 +67,22 @@ impl Simbolo {
         }
     }
 
+    /// Dónde acaba su trazo más a la derecha, en unidades del `viewBox`.
+    ///
+    /// Sale de las coordenadas de los `path` de abajo; si se redibuja un
+    /// símbolo hay que traerlo aquí, porque es lo que decide el color con el
+    /// que se pinta sobre el relleno.
+    fn borde_derecho(self) -> f32 {
+        match self {
+            // Sin símbolo el umbral da igual: no se dibuja nada.
+            Self::Nada => 0.0,
+            // translate(10.35) + 16 unidades del `bolt` a escala 0,44.
+            Self::Rayo => 10.35 + 16.0 * 0.44,
+            Self::Ac => 16.95,
+            Self::Alerta => 14.88,
+        }
+    }
+
     /// Para la clave del icono cacheado.
     fn clave(self) -> &'static str {
         match self {
@@ -105,10 +121,16 @@ fn pictograma(porciento: u8, simbolo: Simbolo, color: iced_core::Color) -> Strin
       stroke="{contorno}" stroke-opacity="0.72" stroke-width="1.5"/>
 <rect x="{X0}" y="9.35" width="{relleno:.2}" height="6.8" rx="1.0" fill="{c}"/>"##
     );
-    // Los dos símbolos van centrados en el hueco, así que la tinta la decide si
-    // el relleno ha llegado hasta ahí: sobre el color, blanco no se distingue.
-    // El centro del dibujo cae en x=11,25, o sea al 50 % del recorrido.
-    let tinta = if porciento > 50 {
+    // La tinta la decide si el relleno ha llegado a tapar el símbolo ENTERO.
+    //
+    // Antes el umbral era un 50 % fijo con un comentario que situaba el centro
+    // del dibujo en x=11,25. Es falso: el enchufe va de 10,8 a 17,0 y el rayo
+    // de 10,35 a 17,39, o sea centrados en 13,9. Con el umbral en 50 el símbolo
+    // se pintaba negro ya al 51 %, cuando el relleno solo llegaba a x=14,2 y la
+    // mitad derecha quedaba en negro sobre el hueco de la carcasa: sobre un
+    // panel oscuro, invisible. El borde derecho de cada símbolo es lo que dice
+    // de verdad a partir de qué nivel hay color debajo del último trazo.
+    let tinta = if porciento as f32 >= (simbolo.borde_derecho() - X0) / ANCHO_UTIL * 100.0 {
         "#000000".to_string()
     } else {
         hex(crate::view::TEXT())
@@ -454,6 +476,40 @@ mod tests {
         }
     }
 
+    /// El símbolo solo se pinta en negro cuando el relleno lo tapa ENTERO.
+    ///
+    /// Con el umbral fijo del 50 % que había antes, un 51 % pintaba el enchufe
+    /// en negro cuando el relleno solo llegaba a x=14,2 de los 17,0 que ocupa:
+    /// el último tercio quedaba negro sobre el hueco de la carcasa, o sea
+    /// invisible en el panel oscuro. `borde_derecho` es lo que fija la frontera.
+    ///
+    /// Con `BOOKOS_BATERIA_SVG=/ruta` deja los pictogramas de estos niveles en
+    /// disco, que es la forma de mirarlos sin una batería de verdad delante.
+    #[test]
+    fn el_simbolo_no_se_pinta_en_negro_hasta_que_el_relleno_lo_tapa() {
+        let destino = std::env::var("BOOKOS_BATERIA_SVG").ok();
+        if let Some(d) = &destino {
+            std::fs::create_dir_all(d).expect("el directorio de volcado");
+        }
+        for (simbolo, umbral) in [(Simbolo::Ac, 64u8), (Simbolo::Rayo, 66), (Simbolo::Alerta, 54)] {
+            for nivel in [5, 35, 50, umbral - 1, umbral, 95] {
+                let svg = pictograma(nivel, simbolo, tema::acento());
+                let negro = svg.contains(r##"fill="#000000""##);
+                assert_eq!(
+                    negro,
+                    nivel >= umbral,
+                    "{} al {nivel} %: negro={negro}, y el relleno llega a x={:.1} de {:.1}",
+                    simbolo.clave(),
+                    3.35 + 21.4 * nivel as f32 / 100.0,
+                    simbolo.borde_derecho(),
+                );
+                if let Some(d) = &destino {
+                    let _ = std::fs::write(format!("{d}/{}-{nivel}.svg", simbolo.clave()), &svg);
+                }
+            }
+        }
+    }
+
     /// El perfil manda sobre el estado de carga: enchufado y cargando en modo
     /// ahorro, el pictograma sigue siendo amarillo. Antes se ponía verde y el
     /// perfil no se veía nunca en un portátil de sobremesa.
@@ -514,7 +570,11 @@ mod tests {
             rayo.contains("<g transform"),
             "el rayo va escalado en un grupo"
         );
-        assert_eq!(rayo.matches("<rect").count(), 3, "carcasa, terminal y relleno");
+        assert_eq!(
+            rayo.matches("<rect").count(),
+            3,
+            "carcasa, terminal y relleno"
+        );
 
         let nada = pictograma(80, Simbolo::Nada, tema::acento());
         assert_eq!(nada.matches("<rect").count(), 3);

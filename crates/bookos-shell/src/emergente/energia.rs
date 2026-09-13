@@ -21,13 +21,13 @@ use std::process::{Command, Stdio};
 
 use iced_core::alignment::Vertical;
 use iced_core::{Border, Color, Length};
-use iced_widget::{column, container, row, text, Space};
+use iced_widget::{Space, column, container, row, text};
 
+use crate::Accion;
 use crate::icono::{self, Icono};
 use crate::state::Battery;
 use crate::tema;
 use crate::view::PanelElement;
-use crate::Accion;
 
 use super::control;
 use super::{Ancla, Tecla};
@@ -119,7 +119,11 @@ struct Perfil {
 fn nombrar(clave: &str) -> (&'static str, Color, &'static str) {
     match clave {
         "power-saver" => ("Ahorro de energía", tema::perfil_ahorro(), "perfil-ahorro"),
-        "balanced" => ("Equilibrado", tema::perfil_equilibrado(), "perfil-equilibrado"),
+        "balanced" => (
+            "Equilibrado",
+            tema::perfil_equilibrado(),
+            "perfil-equilibrado",
+        ),
         "performance" => (
             "Alto rendimiento",
             tema::perfil_rendimiento(),
@@ -380,12 +384,18 @@ impl Energia {
         let detalle = self.estado();
         row![
             column![
-                text("Batería").size(17.0).font(gorda()).color(tema::texto()),
+                text("Batería")
+                    .size(17.0)
+                    .font(gorda())
+                    .color(tema::texto()),
                 text(detalle).size(11.0).color(tema::TEXTO2),
             ]
             .spacing(3),
             Space::new().width(Length::Fill),
-            text(nivel).size(30.0).font(gorda()).color(self.color_activo()),
+            text(nivel)
+                .size(30.0)
+                .font(gorda())
+                .color(self.color_activo()),
         ]
         .align_y(Vertical::Center)
         .into()
@@ -535,9 +545,11 @@ impl Energia {
         // aquí —la barra de nivel, el rótulo «MODO DE ENERGÍA», la rejilla de
         // datos— repetía algo que ya estaba dicho o contaba algo que no se
         // viene a mirar al desplegar la batería del panel.
-        let mut contenido = column![container(self.cabecera())
-            .height(Length::Fixed(CABECERA))
-            .center_y(Length::Fixed(CABECERA))];
+        let mut contenido = column![
+            container(self.cabecera())
+                .height(Length::Fixed(CABECERA))
+                .center_y(Length::Fixed(CABECERA))
+        ];
         if !self.perfiles.is_empty() {
             contenido = contenido.push(Space::new().height(Length::Fixed(HUECO_BLOQUE)));
             for i in 0..self.perfiles.len() {
@@ -599,14 +611,4 @@ mod tests {
             e.size().1
         );
     }
-
-    fn bat(percent: u8, charging: bool, plugged: bool) -> Battery {
-        Battery {
-            percent,
-            charging,
-            plugged,
-            minutes: None,
-        }
-    }
-
 }

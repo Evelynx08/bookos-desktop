@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use iced_core::alignment::Vertical;
 use iced_core::{Border, Color, Length};
-use iced_widget::{column, container, row, text, Space};
+use iced_widget::{Space, column, container, row, text};
 
 use crate::notificaciones::Notificacion;
 use crate::tema;
@@ -24,6 +24,7 @@ use crate::view::PanelElement;
 /// algo que se lea entero.
 const ANCHO: f32 = 340.0;
 const ALTO: f32 = 76.0;
+const ALTO_ACCIONES: f32 = 112.0;
 const MARGEN: f32 = 14.0;
 /// Lado del icono de la aplicación.
 const ICONO: f32 = 32.0;
@@ -120,7 +121,35 @@ impl Toast {
     }
 
     pub fn size(&self) -> (f32, f32) {
-        (ANCHO + MARGEN_SOMBRA * 2.0, ALTO + MARGEN_SOMBRA * 2.0)
+        let alto = if self.notificacion.acciones.is_empty() {
+            ALTO
+        } else {
+            ALTO_ACCIONES
+        };
+        (ANCHO + MARGEN_SOMBRA * 2.0, alto + MARGEN_SOMBRA * 2.0)
+    }
+
+    /// Devuelve la clave de la acción pulsada, en coordenadas relativas a la
+    /// tarjeta (sin el margen reservado para la sombra).
+    pub fn accion_en(&self, x: f32, y: f32) -> Option<String> {
+        if self.notificacion.acciones.is_empty() || !(0.0..=ANCHO).contains(&x) {
+            return None;
+        }
+        let y0 = ALTO_ACCIONES - 30.0;
+        if !(y0..=ALTO_ACCIONES).contains(&y) {
+            return None;
+        }
+        let hueco = 6.0;
+        let total = self.notificacion.acciones.len() as f32;
+        let ancho = (ANCHO - 2.0 * MARGEN - hueco * (total - 1.0)) / total;
+        let i = ((x - MARGEN) / (ancho + hueco)) as usize;
+        if i >= self.notificacion.acciones.len() {
+            return None;
+        }
+        let local = x - MARGEN - i as f32 * (ancho + hueco);
+        (0.0..=ancho)
+            .contains(&local)
+            .then(|| self.notificacion.acciones[i].clave.clone())
     }
 
     pub fn view(&self) -> PanelElement<'_> {
@@ -158,39 +187,93 @@ impl Toast {
             );
         }
 
-        let tarjeta = container(
-            row![
-                dibujo,
-                Space::new().width(Length::Fixed(12.0)),
-                // Ancho fijo: sin él, iced parte el resumen en dos líneas y la
-                // tarjeta se desborda por abajo.
-                container(textos).width(Length::Fixed(ancho_texto)),
-            ]
-            .align_y(Vertical::Center),
-        )
-        .width(Length::Fixed(ANCHO))
-        .height(Length::Fixed(ALTO))
-        .center_y(Length::Fixed(ALTO))
-        .padding([0, MARGEN as u16])
-        .style(|_theme: &iced_widget::Theme| container::Style {
-            background: Some(tema::card().into()),
-            border: Border {
-                radius: tema::R_POPOVER.into(),
-                width: 1.0,
-                color: tema::borde(),
-            },
-            // La misma sombra que el aviso de volumen: el toast también flota
-            // sobre lo que haya, y sin ella se pega al fondo de pantalla.
-            shadow: iced_core::Shadow {
-                color: Color {
-                    a: 0.35,
-                    ..Color::BLACK
+        let cuerpo = row![
+            dibujo,
+            Space::new().width(Length::Fixed(12.0)),
+            // Ancho fijo: sin él, iced parte el resumen en dos líneas y la
+            // tarjeta se desborda por abajo.
+            container(textos).width(Length::Fixed(ancho_texto)),
+        ]
+        .align_y(Vertical::Center);
+        let mut contenido = column![cuerpo];
+        if let Some(valor) = n.progreso {
+            let lleno = (ancho_texto * valor as f32 / 100.0).max(2.0);
+            contenido = contenido.push(
+                container(
+                    container(Space::new())
+                        .width(Length::Fixed(lleno))
+                        .height(Length::Fixed(4.0))
+                        .style(|_| iced_widget::container::Style {
+                            background: Some(tema::acento().into()),
+                            ..Default::default()
+                        }),
+                )
+                .width(Length::Fixed(ancho_texto))
+                .height(Length::Fixed(4.0))
+                .style(|_| container::Style {
+                    background: Some(tema::surco().into()),
+                    border: Border {
+                        radius: 2.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+            );
+        }
+        if n.progreso_indeterminado && n.progreso.is_none() {
+            contenido = contenido.push(text("En curso…").size(10.0).color(tema::TEXTO2));
+        }
+        if !n.acciones.is_empty() {
+            let botones = n.acciones.iter().fold(row![], |fila, accion| {
+                fila.push(
+                    container(
+                        text(accion.etiqueta.clone())
+                            .size(11.0)
+                            .color(tema::sobre_acento()),
+                    )
+                    .padding([4, 8])
+                    .style(|_| container::Style {
+                        background: Some(tema::acento().into()),
+                        border: Border {
+                            radius: tema::R_BOTON_PEQUENO.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+                )
+                .push(Space::new().width(Length::Fixed(6.0)))
+            });
+            contenido = contenido.push(botones);
+        }
+        let alto = if n.acciones.is_empty() {
+            ALTO
+        } else {
+            ALTO_ACCIONES
+        };
+        let tarjeta = container(contenido)
+            .width(Length::Fixed(ANCHO))
+            .height(Length::Fixed(alto))
+            .center_y(Length::Fixed(alto))
+            .padding([0, MARGEN as u16])
+            .style(|_theme: &iced_widget::Theme| container::Style {
+                background: Some(tema::card().into()),
+                border: Border {
+                    radius: tema::R_POPOVER.into(),
+                    width: 1.0,
+                    color: tema::borde(),
                 },
-                offset: iced_core::Vector::new(0.0, 8.0),
-                blur_radius: 24.0,
-            },
-            ..Default::default()
-        });
+                // La misma sombra que el aviso de volumen: el toast también flota
+                // sobre lo que haya, y sin ella se pega al fondo de pantalla.
+                shadow: iced_core::Shadow {
+                    color: Color {
+                        a: 0.35,
+                        ..Color::BLACK
+                    },
+                    offset: iced_core::Vector::new(0.0, 8.0),
+                    blur_radius: 24.0,
+                },
+                ..Default::default()
+            });
         container(tarjeta).padding(MARGEN_SOMBRA).into()
     }
 }
@@ -252,5 +335,31 @@ mod tests {
         assert_eq!(t.alfa(), 1.0);
         std::thread::sleep(SALIDA / 2);
         assert!(t.alfa() < 1.0, "no se está yendo");
+    }
+
+    #[test]
+    fn las_acciones_amplian_el_toast_y_devuelven_su_clave() {
+        let t = Toast::new(
+            Notificacion::nueva_con_datos(
+                7,
+                "Prueba".into(),
+                "Resumen".into(),
+                String::new(),
+                "",
+                false,
+                vec![crate::notificaciones::Accion {
+                    clave: "abrir".into(),
+                    etiqueta: "Abrir".into(),
+                }],
+                Some(42),
+                false,
+            ),
+            -1,
+        );
+        assert!(t.size().1 > ALTO + MARGEN_SOMBRA * 2.0);
+        assert_eq!(
+            t.accion_en(80.0, ALTO_ACCIONES - 10.0).as_deref(),
+            Some("abrir")
+        );
     }
 }

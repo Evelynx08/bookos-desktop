@@ -1,25 +1,15 @@
-//! El emergente del Bluetooth: qué hay emparejado y qué está puesto.
-//!
-//! Comparte tarjeta con el del Wi-Fi (ver [`super::lista`]) y saca el estado de
-//! `bluetoothctl`, que es lo que ya hace el widget del panel: BlueZ no publica
-//! nada útil en sysfs y meter un cliente de D-Bus aquí sería una dependencia
-//! nueva.
-//!
-//! **La batería de los auriculares no se enseña** aunque el diseño la ponga:
-//! BlueZ la expone en la propiedad `Battery1` de cada dispositivo, y sacarla
-//! por `bluetoothctl` obliga a una orden por dispositivo. Es un proceso por
-//! cada uno cada vez que se abre la tarjeta; se deja para cuando el shell hable
-//! D-Bus de verdad.
+//! Estado del servicio compartido; abrir la tarjeta nunca espera al sistema.
 
-use std::process::{Child, Command, Stdio};
+use serde_json::Value;
+use bookos_system::Operation;
 
 use iced_core::Length;
-use iced_widget::{column, Space};
+use iced_widget::{Space, column};
 
+use crate::Accion;
 use crate::icono;
 use crate::tema;
 use crate::view::PanelElement;
-use crate::Accion;
 
 use super::control;
 use super::lista::{self, Entrada};
@@ -39,7 +29,8 @@ pub struct Bluetooth {
     señalada: tema::Realce,
     /// El botón del pie bajo el puntero: el 0 es el izquierdo y el 1 el otro.
     pie: tema::Realce,
-    pendiente: Option<Child>,
+    ultimo: Value,
+    estado_carga: Option<String>,
 }
 
 impl Bluetooth {
@@ -51,39 +42,31 @@ impl Bluetooth {
             interruptor: tema::Transicion::nueva(0.0, tema::D_MODAL, tema::C_MUELLE),
             señalada: tema::Realce::nuevo(),
             pie: tema::Realce::nuevo(),
-            pendiente: None,
+            ultimo: Value::Null,
+            estado_carga: Some("Cargando…".into()),
         };
-        if let Ok(salida) = Command::new("sh").arg("-c").arg(ORDEN).output() {
-            b.aplicar(&String::from_utf8_lossy(&salida.stdout));
-        }
-        // Igual que en la tarjeta de red: lo que se lee al abrir no se anima.
-        b.interruptor.fijar(b.encendido as u8 as f32);
+        b.refrescar();
         b
     }
 
-    fn aplicar(&mut self, salida: &str) {
-        self.encendido = salida.contains("Powered: yes");
+    fn aplicar(&mut self, data: Value, error: Option<String>) -> bool {
+        let status = error.or_else(|| data.is_null().then(|| "Cargando…".into()));
+        if self.ultimo == data && self.estado_carga == status { return false; }
+        self.estado_carga = status;
+        self.encendido = data["enabled"].as_bool().unwrap_or(false);
+        let devices: Vec<_> = data["devices"].as_array().into_iter().flatten()
+            .filter(|d| d["paired"] == true || d["connected"] == true).take(MAXIMO).collect();
+        self.direcciones = devices.iter().map(|d| d["mac"].as_str().unwrap_or_default().into()).collect();
+        self.entradas = devices.iter().map(|d| {
+            let connected = d["connected"] == true;
+            Entrada { nombre: d["name"].as_str().unwrap_or_default().into(),
+                icono: icono::propio(if connected { "bluetooth" } else { "bluetooth-apagado" }),
+                estado: if connected { "Conectado".into() } else { "Emparejado".into() },
+                derecha: d["battery"].as_u64().map(|v| format!("{v}%")), activa: connected }
+        }).collect();
         self.interruptor.ir_a(self.encendido as u8 as f32);
-        let dispositivos: Vec<_> = interpretar(salida).into_iter().take(MAXIMO).collect();
-        self.direcciones = dispositivos.iter().map(|(_, _, mac)| mac.clone()).collect();
-        self.entradas = dispositivos
-            .into_iter()
-            .map(|(nombre, conectado, _)| Entrada {
-                icono: icono::propio(if conectado {
-                    "bluetooth"
-                } else {
-                    "bluetooth-apagado"
-                }),
-                estado: if conectado {
-                    "Conectado".into()
-                } else {
-                    "Emparejado".into()
-                },
-                derecha: None,
-                nombre,
-                activa: conectado,
-            })
-            .collect();
+        self.ultimo = data;
+        true
     }
 
     /// El alto reservado. El `MARGEN` final es el de abajo de la tarjeta:
@@ -134,24 +117,15 @@ impl Bluetooth {
     }
 
     pub fn pulsar(&mut self, x: f32, y: f32) -> Option<Accion> {
-        if let Some(derecha) = self.pie_en(x, y) {
-            return Some(Accion::Lanzar(if derecha {
-                "bookos-settings --bluetooth".into()
-            } else {
-                "bookos-settings --bluetooth || blueman-manager".into()
-            }));
+        if self.pie_en(x, y).is_some() {
+            return Some(Accion::Lanzar("bookos-settings --bluetooth".into()));
         }
         let i = lista::fila_en(x, y, self.y_lista(), self.entradas.len())?;
-        let entrada = &self.entradas[i];
-        // Conectar y desconectar por dirección y no por nombre: dos auriculares
-        // del mismo modelo se llaman igual.
-        let orden = if entrada.activa {
-            "disconnect"
-        } else {
-            "connect"
-        };
-        let mac = self.direcciones.get(i)?;
-        Some(Accion::Lanzar(format!("bluetoothctl {orden} {mac}")))
+        let address = self.direcciones.get(i)?.clone();
+        bookos_system::request(if self.entradas[i].activa {
+            Operation::BluetoothDisconnect { address }
+        } else { Operation::BluetoothConnect { address } });
+        None
     }
 
     pub fn tecla(&mut self, tecla: crate::TeclaPulsada) -> Tecla {
@@ -162,34 +136,15 @@ impl Bluetooth {
     }
 
     pub fn refrescar(&mut self) -> bool {
-        let mut cambio = false;
-        if let Some(hijo) = &mut self.pendiente {
-            match hijo.try_wait() {
-                Ok(Some(_)) => {
-                    let hijo = self.pendiente.take().expect("acabamos de verlo dentro");
-                    if let Ok(salida) = hijo.wait_with_output() {
-                        let antes = self.entradas.len();
-                        self.aplicar(&String::from_utf8_lossy(&salida.stdout));
-                        cambio = self.entradas.len() != antes;
-                    }
-                }
-                Ok(None) => return false,
-                Err(_) => self.pendiente = None,
-            }
-        }
-        self.pendiente = Command::new("sh")
-            .arg("-c")
-            .arg(ORDEN)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok();
-        cambio
+        let state = bookos_system::snapshot();
+        self.aplicar(state.bluetooth, bookos_system::unavailable("bluetooth"))
     }
 
     pub fn view(&self) -> PanelElement<'_> {
         let mut contenido = column![lista::cabecera("Bluetooth", Some(self.interruptor.valor()))];
-        if self.entradas.is_empty() {
+        if let Some(status) = &self.estado_carga {
+            contenido = contenido.push(lista::vacia(status));
+        } else if self.entradas.is_empty() {
             contenido = contenido.push(lista::vacia(if self.encendido {
                 "No hay dispositivos emparejados"
             } else {
@@ -215,69 +170,17 @@ impl Bluetooth {
 ///
 /// `devices Connected` va antes que `devices Paired` para poder marcar cuáles
 /// están puestos: la segunda lista incluye a los de la primera.
-const ORDEN: &str =
-    "bluetoothctl show; echo ---; bluetoothctl devices Connected; echo ---; bluetoothctl devices Paired";
-
-/// Saca `(nombre, conectado, mac)` de la salida. El separador `---` divide las
-/// tres órdenes.
-fn interpretar(salida: &str) -> Vec<(String, bool, String)> {
-    let mut partes = salida.split("---");
-    let _show = partes.next();
-    let conectados: Vec<String> = partes
-        .next()
-        .map(|t| macs(t).into_iter().map(|(m, _)| m).collect())
-        .unwrap_or_default();
-    let emparejados = partes.next().map(macs).unwrap_or_default();
-    let mut salida: Vec<(String, bool, String)> = emparejados
-        .into_iter()
-        .map(|(mac, nombre)| {
-            let puesto = conectados.contains(&mac);
-            (nombre, puesto, mac)
-        })
-        .collect();
-    // Lo puesto arriba: es lo que se busca al abrir la tarjeta.
-    salida.sort_by(|a, b| b.1.cmp(&a.1));
-    salida
-}
-
-/// `Device E8:C9:13:E0:E6:DA Buds3 Pro de Evelyn` → `(mac, nombre)`.
-fn macs(texto: &str) -> Vec<(String, String)> {
-    texto
-        .lines()
-        .filter_map(|l| {
-            let l = l.trim();
-            let resto = l.strip_prefix("Device ")?;
-            let (mac, nombre) = resto.split_once(' ')?;
-            Some((mac.to_string(), nombre.trim().to_string()))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// La salida real de esta máquina: unos auriculares emparejados y sin
-    /// conectar.
     #[test]
-    fn interpreta_la_salida_de_bluetoothctl() {
-        let salida = "Controller 40:C7:3C:E2:53:D2 (public)\n\tPowered: yes\n---\n---\n\
-                      Device E8:C9:13:E0:E6:DA Buds3 Pro de Evelyn\n";
-        let d = interpretar(salida);
-        assert_eq!(d.len(), 1);
-        assert_eq!(d[0].0, "Buds3 Pro de Evelyn");
-        assert!(!d[0].1, "no está conectado, solo emparejado");
-        assert_eq!(d[0].2, "E8:C9:13:E0:E6:DA");
-    }
-
-    /// Lo conectado va arriba.
-    #[test]
-    fn lo_puesto_sale_primero() {
-        let salida = "Powered: yes\n---\nDevice BB:BB Teclado\n---\n\
-                      Device AA:AA Ratón\nDevice BB:BB Teclado\n";
-        let d = interpretar(salida);
-        assert_eq!(d[0].0, "Teclado");
-        assert!(d[0].1);
-        assert_eq!(d[1].0, "Ratón");
+    fn actualiza_sin_cambiar_el_numero_de_elementos() {
+        let mut card = Bluetooth::new();
+        let first = serde_json::json!({"enabled":true,"devices":[{"ssid":"A","name":"A","mac":"00","paired":true,"signal":20}]});
+        assert!(card.aplicar(first.clone(), None));
+        assert!(!card.aplicar(first, None));
+        let next = serde_json::json!({"enabled":true,"devices":[{"ssid":"B","name":"B","mac":"00","paired":true,"signal":80}]});
+        assert!(card.aplicar(next, None));
+        assert_eq!(card.entradas[0].nombre, "B");
     }
 }

@@ -14,7 +14,8 @@ use smithay::backend::input::{
     GesturePinchUpdateEvent, GestureSwipeUpdateEvent, InputBackend, InputEvent, KeyState,
     KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
 };
-use smithay::input::keyboard::{keysyms, FilterResult};
+use smithay::input::keyboard::{FilterResult, keysyms};
+use smithay::input::pointer::RelativeMotionEvent;
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
 use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 
@@ -51,6 +52,15 @@ fn modificador_conmutador_suelto(
 
 pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
     state.last_input = Some(std::time::Instant::now());
+    state.idle_notifier_state.notify_activity(&state.seat);
+    crate::backend::despertar_dpms(state);
+    if state
+        .shell
+        .as_ref()
+        .is_some_and(|shell| shell.esta_bloqueado())
+    {
+        crate::backend::programar_suspension_inactividad(state);
+    }
 
     match event {
         InputEvent::Keyboard { event } => {
@@ -252,6 +262,13 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
             if std::mem::take(&mut state.abrir_launchpad) {
                 crate::keybinds::ejecutar(state, crate::keybinds::Accion::Launchpad);
             }
+            if state.shell.as_ref().is_some_and(|s| s.esta_bloqueado()) {
+                let caps_lock = kbd.modifier_state().caps_lock;
+                if let Some(shell) = state.shell.as_mut() {
+                    shell.bloqueo_caps_lock(caps_lock);
+                }
+                state.needs_redraw = true;
+            }
         }
 
         // libinput: desplazamiento relativo respecto de donde estaba el cursor.
@@ -298,9 +315,7 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
                     ButtonState::Pressed => {
                         state.shell.as_mut().and_then(|s| s.captura_pulsar(x, y))
                     }
-                    ButtonState::Released => {
-                        state.shell.as_mut().and_then(|s| s.captura_soltar())
-                    }
+                    ButtonState::Released => state.shell.as_mut().and_then(|s| s.captura_soltar()),
                 };
                 if let Some(accion) = accion {
                     crate::keybinds::hacer(state, accion);
@@ -658,9 +673,9 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
 
 /// Traduce un keysym de xkb a la tecla que entiende el shell.
 ///
-/// El shell no conoce xkb a propósito: su enum tiene ocho variantes y ninguna
-/// dependencia, así que la frontera aguanta aunque debajo cambie la capa de
-/// teclado.
+/// El shell no conoce xkb a propósito: su enum es una docena de variantes sin
+/// ninguna dependencia, así que la frontera aguanta aunque debajo cambie la
+/// capa de teclado.
 fn traducir_tecla(handle: &smithay::input::keyboard::KeysymHandle<'_>) -> Option<TeclaPulsada> {
     use smithay::input::keyboard::keysyms;
     let sym = handle.modified_sym();
@@ -671,6 +686,11 @@ fn traducir_tecla(handle: &smithay::input::keyboard::KeysymHandle<'_>) -> Option
         keysyms::KEY_Down => TeclaPulsada::Abajo,
         keysyms::KEY_Left => TeclaPulsada::Izquierda,
         keysyms::KEY_Right => TeclaPulsada::Derecha,
+        keysyms::KEY_Home | keysyms::KEY_KP_Home => TeclaPulsada::Inicio,
+        keysyms::KEY_End | keysyms::KEY_KP_End => TeclaPulsada::Fin,
+        keysyms::KEY_Prior | keysyms::KEY_KP_Prior => TeclaPulsada::PaginaArriba,
+        keysyms::KEY_Next | keysyms::KEY_KP_Next => TeclaPulsada::PaginaAbajo,
+        keysyms::KEY_Tab | keysyms::KEY_ISO_Left_Tab => TeclaPulsada::Tabulador,
         keysyms::KEY_BackSpace => TeclaPulsada::Retroceso,
         // Lo demás solo interesa si escribe algo: es lo que alimentará la
         // búsqueda del launchpad. Los controles se descartan para que un
@@ -698,6 +718,7 @@ pub fn set_pointer(state: &mut BookosComp, destino: Point<f64, Logical>, time: u
         .outputs()
         .filter_map(|o| state.space.output_geometry(o))
         .collect();
+    let anterior = state.pointer_location;
     let location = confinar_a_salidas(destino, &geometrías);
     state.pointer_location = location;
     // Mover el cursor **es** un cambio en pantalla. Sin esto el puntero solo se
@@ -800,6 +821,15 @@ pub fn set_pointer(state: &mut BookosComp, destino: Point<f64, Logical>, time: u
             location,
             serial: SERIAL_COUNTER.next_serial(),
             time,
+        },
+    );
+    pointer.relative_motion(
+        state,
+        state.surface_under(location),
+        &RelativeMotionEvent {
+            delta: location - anterior,
+            delta_unaccel: location - anterior,
+            utime: u64::from(time) * 1_000,
         },
     );
     pointer.frame(state);
@@ -958,7 +988,11 @@ fn pulsar_escritorio(state: &mut BookosComp, punto: Point<f64, Logical>) -> bool
                 // Pulsar sobre algo que **ya** estaba seleccionado no deshace la
                 // selección: es lo que permite arrastrar varios iconos de una
                 // vez, como en cualquier gestor de archivos.
-                let ya = shell.escritorio_seleccion().get(i).copied().unwrap_or(false);
+                let ya = shell
+                    .escritorio_seleccion()
+                    .get(i)
+                    .copied()
+                    .unwrap_or(false);
                 if ctrl || !ya {
                     shell.escritorio_seleccionar(Some(i), ctrl);
                 }

@@ -55,31 +55,36 @@ pub fn arrancar(state: &mut BookosComp) {
         }
     };
 
-    let resultado = state
-        .loop_handle
-        .insert_source(xwayland, move |evento, _, state| match evento {
-            XWaylandEvent::Ready {
-                x11_socket,
-                display_number,
-            } => {
-                let wm = X11Wm::start_wm(state.loop_handle.clone(), x11_socket, cliente.clone());
-                match wm {
-                    Ok(wm) => {
-                        // DISPLAY solo se publica cuando el gestor está en pie.
-                        // Publicarlo antes deja una ventana de tiempo en la que
-                        // un cliente X11 se conecta, no encuentra gestor y se
-                        // dibuja sin decoración ni foco.
-                        state.xwm = Some(wm);
-                        state.display_x11 = Some(display_number);
-                        tracing::info!(display = format!(":{display_number}"), "XWayland listo");
+    let resultado =
+        state
+            .loop_handle
+            .insert_source(xwayland, move |evento, _, state| match evento {
+                XWaylandEvent::Ready {
+                    x11_socket,
+                    display_number,
+                } => {
+                    let wm =
+                        X11Wm::start_wm(state.loop_handle.clone(), x11_socket, cliente.clone());
+                    match wm {
+                        Ok(wm) => {
+                            // DISPLAY solo se publica cuando el gestor está en pie.
+                            // Publicarlo antes deja una ventana de tiempo en la que
+                            // un cliente X11 se conecta, no encuentra gestor y se
+                            // dibuja sin decoración ni foco.
+                            state.xwm = Some(wm);
+                            state.display_x11 = Some(display_number);
+                            tracing::info!(
+                                display = format!(":{display_number}"),
+                                "XWayland listo"
+                            );
+                        }
+                        Err(err) => tracing::error!("no se pudo arrancar el gestor X11: {err}"),
                     }
-                    Err(err) => tracing::error!("no se pudo arrancar el gestor X11: {err}"),
                 }
-            }
-            XWaylandEvent::Error => {
-                tracing::error!("XWayland murió al arrancar; la sesión sigue sin X11");
-            }
-        });
+                XWaylandEvent::Error => {
+                    tracing::error!("XWayland murió al arrancar; la sesión sigue sin X11");
+                }
+            });
     if let Err(err) = resultado {
         tracing::error!("no se pudo escuchar a XWayland: {err}");
     }
@@ -108,7 +113,9 @@ impl BookosComp {
 
 impl smithay::xwayland::XwmHandler for BookosComp {
     fn xwm_state(&mut self, _xwm: XwmId) -> &mut X11Wm {
-        self.xwm.as_mut().expect("el gestor X11 existe mientras el bucle le entrega eventos")
+        self.xwm
+            .as_mut()
+            .expect("el gestor X11 existe mientras el bucle le entrega eventos")
     }
 
     /// Existe pero aún no se ve. No se mapea nada todavía: muchas ventanas X11

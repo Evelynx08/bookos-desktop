@@ -26,7 +26,7 @@
 //! siempre. Aquí cada llamada a un widget va en su propio `catch_unwind`; el
 //! que revienta se apaga y los demás siguen dibujándose.
 
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Duration;
 
 use iced_core::Length;
@@ -137,7 +137,7 @@ pub fn ancho_texto(caracteres: usize) -> f32 {
 /// estimación paralela: es el mismo motor.
 pub fn ancho_de(texto: &str, tamaño: f32) -> f32 {
     use iced_core::text::{Paragraph as _, Shaping, Wrapping};
-    use iced_core::{alignment, Pixels, Size};
+    use iced_core::{Pixels, Size, alignment};
 
     let parrafo = iced_graphics::text::Paragraph::with_text(iced_core::Text {
         content: texto,
@@ -358,8 +358,23 @@ impl Panel {
         self.centro.as_ref().and_then(ver)
     }
 
+    /// Los que de verdad se dibujan, en orden.
+    ///
+    /// Los de ancho cero se quedan fuera —y no como un elemento vacío— porque
+    /// la fila de [`crate::view::panel`] mete un hueco **entre cada dos
+    /// elementos** que recibe. Un widget invisible (la red o el bluetooth sin
+    /// adaptador, la batería en un sobremesa) colaba así su hueco de 16 px en
+    /// el dibujo, mientras [`Panel::zonas_derecha`] lo saltaba entero. Las
+    /// zonas quedaban corridas 16 px por cada invisible respecto de lo pintado,
+    /// y como se calculan de derecha a izquierda el error caía sobre los de la
+    /// izquierda: con red y bluetooth apagados, pulsar en el hueco vacío a la
+    /// derecha del porcentaje abría la tarjeta de la batería.
     pub fn derecha(&self) -> Vec<PanelElement<'_>> {
-        self.derecha.iter().filter_map(ver).collect()
+        self.derecha
+            .iter()
+            .filter(|r| r.widget.ancho() > 0.0)
+            .filter_map(ver)
+            .collect()
     }
 
     fn ranuras(&self) -> impl Iterator<Item = &Ranura> {
@@ -461,6 +476,51 @@ mod tests {
         assert_eq!(panel.subsistemas(), vec!["net"]);
 
         std::panic::set_hook(anterior);
+    }
+
+    /// Un widget de los que no se dibujan: la red o el bluetooth sin adaptador,
+    /// la batería en un sobremesa.
+    struct Invisible;
+    impl Widget for Invisible {
+        fn nombre(&self) -> &'static str {
+            "invisible"
+        }
+        fn refrescar(&mut self) -> bool {
+            false
+        }
+        fn ancho(&self) -> f32 {
+            0.0
+        }
+        fn ver(&self) -> PanelElement<'_> {
+            vacio()
+        }
+    }
+
+    /// Lo que se dibuja y lo que se puede pulsar tienen que ser lo mismo.
+    ///
+    /// La fila del panel mete un hueco entre cada dos elementos que recibe, así
+    /// que un invisible que llegara hasta ella colaría 16 px en el dibujo que
+    /// `zonas_derecha` no cuenta. Como las zonas se calculan de derecha a
+    /// izquierda, ese desfase lo pagan los widgets de la izquierda: con la red
+    /// y el bluetooth apagados, pulsar el hueco vacío a la derecha del
+    /// porcentaje de la batería abría la tarjeta de la batería.
+    #[test]
+    fn un_widget_invisible_no_deja_hueco_ni_corre_las_zonas() {
+        let panel = Panel::new(
+            None,
+            vec![
+                Box::new(Cambiante(1)),
+                Box::new(Invisible),
+                Box::new(Invisible),
+                Box::new(Cambiante(1)),
+            ],
+        );
+        assert_eq!(
+            panel.derecha().len(),
+            panel.zonas_derecha(1000.0, 12.0, 16.0).len(),
+            "se dibujan más elementos de los que reciben zona: cada uno de más \
+             mete su hueco y corre las zonas de sus vecinos de la izquierda"
+        );
     }
 
     #[test]

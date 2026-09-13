@@ -73,7 +73,11 @@ mod tests {
     #[test]
     fn las_que_nunca_tuvieron_foco_van_al_final() {
         let s = sellos(&[None, Some(10), None, Some(20)]);
-        assert_eq!(orden(&s, 12), vec![3, 1, 0, 2], "y entre ellas, por llegada");
+        assert_eq!(
+            orden(&s, 12),
+            vec![3, 1, 0, 2],
+            "y entre ellas, por llegada"
+        );
     }
 
     /// El corte deja lo más reciente, no lo primero que se encontró.

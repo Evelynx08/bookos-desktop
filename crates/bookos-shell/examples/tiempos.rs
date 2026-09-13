@@ -36,7 +36,11 @@ fn medir(nombre: &str, veces: u32, mut f: impl FnMut(u32)) {
     }
     let media = t.elapsed().as_secs_f64() * 1000.0 / veces as f64;
     // 8 ms es un fotograma a 120 Hz, que es lo que da el panel del Book5.
-    let aviso = if media > 8.0 { "   <-- más de un frame" } else { "" };
+    let aviso = if media > 8.0 {
+        "   <-- más de un frame"
+    } else {
+        ""
+    };
     println!("  {nombre:<34} {media:>7.2} ms{aviso}");
 }
 

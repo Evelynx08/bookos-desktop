@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use iced_core::alignment::Vertical;
 use iced_core::{Border, Color, Length};
-use iced_widget::{container, row, text, Space};
+use iced_widget::{Space, container, row, text};
 
 use crate::icono::{self, Icono};
 use crate::tema;
@@ -91,12 +91,7 @@ pub const MARGEN_BUFFER_INFERIOR: f32 = MARGEN_INFERIOR + MARGEN_SOMBRA;
 /// Es el **mismo en los dos temas** y no hace falta una versión clara: `#c7c7cc`
 /// es el gris de surco de iOS, y funciona igual sobre la cápsula negra —donde
 /// se lee como claro— que sobre la blanca, donde se lee como gris.
-const SURCO: Color = Color {
-    r: 0.78,
-    g: 0.78,
-    b: 0.80,
-    a: 1.0,
-};
+const SURCO: Color = tema::hex(0xc7c7cc);
 
 pub struct Osd {
     icono: Option<Icono>,

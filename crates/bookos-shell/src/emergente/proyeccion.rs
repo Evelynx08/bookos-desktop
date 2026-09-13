@@ -2,7 +2,7 @@
 
 use iced_core::alignment::Horizontal;
 use iced_core::{Border, Color, Length};
-use iced_widget::{column, container, row, text, Space};
+use iced_widget::{Space, column, container, row, text};
 
 use super::{Ancla, Tecla};
 use crate::tema;

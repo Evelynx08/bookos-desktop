@@ -171,14 +171,8 @@ impl Network {
     }
 }
 
-/// Brillo en tanto por ciento sobre el máximo del panel.
-///
-/// Se lee `actual_brightness` y no `brightness`: el segundo es lo último que se
-/// **pidió**, y con transiciones suaves puede ir por delante de lo que se ve.
-/// El dispositivo de retroiluminación que se maneja: `intel_backlight`,
-/// `amdgpu_bl0`… Se ordena y se coge el primero para que la elección sea la
-/// misma en cada arranque; con dos paneles habría que elegir de verdad, pero
-/// hoy no hay portátil con dos.
+/// Dispositivo válido de retroiluminación. Se prefiere el controlador nativo
+/// a las interfaces de compatibilidad del firmware.
 pub(crate) fn backlight_device() -> Option<String> {
     backlight_path()?
         .file_name()
@@ -199,11 +193,8 @@ pub(crate) fn backlight_max(dispositivo: &str) -> Option<u32> {
 
 /// Recuerda el resultado de buscar un dispositivo en sysfs.
 ///
-/// La ruta del backlight o de la batería **no cambia en toda la sesión**: son
-/// dispositivos del portátil, no cosas que se enchufen. Buscarla otra vez en
-/// cada refresco es un `readdir` con sus asignaciones y su ordenación por cada
-/// evento del kernel, y los eventos del kernel llegan en ráfagas: al mover el
-/// brillo con la tecla, uno por paso.
+/// Se usa para la batería. La retroiluminación se redetecta por separado para
+/// tolerar retiradas y cambios de controlador durante la sesión.
 ///
 /// **El fallo no se cachea.** Si no hay nada, se vuelve a mirar la próxima vez:
 /// un módulo puede cargarse después de arrancar la sesión, y recordar «aquí no
@@ -225,27 +216,34 @@ fn recordar(
 }
 
 fn backlight_path() -> Option<PathBuf> {
-    static CACHE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    recordar(&CACHE, || {
-        let dir = fs::read_dir("/sys/class/backlight").ok()?;
-        let mut paths: Vec<PathBuf> = dir.filter_map(|e| e.ok()).map(|e| e.path()).collect();
-        paths.sort();
-        paths.into_iter().next()
-    })
+    elegir_luz(Path::new("/sys/class/backlight"), false)
+}
+
+// No se conserva una ruta entre refrescos: el controlador puede reaparecer
+// tras suspender o cargarse después del arranque.
+fn elegir_luz(root: &Path, teclado: bool) -> Option<PathBuf> {
+    let mut paths: Vec<_> = fs::read_dir(root).ok()?.filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| !teclado || p.file_name().is_some_and(|n| n.to_string_lossy().contains("kbd_backlight")))
+        .filter(|p| read_num(p.join("max_brightness")).is_some_and(|n| n > 0)
+            && read_num(p.join("brightness")).is_some())
+        .collect();
+    paths.sort_by_key(|p| {
+        let kind = fs::read_to_string(p.join("type")).unwrap_or_default();
+        (match kind.trim() { "raw" => 0, "platform" => 1, _ => 2 }, p.clone())
+    });
+    paths.into_iter().next()
+}
+
+pub(crate) fn teclado_actual() -> Option<(String, u32, u32)> {
+    let path = elegir_luz(Path::new("/sys/class/leds"), true)?;
+    let max = read_num(path.join("max_brightness"))?;
+    Some((path.file_name()?.to_str()?.into(), read_num(path.join("brightness"))?.min(max), max))
 }
 
 pub(crate) fn read_brightness() -> Option<u8> {
     let path = backlight_path()?;
-    // El máximo es una constante del panel: se lee una vez por sesión.
-    static MAXIMO: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let max = match MAXIMO.get() {
-        Some(max) => *max,
-        None => {
-            let max = read_num(path.join("max_brightness"))?;
-            let _ = MAXIMO.set(max);
-            max
-        }
-    };
+    let max = read_num(path.join("max_brightness"))?;
     if max == 0 {
         return None;
     }
@@ -257,7 +255,7 @@ pub(crate) fn read_brightness() -> Option<u8> {
     // Ese medio milisegundo se pagaba en **cada** evento de udev, que llegan en
     // ráfaga al mover el brillo con la tecla.
     let ahora = read_num(path.join("brightness"))?;
-    Some((ahora.min(max) * 100 / max) as u8)
+    Some((u64::from(ahora.min(max)) * 100 / u64::from(max)) as u8)
 }
 
 fn battery_path() -> Option<PathBuf> {
@@ -439,6 +437,40 @@ fn local_tm(unix_secs: i64) -> (u8, u8, i32, i32, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn luz_descarta_controladores_invalidos_y_redetecta_tras_retirada() {
+        let root = bateria_falsa("luces", &[]);
+        let crear = |nombre: &str, tipo: &str, maximo: &str| {
+            let p = root.join(nombre);
+            fs::create_dir_all(&p).unwrap();
+            fs::write(p.join("type"), tipo).unwrap();
+            fs::write(p.join("max_brightness"), maximo).unwrap();
+            fs::write(p.join("brightness"), "0").unwrap();
+            p
+        };
+        crear("a_invalido", "raw", "0");
+        let firmware = crear("acpi_video0", "firmware", "10");
+        let raw = crear("intel_backlight", "raw", "400");
+        assert_eq!(elegir_luz(&root, false), Some(raw.clone()));
+        fs::remove_dir_all(raw).unwrap();
+        assert_eq!(elegir_luz(&root, false), Some(firmware));
+        let nuevo = crear("amdgpu_bl0", "raw", "255");
+        assert_eq!(elegir_luz(&root, false), Some(nuevo));
+    }
+
+    #[test]
+    fn teclado_apagado_se_detecta_y_un_led_roto_no_oculta_el_valido() {
+        let root = bateria_falsa("leds", &[]);
+        fs::create_dir(root.join("a::kbd_backlight")).unwrap();
+        let teclado = root.join("samsung-galaxybook::kbd_backlight");
+        fs::create_dir(&teclado).unwrap();
+        fs::write(teclado.join("max_brightness"), "3").unwrap();
+        fs::write(teclado.join("brightness"), "0").unwrap();
+        assert_eq!(elegir_luz(&root, true), Some(teclado.clone()));
+        fs::remove_dir_all(teclado).unwrap();
+        assert_eq!(elegir_luz(&root, true), None);
+    }
 
     /// Monta un directorio con la pinta de una batería de sysfs.
     fn bateria_falsa(nombre: &str, ficheros: &[(&str, &str)]) -> PathBuf {

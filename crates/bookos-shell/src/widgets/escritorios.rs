@@ -15,7 +15,7 @@
 //! pulsables: el que tocas es al que vas.
 
 use iced_core::{Border, Color, Length};
-use iced_widget::{container, row, Space};
+use iced_widget::{Space, container, row};
 
 use crate::tema;
 use crate::view::PanelElement;
@@ -37,7 +37,10 @@ pub struct Escritorios {
 impl Escritorios {
     pub fn new() -> Self {
         Self {
-            cuantos: 0,
+            // La configuración BookOS trae dos escritorios; mostrarlos desde
+            // el primer fotograma evita que aparezca un punto suelto mientras
+            // llega la primera actualización del compositor.
+            cuantos: 2,
             activo: 0,
         }
     }
@@ -134,11 +137,16 @@ impl Widget for Escritorios {
 mod tests {
     use super::*;
 
-    /// Sin dato del compositor el widget no ocupa sitio: si ocupara, dejaría un
-    /// hueco en el panel durante todo el arranque.
+    /// Con cero escritorios el widget no ocupa sitio: si ocupara, dejaría un
+    /// hueco en el panel.
+    ///
+    /// Se fuerza el cero en vez de dar por hecho el del constructor: arranca en
+    /// dos —los de la configuración de BookOS— para no enseñar un punto suelto
+    /// mientras llega la primera actualización del compositor.
     #[test]
     fn sin_escritorios_no_se_dibuja() {
-        let e = Escritorios::new();
+        let mut e = Escritorios::new();
+        e.escritorios(0, 0);
         assert_eq!(e.ancho(), 0.0);
         assert_eq!(e.en(3.0), None);
     }

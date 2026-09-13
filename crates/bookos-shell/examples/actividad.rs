@@ -39,7 +39,13 @@ fn base(clase: Clase) -> Estado {
             item("1", "Cielo de invierno", "La Habitación Roja", true, true),
             item("2", "Ayer", "Los Planetas", false, false),
             item("3", "Mediterráneo", "Serrat", true, false),
-            item("4", "La estatua del jardín botánico", "Radio Futura", false, false),
+            item(
+                "4",
+                "La estatua del jardín botánico",
+                "Radio Futura",
+                false,
+                false,
+            ),
         ],
     }
 }
@@ -71,7 +77,11 @@ fn portada() -> Portada {
             ]);
         }
     }
-    Portada { rgba, width: w, height: h }
+    Portada {
+        rgba,
+        width: w,
+        height: h,
+    }
 }
 
 fn volcar(nombre: &str, buf: &[u8], w: u32, h: u32) {
@@ -99,7 +109,11 @@ fn pinta(nombre: &str, tema: bookos_shell::tema::Tema, estado: Estado, clics: &[
         temporizador_siempre: true,
         ..Default::default()
     };
-    let config = Config { tema, actividades, ..Config::default() };
+    let config = Config {
+        tema,
+        actividades,
+        ..Config::default()
+    };
     let mut shell = Shell::con_config(1646, ESCALA, config);
     shell.publicar_actividad(estado);
     for (x, y) in clics {
@@ -121,8 +135,18 @@ fn main() {
     // El primer clic cae en el centro de la tarjeta compacta y la abre; el
     // segundo, en la esquina inferior izquierda del reproductor, saca la cola.
     for (etiqueta, tema) in [("oscuro", Oscuro), ("claro", Claro)] {
-        pinta(&format!("player-compacto-{etiqueta}"), tema, base(Clase::Player), &[]);
-        pinta(&format!("player-abierto-{etiqueta}"), tema, base(Clase::Player), &[(180.0, 55.0)]);
+        pinta(
+            &format!("player-compacto-{etiqueta}"),
+            tema,
+            base(Clase::Player),
+            &[],
+        );
+        pinta(
+            &format!("player-abierto-{etiqueta}"),
+            tema,
+            base(Clase::Player),
+            &[(180.0, 55.0)],
+        );
         pinta(
             &format!("player-cola-{etiqueta}"),
             tema,
@@ -131,16 +155,46 @@ fn main() {
             // progreso: 26 de margen + la posición que le dan las constantes.
             &[(180.0, 55.0), (26.0 + 370.0, 26.0 + 205.0)],
         );
-        pinta(&format!("timer-compacto-{etiqueta}"), tema, base(Clase::Timer), &[]);
-        pinta(&format!("timer-abierto-{etiqueta}"), tema, base(Clase::Timer), &[(180.0, 55.0)]);
+        pinta(
+            &format!("timer-compacto-{etiqueta}"),
+            tema,
+            base(Clase::Timer),
+            &[],
+        );
+        pinta(
+            &format!("timer-abierto-{etiqueta}"),
+            tema,
+            base(Clase::Timer),
+            &[(180.0, 55.0)],
+        );
         let mut vencido = base(Clase::Timer);
         vencido.restante_ms = -7_000;
-        pinta(&format!("timer-vencido-{etiqueta}"), tema, vencido, &[(180.0, 55.0)]);
-        pinta(&format!("grabadora-compacta-{etiqueta}"), tema, base(Clase::Recorder), &[]);
-        pinta(&format!("grabadora-abierta-{etiqueta}"), tema, base(Clase::Recorder), &[(180.0, 55.0)]);
+        pinta(
+            &format!("timer-vencido-{etiqueta}"),
+            tema,
+            vencido,
+            &[(180.0, 55.0)],
+        );
+        pinta(
+            &format!("grabadora-compacta-{etiqueta}"),
+            tema,
+            base(Clase::Recorder),
+            &[],
+        );
+        pinta(
+            &format!("grabadora-abierta-{etiqueta}"),
+            tema,
+            base(Clase::Recorder),
+            &[(180.0, 55.0)],
+        );
         let mut pausado = base(Clase::Player);
         pausado.pausado = true;
         pausado.portada = None;
-        pinta(&format!("player-sin-portada-{etiqueta}"), tema, pausado, &[(180.0, 55.0)]);
+        pinta(
+            &format!("player-sin-portada-{etiqueta}"),
+            tema,
+            pausado,
+            &[(180.0, 55.0)],
+        );
     }
 }

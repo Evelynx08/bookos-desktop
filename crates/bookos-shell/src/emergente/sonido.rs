@@ -12,21 +12,16 @@
 //! agarrada mientras mueves el ratón, incluso si te sales de la tarjeta — que
 //! es lo que hace cualquiera al llevar el volumen al máximo de un tirón.
 //!
-//! **Qué se escribe y qué no.** El nivel se manda a PipeWire con `wpctl` en
-//! cuanto se mueve, sin esperar a soltar: el sonido tiene que seguir al dedo o
-//! no se puede ajustar de oído. El proceso se lanza sin esperarlo, por lo mismo
-//! que el widget del panel no espera la lectura: `wpctl` tarda 21 ms medidos y
-//! eso es más de un frame.
+//! El servicio compartido recibe los cambios de volumen y publica el estado.
+//! El hilo de dibujo solo consulta la caché y encola operaciones.
 
-use std::process::{Command, Stdio};
-
-use iced_core::alignment::Vertical;
 use iced_core::Length;
-use iced_widget::{column, row, text, Space};
+use iced_core::alignment::Vertical;
+use iced_widget::{Space, column, row, text};
 
+use crate::Accion;
 use crate::tema;
 use crate::view::PanelElement;
-use crate::Accion;
 
 use super::control::{self, BOTON, HUECO, MARGEN_AGARRE, PILDORA};
 use super::{Ancla, Tecla};
@@ -57,6 +52,7 @@ pub struct Sonido {
 
 /// Un destino de PipeWire tal y como lo enseña el emergente.
 struct Canal {
+    disponible: bool,
     nivel: u8,
     silenciado: bool,
     /// El nombre del destino para `wpctl`.
@@ -73,6 +69,7 @@ impl Canal {
     fn nuevo(destino: &'static str, micro: bool) -> Self {
         let (nivel, silenciado) = crate::widgets::volumen::consultar(destino).unwrap_or((0, false));
         let mut canal = Self {
+            disponible: crate::widgets::volumen::consultar(destino).is_some(),
             nivel,
             silenciado,
             destino,
@@ -101,6 +98,7 @@ impl Canal {
 
     /// Manda el nivel a PipeWire. No espera: ver la cabecera del módulo.
     fn poner(&mut self, nivel: u8) {
+        if !self.disponible {return;}
         self.nivel = nivel.min(100);
         // Mover el deslizador de un canal silenciado lo devuelve a la vida: es
         // lo que hace el plasmoide, y lo que espera cualquiera que empuje la
@@ -118,13 +116,16 @@ impl Canal {
     }
 
     fn alternar_silencio(&mut self) {
+        if !self.disponible {return;}
         self.silenciado = !self.silenciado;
         let _ = lanzar(&["set-mute", self.destino, "toggle"]);
         self.actualizar_icono();
     }
 
     fn etiqueta(&self) -> String {
-        if self.silenciado {
+        if !self.disponible {
+            "No disponible".into()
+        } else if self.silenciado {
             "Silenciado".into()
         } else {
             format!("{}%", self.nivel)
@@ -133,6 +134,22 @@ impl Canal {
 }
 
 impl Sonido {
+    pub fn refrescar(&mut self) -> bool {
+        if self.agarrada.is_some() { return false; }
+        let mut changed = false;
+        for canal in [&mut self.salida, &mut self.entrada] {
+            let value=bookos_system::volume(canal.micro);
+            if canal.disponible != value.is_some() {canal.disponible=value.is_some();changed=true;}
+            if let Some((nivel, silenciado)) = value {
+                if canal.nivel != nivel || canal.silenciado != silenciado {
+                    canal.nivel = nivel; canal.silenciado = silenciado;
+                    canal.actualizar_icono(); changed = true;
+                }
+            }
+        }
+        changed
+    }
+
     pub fn new() -> Self {
         Self {
             salida: Canal::nuevo("@DEFAULT_AUDIO_SINK@", false),
@@ -317,6 +334,11 @@ impl Sonido {
             text(canal.etiqueta()).size(tema::T_CUERPO).color(color),
         ];
         let ancho = ANCHO - MARGEN * 2.0 - BOTON - HUECO;
+        if !canal.disponible {
+            let mensaje=bookos_system::unavailable("audio").map(|_|"Servicio de audio no disponible")
+                .unwrap_or("Esperando dispositivo de audio…");
+            return column![cabecera,Space::new().height(Length::Fixed(8.0)),text(mensaje).size(tema::T_PEQUENO).color(tema::TEXTO2)].into();
+        }
         let controles = row![
             control::pildora(ancho, canal.nivel, canal.silenciado),
             Space::new().width(Length::Fixed(HUECO)),
@@ -327,15 +349,7 @@ impl Sonido {
     }
 }
 
-/// Lanza `wpctl` sin esperarlo.
-fn lanzar(args: &[&str]) -> Option<std::process::Child> {
-    Command::new("wpctl")
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()
-}
+fn lanzar(args: &[&str]) -> bool { bookos_system::audio_request(args) }
 
 #[cfg(test)]
 mod tests {

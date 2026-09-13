@@ -20,6 +20,12 @@ use crate::icono::{self, Icono};
 /// nadie, pero cada una sostiene su icono cargado y un `String` por campo.
 pub const MAXIMO: usize = 20;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Accion {
+    pub clave: String,
+    pub etiqueta: String,
+}
+
 /// Una notificación tal y como la enseña el shell.
 #[derive(Clone)]
 pub struct Notificacion {
@@ -35,6 +41,11 @@ pub struct Notificacion {
     /// Urgencia crítica (2 en la especificación). Las críticas no se silencian
     /// con «No molestar»: para eso están.
     pub critica: bool,
+    pub acciones: Vec<Accion>,
+    pub progreso: Option<u8>,
+    pub progreso_indeterminado: bool,
+    /// Se marca al abrir el historial; las nuevas siguen destacadas en el panel.
+    pub leida: bool,
     /// Cuándo llegó, para el «hace 3 min» de la tarjeta.
     pub llegada: Instant,
 }
@@ -55,6 +66,30 @@ impl Notificacion {
         icono: &str,
         critica: bool,
     ) -> Self {
+        Self::nueva_con_datos(
+            id,
+            app,
+            resumen,
+            cuerpo,
+            icono,
+            critica,
+            Vec::new(),
+            None,
+            false,
+        )
+    }
+
+    pub fn nueva_con_datos(
+        id: u32,
+        app: String,
+        resumen: String,
+        cuerpo: String,
+        icono: &str,
+        critica: bool,
+        acciones: Vec<Accion>,
+        progreso: Option<u8>,
+        progreso_indeterminado: bool,
+    ) -> Self {
         let icono = icono::cargar(icono)
             .or_else(|| icono::cargar(&app.to_lowercase()))
             .or_else(|| icono::propio("notificaciones"));
@@ -65,6 +100,10 @@ impl Notificacion {
             cuerpo,
             icono,
             critica,
+            acciones,
+            progreso,
+            progreso_indeterminado,
+            leida: false,
             llegada: Instant::now(),
         }
     }
@@ -121,7 +160,19 @@ impl Registro {
     }
 
     pub fn cuantas(&self) -> u32 {
-        self.lista.len() as u32
+        self.lista.iter().filter(|n| !n.leida).count() as u32
+    }
+
+    /// Marca el historial como leído y devuelve si cambió algo.
+    pub fn marcar_leidas(&mut self) -> bool {
+        let mut cambio = false;
+        for n in &mut self.lista {
+            if !n.leida {
+                n.leida = true;
+                cambio = true;
+            }
+        }
+        cambio
     }
 
     pub fn hay(&self) -> bool {
@@ -141,6 +192,10 @@ mod tests {
             cuerpo: String::new(),
             icono: None,
             critica: false,
+            acciones: Vec::new(),
+            progreso: None,
+            progreso_indeterminado: false,
+            leida: false,
             llegada: Instant::now(),
         }
     }
@@ -189,5 +244,16 @@ mod tests {
         assert_eq!(reciente.hace(), "hace 3 min");
         reciente.llegada = Instant::now() - std::time::Duration::from_secs(7300);
         assert_eq!(reciente.hace(), "hace 2 h");
+    }
+
+    #[test]
+    fn solo_las_nuevas_cuentan_como_pendientes() {
+        let mut r = Registro::default();
+        r.añadir(n(1, "x"));
+        r.añadir(n(2, "y"));
+        assert_eq!(r.cuantas(), 2);
+        assert!(r.marcar_leidas());
+        assert_eq!(r.cuantas(), 0);
+        assert!(!r.marcar_leidas());
     }
 }

@@ -23,6 +23,7 @@
 //! así que el hilo de PipeWire devuelve el `Vec` vacío cuando termina con él y
 //! aquí se reutiliza.
 
+use std::collections::HashSet;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,7 @@ use crate::pw::{Emisor, Orden};
 pub struct Emision {
     /// El identificador de la sesión del portal. Es el que conoce el hilo.
     pub sesion: u32,
+    pub ruta: zbus::zvariant::OwnedObjectPath,
     pub output: Output,
     /// El tamaño que se negoció con PipeWire. Si la salida cambia de modo deja
     /// de cuadrar y la emisión se para: renegociar el formato es otra tanda, y
@@ -48,8 +50,11 @@ pub struct Emision {
 pub struct Emisiones {
     emisor: Option<Emisor>,
     /// Por donde vuelven los `Vec` que el hilo ya ha vaciado.
-    reciclado: Option<mpsc::Receiver<Vec<u8>>>,
+    reciclado: Option<mpsc::Receiver<(u32, Vec<u8>)>>,
     libres: Vec<Vec<u8>>,
+    /// Sesiones que ya tienen un marco viajando hacia PipeWire. Esta barrera
+    /// evita llenar un canal ilimitado si el consumidor se atasca.
+    pendientes: HashSet<u32>,
     activas: Vec<Emision>,
 }
 
@@ -77,6 +82,7 @@ impl Emisiones {
             emisor: None,
             reciclado: None,
             libres: Vec::new(),
+            pendientes: HashSet::new(),
             activas: Vec::new(),
         }
     }
@@ -99,6 +105,7 @@ impl Emisiones {
     /// Para una sesión y le dice al hilo que suelte el nodo.
     pub fn quitar(&mut self, sesion: u32) {
         self.activas.retain(|e| e.sesion != sesion);
+        self.pendientes.remove(&sesion);
         if let Some(emisor) = self.emisor.as_ref() {
             emisor.enviar(Orden::Cerrar { sesion });
         }
@@ -109,11 +116,16 @@ impl Emisiones {
     }
 
     /// Las emisiones de esta salida a las que ya les toca fotograma.
-    pub fn tocan(&self, output: &Output, ahora: Instant) -> Vec<usize> {
+    pub fn tocan(&mut self, output: &Output, ahora: Instant) -> Vec<usize> {
+        self.recoger();
         self.activas
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.output == *output && ahora.duration_since(e.ultimo) >= e.periodo)
+            .filter(|(_, e)| {
+                e.output == *output
+                    && !self.pendientes.contains(&e.sesion)
+                    && ahora.duration_since(e.ultimo) >= e.periodo
+            })
             .map(|(i, _)| i)
             .collect()
     }
@@ -129,23 +141,29 @@ impl Emisiones {
         tamano: Size<i32, BufferCoord>,
         invertida: bool,
         ahora: Instant,
-    ) {
-        let Some(emision) = self.activas.get(indice) else { return };
+    ) -> Option<zbus::zvariant::OwnedObjectPath> {
+        let Some(emision) = self.activas.get(indice) else {
+            return None;
+        };
         let sesion = emision.sesion;
         if tamano != emision.tamano {
             // La salida ha cambiado de modo por debajo. Se para en vez de
             // mandar píxeles que no cuadran con el formato negociado.
             tracing::info!(sesion, "la salida cambió de tamaño; se corta la emisión");
+            let ruta = emision.ruta.clone();
             self.quitar(sesion);
-            return;
+            return Some(ruta);
         }
 
         let stride = tamano.w.max(0) as usize * 4;
         let alto = tamano.h.max(0) as usize;
         let necesarios = stride * alto;
         if pixeles.len() < necesarios {
-            tracing::warn!(sesion, "el readback trajo menos píxeles de los que mide la salida");
-            return;
+            tracing::warn!(
+                sesion,
+                "el readback trajo menos píxeles de los que mide la salida"
+            );
+            return None;
         }
         self.activas[indice].ultimo = ahora;
 
@@ -162,19 +180,23 @@ impl Emisiones {
         }
 
         if let Some(emisor) = self.emisor.as_ref() {
+            self.pendientes.insert(sesion);
             emisor.enviar(Orden::Marco { sesion, datos });
         }
+        None
     }
 
     /// Recupera los `Vec` que el hilo ya ha soltado.
     fn recoger(&mut self) {
-        let Some(reciclado) = self.reciclado.as_ref() else { return };
+        let Some(reciclado) = self.reciclado.as_ref() else {
+            return;
+        };
         // Tres son los buffers que PipeWire tiene; más de eso en la reserva
         // sería memoria parada.
-        while self.libres.len() < 3 {
-            match reciclado.try_recv() {
-                Ok(v) => self.libres.push(v),
-                Err(_) => break,
+        while let Ok((sesion, v)) = reciclado.try_recv() {
+            self.pendientes.remove(&sesion);
+            if self.libres.len() < 3 {
+                self.libres.push(v);
             }
         }
     }

@@ -12,7 +12,7 @@
 
 use iced_core::alignment::Horizontal;
 use iced_core::{Border, Color, Length};
-use iced_widget::{column, container, row, text, Space};
+use iced_widget::{Space, column, container, row, text};
 
 use super::{Ancla, Tecla};
 use crate::tema;
@@ -272,7 +272,11 @@ impl Compartir {
                     border: Border {
                         radius: tema::R_CONTROL.into(),
                         width: if activa { 2.0 } else { 1.0 },
-                        color: if activa { tema::acento() } else { tema::borde() },
+                        color: if activa {
+                            tema::acento()
+                        } else {
+                            tema::borde()
+                        },
                     },
                     ..Default::default()
                 }),
@@ -291,7 +295,9 @@ impl Compartir {
                 Space::new().height(CABECERA_HUECO),
                 celdas,
                 Space::new().height(BOTONES_HUECO),
-                container(botones).width(Length::Fill).align_x(Horizontal::Right),
+                container(botones)
+                    .width(Length::Fill)
+                    .align_x(Horizontal::Right),
             ]
             .align_x(Horizontal::Center),
         )
@@ -305,11 +311,11 @@ impl Compartir {
     fn boton(&self, texto: &'static str, indice: usize) -> PanelElement<'_> {
         let principal = indice == 1;
         let sobre = self.sobre_boton == Some(indice);
-        container(
-            text(texto)
-                .size(tema::T_CUERPO)
-                .color(if principal { Color::WHITE } else { tema::texto() }),
-        )
+        container(text(texto).size(tema::T_CUERPO).color(if principal {
+            Color::WHITE
+        } else {
+            tema::texto()
+        }))
         .center_x(BOTON_W)
         .center_y(BOTON_H)
         .style(move |_| iced_widget::container::Style {
@@ -321,7 +327,11 @@ impl Compartir {
             border: Border {
                 radius: tema::R_CONTROL.into(),
                 width: 1.0,
-                color: if principal { tema::acento() } else { tema::borde() },
+                color: if principal {
+                    tema::acento()
+                } else {
+                    tema::borde()
+                },
             },
             ..Default::default()
         })
@@ -364,8 +374,16 @@ mod pruebas {
             7,
             "Firefox".into(),
             vec![
-                Pantalla { nombre: "eDP-1".into(), ancho: 1920, alto: 1080 },
-                Pantalla { nombre: "HDMI-A-1".into(), ancho: 2560, alto: 1440 },
+                Pantalla {
+                    nombre: "eDP-1".into(),
+                    ancho: 1920,
+                    alto: 1080,
+                },
+                Pantalla {
+                    nombre: "HDMI-A-1".into(),
+                    ancho: 2560,
+                    alto: 1440,
+                },
             ],
         )
     }
@@ -382,7 +400,10 @@ mod pruebas {
         let by = MARGEN_SOMBRA + c.botones_y() + BOTON_H / 2.0;
         assert!(matches!(
             c.pulsar(bx, by),
-            Some(Accion::Compartir { sesion: 7, pantalla: Some(1) })
+            Some(Accion::Compartir {
+                sesion: 7,
+                pantalla: Some(1)
+            })
         ));
     }
 
@@ -393,7 +414,10 @@ mod pruebas {
         let by = MARGEN_SOMBRA + c.botones_y() + BOTON_H / 2.0;
         assert!(matches!(
             c.pulsar(bx, by),
-            Some(Accion::Compartir { sesion: 7, pantalla: None })
+            Some(Accion::Compartir {
+                sesion: 7,
+                pantalla: None
+            })
         ));
         // Escape no cierra a secas: manda la negativa, porque el portal está
         // bloqueado esperándola.

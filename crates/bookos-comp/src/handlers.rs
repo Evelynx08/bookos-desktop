@@ -18,6 +18,13 @@ use smithay::wayland::selection::data_device::{
     ServerDndGrabHandler,
 };
 use smithay::wayland::fractional_scale::{with_fractional_scale, FractionalScaleHandler};
+use smithay::wayland::foreign_toplevel_list::{
+    ForeignToplevelListHandler, ForeignToplevelListState,
+};
+use smithay::wayland::idle_inhibit::IdleInhibitHandler;
+use smithay::wayland::idle_notify::{IdleNotifierHandler, IdleNotifierState};
+use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraintsHandler};
+use smithay::wayland::input_method::{InputMethodHandler, PopupSurface as InputMethodPopupSurface};
 use smithay::wayland::output::OutputHandler;
 use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::selection::primary_selection::{
@@ -29,11 +36,20 @@ use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_to
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
 };
+use smithay::desktop::{layer_map_for_output, LayerSurface as DesktopLayerSurface, WindowSurfaceType};
+use smithay::wayland::shell::wlr_layer::{
+    Layer, LayerSurface, WlrLayerShellHandler, WlrLayerShellState,
+};
 use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::{
     delegate_compositor, delegate_data_control, delegate_data_device, delegate_fractional_scale,
     delegate_output, delegate_primary_selection, delegate_seat, delegate_shm, delegate_viewporter,
-    delegate_xdg_shell, delegate_presentation,
+    delegate_xdg_shell, delegate_presentation, delegate_idle_inhibit,
+    delegate_idle_notify,
+    delegate_pointer_constraints, delegate_relative_pointer, delegate_text_input_manager,
+    delegate_input_method_manager,
+    delegate_layer_shell,
+    delegate_foreign_toplevel_list,
 };
 
 use crate::state::{BookosComp, ClientState};
@@ -65,6 +81,25 @@ impl CompositorHandler for BookosComp {
         let mut root = surface.clone();
         while let Some(parent) = get_parent(&root) {
             root = parent;
+        }
+
+        // Las layer-surfaces no son ventanas del `Space`, pero sus commits sí
+        // cambian una parte visible de la escena. Reorganizar aquí respeta el
+        // tamaño, anclas y zona exclusiva que el cliente acaba de confirmar.
+        if let Some(layer) = self.space.layer_for_surface(&root, WindowSurfaceType::ALL) {
+            for output in self.space.outputs().cloned().collect::<Vec<_>>() {
+                let mut map = layer_map_for_output(&output);
+                if map
+                    .layer_for_surface(&root, WindowSurfaceType::ALL)
+                    .is_some()
+                {
+                    map.arrange();
+                    layer.layer_surface().send_pending_configure();
+                    break;
+                }
+            }
+            self.needs_redraw = true;
+            return;
         }
 
         // Una sola búsqueda para todo lo que viene. Antes se recorría el
@@ -109,11 +144,15 @@ impl BookosComp {
             .filter_map(|w| w.wl_surface().map(|s| s.into_owned()))
             .collect();
         for surface in surfaces {
-            let scale = self.window_for_surface(&surface)
-                .and_then(|window| self.space.outputs_for_element(&window)
-                    .into_iter()
-                    .map(|o| o.current_scale().fractional_scale())
-                    .max_by(f64::total_cmp))
+            let scale = self
+                .window_for_surface(&surface)
+                .and_then(|window| {
+                    self.space
+                        .outputs_for_element(&window)
+                        .into_iter()
+                        .map(|o| o.current_scale().fractional_scale())
+                        .max_by(f64::total_cmp)
+                })
                 .unwrap_or(scale);
             with_states(&surface, |states| {
                 with_fractional_scale(states, |fractional| {
@@ -169,10 +208,16 @@ impl BookosComp {
     pub fn output_scale(&self) -> f64 {
         self.space
             .outputs()
-            .find(|o| self.space.output_geometry(o).is_some_and(|r| {
-                r.to_f64().contains(self.pointer_location)
-            }))
-            .or_else(|| self.space.outputs().find(|o| o.current_location() == (0, 0).into()))
+            .find(|o| {
+                self.space
+                    .output_geometry(o)
+                    .is_some_and(|r| r.to_f64().contains(self.pointer_location))
+            })
+            .or_else(|| {
+                self.space
+                    .outputs()
+                    .find(|o| o.current_location() == (0, 0).into())
+            })
             .or_else(|| self.space.outputs().next())
             .map(|o| o.current_scale().fractional_scale())
             .unwrap_or(1.0)
@@ -666,9 +711,191 @@ delegate_fractional_scale!(BookosComp);
 delegate_viewporter!(BookosComp);
 delegate_presentation!(BookosComp);
 
+impl IdleInhibitHandler for BookosComp {
+    fn inhibit(&mut self, surface: WlSurface) {
+        if !self
+            .idle_inhibidores
+            .iter()
+            .any(|actual| actual == &surface)
+        {
+            self.idle_inhibidores.push(surface);
+            self.idle_notifier_state.set_is_inhibited(true);
+            crate::backend::programar_bloqueo_inactividad(self);
+            crate::backend::programar_suspension_inactividad(self);
+            tracing::debug!("una aplicación ha inhibido el idle de pantalla");
+        }
+    }
+
+    fn uninhibit(&mut self, surface: WlSurface) {
+        self.idle_inhibidores.retain(|actual| actual != &surface);
+        self.idle_notifier_state
+            .set_is_inhibited(!self.idle_inhibidores.is_empty());
+        if self.idle_inhibidores.is_empty() {
+            self.last_input = Some(std::time::Instant::now());
+        }
+        crate::backend::programar_bloqueo_inactividad(self);
+        crate::backend::programar_suspension_inactividad(self);
+        tracing::debug!("una aplicación ha liberado el idle de pantalla");
+    }
+}
+
+delegate_idle_inhibit!(BookosComp);
+
+impl IdleNotifierHandler for BookosComp {
+    fn idle_notifier_state(&mut self) -> &mut IdleNotifierState<Self> {
+        &mut self.idle_notifier_state
+    }
+}
+
+delegate_idle_notify!(BookosComp);
+delegate_relative_pointer!(BookosComp);
+
+impl WlrLayerShellHandler for BookosComp {
+    fn shell_state(&mut self) -> &mut WlrLayerShellState {
+        &mut self.layer_shell_state
+    }
+
+    fn new_layer_surface(
+        &mut self,
+        surface: LayerSurface,
+        output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
+        _layer: Layer,
+        namespace: String,
+    ) {
+        let output = output
+            .as_ref()
+            .and_then(smithay::output::Output::from_resource)
+            .or_else(|| self.space.outputs().next().cloned());
+        let Some(output) = output else {
+            tracing::warn!("layer-shell recibido antes de tener una salida");
+            return;
+        };
+        let layer = DesktopLayerSurface::new(surface, namespace);
+        if let Err(err) = layer_map_for_output(&output).map_layer(&layer) {
+            tracing::warn!("no se pudo mapear layer-shell: {err}");
+            return;
+        }
+        self.needs_redraw = true;
+    }
+
+    fn layer_destroyed(&mut self, surface: LayerSurface) {
+        for output in self.space.outputs().cloned().collect::<Vec<_>>() {
+            let mut map = layer_map_for_output(&output);
+            let layer = map
+                .layers()
+                .find(|layer| layer.layer_surface() == &surface)
+                .cloned();
+            if let Some(layer) = layer {
+                map.unmap_layer(&layer);
+                self.needs_redraw = true;
+                break;
+            }
+        }
+    }
+}
+
+delegate_layer_shell!(BookosComp);
+
+impl ForeignToplevelListHandler for BookosComp {
+    fn foreign_toplevel_list_state(&mut self) -> &mut ForeignToplevelListState {
+        &mut self.foreign_toplevel_list_state
+    }
+}
+
+delegate_foreign_toplevel_list!(BookosComp);
+
+impl PointerConstraintsHandler for BookosComp {
+    fn new_constraint(
+        &mut self,
+        surface: &WlSurface,
+        pointer: &smithay::input::pointer::PointerHandle<Self>,
+    ) {
+        let enfocado = self
+            .surface_under(self.pointer_location)
+            .is_some_and(|(actual, _)| actual == *surface);
+        if enfocado {
+            with_pointer_constraint(surface, pointer, |constraint| {
+                if let Some(constraint) = constraint {
+                    constraint.activate();
+                }
+            });
+        }
+    }
+
+    fn cursor_position_hint(
+        &mut self,
+        _surface: &WlSurface,
+        _pointer: &smithay::input::pointer::PointerHandle<Self>,
+        _location: smithay::utils::Point<f64, smithay::utils::Logical>,
+    ) {
+        // El hint solo se usa para recolocar el cursor al activar un juego.
+        // La posición real se conserva en `pointer_location`; el compositor
+        // no la cambia hasta que llega movimiento del dispositivo.
+    }
+}
+
+delegate_pointer_constraints!(BookosComp);
+delegate_text_input_manager!(BookosComp);
+
+impl InputMethodHandler for BookosComp {
+    fn new_popup(&mut self, _surface: InputMethodPopupSurface) {}
+    fn dismiss_popup(&mut self, _surface: InputMethodPopupSurface) {}
+    fn popup_repositioned(&mut self, _surface: InputMethodPopupSurface) {}
+    fn parent_geometry(
+        &self,
+        _parent: &WlSurface,
+    ) -> smithay::utils::Rectangle<i32, smithay::utils::Logical> {
+        smithay::utils::Rectangle::default()
+    }
+}
+
+delegate_input_method_manager!(BookosComp);
+
 /// `wp_cursor_shape_v1` comparte el manejo del cursor con el de las tabletas,
 /// así que exige este trait aunque aquí no haya ninguna. Todos sus métodos
 /// tienen implementación por defecto: declararlo basta, y el día que haya una
 /// Wacom el sitio donde escribir su cursor ya está.
 impl smithay::wayland::tablet_manager::TabletSeatHandler for BookosComp {}
 smithay::delegate_cursor_shape!(BookosComp);
+smithay::delegate_xdg_activation!(BookosComp);
+
+/// Quién puede llevarse el foco y cuándo.
+///
+/// El protocolo existe para separar dos cosas que sin él son la misma: «una
+/// ventana nueva aparece» y «el usuario ha pedido esta ventana». Sin él solo
+/// hay dos políticas y las dos molestan —enfocar siempre te quita el teclado de
+/// donde estabas escribiendo, no enfocar nunca deja lo que lanzas del dock sin
+/// responder—. El vale dice cuál de las dos es.
+impl smithay::wayland::xdg_activation::XdgActivationHandler for BookosComp {
+    fn activation_state(&mut self) -> &mut smithay::wayland::xdg_activation::XdgActivationState {
+        &mut self.activacion_state
+    }
+
+    fn request_activation(
+        &mut self,
+        token: smithay::wayland::xdg_activation::XdgActivationToken,
+        datos: smithay::wayland::xdg_activation::XdgActivationTokenData,
+        surface: WlSurface,
+    ) {
+        let caducado = datos.timestamp.elapsed() > crate::keybinds::VALE_VALIDO;
+        // Se retira siempre, valga o no: es de un solo uso.
+        self.activacion_state.remove_token(&token);
+        if caducado {
+            tracing::debug!(?datos.app_id, "vale de activación caducado; sin foco");
+            return;
+        }
+        let Some(window) = self
+            .space
+            .elements()
+            .find(|w| w.wl_surface().as_deref() == Some(&surface))
+            .cloned()
+        else {
+            // Todavía no está en el `Space`: la ventana pide el foco antes de
+            // mapearse. No es un error y no hace falta guardarlo —el camino de
+            // `lanzar` marca la suya al mapear, ver `ventanas::mapear`—.
+            return;
+        };
+        tracing::debug!(?datos.app_id, "activación concedida");
+        self.enfocar(&window);
+    }
+}

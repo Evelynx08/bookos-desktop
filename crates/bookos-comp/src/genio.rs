@@ -190,7 +190,10 @@ pub fn capturar(renderer: &mut GlesRenderer, window: &Window, scale: f64) -> Opt
         // Transparente de partida: lo que el cliente no pinte —las esquinas
         // redondeadas de su decoración— tiene que seguir siendo hueco.
         frame
-            .clear(smithay::backend::renderer::Color32F::TRANSPARENT, &[completo])
+            .clear(
+                smithay::backend::renderer::Color32F::TRANSPARENT,
+                &[completo],
+            )
             .ok()?;
         // Los elementos vienen de delante hacia atrás, así que se dibujan al
         // revés para que lo de delante quede encima.
@@ -200,9 +203,9 @@ pub fn capturar(renderer: &mut GlesRenderer, window: &Window, scale: f64) -> Opt
                 tracing::warn!("una superficie no entró en la captura: {err}");
             }
         }
-        let _ = frame.finish().inspect_err(|err| {
-            tracing::warn!("no se pudo cerrar el frame de la captura: {err}")
-        });
+        let _ = frame
+            .finish()
+            .inspect_err(|err| tracing::warn!("no se pudo cerrar el frame de la captura: {err}"));
     }
     Some(Captura {
         textura,

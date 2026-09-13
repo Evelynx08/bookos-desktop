@@ -11,11 +11,11 @@ use std::time::{Duration, Instant};
 
 use iced_core::alignment::Vertical;
 use iced_core::{Border, Color, Length};
-use iced_widget::{column, container, row, text, Space};
+use iced_widget::{Space, column, container, row, text};
 
+use crate::Accion;
 use crate::tema;
 use crate::view::PanelElement;
-use crate::Accion;
 
 use super::control;
 use super::lista::{self, interruptor};
@@ -62,9 +62,16 @@ pub struct Notificaciones {
     lista: Vec<crate::notificaciones::Notificacion>,
     /// La fila señalada de la lista, para el realce y para la ✕.
     fila: tema::Realce,
+    /// Fila activa para navegación sin ratón.
+    seleccionada: Option<usize>,
 }
 
 impl Notificaciones {
+    pub fn poner_silencio(&mut self, silencio: Option<(Instant, Option<Duration>)>) {
+        self.silencio = silencio;
+        self.interruptor.fijar(self.silenciado() as u8 as f32);
+    }
+
     /// El silencio tal y como estaba, para que abrir y cerrar la tarjeta no lo
     /// olvide: su dueño es el shell, que sigue vivo con la tarjeta cerrada.
     pub fn con_silencio(silencio: Option<(Instant, Option<Duration>)>) -> Self {
@@ -91,6 +98,7 @@ impl Notificaciones {
             icono: crate::icono::propio("noche"),
             lista: Vec::new(),
             fila: tema::Realce::nuevo(),
+            seleccionada: None,
         }
     }
 
@@ -129,6 +137,9 @@ impl Notificaciones {
         // Lo señalado se apaga: la fila que había bajo el puntero puede haber
         // desaparecido, y dejar el realce puesto marcaría a la de al lado.
         self.fila.señalar(None);
+        self.seleccionada = self
+            .seleccionada
+            .filter(|i| *i < self.lista.len().min(VISIBLES));
     }
 
     /// Qué fila de la lista cae en un punto.
@@ -245,11 +256,21 @@ impl Notificaciones {
 
     pub fn pulsar(&mut self, x: f32, y: f32) -> Option<Accion> {
         let punto = iced_core::Point::new(x, y);
-        // La ✕ de una fila cierra solo esa; el resto de la fila, también: una
-        // notificación que ya has leído no tiene otra cosa que hacer, y así el
-        // blanco no se pierde en un rectángulo de 335 px que no responde.
-        if let Some(id) = self.fila_en(x, y).map(|i| self.lista[i].id) {
-            return Some(Accion::CerrarNotificacion(id));
+        // La ✕ queda en el extremo derecho. Si la aplicación ofrece acciones,
+        // tocar el cuerpo ejecuta la primera (la habitual es «Abrir»), y el
+        // teclado puede hacer lo mismo con Intro.
+        if let Some(i) = self.fila_en(x, y) {
+            let notif = &self.lista[i];
+            if x >= lista::ANCHO - lista::MARGEN - CIERRE {
+                return Some(Accion::CerrarNotificacion(notif.id));
+            }
+            if let Some(accion) = notif.acciones.first() {
+                return Some(Accion::NotificacionAccion {
+                    id: notif.id,
+                    clave: accion.clave.clone(),
+                });
+            }
+            return Some(Accion::CerrarNotificacion(notif.id));
         }
         if self.rect_borrar().contains(punto) {
             return Some(Accion::BorrarNotificaciones);
@@ -276,6 +297,50 @@ impl Notificaciones {
     pub fn tecla(&mut self, tecla: crate::TeclaPulsada) -> Tecla {
         match tecla {
             crate::TeclaPulsada::Escape => Tecla::Cerrar,
+            crate::TeclaPulsada::Arriba | crate::TeclaPulsada::Abajo => {
+                let n = self.lista.len().min(VISIBLES);
+                if n == 0 {
+                    return Tecla::Ignorada;
+                }
+                let actual = self.seleccionada.unwrap_or_else(|| {
+                    if matches!(tecla, crate::TeclaPulsada::Arriba) { n - 1 } else { 0 }
+                });
+                let siguiente = if matches!(tecla, crate::TeclaPulsada::Arriba) {
+                    actual.saturating_sub(1)
+                } else {
+                    (actual + 1).min(n - 1)
+                };
+                self.seleccionada = Some(siguiente);
+                self.fila.señalar(Some(siguiente));
+                Tecla::Consumida
+            }
+            crate::TeclaPulsada::Inicio => {
+                if self.lista.is_empty() { Tecla::Ignorada } else {
+                    self.seleccionada = Some(0);
+                    self.fila.señalar(Some(0));
+                    Tecla::Consumida
+                }
+            }
+            crate::TeclaPulsada::Fin => {
+                let n = self.lista.len().min(VISIBLES);
+                if n == 0 { Tecla::Ignorada } else {
+                    self.seleccionada = Some(n - 1);
+                    self.fila.señalar(Some(n - 1));
+                    Tecla::Consumida
+                }
+            }
+            crate::TeclaPulsada::Intro => {
+                let Some(i) = self.seleccionada else { return Tecla::Ignorada; };
+                let Some(notif) = self.lista.get(i) else { return Tecla::Ignorada; };
+                if let Some(accion) = notif.acciones.first() {
+                    Tecla::Hacer(Accion::NotificacionAccion {
+                        id: notif.id,
+                        clave: accion.clave.clone(),
+                    })
+                } else {
+                    Tecla::Hacer(Accion::CerrarNotificacion(notif.id))
+                }
+            }
             _ => Tecla::Ignorada,
         }
     }
@@ -296,14 +361,36 @@ impl Notificaciones {
         };
         // La crítica lleva el nombre en rojo: es lo que la separa de las demás
         // sin meter un fondo de color que taparía su propio icono.
+        let repeticiones = self
+            .lista
+            .iter()
+            .filter(|n| n.app == notif.app)
+            .count();
+        let app = if repeticiones > 1 {
+            format!("{} · {}", notif.app, repeticiones)
+        } else {
+            notif.app.clone()
+        };
         let color_app = if notif.critica {
             tema::rojo()
         } else {
             tema::TEXTO2
         };
+        let indicador = match (notif.acciones.len(), notif.progreso, notif.progreso_indeterminado) {
+            (acciones, Some(porcentaje), _) if acciones > 0 => {
+                format!("{} · {}%", acciones, porcentaje)
+            }
+            (acciones, _, true) if acciones > 0 => format!("{} · …", acciones),
+            (acciones, Some(porcentaje), _) if acciones == 0 => format!("{}%", porcentaje),
+            (acciones, _, true) if acciones == 0 => "…".to_string(),
+            (acciones, _, _) if acciones > 0 => format!("{} acciones", acciones),
+            _ => String::new(),
+        };
         let cabecera = row![
-            text(notif.app.clone()).size(11.0).color(color_app),
+            text(app).size(11.0).color(color_app),
             Space::new().width(Length::Fill),
+            text(indicador).size(10.0).color(tema::TEXTO2),
+            Space::new().width(Length::Fixed(6.0)),
             text(notif.hace()).size(11.0).color(tema::TEXTO2),
             // El hueco de la ✕, siempre reservado: si apareciera y
             // desapareciera, el texto de la derecha bailaría al pasar el ratón.
@@ -516,7 +603,11 @@ impl Notificaciones {
             cola = cola.push(lista::vacia("No hay notificaciones"));
         }
         for (i, notif) in self.lista.iter().take(VISIBLES).enumerate() {
-            cola = cola.push(self.fila_notificacion(notif, self.fila.intensidad(i)));
+            let resaltado = self
+                .seleccionada
+                .is_some_and(|seleccion| seleccion == i);
+            let intensidad = self.fila.intensidad(i).max(if resaltado { 0.65 } else { 0.0 });
+            cola = cola.push(self.fila_notificacion(notif, intensidad));
         }
 
         let mut contenido = column![
@@ -576,5 +667,29 @@ mod tests {
         let mut n = Notificaciones::new();
         n.silencio = Some((Instant::now(), Some(Duration::ZERO)));
         assert!(!n.silenciado());
+    }
+
+    #[test]
+    fn las_flechas_y_intro_recuperan_una_accion() {
+        let mut n = Notificaciones::new();
+        n.actualizar(vec![crate::notificaciones::Notificacion::nueva_con_datos(
+            7,
+            "Prueba".into(),
+            "Aviso".into(),
+            String::new(),
+            "",
+            false,
+            vec![crate::notificaciones::Accion {
+                clave: "abrir".into(),
+                etiqueta: "Abrir".into(),
+            }],
+            None,
+            false,
+        )]);
+        assert!(matches!(n.tecla(crate::TeclaPulsada::Abajo), Tecla::Consumida));
+        assert!(matches!(
+            n.tecla(crate::TeclaPulsada::Intro),
+            Tecla::Hacer(Accion::NotificacionAccion { id: 7, .. })
+        ));
     }
 }

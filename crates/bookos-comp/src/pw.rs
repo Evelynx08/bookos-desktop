@@ -33,9 +33,9 @@ use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::rc::Rc;
 use std::sync::mpsc;
 
+use libspa::param::ParamType;
 use libspa::param::format::{FormatProperties, MediaSubtype, MediaType};
 use libspa::param::video::VideoFormat;
-use libspa::param::ParamType;
 use libspa::pod::{self, Pod};
 use libspa::utils::{Fraction, Rectangle, SpaTypes};
 use pipewire as pw;
@@ -56,10 +56,17 @@ pub enum Orden {
     /// No lleva marca de tiempo: sin `SPA_META_Header` en el buffer, PipeWire
     /// fecha el fotograma con el reloj del grafo al encolarlo, que es lo que
     /// quiere un consumidor de vídeo en vivo.
-    Marco { sesion: u32, datos: Vec<u8> },
+    Marco {
+        sesion: u32,
+        datos: Vec<u8>,
+    },
     /// Un descriptor de conexión a PipeWire para dárselo al cliente del portal.
-    Descriptor { respuesta: crate::portal::Emisario<OwnedFd> },
-    Cerrar { sesion: u32 },
+    Descriptor {
+        respuesta: crate::portal::Emisario<OwnedFd>,
+    },
+    Cerrar {
+        sesion: u32,
+    },
 }
 
 /// El extremo del compositor: por aquí se le habla al hilo.
@@ -88,16 +95,16 @@ struct Nodo {
     formato: Option<(u32, u32, u32)>,
     /// Los `Vec` vacíos vuelven al compositor por aquí para no asignar 8 MB por
     /// fotograma. Si el otro extremo desapareció, se tiran.
-    reciclado: mpsc::Sender<Vec<u8>>,
+    reciclado: mpsc::Sender<(u32, Vec<u8>)>,
 }
 
 type Nodos = Rc<RefCell<HashMap<u32, Nodo>>>;
 
 /// Arranca el hilo. Devuelve por dónde hablarle y por dónde recoger los `Vec`
 /// reciclados.
-pub fn arrancar() -> Option<(Emisor, mpsc::Receiver<Vec<u8>>)> {
+pub fn arrancar() -> Option<(Emisor, mpsc::Receiver<(u32, Vec<u8>)>)> {
     let (canal, receptor) = pw::channel::channel::<Orden>();
-    let (devolver, reciclado) = mpsc::channel::<Vec<u8>>();
+    let (devolver, reciclado) = mpsc::channel::<(u32, Vec<u8>)>();
 
     let hilo = std::thread::Builder::new()
         .name("bookos-pipewire".into())
@@ -116,7 +123,10 @@ pub fn arrancar() -> Option<(Emisor, mpsc::Receiver<Vec<u8>>)> {
     }
 }
 
-fn bucle(receptor: pw::channel::Receiver<Orden>, devolver: mpsc::Sender<Vec<u8>>) -> anyhow::Result<()> {
+fn bucle(
+    receptor: pw::channel::Receiver<Orden>,
+    devolver: mpsc::Sender<(u32, Vec<u8>)>,
+) -> anyhow::Result<()> {
     pw::init();
 
     let bucle = pw::main_loop::MainLoopRc::new(None)?;
@@ -130,8 +140,23 @@ fn bucle(receptor: pw::channel::Receiver<Orden>, devolver: mpsc::Sender<Vec<u8>>
         let core = core.clone();
         let contexto = contexto.clone();
         receptor.attach(bucle.loop_(), move |orden| match orden {
-            Orden::Abrir { sesion, ancho, alto, fps, respuesta } => {
-                match abrir(&core, &nodos, sesion, ancho, alto, fps, devolver.clone(), respuesta) {
+            Orden::Abrir {
+                sesion,
+                ancho,
+                alto,
+                fps,
+                respuesta,
+            } => {
+                match abrir(
+                    &core,
+                    &nodos,
+                    sesion,
+                    ancho,
+                    alto,
+                    fps,
+                    devolver.clone(),
+                    respuesta,
+                ) {
                     Ok(()) => {}
                     Err(err) => tracing::warn!(sesion, "no se pudo abrir el nodo: {err}"),
                 }
@@ -143,9 +168,12 @@ fn bucle(receptor: pw::channel::Receiver<Orden>, devolver: mpsc::Sender<Vec<u8>>
                 // todavía vivo, eso es un pánico.
                 let stream = {
                     let mut nodos = nodos.borrow_mut();
-                    let Some(nodo) = nodos.get_mut(&sesion) else { return };
+                    let Some(nodo) = nodos.get_mut(&sesion) else {
+                        let _ = devolver.send((sesion, datos));
+                        return;
+                    };
                     if let Some(viejo) = nodo.pendiente.replace(datos) {
-                        let _ = nodo.reciclado.send(viejo);
+                        let _ = nodo.reciclado.send((sesion, viejo));
                     }
                     nodo.stream.clone()
                 };
@@ -200,7 +228,7 @@ fn abrir(
     ancho: u32,
     alto: u32,
     fps: u32,
-    reciclado: mpsc::Sender<Vec<u8>>,
+    reciclado: mpsc::Sender<(u32, Vec<u8>)>,
     respuesta: crate::portal::Emisario<u32>,
 ) -> anyhow::Result<()> {
     let props = pw::properties::properties! {
@@ -242,7 +270,10 @@ fn abrir(
                     return;
                 }
                 let Some(param) = param else {
-                    nodos_formato.borrow_mut().entry(sesion).and_modify(|n| n.formato = None);
+                    nodos_formato
+                        .borrow_mut()
+                        .entry(sesion)
+                        .and_modify(|n| n.formato = None);
                     return;
                 };
                 let Ok((tipo, subtipo)) = libspa::param::format_utils::parse_format(param) else {
@@ -264,20 +295,27 @@ fn abrir(
                     nodo.formato = Some((tam.width, tam.height, stride));
                 }
                 let buffers = pod_buffers(stride, bytes);
-                let mut params = [Pod::from_bytes(&buffers).expect("pod de Buffers recién serializado")];
+                let mut params =
+                    [Pod::from_bytes(&buffers).expect("pod de Buffers recién serializado")];
                 if let Err(err) = stream.update_params(&mut params) {
                     tracing::warn!(sesion, "no se pudieron fijar los buffers: {err}");
                 }
             })
             .process(move |stream, _| {
                 let mut nodos = nodos_proceso.borrow_mut();
-                let Some(nodo) = nodos.get_mut(&sesion) else { return };
-                let Some((_, _, stride)) = nodo.formato else { return };
+                let Some(nodo) = nodos.get_mut(&sesion) else {
+                    return;
+                };
+                let Some((_, _, stride)) = nodo.formato else {
+                    return;
+                };
                 // Sin fotograma pendiente no se encola nada: encolar un buffer
                 // vacío haría que el consumidor pintara negro.
-                let Some(datos) = nodo.pendiente.take() else { return };
+                let Some(datos) = nodo.pendiente.take() else {
+                    return;
+                };
                 let Some(mut buffer) = stream.dequeue_buffer() else {
-                    let _ = nodo.reciclado.send(datos);
+                    let _ = nodo.reciclado.send((sesion, datos));
                     return;
                 };
                 let devolver = {
@@ -300,7 +338,7 @@ fn abrir(
                     *chunk.size_mut() = escritos as u32;
                     datos
                 };
-                let _ = nodo.reciclado.send(devolver);
+                let _ = nodo.reciclado.send((sesion, devolver));
             })
             .register()?
     };
@@ -392,17 +430,30 @@ fn pod_buffers(stride: u32, bytes: u32) -> Vec<u8> {
                 spa_sys::SPA_PARAM_BUFFERS_buffers,
                 pod::Value::Choice(pod::ChoiceValue::Int(Choice(
                     ChoiceFlags::empty(),
-                    ChoiceEnum::Range { default: 3, min: 2, max: 8 },
+                    ChoiceEnum::Range {
+                        default: 3,
+                        min: 2,
+                        max: 8,
+                    },
                 ))),
             ),
             prop(spa_sys::SPA_PARAM_BUFFERS_blocks, pod::Value::Int(1)),
-            prop(spa_sys::SPA_PARAM_BUFFERS_size, pod::Value::Int(bytes as i32)),
-            prop(spa_sys::SPA_PARAM_BUFFERS_stride, pod::Value::Int(stride as i32)),
+            prop(
+                spa_sys::SPA_PARAM_BUFFERS_size,
+                pod::Value::Int(bytes as i32),
+            ),
+            prop(
+                spa_sys::SPA_PARAM_BUFFERS_stride,
+                pod::Value::Int(stride as i32),
+            ),
             prop(
                 spa_sys::SPA_PARAM_BUFFERS_dataType,
                 pod::Value::Choice(pod::ChoiceValue::Int(Choice(
                     ChoiceFlags::empty(),
-                    ChoiceEnum::Flags { default: tipos as i32, flags: Vec::new() },
+                    ChoiceEnum::Flags {
+                        default: tipos as i32,
+                        flags: Vec::new(),
+                    },
                 ))),
             ),
         ],

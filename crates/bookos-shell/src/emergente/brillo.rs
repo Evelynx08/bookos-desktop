@@ -1,32 +1,16 @@
 //! El emergente del brillo, colgado de su icono.
 //!
-//! Es el plasmoide `bookos-brightness` con las medidas del sistema: la misma
-//! píldora que el sonido, con el icono del sol al lado en vez de un botón de
-//! silencio — el brillo no se silencia.
-//!
-//! ## Por qué se escribe por D-Bus y no en sysfs
-//!
-//! `/sys/class/backlight/*/brightness` es de root con permisos 644: un
-//! escritorio de usuario no puede escribir ahí, y **no debe** poder. Quien
-//! concede el permiso es logind, que expone `SetBrightness` en la sesión
-//! activa. Se llama con `busctl`, que viene con systemd, en vez de hablar
-//! D-Bus desde aquí: meter un cliente de D-Bus en el shell es una dependencia
-//! nueva y un hilo más dentro del compositor para escribir un número.
-//!
-//! La ruta es `/org/freedesktop/login1/session/auto`, que logind resuelve a la
-//! sesión de quien llama. Probado: con el id de sesión a mano —`_32` para la
-//! sesión "2"— también funciona, pero hay que escaparlo carácter a carácter.
-
-use std::process::{Command, Stdio};
+//! Pantalla y teclado se detectan de nuevo al refrescar. Las escrituras
+//! se agrupan en un hilo dedicado para no interrumpir el renderizado.
 
 use iced_core::alignment::Vertical;
 use iced_core::{Border, Color, Length};
-use iced_widget::{column, container, row, text, Space};
+use iced_widget::{Space, column, container, row, text};
 
+use crate::Accion;
 use crate::icono::Icono;
 use crate::tema;
 use crate::view::PanelElement;
-use crate::Accion;
 
 use super::control::{self, BOTON, HUECO, MARGEN_AGARRE, PILDORA};
 use super::{Ancla, Tecla};
@@ -53,6 +37,7 @@ const MINIMO: u8 = 5;
 /// La retroiluminación del teclado: dispositivo en `/sys/class/leds`, valor
 /// actual y máximo. Va con niveles enteros —en este portátil, cuatro pasos— y
 /// no en tanto por ciento, así que se guarda crudo y se enseña convertido.
+#[derive(PartialEq, Eq)]
 struct Teclado {
     dispositivo: String,
     nivel: u32,
@@ -62,28 +47,8 @@ struct Teclado {
 /// Cuál es la luz del teclado, si la hay. Mismo criterio que el compositor al
 /// atender la tecla XF86: el primer `led` cuyo nombre lleve `kbd_backlight`.
 fn leds_teclado() -> Option<Teclado> {
-    let dir = std::fs::read_dir("/sys/class/leds").ok()?;
-    for entrada in dir.filter_map(|e| e.ok()) {
-        let dispositivo = entrada.file_name().to_string_lossy().to_string();
-        if !dispositivo.contains("kbd_backlight") {
-            continue;
-        }
-        let leer = |f: &str| {
-            std::fs::read_to_string(entrada.path().join(f))
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-        };
-        let maximo = leer("max_brightness")?;
-        if maximo == 0 {
-            return None;
-        }
-        return Some(Teclado {
-            dispositivo,
-            nivel: leer("brightness").unwrap_or(0),
-            maximo,
-        });
-    }
-    None
+    let (dispositivo, nivel, maximo) = crate::brillo_teclado_actual()?;
+    Some(Teclado { dispositivo, nivel, maximo })
 }
 
 /// Qué píldora se está arrastrando. Sin esto, agarrar la del teclado movía la
@@ -120,12 +85,25 @@ impl Brillo {
         Self {
             nivel: crate::state::read_brightness().unwrap_or(0),
             agarrada: Agarre::Nada,
-            icono: crate::icono::cargar("brightness-high"),
+            icono: crate::icono::propio("brillo"),
             dispositivo,
             maximo,
             teclado: leds_teclado(),
-            icono_teclado: crate::icono::cargar("teclado"),
+            icono_teclado: crate::icono::propio("teclado"),
         }
+    }
+
+    pub fn refrescar(&mut self) -> bool {
+        if self.agarrado() { return false; }
+        let device = crate::backlight();
+        let (dispositivo, maximo) = device.map(|(d, m)| (Some(d), m)).unwrap_or((None, 0));
+        let nivel = crate::brillo_actual().unwrap_or(0);
+        let teclado = leds_teclado();
+        let changed = self.dispositivo != dispositivo || self.maximo != maximo
+            || self.nivel != nivel || self.teclado != teclado;
+        self.dispositivo = dispositivo; self.maximo = maximo;
+        self.nivel = nivel; self.teclado = teclado;
+        changed
     }
 
     pub fn size(&self) -> (f32, f32) {
@@ -182,21 +160,7 @@ impl Brillo {
             return false;
         }
         teclado.nivel = crudo;
-        let _ = Command::new("busctl")
-            .args([
-                "call",
-                "org.freedesktop.login1",
-                "/org/freedesktop/login1/session/auto",
-                "org.freedesktop.login1.Session",
-                "SetBrightness",
-                "ssu",
-                "leds",
-                &teclado.dispositivo,
-                &crudo.to_string(),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+        crate::retroiluminacion::solicitar("leds", &teclado.dispositivo, crudo);
         true
     }
 
@@ -204,12 +168,13 @@ impl Brillo {
     fn porciento_teclado(&self) -> u8 {
         self.teclado
             .as_ref()
-            .map(|t| (t.nivel * 100 / t.maximo.max(1)) as u8)
+            .map(|t| (u64::from(t.nivel) * 100 / u64::from(t.maximo.max(1))) as u8)
             .unwrap_or(0)
     }
 
     /// Escribe el nivel y lo manda a logind. `true` si cambió.
     fn poner(&mut self, nivel: u8) -> bool {
+        if self.dispositivo.is_none() || self.maximo == 0 { return false; }
         let nivel = nivel.clamp(MINIMO, 100);
         if nivel == self.nivel {
             return false;
@@ -222,21 +187,7 @@ impl Brillo {
         // llega a 400. Comprobado de punta a punta: pedir el 60 % deja
         // `actual_brightness` en 240, que es justo 400 × 0,6.
         let crudo = (self.maximo as f64 * nivel as f64 / 100.0).round() as u32;
-        let _ = Command::new("busctl")
-            .args([
-                "call",
-                "org.freedesktop.login1",
-                "/org/freedesktop/login1/session/auto",
-                "org.freedesktop.login1.Session",
-                "SetBrightness",
-                "ssu",
-                "backlight",
-                dispositivo,
-                &crudo.to_string(),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+        crate::retroiluminacion::solicitar("backlight", dispositivo, crudo);
         true
     }
 
@@ -306,37 +257,23 @@ impl Brillo {
         let cabecera = row![
             text("Pantalla").size(tema::T_PEQUENO).color(tema::TEXTO2),
             Space::new().width(crate::FILL),
-            text(format!("{}%", self.nivel))
+            text(if self.dispositivo.is_some() { format!("{}%", self.nivel) } else { "No disponible".into() })
                 .size(tema::T_CUERPO)
                 .color(tema::texto()),
         ];
         let controles = row![
-            control::pildora(BARRA, self.nivel, false),
+            control::pildora(BARRA, self.nivel, self.dispositivo.is_none()),
             Space::new().width(Length::Fixed(HUECO)),
             // Sin realce de puntero: este botón no se pulsa —el brillo se
             // cambia con la píldora— y encenderlo al pasar por encima
             // prometería una acción que no existe.
-            control::boton(self.icono.as_ref(), false, 0.0),
+            control::boton(self.icono.as_ref(), self.dispositivo.is_none(), 0.0),
         ]
         .align_y(Vertical::Center);
-        // «Config» arriba a la derecha, como en el diseño.
-        let config = container(text("Config").size(11.0).color(tema::TEXTO2))
-            .height(Length::Fixed(24.0))
-            .center_y(Length::Fixed(24.0))
-            .padding([0, 10])
-            .style(|_theme: &iced_widget::Theme| container::Style {
-                background: Some(tema::hover().into()),
-                border: Border {
-                    radius: 12.0.into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            });
         let mut contenido = column![
             row![
                 text("Brillo").size(tema::T_TITULO).color(tema::texto()),
                 Space::new().width(crate::FILL),
-                config,
             ]
             .align_y(Vertical::Center),
             Space::new().height(Length::Fixed(14.0)),
@@ -360,23 +297,19 @@ impl Brillo {
                     row![
                         control::pildora(BARRA, porciento, false),
                         Space::new().width(Length::Fixed(HUECO)),
-                        control::boton(self.icono_teclado.as_ref(), false, 0.0),
+                        control::boton(self.icono_teclado.as_ref(), porciento == 0, 0.0),
                     ]
                     .align_y(Vertical::Center),
                 );
         }
-        // La luz nocturna: la aplica el compositor cambiando la curva de color
-        // de la salida, y eso todavía no existe, así que el interruptor se
-        // dibuja apagado y sin responder. Está aquí porque es parte de esta
-        // tarjeta en el diseño y porque su sitio no va a cambiar.
+        // Estado informativo hasta que haya un control de luz nocturna.
         let nocturna = container(
             row![
                 column![
                     text("Luz nocturna").size(14.0).color(tema::texto()),
-                    text("Suspendida").size(10.0).color(tema::TEXTO2),
+                    text("No disponible").size(tema::T_PEQUENO).color(tema::TEXTO2),
                 ],
                 Space::new().width(crate::FILL),
-                super::lista::interruptor(0.0),
             ]
             .align_y(Vertical::Center),
         )

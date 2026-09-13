@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 
 use iced_core::alignment::Horizontal;
 use iced_core::{Border, Color, Length};
-use iced_widget::{column, container, text, Space};
+use iced_widget::{Space, column, container, text};
 
 use crate::icono::Icono;
 use crate::tema;
@@ -261,10 +261,7 @@ impl Escritorio {
         let Some((dx, dy)) = self.arrastre.take() else {
             return false;
         };
-        let paso = (
-            (dx / CELDA.0).round() as i32,
-            (dy / CELDA.1).round() as i32,
-        );
+        let paso = ((dx / CELDA.0).round() as i32, (dy / CELDA.1).round() as i32);
         if paso == (0, 0) {
             return false;
         }
@@ -437,7 +434,11 @@ fn cortar(texto: &str, ancho: f32, tamaño: f32) -> (String, String) {
         .filter(|i| i * 2 >= caben)
         .unwrap_or(caben);
     (
-        letras[..corte].iter().collect::<String>().trim_end().to_string(),
+        letras[..corte]
+            .iter()
+            .collect::<String>()
+            .trim_end()
+            .to_string(),
         letras[corte..].iter().collect(),
     )
 }
@@ -468,11 +469,7 @@ fn leer() -> Vec<Elemento> {
     };
     let mut elementos: Vec<Elemento> = entradas
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            !e.file_name()
-                .to_string_lossy()
-                .starts_with('.')
-        })
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
         .filter_map(|e| Elemento::leer(&e.path()))
         .collect();
     elementos.sort_by(|a, b| {

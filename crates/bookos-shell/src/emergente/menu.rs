@@ -6,17 +6,16 @@
 //! `Plasma5Support.DataSource` de tipo "executable", aquí sale como una
 //! [`Accion`] que ejecuta el compositor.
 //!
-//! Las acciones de energía van **forzadas y sin confirmación**, igual que en el
-//! plasmoide: `systemctl suspend -i`, con el `-i` que ignora inhibidores. Es
-//! deliberado allí y se mantiene aquí para que el escritorio se comporte igual
-//! desde los dos sitios.
+//! Las acciones de energía pasan por logind y respetan sus inhibidores: una
+//! aplicación que está guardando datos o presentando contenido puede retrasar
+//! la transición de forma segura.
 
 use iced_core::{Border, Length};
-use iced_widget::{column, container, row, text, Space};
+use iced_widget::{Space, column, container, row, text};
 
+use crate::Accion;
 use crate::tema;
 use crate::view::PanelElement;
-use crate::Accion;
 
 use super::{Ancla, Tecla};
 
@@ -91,19 +90,19 @@ fn entradas() -> Vec<Entrada> {
             etiqueta: "Dormir",
             icono: "dormir",
             atajo: None,
-            accion: || Accion::Lanzar("systemctl suspend -i".into()),
+            accion: || Accion::Lanzar("systemctl suspend".into()),
         },
         Item {
             etiqueta: "Reiniciar…",
             icono: "reiniciar",
             atajo: None,
-            accion: || Accion::Lanzar("systemctl reboot -i || systemctl reboot --force".into()),
+            accion: || Accion::Lanzar("systemctl reboot".into()),
         },
         Item {
             etiqueta: "Apagar…",
             icono: "apagar",
             atajo: None,
-            accion: || Accion::Lanzar("systemctl poweroff -i || systemctl poweroff --force".into()),
+            accion: || Accion::Lanzar("systemctl poweroff".into()),
         },
         Divisor,
         Item {
