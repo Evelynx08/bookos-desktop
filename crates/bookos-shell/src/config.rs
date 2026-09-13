@@ -472,7 +472,7 @@ impl Config {
                     "auto" | "automatico" | "automático" => {
                         config.modo_tema = crate::tema::ModoTema::Automatico
                     }
-                    otro => tracing::warn!(otro, "«tema» solo entiende claro u oscuro"),
+                    otro => tracing::warn!(otro, "«tema» solo entiende claro, oscuro o automatico"),
                 },
                 // Un nombre que no está en la tabla se ignora en vez de
                 // dejar el escritorio con un acento a medias.
