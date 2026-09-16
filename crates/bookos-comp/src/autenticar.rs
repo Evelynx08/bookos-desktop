@@ -70,10 +70,63 @@ impl Comprobacion {
             Err(TryRecvError::Disconnected) => Some(false),
         }
     }
+
+    /// Inicia la conversación PAM configurada por la distribución para el
+    /// lector de huellas. El compositor nunca recibe ni almacena datos
+    /// biométricos: solo recibe el resultado booleano.
+    pub fn huella(usuario: &str) -> Option<Self> {
+        // Como máximo una conversación con el sensor, incluso al bloquear
+        // otra vez antes de que expire el intento anterior.
+        static OCUPADO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        use std::sync::atomic::Ordering;
+        if !std::path::Path::new("/etc/pam.d/bookos-fingerprint").is_file() {
+            return None;
+        }
+        if OCUPADO.swap(true, Ordering::SeqCst) {
+            return None;
+        }
+        struct Liberar;
+        impl Drop for Liberar {
+            fn drop(&mut self) {
+                OCUPADO.store(false, Ordering::SeqCst);
+            }
+        }
+        let liberar = Liberar;
+        let usuario = usuario.to_string();
+        let (envio, resultado) = mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("bookos-fingerprint".into())
+            .spawn(move || {
+                let _liberar = liberar;
+                let _ = envio.send(autenticar_servicio("bookos-fingerprint", &usuario, ""));
+            })
+            .ok()?;
+        Some(Self { resultado })
+    }
 }
 
 pub fn usuario() -> String {
-    std::env::var("USER").unwrap_or_else(|_| "root".into())
+    // La identidad autenticada es el UID de la sesión, nunca una variable
+    // de entorno ni root como reserva. La variante reentrante sirve también
+    // cuando hay trabajadores PAM activos.
+    let mut entrada: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut resultado = std::ptr::null_mut();
+    let mut buffer = vec![0_u8; 65536];
+    let status = unsafe {
+        libc::getpwuid_r(
+            libc::getuid(),
+            &mut entrada,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut resultado,
+        )
+    };
+    if status != 0 || resultado.is_null() || entrada.pw_name.is_null() {
+        return String::new();
+    }
+    unsafe { CStr::from_ptr(entrada.pw_name) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn servicio() -> &'static str {
@@ -84,13 +137,20 @@ fn servicio() -> &'static str {
 }
 
 fn autenticar(usuario: &str, contrasena: &str) -> bool {
+    autenticar_servicio(servicio(), usuario, contrasena)
+}
+
+fn autenticar_servicio(nombre: &str, usuario: &str, contrasena: &str) -> bool {
+    if usuario.is_empty() {
+        return false;
+    }
     let Ok(usuario) = CString::new(usuario) else {
         return false;
     };
     let Ok(contrasena) = CString::new(contrasena) else {
         return false;
     };
-    let Ok(servicio) = CString::new(servicio()) else {
+    let Ok(servicio) = CString::new(nombre) else {
         return false;
     };
 
@@ -217,6 +277,24 @@ fn liberar_respuestas(respuestas: *mut PamResponse, cuantos: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn una_identidad_ausente_nunca_autentica() {
+        assert!(!autenticar_servicio("bookos-fingerprint", "", ""));
+        assert!(!autenticar_servicio(
+            "bookos-fingerprint",
+            "usuario\0invalido",
+            ""
+        ));
+    }
+
+    #[test]
+    fn un_worker_desconectado_falla_cerrado() {
+        let (tx, rx) = mpsc::channel();
+        drop(tx);
+        let mut comprobacion = Comprobacion { resultado: rx };
+        assert_eq!(comprobacion.resultado(), Some(false));
+    }
 
     #[test]
     fn una_contrasena_falsa_no_pasa() {

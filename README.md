@@ -169,9 +169,9 @@ from what still needs integration work for a production session.
 | Desktops and Exposé | ✅ Working | 1–5 desktops, names, overview, live thumbnails and gestures |
 | Panel, dock and launchpad | ✅ Working | Modular widgets, folders, search, pinning and context menus |
 | Notifications | 🟡 Partial | D-Bus server, toast, history, Do Not Disturb, `ActionInvoked` actions, progress, visual grouping per application and keyboard navigation; persistent reply and per-application preferences are missing |
-| Lock screen | 🟡 Partial | Live design, PAM authentication, automatic lock on idle and lock on resume; fingerprint and advanced policies are missing |
+| Lock screen | 🟡 Partial | PAM password authentication, optional fingerprint, automatic lock and lock on resume; physical fingerprint validation and advanced policies remain |
 | Displays | ✅ Working | Several DRM/KMS outputs, 2D layout, independent scale/mode/Hz/VRR, primary output, EDID profiles and hotplug; panel and dock follow the primary |
-| BookOS Settings | 🟡 Partial | Displays, appearance, wallpaper, lock screen and activity reload; panel, dock, gestures, shortcuts and effects are missing |
+| BookOS Settings | 🟡 Partial | Displays, appearance, wallpaper, lock screen, fingerprint preference, live dock icon size and activity reload; further panel/gesture controls remain |
 | Dynamic activities | 🟡 Partial | Player, Timer and Voice Recorder; hardening the D-Bus identity and the final app integration are missing |
 | Screenshots | ✅ Working | Region selector on Print, to file or to the clipboard, and `zwlr_screencopy_v1` v3 for `grim` and friends (`wl_shm` only) |
 | Screen sharing | 🟡 Partial | `impl.portal.ScreenCast` and `Screenshot` inside the compositor, a PipeWire node driven by frames, backpressure, `Request` cancellation, `Session.Closed` and a permission card of its own. Tested nested with `gst-launch-1.0 pipewiresrc`: correct image at 2240×1400. Whole displays only, the cursor is always included, and frames go through the CPU: the DMA-BUF path is missing |
@@ -293,6 +293,13 @@ The log of each start-up lands in `$XDG_RUNTIME_DIR/bookos-session.log`.
 ---
 
 ## Shortcuts
+
+Window organisation: **Alt+F3**, or right-click a server-side title bar, opens
+the window menu. **Meta+Alt+T** toggles Always on top. The menu also sends the
+window to another desktop on its current monitor or to another connected
+monitor (its active desktop). Sending to another desktop does not follow the
+window. Moving between monitors preserves maximised/fullscreen state and
+translates the saved floating geometry using logical coordinates.
 
 | Shortcut | What it does |
 |---|---|
@@ -639,7 +646,95 @@ themes, reduced motion, the keyboard and recoverable errors, and have at least
 one logic or visual test. The complete session must be able to lock, suspend,
 share the screen and recover its configuration without depending on Plasma.
 
+### Session recovery
+
+`bookos-session` supervises the compositor. A non-zero exit saves
+`$XDG_STATE_HOME/bookos/compositor-last-crash.log` (default
+`~/.local/state/bookos/`) and launches `session/bookos-recovery.py` outside the
+failed compositor. Normal logout does not show an error.
+
+The recovery screen uses the HIG dialog pattern and reads Settings'
+`~/.config/bookos/palette.css`. It offers an explicit retry, an installed
+Plasma/GNOME Wayland session, or return to the login manager. It never retries
+automatically in a loop and cannot restore applications disconnected by the
+crash. A crash while locked permits only return to login, preserving the
+authentication boundary.
+
+The graphical recovery requires **Python 3, PySide6 QtWidgets and KWin
+Wayland**. KWin temporarily owns a private recovery display; it exits before
+the selected desktop starts. Without usable recovery graphics the supervisor
+tries a text prompt on the controlling terminal, then returns to login if no
+terminal is available. This covers process exits, not a frozen kernel/GPU or
+a compositor that remains alive but stops responding.
+
+`session/instalar.sh` installs the compositor, supervisor and recovery helper.
+The ISO's `rpm/bookos-desktop.spec` also installs `session/bookos-recovery.py`
+at `/usr/libexec/bookos-recovery.py` and declares the runtime dependencies above.
+
+Verification:
+
+```bash
+python3 -B -m unittest discover -s session -p 'test_*.py'
+BOOKOS_MENU_VENTANA_PNG=/tmp/menu.png cargo test -p bookos-shell --test menu_ventana
+# In a nested development session, with isolated configuration and D-Bus:
+BOOKOS_INPUT_SELFTEST=1 BOOKOS_SELFTEST_ORGANIZAR=1 cargo run -p bookos-comp -- 'konsole --separate'
+```
+
+The organisation self-test uses two real clients and a simulated second output
+with fractional scale and negative coordinates; it is not a physical DRM
+hotplug or crash-recovery test.
+
 ---
+
+## Desktop improvements: confirmation, fingerprint and live controls
+
+Manual power actions now use a HIG confirmation with Cancel selected initially.
+This covers the BookOS menu, energy chooser, Meta+L, Ctrl+Alt+Delete and the
+lock-screen power menu. Tab/left/right select a button; Enter activates it;
+Escape cancels. Automatic locking and suspend handling do not wait for a dialog.
+Ctrl+Alt+Backspace remains the explicit emergency exit.
+
+Settings → Desktop exposes `dock_tamano` (32–80 logical pixels, default 50).
+Saving resizes, repaints and repositions the dock without restarting the session;
+hit testing and the reserved window area follow the new size. The number of
+desktops still requires a session restart when changed from this Settings page.
+
+Settings → Lock screen exposes `bloqueo_huella` (off by default). It requires an
+enrolled fingerprint, fprintd and the dedicated `/etc/pam.d/bookos-fingerprint`
+service. The RPM installs it and requires `fprintd-pam`; the development installer
+preserves an existing service and selects `system-auth` or `common-account` for
+account validation. It does not modify the shared password authentication stack.
+The biometric policy uses `pam_fprintd.so max-tries=3 timeout=15`, following the
+[upstream module manual](https://manpages.debian.org/trixie/libpam-fprintd/pam_fprintd.8.en.html).
+
+Fingerprint checking runs separately from password checking, so the password
+field stays usable. F9 retries after a failure (with a 3-second local delay).
+Only one sensor worker can run at a time, and results are tied to the current
+lock generation. Unlocking discards outstanding results; a previous sensor
+worker can retain the device until its bounded PAM timeout. PAM authentication
+**and account validation** must both pass. Identity comes from the session UID,
+not `$USER`. This is an alternative authentication method, **not two-factor
+authentication**. Missing modules, sensors or fingerprints leave the screen locked.
+
+Panel widgets fade a neutral update highlight over 220 ms without changing
+layout; reduced effects disable it. Open cards are repainted when system events
+change their data, including the card-only refresh path. Animation frames do
+not poll hardware and the final frame clears the pending animation.
+
+Verification (never executes a real shutdown/reboot):
+
+```bash
+cargo test --workspace --offline
+BOOKOS_DUMP_CONFIRMACION=/tmp/confirmacion.png cargo test -p bookos-shell --test desktop_mejoras
+# Nested development session, using isolated configuration and D-Bus:
+BOOKOS_INPUT_SELFTEST=1 BOOKOS_SELFTEST_MEJORAS=1 cargo run -p bookos-comp
+```
+
+The tests cover confirmation/cancellation, fractional-scale rendering, live
+dock resizing, open-card repainting, config validation and fail-closed auth
+results. A real enrolled fingerprint reader and actual suspend/resume still
+need interactive validation after installation. No system PAM files or installed
+compositor binaries are changed by the tests.
 
 ## License
 

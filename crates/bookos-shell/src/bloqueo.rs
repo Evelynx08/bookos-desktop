@@ -79,6 +79,17 @@ pub enum Peticion {
     Suspender,
 }
 
+impl Peticion {
+    fn energia(self) -> crate::confirmacion::Energia {
+        use crate::confirmacion::Energia;
+        match self {
+            Self::Apagar => Energia::Apagar,
+            Self::Reiniciar => Energia::Reiniciar,
+            Self::Suspender => Energia::Suspender,
+        }
+    }
+}
+
 /// Qué está pasando con lo que se ha escrito.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Estado {
@@ -246,6 +257,8 @@ pub struct Bloqueo {
     /// Cuántos caracteres lleva la contraseña. El texto no se guarda aquí.
     pub escritos: usize,
     pub estado: Estado,
+    pub huella_mensaje: &'static str,
+    confirmacion: Option<(Peticion, crate::confirmacion::Confirmacion)>,
     /// Estado de Bloq Mayús. No forma parte de la contraseña, pero explicarlo
     /// evita intentos fallidos que parecen una clave incorrecta.
     pub caps_lock: bool,
@@ -281,6 +294,8 @@ impl Bloqueo {
             fecha,
             escritos: 0,
             estado: Estado::Escribiendo,
+            huella_mensaje: "",
+            confirmacion: None,
             caps_lock: false,
             menu: false,
             menu_desde: None,
@@ -357,6 +372,9 @@ impl Bloqueo {
             self.campo(acceso_avance),
             Space::new().height(Length::Fixed(10.0)),
             self.mensaje(acceso_avance),
+            text(self.huella_mensaje)
+                .size(13)
+                .color(con_alfa(Color::WHITE, acceso_avance * 0.82)),
         ]
         .align_x(Horizontal::Center);
 
@@ -401,7 +419,25 @@ impl Bloqueo {
             .height(Length::Fixed(pantalla.1))
             .align_x(Horizontal::Left)
             .align_y(Vertical::Bottom);
-        capas.push(esquina).into()
+        capas = capas.push(esquina);
+        if let Some((_, c)) = &self.confirmacion {
+            capas = capas.push(
+                container(c.view())
+                    .center_x(Length::Fixed(pantalla.0))
+                    .center_y(Length::Fixed(pantalla.1))
+                    .style(|_| container::Style {
+                        background: Some(
+                            Color {
+                                a: 0.45,
+                                ..Color::BLACK
+                            }
+                            .into(),
+                        ),
+                        ..Default::default()
+                    }),
+            );
+        }
+        capas.into()
     }
 
     fn entrada_avance(&self, retraso_ms: u64, duracion_ms: u64) -> f32 {
@@ -551,13 +587,28 @@ impl Bloqueo {
     /// cierra: un menú que se queda abierto al pulsar fuera es el que acaba
     /// apagando el equipo sin querer.
     pub fn pulsar(&mut self, x: f32, y: f32, pantalla: (f32, f32)) -> (Option<Peticion>, bool) {
+        if let Some((peticion, c)) = &self.confirmacion {
+            let resultado = c.pulsar(
+                x - (pantalla.0 - crate::confirmacion::Confirmacion::ANCHO) / 2.0,
+                y - (pantalla.1 - crate::confirmacion::Confirmacion::ALTO) / 2.0,
+            );
+            let accion = resultado.filter(|si| *si).map(|_| *peticion);
+            if resultado.is_some() {
+                self.confirmacion = None;
+            }
+            return (accion, resultado.is_some());
+        }
         let dentro =
             |r: (f32, f32, f32, f32)| x >= r.0 && x <= r.0 + r.2 && y >= r.1 && y <= r.1 + r.3;
         if self.menu {
             for (i, (_, _, peticion)) in ENTRADAS.iter().enumerate() {
                 if dentro(self.entrada_energia(i, pantalla)) {
                     self.cerrar_menu();
-                    return (Some(*peticion), true);
+                    self.confirmacion = Some((
+                        *peticion,
+                        crate::confirmacion::Confirmacion::new(peticion.energia()),
+                    ));
+                    return (None, true);
                 }
             }
         }
@@ -607,6 +658,18 @@ impl Bloqueo {
                 crate::medios::Orden::Siguiente,
             ][i],
         )
+    }
+
+    pub fn confirmar_tecla(&mut self, tecla: crate::TeclaPulsada) -> (bool, Option<Peticion>) {
+        let Some((p, c)) = self.confirmacion.as_mut() else {
+            return (false, None);
+        };
+        let resultado = c.tecla(tecla);
+        let accion = resultado.filter(|si| *si).map(|_| *p);
+        if resultado.is_some() {
+            self.confirmacion = None;
+        }
+        (true, accion)
     }
 
     fn cerrar_menu(&mut self) {
@@ -1204,11 +1267,17 @@ mod tests {
         // La última entrada es Suspender, y el menú cae encima del botón.
         let (ex, ey, ew, eh) = b.entrada_energia(ENTRADAS.len() - 1, pantalla);
         assert!(ey + eh < by, "el menú se dibuja sobre el botón, no debajo");
-        assert_eq!(
-            b.pulsar(ex + ew / 2.0, ey + eh / 2.0, pantalla).0,
-            Some(Peticion::Suspender)
-        );
+        assert_eq!(b.pulsar(ex + ew / 2.0, ey + eh / 2.0, pantalla).0, None);
         assert!(!b.menu, "elegir una entrada tiene que cerrar el menú");
+        assert!(
+            b.confirmacion.is_some(),
+            "hay que confirmar antes de suspender"
+        );
+        b.confirmar_tecla(crate::TeclaPulsada::Derecha);
+        assert_eq!(
+            b.confirmar_tecla(crate::TeclaPulsada::Intro),
+            (true, Some(Peticion::Suspender))
+        );
 
         // Y pulsar en cualquier otro sitio lo recoge sin hacer nada.
         b.menu = true;
@@ -1232,6 +1301,27 @@ mod tests {
         // no lo verá; queda como recordatorio de dónde está la frontera.
         assert_eq!(b.escritos, 0);
         assert_eq!(b.estado, Estado::Escribiendo);
+    }
+
+    #[test]
+    fn confirmar_energia_no_filtra_teclas_a_la_contrasena() {
+        let mut b = Bloqueo::new(
+            "12:30".into(),
+            "lunes".into(),
+            None,
+            crate::config::Bloqueo::default(),
+        );
+        b.confirmacion = Some((
+            Peticion::Apagar,
+            crate::confirmacion::Confirmacion::new(Peticion::Apagar.energia()),
+        ));
+        assert_eq!(
+            b.confirmar_tecla(crate::TeclaPulsada::Caracter('x')),
+            (true, None)
+        );
+        assert_eq!(b.confirmar_tecla(crate::TeclaPulsada::Intro), (true, None));
+        assert!(b.confirmacion.is_none());
+        assert_eq!(b.escritos, 0);
     }
 
     #[test]

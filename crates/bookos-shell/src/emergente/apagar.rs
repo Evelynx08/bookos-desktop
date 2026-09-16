@@ -100,9 +100,15 @@ pub struct Apagar {
     /// ratón y para el teclado: mover el ratón mueve la selección, así que
     /// Intro hace siempre lo que está resaltado.
     señalada: Realce,
+    confirmar: Option<crate::confirmacion::Confirmacion>,
 }
 
 impl Apagar {
+    pub fn confirmar(accion: crate::confirmacion::Energia) -> Self {
+        let mut dialogo = Self::new();
+        dialogo.confirmar = Some(crate::confirmacion::Confirmacion::new(accion));
+        dialogo
+    }
     pub fn new() -> Self {
         let mut señalada = Realce::nuevo();
         señalada.señalar(Some(INICIAL));
@@ -110,10 +116,17 @@ impl Apagar {
         Self {
             opciones: opciones(),
             señalada,
+            confirmar: None,
         }
     }
 
     pub fn size(&self) -> (f32, f32) {
+        if self.confirmar.is_some() {
+            return (
+                crate::confirmacion::Confirmacion::ANCHO,
+                crate::confirmacion::Confirmacion::ALTO,
+            );
+        }
         (ANCHO, MARGEN * 2.0 + TITULO + HUECO_TITULO + BOTON_ALTO)
     }
 
@@ -157,6 +170,9 @@ impl Apagar {
     }
 
     pub fn puntero(&mut self, punto: Option<(f32, f32)>) -> bool {
+        if self.confirmar.is_some() {
+            return false;
+        }
         // Salir del diálogo **no** apaga la selección: hay que dejar siempre
         // una señalada para que Intro tenga qué hacer. Solo la cambia pasar por
         // encima de otra.
@@ -167,11 +183,25 @@ impl Apagar {
     }
 
     pub fn pulsar(&mut self, x: f32, y: f32) -> Option<Accion> {
+        if let Some(c) = &self.confirmar {
+            return match c.pulsar(x, y) {
+                Some(true) => Some(Accion::EnergiaConfirmada(c.accion)),
+                Some(false) => Some(Accion::CerrarEmergente),
+                None => None,
+            };
+        }
         let i = self.boton_en(x, y)?;
         Some((self.opciones[i].accion)())
     }
 
     pub fn tecla(&mut self, tecla: crate::TeclaPulsada) -> Tecla {
+        if let Some(c) = &mut self.confirmar {
+            return match c.tecla(tecla) {
+                Some(true) => Tecla::Hacer(Accion::EnergiaConfirmada(c.accion)),
+                Some(false) => Tecla::Cerrar,
+                None => Tecla::Consumida,
+            };
+        }
         use crate::TeclaPulsada as T;
         match tecla {
             T::Escape => Tecla::Cerrar,
@@ -191,12 +221,16 @@ impl Apagar {
     fn mover(&mut self, paso: isize) -> Tecla {
         let n = self.opciones.len() as isize;
         let actual = self.señalada.actual().unwrap_or(INICIAL) as isize;
-        self.señalada
-            .señalar(Some((actual + paso).clamp(0, n - 1) as usize));
+        let siguiente = (actual + paso).clamp(0, n - 1) as usize;
+        self.señalada.señalar(Some(siguiente));
+        self.confirmar = None;
         Tecla::Consumida
     }
 
     pub fn view(&self) -> PanelElement<'_> {
+        if let Some(c) = &self.confirmar {
+            return c.view();
+        }
         let mut fila = row![];
         for (i, opcion) in self.opciones.iter().enumerate() {
             if i > 0 {

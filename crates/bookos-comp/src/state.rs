@@ -52,6 +52,8 @@ use smithay::wayland::viewporter::ViewporterState;
 pub struct Bloqueo {
     pub escrito: String,
     pub comprobando: Option<crate::autenticar::Comprobacion>,
+    pub huella: Option<crate::autenticar::Comprobacion>,
+    pub huella_reintentar: Option<Instant>,
     /// El último intento falló y aún no se ha vuelto a escribir.
     pub fallo: bool,
     /// Fallos consecutivos y barrera local adicional a la que aplique PAM.
@@ -185,6 +187,8 @@ pub struct BookosComp {
     /// índice y el compositor lo traduce. Es lo que permite que una celda sea
     /// una ventana concreta sin que el shell sepa qué es una ventana.
     pub conmutador_destinos: Vec<smithay::desktop::Window>,
+    pub menu_ventana: Option<smithay::desktop::Window>,
+    pub menu_ventana_suelta: bool,
     /// Modo del selector abierto. También identifica qué modificador debe
     /// soltarse para confirmar: Alt en aplicaciones, Meta en ventanas.
     pub conmutador_modo: Option<bookos_shell::conmutador::Modo>,
@@ -207,6 +211,11 @@ pub struct BookosComp {
     pub meta_sola: bool,
     /// Hay un launchpad pendiente de abrir por la suelta de Meta.
     pub abrir_launchpad: bool,
+    /// Los remapeos de `teclas.conf`. Se releen con `ReloadConfig("teclas")`.
+    pub teclas: crate::teclas::Remapeos,
+    pub traductor: crate::teclas::Traductor,
+    /// La app de teclas espera la próxima tecla (`CaptureKey`).
+    pub captura_tecla: bool,
     /// El shader del «magic lamp», compilado al arrancar el backend. `None` si
     /// el driver no lo acepta: entonces el minimizar encoge sin deformar.
     pub genio: Option<crate::genio::Genio>,
@@ -752,11 +761,16 @@ impl BookosComp {
                 config.nombres_escritorios.clone(),
             ),
             conmutador_destinos: Vec::new(),
+            menu_ventana: None,
+            menu_ventana_suelta: false,
             conmutador_modo: None,
             conmutador_resolver: false,
             conmutador_clic: false,
             meta_sola: false,
             abrir_launchpad: false,
+            teclas: crate::teclas::cargar(),
+            traductor: Default::default(),
+            captura_tecla: false,
             conmutador_pegado: false,
             genio: None,
             capturas: Vec::new(),
@@ -880,6 +894,11 @@ impl BookosComp {
             )
             .map_err(|err| anyhow::anyhow!("insert_source(display): {err}"))?;
 
+        // El supervisor recibe nuestro socket exacto; no debe adivinarlo a
+        // partir de los sockets de otras sesiones del mismo usuario.
+        if let Some(path) = std::env::var_os("BOOKOS_SESSION_SOCKET_FILE") {
+            std::fs::write(path, socket_name.as_encoded_bytes())?;
+        }
         Ok(socket_name)
     }
 

@@ -95,6 +95,7 @@ pub fn avanzar_animaciones(state: &mut BookosComp) {
         shell.animar_toast();
         shell.animar_emergente();
         shell.animar_dock();
+        shell.animar_panel();
         shell.animar_conmutador();
         shell.animar_osd();
         shell.animar_actividad();
@@ -278,6 +279,11 @@ pub fn escena(
         }
     }
 
+    if completa && !vista_escritorios {
+        if let Some(elemento) = state.shell.as_ref().and_then(|s| s.menu_ventana_element(renderer)) {
+            elementos.push(OverlayElement::Memory(elemento));
+        }
+    }
     elementos.extend(
         state
             .shell

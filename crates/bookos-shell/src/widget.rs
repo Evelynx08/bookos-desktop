@@ -27,7 +27,7 @@
 //! que revienta se apaga y los demás siguen dibujándose.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use iced_core::Length;
 use iced_widget::Space;
@@ -172,6 +172,7 @@ struct Ranura {
     /// Un widget que ha entrado en pánico no se vuelve a llamar. Reintentarlo
     /// repetiría el fallo en cada frame y llenaría el log.
     muerto: bool,
+    cambio_desde: Option<Instant>,
 }
 
 impl Ranura {
@@ -179,6 +180,7 @@ impl Ranura {
         Self {
             widget,
             muerto: false,
+            cambio_desde: None,
         }
     }
 
@@ -250,10 +252,29 @@ impl Panel {
         let mut cambio = false;
         for ranura in self.ranuras_mut() {
             if ranura.guard("refrescar", |w| w.refrescar()) == Some(true) {
+                ranura.cambio_desde = (!crate::tema::efectos_reducidos()).then(Instant::now);
                 cambio = true;
             }
         }
         cambio
+    }
+
+    /// Conserva el último frame pendiente hasta pintarlo, incluso si el bucle
+    /// estuvo parado más que la animación. Nunca consulta hardware por frame.
+    pub fn animando(&self) -> bool {
+        self.ranuras()
+            .any(|r| !r.muerto && r.cambio_desde.is_some())
+    }
+
+    pub fn avanzar(&mut self) {
+        for r in self.ranuras_mut() {
+            if crate::tema::efectos_reducidos()
+                || r.cambio_desde
+                    .is_some_and(|t| t.elapsed() >= crate::tema::D_TARJETA)
+            {
+                r.cambio_desde = None;
+            }
+        }
     }
 
     /// Lo antes que alguno quiere despertar.
@@ -397,7 +418,25 @@ fn ver(ranura: &Ranura) -> Option<PanelElement<'_>> {
     if ranura.muerto {
         return None;
     }
-    Some(ranura.widget.ver())
+    let alfa = ranura.cambio_desde.map_or(0.0, |t| {
+        if crate::tema::efectos_reducidos() {
+            return 0.0;
+        }
+        let progreso = (t.elapsed().as_secs_f32() / crate::tema::D_TARJETA.as_secs_f32()).min(1.0);
+        0.08 * (1.0 - progreso)
+    });
+    Some(
+        iced_widget::container(ranura.widget.ver())
+            .style(move |_| iced_widget::container::Style {
+                background: Some(crate::tema::alfa(crate::tema::tinta(), alfa).into()),
+                border: iced_core::Border {
+                    radius: 6.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .into(),
+    )
 }
 
 /// Un hueco de ancho cero, para cuando no hay nada que enseñar.
@@ -528,5 +567,18 @@ mod tests {
         let panel = Panel::new(None, vec![Box::new(Cambiante(1)), Box::new(Bomba)]);
         // La bomba no pide alarma; el cambiante pide 7 s.
         assert_eq!(panel.proxima_alarma(), Some(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn el_ultimo_frame_de_la_animacion_no_deja_un_bucle_activo() {
+        let mut panel = Panel::new(None, vec![Box::new(Cambiante(1))]);
+        panel.derecha[0].cambio_desde = Some(Instant::now() - Duration::from_secs(1));
+        assert!(panel.animando());
+        panel.avanzar();
+        assert!(!panel.animando());
+        assert!(
+            !panel.refrescar(),
+            "no hay datos nuevos ni animación perpetua"
+        );
     }
 }

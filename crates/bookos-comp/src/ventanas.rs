@@ -84,6 +84,7 @@ const CASCADA: i32 = 32;
 /// no hace falta nada más caro.
 #[derive(Debug, Default)]
 pub struct Estado {
+    encima: Cell<bool>,
     /// Cuándo apareció. `None` mientras no se ha colocado todavía: una ventana
     /// sin tamaño aún no puede centrarse ni empezar a animarse.
     nacida: Cell<Option<Instant>>,
@@ -955,6 +956,52 @@ pub fn hueco(
 /// a un mensaje de Wayland: son las operaciones del escritorio, y los handlers
 /// del protocolo solo las invocan.
 impl BookosComp {
+    pub fn alternar_encima(&mut self, window: &Window) {
+        let encima = !siempre_encima(window);
+        estado(window).encima.set(encima);
+        // Entre las ventanas normales (30) y las capas del escritorio (40).
+        window.override_z_index(if encima { 35 } else { 30 });
+        self.space.raise_element(window, false);
+        self.needs_redraw = true;
+    }
+
+    /// Traslada coordenadas lógicas y conserva maximizado/fullscreen y el
+    /// rectángulo flotante al que volver. El destino puede tener otra escala.
+    pub fn mover_a_monitor(&mut self, window: &Window, nombre: &str) {
+        if self.minimizando.iter().any(|(w, _)| w == window) { return; }
+        crate::escritorios::terminar_todos(self);
+        let Some(destino) = self.space.outputs().find(|o| o.name() == nombre)
+            .and_then(|o| self.space.output_geometry(o)) else { return; };
+        let Some(loc) = self.space.element_location(window) else { return; };
+        let origen = crate::escritorios::salida_de(self, window)
+            .and_then(|n| self.space.outputs().find(|o| o.name() == n))
+            .and_then(|o| self.space.output_geometry(o)).unwrap_or(destino);
+        if origen == destino { return; }
+        let puntero = self.pointer_location;
+        // Los helpers de área útil usan la salida bajo el puntero. Se cambia
+        // solo durante la operación, sin emitir movimiento al cliente.
+        self.pointer_location = (destino.loc.x as f64 + 1.0, destino.loc.y as f64 + 1.0).into();
+        let area = crate::decoracion::area_util(self, window);
+        let posicion = confinar(loc + (destino.loc - origen.loc), window.geometry().size, area);
+        if let Some(previa) = estado(window).restaurar.get() {
+            estado(window).restaurar.set(Some(Rectangle::new(
+                confinar(previa.loc + (destino.loc - origen.loc), previa.size, area), previa.size)));
+        }
+        self.space.map_element(window.clone(), posicion, false);
+        if completa(window) {
+            // Reaplicar fullscreen al nuevo output aunque ya estuviera activo.
+            estado(window).completa.set(false);
+            self.pantalla_completa(window, true);
+        } else if let Some(zona) = zona_de(window) {
+            self.encajar(window, zona);
+        } else if let Some(x11) = window.x11_surface() {
+            let _ = x11.configure(Rectangle::new(posicion, window.geometry().size));
+        }
+        estado(window).desde.set(None);
+        self.pointer_location = puntero;
+        self.enfocar(window);
+        self.revisar_barras();
+    }
     /// El hueco que le queda a las ventanas: la pantalla menos el panel.
     ///
     /// El dock no se descuenta a propósito: flota por encima, como en macOS.
@@ -1600,6 +1647,10 @@ pub fn zona_de(window: &Window) -> Option<Zona> {
 }
 
 /// ¿Está esta ventana encajada en alguna zona?
+pub fn siempre_encima(window: &Window) -> bool {
+    estado(window).encima.get()
+}
+
 pub fn encajada(window: &Window) -> bool {
     estado(window).zona.get().is_some()
 }

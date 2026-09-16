@@ -208,6 +208,8 @@ impl Compartido {
         poner("backend", Value::from(backend.to_string()));
         // Todo lo que sigue se aplica sin reiniciar la sesión.
         poner("live_apply", Value::from(true));
+        // `teclas.conf`: GetKeyRemaps, ApplyKeyRemaps y CaptureKey.
+        poner("key_remap", Value::from(true));
         poner("fractional_scale", Value::from(true));
         poner("per_output_scale", Value::from(true));
         // El modelo entiende un escritorio lógico bidimensional aunque el

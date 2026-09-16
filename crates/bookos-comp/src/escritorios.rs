@@ -388,7 +388,7 @@ const DESLIZAMIENTO: std::time::Duration = bookos_shell::tema::D_PAGINA;
 /// entre dos monitores, y en ese caso «está» en el que enseña más de ella. Sin
 /// salida —ventana fuera de todo, que pasa mientras se recoloca— devuelve
 /// `None` y quien llame decide.
-fn salida_de(state: &BookosComp, window: &Window) -> Option<String> {
+pub fn salida_de(state: &BookosComp, window: &Window) -> Option<String> {
     let geo = state.space.element_geometry(window)?;
     let centro = (
         geo.loc.x as f64 + geo.size.w as f64 / 2.0,
@@ -630,11 +630,37 @@ fn terminar_deslizamiento(state: &mut BookosComp, salida: &str) {
 /// Termina de golpe los cambios en marcha en **todas** las salidas. Lo usan las
 /// operaciones que reorganizan los escritorios enteros (crear, eliminar): ahí
 /// dejar una transición a medias dejaría ventanas mapeadas fuera de sitio.
-fn terminar_todos(state: &mut BookosComp) {
+pub fn terminar_todos(state: &mut BookosComp) {
     let salidas: Vec<String> = state.escritorios.deslizando.keys().cloned().collect();
     for salida in salidas {
         terminar_deslizamiento(state, &salida);
     }
+}
+
+/// Envía una ventana al escritorio de su monitor sin cambiar la vista.
+pub fn mover_ventana(state: &mut BookosComp, window: &Window, destino: usize) {
+    if state.minimizando.iter().any(|(w, _)| w == window) { return; }
+    if destino >= state.escritorios.cuantos() { return; }
+    terminar_todos(state);
+    let Some(salida) = salida_de(state, window) else { return; };
+    if destino == state.escritorios.activo_en(&salida) { return; }
+    let Some(posicion) = state.space.element_location(window) else { return; };
+    let tenia_foco = state.ventana_con_foco().as_ref() == Some(window);
+    state.space.unmap_elem(window);
+    state.escritorios.guardadas_de(&salida)[destino].push((window.clone(), posicion));
+    if window.set_activated(false) {
+        if let Some(toplevel) = window.toplevel() { toplevel.send_pending_configure(); }
+    }
+    if tenia_foco {
+        let siguiente = state.space.elements().rev()
+            .find(|w| salida_de(state, w).as_deref() == Some(&salida)).cloned();
+        if let Some(w) = siguiente { state.enfocar(&w); }
+        else if let Some(kbd) = state.seat.get_keyboard() {
+            kbd.set_focus(state, None, smithay::utils::SERIAL_COUNTER.next_serial());
+        }
+    }
+    state.revisar_barras();
+    state.needs_redraw = true;
 }
 
 /// Aparta todas las ventanas para enseñar el escritorio.

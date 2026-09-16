@@ -1874,7 +1874,90 @@ fn comprobar_ventanas(state: &mut BookosComp) {
     tracing::info!("--- fin de ventanas ---");
 }
 
+fn comprobar_organizacion(state: &mut BookosComp, intento: u32) {
+    use smithay::output::{Output, PhysicalProperties, Subpixel, Mode, Scale};
+    use crate::escritorios;
+    let ventanas: Vec<_> = state.space.elements().cloned().collect();
+    if ventanas.len() < 2 && intento < 8 {
+        if intento == 0 { crate::keybinds::lanzar(state, "konsole --separate"); }
+        state.loop_handle.insert_source(Timer::from_duration(Duration::from_secs(1)), move |_, _, state| {
+            comprobar_organizacion(state, intento + 1);
+            TimeoutAction::Drop
+        }).unwrap();
+        return;
+    }
+    assert!(ventanas.len() >= 2, "organización: hacen falta dos clientes");
+    let window = &ventanas[0];
+    let otra = &ventanas[1];
+    state.alternar_encima(window);
+    state.enfocar(otra);
+    assert_eq!(state.space.elements().next_back(), Some(window), "enfocar otra ventana no tapa la fijada");
+    let origen = state.space.outputs().next().unwrap().clone();
+    let posicion = state.space.element_location(window).unwrap();
+    state.enfocar(window);
+    escritorios::mover_ventana(state, window, 1);
+    assert!(state.space.element_location(window).is_none());
+    assert_ne!(state.ventana_con_foco().as_ref(), Some(window));
+    escritorios::cambiar_a(state, &origen, 1);
+    escritorios::terminar_todos(state);
+    assert_eq!(state.space.element_location(window), Some(posicion));
+    assert!(crate::ventanas::siempre_encima(window));
+    // Monitor lógico para probar traslado, escala y coordenadas negativas.
+    let monitor = Output::new("selftest-monitor".into(), PhysicalProperties {
+        size: (0, 0).into(), subpixel: Subpixel::Unknown, make: "BookOS".into(), model: "Test".into(),
+    });
+    monitor.change_current_state(Some(Mode { size: (1920, 1080).into(), refresh: 60000 }),
+        None, Some(Scale::Fractional(1.5)), Some((-1280, 0).into()));
+    state.space.map_output(&monitor, (-1280, 0));
+    let puntero = state.pointer_location;
+    state.mover_a_monitor(window, "selftest-monitor");
+    assert_eq!(state.pointer_location, puntero);
+    assert_eq!(escritorios::salida_de(state, window).as_deref(), Some("selftest-monitor"));
+    state.mover_a_monitor(window, &origen.name());
+    state.alternar_maximizada(window);
+    state.mover_a_monitor(window, "selftest-monitor");
+    assert!(crate::ventanas::maximizada(window));
+    state.mover_a_monitor(window, &origen.name());
+    state.pantalla_completa(window, true);
+    state.mover_a_monitor(window, "selftest-monitor");
+    assert!(crate::ventanas::completa(window));
+    assert_eq!(state.space.element_location(window), Some((-1280, 0).into()));
+    state.mover_a_monitor(window, &origen.name());
+    state.pantalla_completa(window, false);
+    state.space.unmap_output(&monitor);
+    state.alternar_encima(window);
+    assert!(!crate::ventanas::siempre_encima(window));
+    tracing::info!("BOOKOS_ORGANIZACION_OK: encima, foco, escritorios, monitor, maximizado y fullscreen");
+    state.loop_signal.stop();
+}
+
 fn run(state: &mut BookosComp) {
+    if std::env::var_os("BOOKOS_SELFTEST_MEJORAS").is_some() {
+        use bookos_shell::{Accion, TeclaPulsada};
+        for accion in [Accion::Bloquear, Accion::CerrarSesion,
+            Accion::Lanzar("systemctl poweroff".into()), Accion::Lanzar("systemctl reboot".into()),
+            Accion::Lanzar("systemctl suspend".into())] {
+            crate::keybinds::hacer(state, accion);
+            let shell = state.shell.as_mut().expect("shell");
+            assert!(!shell.esta_bloqueado(), "una petición no debe ejecutarse sin confirmar");
+            assert_eq!(shell.emergente_nombre(), Some("apagar"));
+            assert!(matches!(shell.tecla(TeclaPulsada::Intro), (true, None)), "Intro cancela por defecto");
+            assert!(shell.emergente_nombre().is_none());
+        }
+        let shell = state.shell.as_mut().unwrap();
+        for tamano in [32, 80, 50] {
+            shell.dock_tamano(tamano);
+            let (_, _, _, alto) = shell.dock_rect();
+            assert!((alto - (tamano + 25) as f64).abs() <= 4.0, "dock: {alto}");
+        }
+        tracing::info!("SELFTEST_MEJORAS_OK: confirmaciones cancelables y dock en vivo");
+        state.loop_signal.stop();
+        return;
+    }
+    if std::env::var_os("BOOKOS_SELFTEST_ORGANIZAR").is_some() {
+        comprobar_organizacion(state, 0);
+        return;
+    }
     tracing::info!("--- autotest de entrada ---");
 
     let escala = state.output_scale();

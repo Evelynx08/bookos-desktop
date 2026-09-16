@@ -30,6 +30,7 @@ mod pw;
 mod selftest;
 mod shell;
 mod state;
+mod teclas;
 mod ventanas;
 mod xwayland;
 

@@ -116,6 +116,9 @@ pub enum Emergente {
 }
 
 impl Emergente {
+    pub fn menu_ventana(opciones: Vec<(String, Accion)>) -> Self {
+        Self::MenuDock(menu_dock::MenuDock::ventana(opciones))
+    }
     pub fn menu() -> Self {
         Self::Menu(menu::Menu::new())
     }
@@ -127,6 +130,10 @@ impl Emergente {
     /// El diálogo del botón de encendido.
     pub fn apagar() -> Self {
         Self::Apagar(apagar::Apagar::new())
+    }
+
+    pub fn confirmar_energia(accion: crate::confirmacion::Energia) -> Self {
+        Self::Apagar(apagar::Apagar::confirmar(accion))
     }
 
     pub fn calendario() -> Self {
@@ -211,7 +218,7 @@ impl Emergente {
             Self::Sonido(_) => "sonido",
             Self::Brillo(_) => "brillo",
             Self::Energia(_) => "energia",
-            Self::MenuDock(_) => "menu-dock",
+            Self::MenuDock(m) => if m.es_ventana() { "menu-ventana" } else { "menu-dock" },
             Self::Acerca(_) => "acerca",
             Self::Centro(_) => "centro",
             Self::Notificaciones(_) => "notificaciones",

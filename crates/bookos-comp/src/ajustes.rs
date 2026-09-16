@@ -10,7 +10,7 @@
 //! ```text
 //! ReloadConfig(s seccion) -> b
 //!     Relee `panel.conf`. Secciones: "lockscreen"/"bloqueo",
-//!     "activities"/"actividades", "all".
+//!     "activities"/"actividades", "keys"/"teclas" (este, `teclas.conf`), "all".
 //!
 //! GetCapabilities() -> a{sv}
 //!     Qué sabe hacer este backend. Diccionario a propósito: añadir una
@@ -38,9 +38,24 @@
 //!     validación o el hardware la rechazan; entonces **no** se guarda nada y
 //!     se vuelve a lo que había.
 //!
+//! GetKeyRemaps() -> s / ApplyKeyRemaps(s json) -> (b ok, s error)
+//!     Los remapeos de `teclas.conf` como `[{"origen": s, "destino": s}]`,
+//!     con los mismos textos que el fichero. Aplicar valida, escribe y
+//!     recarga; si una entrada no vale no se escribe nada.
+//!
+//! CaptureKey(b armar) -> b
+//!     Con `true`, la siguiente tecla que no sea un modificador no llega a
+//!     nadie y sale por `KeyCaptured`. No es la respuesta del método porque
+//!     esperar a una persona dentro de él ocupa el ejecutor de zbus y para
+//!     el resto del bus. Con `false` se desarma: quien se canse de esperar
+//!     tiene que desarmar, o la tecla se tragaría más tarde.
+//!
 //! signal OutputsChanged()
 //!     Algo cambió en las pantallas —se aplicó una configuración, se enchufó o
 //!     se quitó un monitor—. Quien la reciba vuelve a pedir `GetOutputs`.
+//!
+//! signal KeyCaptured(u evdev, b copilot)
+//!     La tecla capturada. `copilot` si era el acorde Meta+Mayús+F23.
 //! ```
 //!
 //! **Por qué el hilo de D-Bus no toca nada gráfico.** zbus atiende el bus en su
@@ -94,6 +109,8 @@ fn config_json(config: &bookos_shell::Config) -> serde_json::Value {
         "centro": config.centro,
         "derecha": config.derecha,
         "dock": dock,
+        "dock_tamano": config.dock_tamano,
+        "bloqueo_huella": config.bloqueo_huella,
         "escala": config.escala,
         "cursor": config.cursor,
         "fondo": config.fondo,
@@ -309,7 +326,8 @@ fn validar_config_json(json: &str) -> Result<Vec<(String, String)>, String> {
                 }
                 v
             }
-            "alto_contraste" => booleano(valor, clave)?,
+            "alto_contraste" | "bloqueo_huella" => booleano(valor, clave)?,
+            "dock_tamano" => entero(valor, clave, 32, 80)?,
             "acento" => {
                 let v = texto(valor, clave)?;
                 if bookos_shell::tema::Acento::desde_nombre(&v).is_none() {
@@ -349,6 +367,7 @@ pub enum Aviso {
     Actividad(bookos_shell::actividad::Estado),
     CerrarActividad(String),
     AbrirActividadPrevisualizacion(String),
+    CapturarTecla(bool),
 }
 
 #[derive(Deserialize)]
@@ -468,6 +487,31 @@ impl Servidor {
         (true, String::new())
     }
 
+    fn get_key_remaps(&self) -> String {
+        crate::teclas::cargar().a_json()
+    }
+
+    fn apply_key_remaps(&self, json: String) -> (bool, String) {
+        let remapeos = match crate::teclas::Remapeos::desde_json(&json) {
+            Ok(remapeos) => remapeos,
+            Err(err) => return (false, err),
+        };
+        if let Err(err) = crate::teclas::guardar(&remapeos) {
+            return (false, format!("no se pudieron guardar los remapeos: {err}"));
+        }
+        if self.canal.send(Aviso::Recargar("teclas".into())).is_err() {
+            return (
+                false,
+                "se guardaron, pero el compositor no pudo aplicarlos en vivo".into(),
+            );
+        }
+        (true, String::new())
+    }
+
+    fn capture_key(&self, armar: bool) -> bool {
+        self.canal.send(Aviso::CapturarTecla(armar)).is_ok()
+    }
+
     /// Aplica una configuración de pantallas. `(ok, error)`: `ok=false` nunca
     /// va con `error` vacío, para que la interfaz no pueda enseñar un éxito que
     /// no ocurrió.
@@ -584,6 +628,7 @@ pub fn recibir(state: &mut crate::state::BookosComp, aviso: Aviso) {
             let _ = respuesta.send(r);
         }
         Aviso::Redetectar => redetectar(state),
+        Aviso::CapturarTecla(armar) => state.captura_tecla = armar,
         Aviso::Actividad(estado) => {
             if let Some(shell) = state.shell.as_mut() {
                 shell.publicar_actividad(estado);
@@ -652,13 +697,27 @@ fn recargar(state: &mut crate::state::BookosComp, seccion: &str) {
         "fondo",
         "appearance",
         "apariencia",
+        "keys",
+        "teclas",
+        "desktop",
+        "escritorio",
         "all",
     ];
     if !CONOCIDAS.contains(&seccion) {
         tracing::warn!(seccion, "sección de ajustes desconocida");
         return;
     }
+    if matches!(seccion, "keys" | "teclas" | "all") {
+        state.teclas = crate::teclas::cargar();
+    }
     let config = bookos_shell::Config::cargar();
+
+    if matches!(seccion, "desktop" | "escritorio" | "all") {
+        if state.shell.as_mut().is_some_and(|shell| shell.dock_tamano(config.dock_tamano)) {
+            state.recolocar_encajadas();
+            state.revisar_barras();
+        }
+    }
 
     // El tema se aplica **antes** de tocar el fondo: `Eleccion::para_el_tema`
     // pregunta por el que esté puesto, y con el orden al revés se recargaría la
@@ -871,6 +930,17 @@ pub fn accion_actividad(
     }
 }
 
+pub fn avisar_tecla_capturada(state: &crate::state::BookosComp, evdev: u32, copilot: bool) {
+    let Some(conexion) = state.bus_ajustes.as_ref() else {
+        return;
+    };
+    if let Err(err) =
+        conexion.emit_signal(None::<&str>, RUTA, NOMBRE, "KeyCaptured", &(evdev, copilot))
+    {
+        tracing::warn!("no se pudo emitir KeyCaptured: {err}");
+    }
+}
+
 pub fn arrancar(
     canal: Sender<Aviso>,
     compartido: Arc<Compartido>,
@@ -944,6 +1014,10 @@ mod pruebas {
             .is_err()
         );
         assert!(validar_config_json(r#"{"inventada":true}"#).is_err());
+        for json in [r#"{"dock_tamano":31}"#, r#"{"dock_tamano":81}"#, r#"{"dock_tamano":50.5}"#, r#"{"bloqueo_huella":"si"}"#] {
+            assert!(validar_config_json(json).is_err(), "{json}");
+        }
+        assert!(validar_config_json(r#"{"dock_tamano":80,"bloqueo_huella":true}"#).is_ok());
     }
 
     #[test]

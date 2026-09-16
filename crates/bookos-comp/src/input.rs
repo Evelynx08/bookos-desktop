@@ -14,7 +14,7 @@ use smithay::backend::input::{
     GesturePinchUpdateEvent, GestureSwipeUpdateEvent, InputBackend, InputEvent, KeyState,
     KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
 };
-use smithay::input::keyboard::{FilterResult, keysyms};
+use smithay::input::keyboard::{FilterResult, Keycode, keysyms};
 use smithay::input::pointer::RelativeMotionEvent;
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
 use smithay::utils::{Logical, Point, SERIAL_COUNTER};
@@ -50,6 +50,255 @@ fn modificador_conmutador_suelto(
     }
 }
 
+/// Una tecla, ya traducida por `teclas.conf`, camino de xkb y del cliente.
+///
+/// `codigo` es el de xkb (evdev + 8). Se conserva el código y no solo el keysym
+/// porque algunas teclas Fn llegan sin keysym aunque el kernel sí haya
+/// identificado correctamente su botón físico.
+fn tecla(state: &mut BookosComp, codigo: Keycode, estado: KeyState, time: u32) {
+    let Some(kbd) = state.seat.get_keyboard() else {
+        return;
+    };
+    let serial = SERIAL_COUNTER.next_serial();
+    let pulsada = estado == KeyState::Pressed;
+    // El filtro corre con las teclas **antes** de reenviarlas, así que
+    // los atajos del compositor funcionan aunque el cliente con foco
+    // esté colgado. Esa es justamente la propiedad que hace que el
+    // cambio de TTY sea una salida de emergencia fiable.
+    let accion = kbd.input(
+        state,
+        codigo,
+        estado,
+        serial,
+        time,
+        |state, modifiers, handle| {
+            let _ = modifiers;
+            let bloqueado = state.shell.as_ref().is_some_and(|s| s.esta_bloqueado());
+            // Con la capa de captura abierta, el teclado es suyo: Esc
+            // la cierra, Intro captura y las flechas cambian de modo.
+            // Nada de eso puede llegar a la ventana de debajo.
+            if state.shell.as_ref().is_some_and(|s| s.hay_captura()) {
+                if !pulsada {
+                    return FilterResult::Intercept(None);
+                }
+                let accion = traducir_tecla(&handle)
+                    .and_then(|t| state.shell.as_mut().map(|s| s.captura_tecla(t)))
+                    .and_then(|(_, accion)| accion);
+                state.needs_redraw = true;
+                // Consumida o no, la tecla se queda aquí: mientras
+                // encuadras, el escritorio no responde a nada más.
+                return FilterResult::Intercept(accion.map(crate::keybinds::Accion::DelShell));
+            }
+            // Solo la pulsación: interceptar también la suelta le
+            // dejaría la tecla trabada al cliente. Bloqueado, tampoco
+            // la suelta sale de aquí.
+            if !pulsada {
+                if bloqueado {
+                    return FilterResult::Intercept(None);
+                }
+                // Con una excepción: soltar el modificador **resuelve**
+                // el conmutador de Alt+Tab. Es lo que lo hace el de
+                // macOS y no una lista que se queda abierta: eliges
+                // mientras mantienes la tecla y confirmas al soltarla.
+                //
+                // La acción **no** se devuelve por `Intercept`, que es
+                // lo que hacía antes: `Intercept` se queda la tecla y no
+                // la reenvía (`KeyboardHandle::input` de Smithay), así
+                // que el cliente al que llegas nunca ve que Alt se ha
+                // soltado y se le queda trabada para siempre. Se marca
+                // aquí, se devuelve `Forward` para que la suelta salga
+                // hacia el cliente que la esperaba, y se resuelve al
+                // volver de `kbd.input`.
+                // Smithay actualiza el estado de modificadores antes de
+                // llamar al filtro. Mirarlo evita depender del keysym
+                // concreto de Alt/Meta en cada mapa de teclado.
+                let cerrando = state.shell.as_ref().is_some_and(|s| s.hay_conmutador())
+                    && !state.conmutador_pegado
+                    && state
+                        .conmutador_modo
+                        .is_some_and(|modo| modificador_conmutador_suelto(modo, modifiers));
+                if cerrando {
+                    state.conmutador_resolver = true;
+                }
+                // Meta a secas: se soltó sin que llegara nada más por el
+                // medio, así que era la tecla y no un modificador. El
+                // launchpad se abre al volver de `kbd.input`, igual que
+                // el conmutador y por lo mismo: la suelta tiene que
+                // salir hacia el cliente o se le queda trabada.
+                let meta = matches!(
+                    handle.modified_sym().raw(),
+                    keysyms::KEY_Super_L | keysyms::KEY_Super_R
+                );
+                if meta && std::mem::take(&mut state.meta_sola) {
+                    state.abrir_launchpad = true;
+                }
+                return FilterResult::Forward;
+            }
+            // Cada tecla que llega, con sus modificadores. Es la única
+            // forma de distinguir "el atajo no funciona" de "la tecla no
+            // llega": anidado, el compositor de debajo se queda con
+            // Alt+Tab y aquí no aparece nada.
+            tracing::debug!(
+                codigo = codigo.raw(),
+                sym = handle.modified_sym().raw(),
+                nombre = ?handle.modified_sym().name(),
+                alt = modifiers.alt,
+                logo = modifiers.logo,
+                ctrl = modifiers.ctrl,
+                shift = modifiers.shift,
+                "tecla"
+            );
+            // Meta empieza a contar como «sola» solo si no hay nada más
+            // pulsado; cualquier otra tecla la descarta hasta que se
+            // vuelva a pulsar.
+            state.meta_sola = matches!(
+                handle.modified_sym().raw(),
+                keysyms::KEY_Super_L | keysyms::KEY_Super_R
+            ) && !modifiers.alt
+                && !modifiers.ctrl
+                && !modifiers.shift;
+            // Escape cancela el conmutador sin ir a ninguna parte, y no
+            // llega al cliente: es la salida del propio conmutador.
+            if state.shell.as_ref().is_some_and(|s| s.hay_conmutador())
+                && handle.modified_sym().raw() == keysyms::KEY_Escape
+            {
+                return FilterResult::Intercept(Some(crate::keybinds::Accion::ConmutarCancelar));
+            }
+            if let Some(accion) = crate::keybinds::resolver(modifiers, &handle, codigo.raw()) {
+                // Con el bloqueo echado solo valen las salidas de
+                // emergencia. Que el cambio de TTY siga funcionando no
+                // es un descuido: es la puerta trasera con la que se
+                // recupera la máquina si el bloqueo falla, y la tiene
+                // cualquier escritorio. Lo demás —cerrar ventanas,
+                // maximizar, el launchpad— se traga.
+                if !bloqueado || accion.es_emergencia() {
+                    return FilterResult::Intercept(Some(accion));
+                }
+                return FilterResult::Intercept(None);
+            }
+            if state.shell.as_ref().is_some_and(|s| s.hay_conmutador()) {
+                // La capa es modal: mientras el usuario mantiene Alt o
+                // Meta, ninguna tecla suelta debe acabar escribiéndose
+                // en la ventana que hay debajo.
+                return FilterResult::Intercept(None);
+            }
+            if bloqueado {
+                // La tecla se compara por **keysym** y no por código de
+                // tecla: `key_code` devuelve el de xkb, que es el de
+                // evdev más ocho, y comparar con el 1 de evdev no
+                // acertaba nunca. Ese fue el fallo que dejaba el
+                // bloqueo sin salida.
+                let sym = handle.modified_sym();
+                let tecla = match sym.raw() {
+                    keysyms::KEY_Escape => bookos_shell::TeclaPulsada::Escape,
+                    keysyms::KEY_Return | keysyms::KEY_KP_Enter => bookos_shell::TeclaPulsada::Intro,
+                    keysyms::KEY_Left => bookos_shell::TeclaPulsada::Izquierda,
+                    keysyms::KEY_Right => bookos_shell::TeclaPulsada::Derecha,
+                    keysyms::KEY_Tab => bookos_shell::TeclaPulsada::Tabulador,
+                    _ => bookos_shell::TeclaPulsada::Caracter(' '),
+                };
+                if let Some(shell) = state.shell.as_mut() {
+                    let (consumida, peticion) = shell.bloqueo_confirmar_tecla(tecla);
+                    if consumida {
+                        state.needs_redraw = true;
+                        return FilterResult::Intercept(peticion.map(crate::keybinds::Accion::Energia));
+                    }
+                }
+                let accion = match sym.raw() {
+                    keysyms::KEY_F9 => Some(crate::keybinds::Accion::BloqueoHuella),
+                    keysyms::KEY_Escape => Some(crate::keybinds::Accion::BloqueoLimpiar),
+                    keysyms::KEY_BackSpace => Some(crate::keybinds::Accion::BloqueoBorrar),
+                    keysyms::KEY_Return | keysyms::KEY_KP_Enter => {
+                        Some(crate::keybinds::Accion::BloqueoComprobar)
+                    }
+                    _ => sym
+                        .key_char()
+                        // Los caracteres de control —tabulador, avance
+                        // de línea— tienen `key_char` y no son parte de
+                        // ninguna contraseña.
+                        .filter(|c| !c.is_control())
+                        .map(crate::keybinds::Accion::BloqueoEscribir),
+                };
+                // Ninguna tecla llega a los clientes, se entienda o no:
+                // es la propiedad que define un bloqueo.
+                return FilterResult::Intercept(accion);
+            }
+            // Una superficie emergente abierta se queda con las teclas
+            // que entiende: es lo que permite cerrar el menú con Esc y
+            // recorrerlo con las flechas sin que el cliente con foco
+            // llegue a verlas. `Intercept(None)` es "consumida, pero no
+            // es un atajo del compositor".
+            if let Some(tecla) = traducir_tecla(&handle) {
+                let (consumida, accion) = state
+                    .shell
+                    .as_mut()
+                    .map(|s| s.tecla(tecla))
+                    .unwrap_or((false, None));
+                if consumida {
+                    state.needs_redraw = true;
+                    // La acción no se ejecuta aquí: seguimos dentro del
+                    // filtro de `kbd.input`, con el estado prestado.
+                    return FilterResult::Intercept(accion.map(crate::keybinds::Accion::DelShell));
+                }
+            }
+            FilterResult::Forward
+        },
+    );
+    if let Some(Some(accion)) = accion {
+        crate::keybinds::ejecutar(state, accion);
+    }
+    // El orden importa y es este: la suelta de Alt ya ha salido hacia el
+    // cliente **antiguo** —que es quien vio la pulsación y la espera— y
+    // el cambio de foco ocurre ahora, así que el `enter` del cliente
+    // nuevo llega con el juego de teclas pulsadas ya sin Alt.
+    if std::mem::take(&mut state.conmutador_resolver) {
+        crate::keybinds::ejecutar(state, crate::keybinds::Accion::ConmutarFin);
+    }
+    if std::mem::take(&mut state.abrir_launchpad) {
+        crate::keybinds::ejecutar(state, crate::keybinds::Accion::Launchpad);
+    }
+    if state.shell.as_ref().is_some_and(|s| s.esta_bloqueado()) {
+        let caps_lock = kbd.modifier_state().caps_lock;
+        if let Some(shell) = state.shell.as_mut() {
+            shell.bloqueo_caps_lock(caps_lock);
+        }
+        state.needs_redraw = true;
+    }
+}
+
+/// La acción de un remapeo. Con el bloqueo echado no hace nada: una tecla
+/// cambiada no puede ser una forma de saltárselo.
+fn remapeada(state: &mut BookosComp, accion: crate::keybinds::Accion) {
+    if state.shell.as_ref().is_some_and(|s| s.esta_bloqueado()) {
+        return;
+    }
+    // La tecla no pasa por xkb ni por el filtro, que es quien descarta el
+    // «Meta sola»: sin esto, soltar Meta después abriría el launchpad.
+    state.meta_sola = false;
+    crate::keybinds::ejecutar(state, accion);
+}
+
+/// Si la app de teclas espera una tecla, se queda con esta pulsación y la
+/// anuncia por `KeyCaptured`.
+///
+/// Los modificadores no se capturan: son la primera mitad del acorde de
+/// Copilot, y al pulsarlos no se sabe si viene algo detrás. Quien quiera
+/// remapear uno lo escribe a mano en `teclas.conf`.
+fn capturar(state: &mut BookosComp, evdev: u32) -> bool {
+    const MODIFICADORES: [u32; 8] = [29, 97, 42, 54, 56, 100, 125, 126];
+    if !state.captura_tecla
+        || MODIFICADORES.contains(&evdev)
+        || state.shell.as_ref().is_some_and(|s| s.esta_bloqueado())
+    {
+        return false;
+    }
+    state.captura_tecla = false;
+    let copilot = state.traductor.es_copilot(evdev);
+    crate::ajustes::avisar_tecla_capturada(state, evdev, copilot);
+    state.traductor.tragar_suelta(evdev);
+    true
+}
+
 pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
     state.last_input = Some(std::time::Instant::now());
     state.idle_notifier_state.notify_activity(&state.seat);
@@ -64,210 +313,32 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
 
     match event {
         InputEvent::Keyboard { event } => {
-            let Some(kbd) = state.seat.get_keyboard() else {
-                return;
-            };
-            let serial = SERIAL_COUNTER.next_serial();
-            let time = event.time_msec();
+            // `teclas.conf` habla en evdev, que es lo que dicen
+            // `input-event-codes.h` y `libinput debug-events`; smithay da el
+            // código de xkb, ocho más.
+            let evdev = event.key_code().raw() - 8;
             let pulsada = event.state() == KeyState::Pressed;
-            // Smithay entrega el código XKB (evdev + 8). Se conserva porque
-            // algunas teclas Fn llegan sin keysym aunque el kernel sí haya
-            // identificado correctamente su botón físico.
-            let codigo = event.key_code();
-            // El filtro corre con las teclas **antes** de reenviarlas, así que
-            // los atajos del compositor funcionan aunque el cliente con foco
-            // esté colgado. Esa es justamente la propiedad que hace que el
-            // cambio de TTY sea una salida de emergencia fiable.
-            let accion = kbd.input(
-                state,
-                codigo,
-                event.state(),
-                serial,
-                time,
-                |state, modifiers, handle| {
-                    let _ = modifiers;
-                    let bloqueado = state.shell.as_ref().is_some_and(|s| s.esta_bloqueado());
-                    // Con la capa de captura abierta, el teclado es suyo: Esc
-                    // la cierra, Intro captura y las flechas cambian de modo.
-                    // Nada de eso puede llegar a la ventana de debajo.
-                    if state.shell.as_ref().is_some_and(|s| s.hay_captura()) {
-                        if !pulsada {
-                            return FilterResult::Intercept(None);
-                        }
-                        let accion = traducir_tecla(&handle)
-                            .and_then(|t| state.shell.as_mut().map(|s| s.captura_tecla(t)))
-                            .and_then(|(_, accion)| accion);
-                        state.needs_redraw = true;
-                        // Consumida o no, la tecla se queda aquí: mientras
-                        // encuadras, el escritorio no responde a nada más.
-                        return FilterResult::Intercept(
-                            accion.map(crate::keybinds::Accion::DelShell),
-                        );
-                    }
-                    // Solo la pulsación: interceptar también la suelta le
-                    // dejaría la tecla trabada al cliente. Bloqueado, tampoco
-                    // la suelta sale de aquí.
-                    if !pulsada {
-                        if bloqueado {
-                            return FilterResult::Intercept(None);
-                        }
-                        // Con una excepción: soltar el modificador **resuelve**
-                        // el conmutador de Alt+Tab. Es lo que lo hace el de
-                        // macOS y no una lista que se queda abierta: eliges
-                        // mientras mantienes la tecla y confirmas al soltarla.
-                        //
-                        // La acción **no** se devuelve por `Intercept`, que es
-                        // lo que hacía antes: `Intercept` se queda la tecla y no
-                        // la reenvía (`KeyboardHandle::input` de Smithay), así
-                        // que el cliente al que llegas nunca ve que Alt se ha
-                        // soltado y se le queda trabada para siempre. Se marca
-                        // aquí, se devuelve `Forward` para que la suelta salga
-                        // hacia el cliente que la esperaba, y se resuelve al
-                        // volver de `kbd.input`.
-                        // Smithay actualiza el estado de modificadores antes de
-                        // llamar al filtro. Mirarlo evita depender del keysym
-                        // concreto de Alt/Meta en cada mapa de teclado.
-                        let cerrando = state.shell.as_ref().is_some_and(|s| s.hay_conmutador())
-                            && !state.conmutador_pegado
-                            && state
-                                .conmutador_modo
-                                .is_some_and(|modo| modificador_conmutador_suelto(modo, modifiers));
-                        if cerrando {
-                            state.conmutador_resolver = true;
-                        }
-                        // Meta a secas: se soltó sin que llegara nada más por el
-                        // medio, así que era la tecla y no un modificador. El
-                        // launchpad se abre al volver de `kbd.input`, igual que
-                        // el conmutador y por lo mismo: la suelta tiene que
-                        // salir hacia el cliente o se le queda trabada.
-                        let meta = matches!(
-                            handle.modified_sym().raw(),
-                            keysyms::KEY_Super_L | keysyms::KEY_Super_R
-                        );
-                        if meta && std::mem::take(&mut state.meta_sola) {
-                            state.abrir_launchpad = true;
-                        }
-                        return FilterResult::Forward;
-                    }
-                    // Cada tecla que llega, con sus modificadores. Es la única
-                    // forma de distinguir "el atajo no funciona" de "la tecla no
-                    // llega": anidado, el compositor de debajo se queda con
-                    // Alt+Tab y aquí no aparece nada.
-                    tracing::debug!(
-                        codigo = codigo.raw(),
-                        sym = handle.modified_sym().raw(),
-                        nombre = ?handle.modified_sym().name(),
-                        alt = modifiers.alt,
-                        logo = modifiers.logo,
-                        ctrl = modifiers.ctrl,
-                        shift = modifiers.shift,
-                        "tecla"
-                    );
-                    // Meta empieza a contar como «sola» solo si no hay nada más
-                    // pulsado; cualquier otra tecla la descarta hasta que se
-                    // vuelva a pulsar.
-                    state.meta_sola = matches!(
-                        handle.modified_sym().raw(),
-                        keysyms::KEY_Super_L | keysyms::KEY_Super_R
-                    ) && !modifiers.alt
-                        && !modifiers.ctrl
-                        && !modifiers.shift;
-                    // Escape cancela el conmutador sin ir a ninguna parte, y no
-                    // llega al cliente: es la salida del propio conmutador.
-                    if state.shell.as_ref().is_some_and(|s| s.hay_conmutador())
-                        && handle.modified_sym().raw() == keysyms::KEY_Escape
-                    {
-                        return FilterResult::Intercept(Some(
-                            crate::keybinds::Accion::ConmutarCancelar,
-                        ));
-                    }
-                    if let Some(accion) =
-                        crate::keybinds::resolver(modifiers, &handle, codigo.raw())
-                    {
-                        // Con el bloqueo echado solo valen las salidas de
-                        // emergencia. Que el cambio de TTY siga funcionando no
-                        // es un descuido: es la puerta trasera con la que se
-                        // recupera la máquina si el bloqueo falla, y la tiene
-                        // cualquier escritorio. Lo demás —cerrar ventanas,
-                        // maximizar, el launchpad— se traga.
-                        if !bloqueado || accion.es_emergencia() {
-                            return FilterResult::Intercept(Some(accion));
-                        }
-                        return FilterResult::Intercept(None);
-                    }
-                    if state.shell.as_ref().is_some_and(|s| s.hay_conmutador()) {
-                        // La capa es modal: mientras el usuario mantiene Alt o
-                        // Meta, ninguna tecla suelta debe acabar escribiéndose
-                        // en la ventana que hay debajo.
-                        return FilterResult::Intercept(None);
-                    }
-                    if bloqueado {
-                        // La tecla se compara por **keysym** y no por código de
-                        // tecla: `key_code` devuelve el de xkb, que es el de
-                        // evdev más ocho, y comparar con el 1 de evdev no
-                        // acertaba nunca. Ese fue el fallo que dejaba el
-                        // bloqueo sin salida.
-                        let sym = handle.modified_sym();
-                        let accion = match sym.raw() {
-                            keysyms::KEY_Escape => Some(crate::keybinds::Accion::BloqueoLimpiar),
-                            keysyms::KEY_BackSpace => Some(crate::keybinds::Accion::BloqueoBorrar),
-                            keysyms::KEY_Return | keysyms::KEY_KP_Enter => {
-                                Some(crate::keybinds::Accion::BloqueoComprobar)
-                            }
-                            _ => sym
-                                .key_char()
-                                // Los caracteres de control —tabulador, avance
-                                // de línea— tienen `key_char` y no son parte de
-                                // ninguna contraseña.
-                                .filter(|c| !c.is_control())
-                                .map(crate::keybinds::Accion::BloqueoEscribir),
+            let time = event.time_msec();
+            let eventos = if pulsada && capturar(state, evdev) {
+                Vec::new()
+            } else {
+                state.traductor.traducir(&state.teclas, evdev, pulsada)
+            };
+            for evento in eventos {
+                match evento {
+                    crate::teclas::Evento::Tecla(evdev, pulsada) => {
+                        let estado = if pulsada {
+                            KeyState::Pressed
+                        } else {
+                            KeyState::Released
                         };
-                        // Ninguna tecla llega a los clientes, se entienda o no:
-                        // es la propiedad que define un bloqueo.
-                        return FilterResult::Intercept(accion);
+                        tecla(state, Keycode::new(evdev + 8), estado, time);
                     }
-                    // Una superficie emergente abierta se queda con las teclas
-                    // que entiende: es lo que permite cerrar el menú con Esc y
-                    // recorrerlo con las flechas sin que el cliente con foco
-                    // llegue a verlas. `Intercept(None)` es "consumida, pero no
-                    // es un atajo del compositor".
-                    if let Some(tecla) = traducir_tecla(&handle) {
-                        let (consumida, accion) = state
-                            .shell
-                            .as_mut()
-                            .map(|s| s.tecla(tecla))
-                            .unwrap_or((false, None));
-                        if consumida {
-                            state.needs_redraw = true;
-                            // La acción no se ejecuta aquí: seguimos dentro del
-                            // filtro de `kbd.input`, con el estado prestado.
-                            return FilterResult::Intercept(
-                                accion.map(crate::keybinds::Accion::DelShell),
-                            );
-                        }
+                    crate::teclas::Evento::Accion(accion) => remapeada(state, accion.accion()),
+                    crate::teclas::Evento::Comando(cmd) => {
+                        remapeada(state, crate::keybinds::Accion::Lanzar(cmd));
                     }
-                    FilterResult::Forward
-                },
-            );
-            if let Some(Some(accion)) = accion {
-                crate::keybinds::ejecutar(state, accion);
-            }
-            // El orden importa y es este: la suelta de Alt ya ha salido hacia el
-            // cliente **antiguo** —que es quien vio la pulsación y la espera— y
-            // el cambio de foco ocurre ahora, así que el `enter` del cliente
-            // nuevo llega con el juego de teclas pulsadas ya sin Alt.
-            if std::mem::take(&mut state.conmutador_resolver) {
-                crate::keybinds::ejecutar(state, crate::keybinds::Accion::ConmutarFin);
-            }
-            if std::mem::take(&mut state.abrir_launchpad) {
-                crate::keybinds::ejecutar(state, crate::keybinds::Accion::Launchpad);
-            }
-            if state.shell.as_ref().is_some_and(|s| s.esta_bloqueado()) {
-                let caps_lock = kbd.modifier_state().caps_lock;
-                if let Some(shell) = state.shell.as_mut() {
-                    shell.bloqueo_caps_lock(caps_lock);
                 }
-                state.needs_redraw = true;
             }
         }
 
@@ -376,6 +447,9 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
             // ver el soltar — sin eso se queda creyendo que sigues pulsando y no
             // vuelve a pedir otro movimiento nunca más.
             if pulsado == ButtonState::Released {
+                if button == BTN_RIGHT && std::mem::take(&mut state.menu_ventana_suelta) {
+                    return;
+                }
                 // La banda elástica o los iconos agarrados se cierran aquí, y
                 // ese soltar no es de nadie más: empezó sobre el escritorio.
                 if soltar_escritorio(state) {
@@ -485,6 +559,13 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
             // nadie más. Va después del shell —el panel manda sobre la barra de
             // una ventana que llegue hasta él— y antes del reenvío, porque para
             // el cliente este clic no existe.
+            if pulsado == ButtonState::Pressed && button == BTN_RIGHT {
+                if let Some((window, _)) = crate::decoracion::barra_en(state, punto) {
+                    state.menu_ventana_suelta = true;
+                    crate::keybinds::menu_ventana(state, window);
+                    return;
+                }
+            }
             if pulsado == ButtonState::Pressed && button == BTN_LEFT {
                 if let Some((window, boton)) = crate::decoracion::barra_en(state, punto) {
                     state.enfocar(&window);

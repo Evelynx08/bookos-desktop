@@ -109,28 +109,13 @@ fn entradas() -> Vec<Entrada> {
             etiqueta: "Pantalla de bloqueo",
             icono: "bloquear",
             atajo: Some("Meta+L"),
-            // El mismo encadenado del plasmoide: qdbus6 es el de Qt6, qdbus el
-            // de Qt5, y loginctl vale aunque no haya salvapantallas de KDE.
-            accion: || {
-                Accion::Lanzar(
-                    "qdbus6 org.freedesktop.ScreenSaver /ScreenSaver Lock \
-                     || qdbus org.freedesktop.ScreenSaver /ScreenSaver Lock \
-                     || loginctl lock-session"
-                        .into(),
-                )
-            },
+            accion: || Accion::Bloquear,
         },
         Item {
             etiqueta: "Cerrar sesión…",
             icono: "salir",
             atajo: Some("Ctrl+Alt+Supr"),
-            accion: || {
-                Accion::Lanzar(
-                    "qdbus6 org.kde.LogoutPrompt /LogoutPrompt promptLogout \
-                     || qdbus org.kde.LogoutPrompt /LogoutPrompt promptLogout"
-                        .into(),
-                )
-            },
+            accion: || Accion::CerrarSesion,
         },
     ]
 }

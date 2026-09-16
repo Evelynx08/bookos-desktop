@@ -68,6 +68,8 @@ pub enum Efectos {
 }
 
 pub struct Config {
+    pub dock_tamano: u32,
+    pub bloqueo_huella: bool,
     pub centro: Option<String>,
     pub derecha: Vec<String>,
     pub dock: Vec<Lanzador>,
@@ -314,6 +316,8 @@ impl Default for Config {
             // al elegir imagen. Pedir 24 a escala 1,75 da los 42 px que el
             // tema tiene dibujados de verdad, sin inventar píxeles.
             cursor: 24,
+            dock_tamano: 50,
+            bloqueo_huella: false,
             launchpad_dock: true,
             entrada: Entrada::default(),
             fondo: None,
@@ -378,6 +382,10 @@ impl Config {
                 "centro" => config.centro = items().into_iter().next(),
                 "derecha" => config.derecha = items(),
                 "dock" => config.dock = items().iter().filter_map(|s| lanzador(s)).collect(),
+                "dock_tamano" => {
+                    if let Ok(n) = valor.trim().parse::<u32>() { config.dock_tamano = n.clamp(32, 80); }
+                }
+                "bloqueo_huella" => { config.bloqueo_huella = matches!(valor.trim(), "si" | "sí" | "true" | "1"); }
                 // Un valor absurdo se descarta en vez de aplicarse: una escala
                 // de 0 deja la pantalla en 0x0 píxeles lógicos y el escritorio
                 // no vuelve a arrancar hasta editar el fichero a ciegas.
@@ -994,6 +1002,17 @@ mod tests {
 
     fn parsear(texto: &str) -> Config {
         Config::desde_texto(texto, std::path::Path::new("prueba.conf"))
+    }
+
+    #[test]
+    fn dock_y_huella_tienen_valores_seguros() {
+        assert_eq!(parsear("").dock_tamano, 50);
+        assert!(!parsear("").bloqueo_huella);
+        assert_eq!(parsear("dock_tamano = 12").dock_tamano, 32);
+        assert_eq!(parsear("dock_tamano = 120").dock_tamano, 80);
+        assert_eq!(parsear("dock_tamano = absurdo").dock_tamano, 50);
+        assert!(parsear("bloqueo_huella = si").bloqueo_huella);
+        assert!(!parsear("bloqueo_huella = quizá").bloqueo_huella);
     }
 
     #[test]

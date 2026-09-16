@@ -128,6 +128,7 @@ impl DockItem {
 }
 
 pub struct Dock {
+    tamano: f32,
     items: Vec<DockItem>,
     /// Índice del icono bajo el puntero, si lo hay.
     /// El icono señalado, con su placa entrando y saliendo.
@@ -138,6 +139,14 @@ pub struct Dock {
 }
 
 impl Dock {
+    pub fn tamano_actual(&self) -> u32 {
+        self.tamano as u32
+    }
+    pub fn tamano(&mut self, tamano: u32) {
+        self.tamano = tamano.clamp(32, 80) as f32;
+        self.hover.señalar(None);
+    }
+
     /// Ancla sin alternar. Es lo que hace arrastrar un icono del launchpad
     /// hasta el dock: soltar algo que ya estaba anclado no puede desanclarlo,
     /// que es lo que haría [`Self::alternar_anclado`]. `true` si cambió algo.
@@ -235,6 +244,7 @@ impl Dock {
             items,
             hover: tema::Realce::nuevo(),
             pegado: true,
+            tamano: ICON,
         }
     }
 
@@ -304,18 +314,18 @@ impl Dock {
     pub fn item_en(&self, x: f32, y: f32) -> Option<usize> {
         // La banda del indicador cuenta como parte del icono: pulsar el punto
         // de "abierta" es pulsar la aplicación, no un hueco muerto.
-        if y < PAD || y > PAD + ICON + PUNTO {
+        if y < PAD || y > PAD + self.tamano + PUNTO {
             return None;
         }
         let rel = x - PAD;
         if rel < 0.0 {
             return None;
         }
-        let paso = ICON + GAP;
+        let paso = self.tamano + GAP;
         let i = (rel / paso) as usize;
         // El hueco entre dos iconos no es de nadie: pulsar ahí no debe lanzar
         // el de la izquierda.
-        if rel - i as f32 * paso > ICON {
+        if rel - i as f32 * paso > self.tamano {
             return None;
         }
         (i < self.items.len()).then_some(i)
@@ -348,7 +358,7 @@ impl Dock {
     /// El centro **horizontal** del icono `i`, relativo al dock. Lo necesita el
     /// menú contextual para salir justo encima de él.
     pub fn centro_de(&self, i: usize) -> f32 {
-        PAD + i as f32 * (ICON + GAP) + ICON / 2.0
+        PAD + i as f32 * (self.tamano + GAP) + self.tamano / 2.0
     }
 
     /// Tamaño lógico del dock, derivado del número de items.
@@ -358,15 +368,15 @@ impl Dock {
     pub fn size(&self) -> (f32, f32) {
         let n = self.items.len().max(1) as f32;
         (
-            PAD * 2.0 + n * ICON + (n - 1.0) * GAP,
-            PAD * 2.0 + ICON + PUNTO,
+            PAD * 2.0 + n * self.tamano + (n - 1.0) * GAP,
+            PAD * 2.0 + self.tamano + PUNTO,
         )
     }
 
     pub fn view(&self) -> PanelElement<'_> {
         let mut fila = row![].spacing(GAP);
         for (i, item) in self.items.iter().enumerate() {
-            fila = fila.push(icon_view(item, self.hover.intensidad(i)));
+            fila = fila.push(icon_view(item, self.hover.intensidad(i), self.tamano));
         }
 
         // Pegado al borde solo se redondea por arriba: unas esquinas curvas
@@ -411,17 +421,17 @@ impl Dock {
 ///
 /// Todavía no es la lente de `DockMagnify.qml`: magnificar de verdad exige que
 /// el icono se salga de su slot, y el buffer del dock hoy mide exactamente
-/// `PAD*2 + ICON` de alto, así que lo ampliado quedaría cortado. Reservar ese
+/// `PAD*2 + self.tamano` de alto, así que lo ampliado quedaría cortado. Reservar ese
 /// hueco cambia la geometría ya calibrada y va aparte.
-fn icon_view(item: &DockItem, señalado: f32) -> PanelElement<'_> {
+fn icon_view(item: &DockItem, señalado: f32, tamano: f32) -> PanelElement<'_> {
     let contenido: PanelElement<'_> = match &item.icon {
         Some(Icono::Svg(handle)) => svg(handle.clone())
-            .width(Length::Fixed(ICON))
-            .height(Length::Fixed(ICON))
+            .width(Length::Fixed(tamano))
+            .height(Length::Fixed(tamano))
             .into(),
         Some(Icono::Raster(handle)) => iced_image(handle.clone())
-            .width(Length::Fixed(ICON))
-            .height(Length::Fixed(ICON))
+            .width(Length::Fixed(tamano))
+            .height(Length::Fixed(tamano))
             .into(),
         None => {
             // Baldosa con la inicial. Fea a propósito: se ve que falta el icono.
@@ -436,8 +446,8 @@ fn icon_view(item: &DockItem, señalado: f32) -> PanelElement<'_> {
                     .center_x(Length::Fill)
                     .center_y(Length::Fill),
             )
-            .width(Length::Fixed(ICON))
-            .height(Length::Fixed(ICON))
+            .width(Length::Fixed(tamano))
+            .height(Length::Fixed(tamano))
             .style(|_theme| container::Style {
                 background: Some(
                     Color {
@@ -475,14 +485,14 @@ fn icon_view(item: &DockItem, señalado: f32) -> PanelElement<'_> {
         contenido
     };
 
-    column![icono, punto(item.abierta)].into()
+    column![icono, punto(item.abierta, tamano)].into()
 }
 
 /// El indicador de "esta aplicación tiene ventana", bajo el icono.
 ///
 /// Siempre ocupa su sitio, esté encendido o no: si el hueco apareciera y
 /// desapareciera, el dock entero cambiaría de alto al abrir una ventana.
-fn punto<'a>(encendida: bool) -> PanelElement<'a> {
+fn punto<'a>(encendida: bool, tamano: f32) -> PanelElement<'a> {
     let color = if encendida {
         Color { a: 0.85, ..TEXT() }
     } else {
@@ -503,9 +513,9 @@ fn punto<'a>(encendida: bool) -> PanelElement<'a> {
             ..Default::default()
         }),
     )
-    .width(Length::Fixed(ICON))
+    .width(Length::Fixed(tamano))
     .height(Length::Fixed(PUNTO))
-    .center_x(Length::Fixed(ICON))
+    .center_x(Length::Fixed(tamano))
     .into()
 }
 
@@ -534,6 +544,7 @@ mod tests {
             .collect();
         Dock {
             items,
+            tamano: ICON,
             hover: tema::Realce::nuevo(),
             pegado: true,
         }
@@ -546,6 +557,23 @@ mod tests {
         assert_eq!(d.item_en(centro(0), PAD + ICON / 2.0), Some(0));
         assert_eq!(d.item_en(centro(1), PAD + ICON / 2.0), Some(1));
         assert_eq!(d.item_en(centro(2), PAD + ICON / 2.0), Some(2));
+    }
+
+    #[test]
+    fn tamano_configurable_conserva_los_hit_tests() {
+        let mut d = dock(3);
+        for tamano in [0, 32, 50, 80, 200] {
+            d.tamano(tamano);
+            let lado = tamano.clamp(32, 80) as f32;
+            assert_eq!(d.tamano_actual(), lado as u32);
+            for i in 0..3 {
+                assert_eq!(
+                    d.item_en(PAD + i as f32 * (lado + GAP) + lado / 2.0, PAD + lado / 2.0),
+                    Some(i)
+                );
+            }
+            assert_eq!(d.size().1, PAD * 2.0 + lado + PUNTO);
+        }
     }
 
     #[test]

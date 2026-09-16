@@ -22,6 +22,8 @@ const TERMINAL: &str = "konsole";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Accion {
+    MenuVentana,
+    SiempreEncima,
     /// Ctrl+Alt+F1..F12 — saltar a otro terminal virtual.
     CambiarVt(i32),
     /// Meta+Return — abrir un terminal dentro de la sesión.
@@ -56,6 +58,7 @@ pub enum Accion {
     BloqueoBorrar,
     BloqueoLimpiar,
     BloqueoComprobar,
+    BloqueoHuella,
     /// Las teclas de función del portátil: volumen, brillo, touchpad.
     Multimedia(crate::multimedia::Tecla),
     /// Meta+flechas — encajar la ventana con foco, como en KDE: la primera
@@ -90,6 +93,11 @@ pub enum Accion {
     Proyeccion,
     /// Meta+Alt+F — poner o quitar el panel de diagnóstico de fotogramas.
     Diagnostico,
+    /// Abrir la isla de actividades si está compacta, o recogerla. No tiene
+    /// atajo propio: llega desde un remapeo de `teclas.conf`.
+    Actividades,
+    /// El comando de un remapeo de `teclas.conf`.
+    Lanzar(String),
 }
 
 /// El conmutador de aplicaciones: `Alt+Tab` y `Meta+Tab`, con Mayús al revés.
@@ -274,6 +282,9 @@ pub fn resolver(
         if base == keysyms::KEY_BackSpace {
             return Some(Accion::Salir);
         }
+        if base == keysyms::KEY_Delete {
+            return Some(Accion::DelShell(bookos_shell::Accion::CerrarSesion));
+        }
     }
 
     // El botón de encendido y `Meta+Esc`, los dos al mismo diálogo. El segundo
@@ -359,6 +370,7 @@ pub fn resolver(
     // brazo de Meta y no llegaría nunca aquí.
     if modifiers.logo && modifiers.alt {
         match sym {
+            keysyms::KEY_t | keysyms::KEY_T => return Some(Accion::SiempreEncima),
             keysyms::KEY_b | keysyms::KEY_B => {
                 return Some(Accion::AlternarBarra(crate::shell::Barra::Panel));
             }
@@ -372,6 +384,9 @@ pub fn resolver(
         }
     }
 
+    if modifiers.alt && !modifiers.logo && !modifiers.ctrl && sym == keysyms::KEY_F3 {
+        return Some(Accion::MenuVentana);
+    }
     if modifiers.logo {
         match sym {
             keysyms::KEY_Return | keysyms::KEY_KP_Enter => return Some(Accion::Terminal),
@@ -387,7 +402,7 @@ pub fn resolver(
             // H de *hide*, como en macOS: Meta+M es «minimizar» en Windows pero
             // aquí Meta+M ya no está libre en cuanto haya un menú.
             keysyms::KEY_h | keysyms::KEY_H => return Some(Accion::Minimizar),
-            keysyms::KEY_l | keysyms::KEY_L => return Some(Accion::Bloquear),
+            keysyms::KEY_l | keysyms::KEY_L => return Some(Accion::DelShell(bookos_shell::Accion::Bloquear)),
             // Alternativa deliberada para equipos cuyo firmware se queda Fn
             // antes de crear un evento de teclado. No sustituye Fn+F4: permite
             // abrir el mismo selector con un atajo que siempre llega.
@@ -424,8 +439,35 @@ impl Accion {
     }
 }
 
+pub fn menu_ventana(state: &mut BookosComp, window: Window) {
+    crate::escritorios::terminar_todos(state);
+    let salida = crate::escritorios::salida_de(state, &window);
+    let mut opciones = vec![(
+        if crate::ventanas::siempre_encima(&window) { "Dejar de mantener encima" } else { "Siempre encima" }.into(),
+        bookos_shell::Accion::VentanaEncima,
+    )];
+    for (n, nombre) in state.escritorios.nombres().iter().enumerate() {
+        if salida.as_ref().is_some_and(|s| state.escritorios.activo_en(s) == n) { continue; }
+        opciones.push((format!("Mover a {nombre}"), bookos_shell::Accion::VentanaEscritorio(n)));
+    }
+    for output in state.space.outputs() {
+        let nombre = output.name();
+        if salida.as_ref() == Some(&nombre) { continue; }
+        opciones.push((format!("Mover a {nombre}"), bookos_shell::Accion::VentanaMonitor(nombre)));
+    }
+    state.menu_ventana = Some(window);
+    if let Some(shell) = state.shell.as_mut() { shell.menu_ventana(opciones); }
+    state.needs_redraw = true;
+}
+
 pub fn ejecutar(state: &mut BookosComp, accion: Accion) {
     match accion {
+        Accion::MenuVentana => {
+            if let Some(window) = state.ventana_con_foco() { menu_ventana(state, window); }
+        }
+        Accion::SiempreEncima => {
+            if let Some(window) = state.ventana_con_foco() { state.alternar_encima(&window); }
+        }
         Accion::CambiarVt(vt) => cambiar_vt(state, vt),
         Accion::Terminal => {
             let cmd = std::env::var("BOOKOS_TERMINAL").unwrap_or_else(|_| TERMINAL.to_string());
@@ -486,6 +528,14 @@ pub fn ejecutar(state: &mut BookosComp, accion: Accion) {
         Accion::Bloquear => bloquear(state),
         Accion::DialogoEnergia => alternar_dialogo_energia(state),
         Accion::Diagnostico => diagnostico(state),
+        Accion::Actividades => {
+            if state.shell.as_mut().is_some_and(|s| s.alternar_actividad()) {
+                state.needs_redraw = true;
+            } else {
+                tracing::info!("no hay actividad publicada que abrir");
+            }
+        }
+        Accion::Lanzar(cmd) => lanzar(state, &cmd),
         Accion::Proyeccion => {
             let conectadas = state.pantallas.compartido.salidas().len();
             tracing::info!(conectadas, "selector de proyección abierto");
@@ -495,6 +545,8 @@ pub fn ejecutar(state: &mut BookosComp, accion: Accion) {
             state.needs_redraw = true;
         }
         Accion::Desbloquear => {
+            state.bloqueo_generacion = state.bloqueo_generacion.wrapping_add(1);
+            marcar_bloqueo_sesion(false);
             crate::backend::cancelar_suspension_inactividad(state);
             state.bloqueo = Default::default();
             if let Some(shell) = state.shell.as_mut() {
@@ -530,6 +582,7 @@ pub fn ejecutar(state: &mut BookosComp, accion: Accion) {
             }
         }
         Accion::BloqueoComprobar => comprobar_bloqueo(state),
+        Accion::BloqueoHuella => comprobar_huella(state),
         Accion::Multimedia(tecla) => crate::multimedia::ejecutar(state, tecla),
         Accion::Maximizar => {
             if let Some(window) = state.ventana_con_foco() {
@@ -587,7 +640,26 @@ pub fn ejecutar(state: &mut BookosComp, accion: Accion) {
 /// Ejecuta lo que ha pedido el shell: lanzar un programa, o traer al frente el
 /// que ya está abierto.
 pub fn hacer(state: &mut BookosComp, accion: bookos_shell::Accion) {
+    if let Some(energia) = bookos_shell::confirmacion::Energia::de_accion(&accion) {
+        if let Some(shell) = state.shell.as_mut() { shell.confirmar_energia(energia); }
+        state.needs_redraw = true;
+        return;
+    }
     match accion {
+        bookos_shell::Accion::CerrarEmergente => {
+            if let Some(shell) = state.shell.as_mut() { shell.cerrar_emergente(); }
+            state.needs_redraw = true;
+        }
+        bookos_shell::Accion::EnergiaConfirmada(energia) => {
+            use bookos_shell::confirmacion::Energia;
+            match energia {
+                Energia::Bloquear => bloquear(state),
+                Energia::CerrarSesion => state.loop_signal.stop(),
+                Energia::Suspender => lanzar(state, "systemctl suspend"),
+                Energia::Reiniciar => lanzar(state, "systemctl reboot"),
+                Energia::Apagar => lanzar(state, "systemctl poweroff"),
+            }
+        }
         bookos_shell::Accion::Lanzar(cmd) => lanzar(state, &cmd),
         bookos_shell::Accion::Launchpad => {
             if let Some(shell) = state.shell.as_mut() {
@@ -778,6 +850,17 @@ pub fn hacer(state: &mut BookosComp, accion: bookos_shell::Accion) {
             state.needs_redraw = true;
         }
         bookos_shell::Accion::Bloquear => bloquear(state),
+        bookos_shell::Accion::VentanaEncima
+        | bookos_shell::Accion::VentanaEscritorio(_)
+        | bookos_shell::Accion::VentanaMonitor(_) => {
+            let Some(window) = state.menu_ventana.take().filter(|w| w.alive()) else { return; };
+            match accion {
+                bookos_shell::Accion::VentanaEncima => state.alternar_encima(&window),
+                bookos_shell::Accion::VentanaEscritorio(n) => crate::escritorios::mover_ventana(state, &window, n),
+                bookos_shell::Accion::VentanaMonitor(n) => state.mover_a_monitor(&window, &n),
+                _ => unreachable!(),
+            }
+        }
         bookos_shell::Accion::CerrarSesion => {
             tracing::info!("cierre de sesión pedido desde el diálogo de energía");
             state.loop_signal.stop();
@@ -923,6 +1006,48 @@ fn comprobar_bloqueo(state: &mut BookosComp) {
     recoger_comprobacion(state);
 }
 
+fn mensaje_huella(state: &mut BookosComp, mensaje: &'static str) {
+    if let Some(shell) = state.shell.as_mut() { shell.bloqueo_huella_mensaje(mensaje); }
+    state.needs_redraw = true;
+}
+
+fn comprobar_huella(state: &mut BookosComp) {
+    use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+    if !state.shell.as_ref().is_some_and(|s| s.esta_bloqueado())
+        || !bookos_shell::Config::cargar().bloqueo_huella
+        || state.bloqueo.huella.is_some()
+        || state.bloqueo.huella_reintentar.is_some_and(|t| t > std::time::Instant::now())
+    { return; }
+    let Some(worker) = crate::autenticar::Comprobacion::huella(&crate::autenticar::usuario()) else {
+        mensaje_huella(state, "Huella no disponible. Usa la contraseña o pulsa F9 para reintentar.");
+        return;
+    };
+    state.bloqueo.huella = Some(worker);
+    mensaje_huella(state, "Coloca el dedo en el lector o introduce tu contraseña.");
+    let generacion = state.bloqueo_generacion;
+    let resultado = state.loop_handle.insert_source(
+        Timer::from_duration(std::time::Duration::from_millis(100)),
+        move |_, _, state: &mut BookosComp| {
+            if state.bloqueo_generacion != generacion { return TimeoutAction::Drop; }
+            let Some(worker) = state.bloqueo.huella.as_mut() else { return TimeoutAction::Drop; };
+            match worker.resultado() {
+                None => TimeoutAction::ToDuration(std::time::Duration::from_millis(100)),
+                Some(true) => { ejecutar(state, Accion::Desbloquear); TimeoutAction::Drop },
+                Some(false) => {
+                    state.bloqueo.huella = None;
+                    state.bloqueo.huella_reintentar = Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+                    mensaje_huella(state, "No se pudo verificar la huella. Usa la contraseña o reintenta con F9 en 3 s.");
+                    TimeoutAction::Drop
+                }
+            }
+        });
+    if let Err(err) = resultado {
+        tracing::error!("no se pudo recoger la huella: {err}");
+        state.bloqueo.huella = None;
+        mensaje_huella(state, "Huella no disponible. Introduce tu contraseña.");
+    }
+}
+
 /// Demora local frente a intentos repetidos. PAM conserva su propia política;
 /// esta capa evita crear trabajadores sin límite desde la interfaz.
 fn demora_reintento(fallos: u32) -> u64 {
@@ -940,9 +1065,11 @@ fn demora_reintento(fallos: u32) -> u64 {
 /// dura la comprobación, no en reposo.
 fn recoger_comprobacion(state: &mut BookosComp) {
     use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+    let generacion = state.bloqueo_generacion;
     let result = state.loop_handle.insert_source(
         Timer::from_duration(std::time::Duration::from_millis(100)),
-        |_, _, state: &mut BookosComp| {
+        move |_, _, state: &mut BookosComp| {
+            if state.bloqueo_generacion != generacion { return TimeoutAction::Drop; }
             let Some(comprobacion) = state.bloqueo.comprobando.as_mut() else {
                 return TimeoutAction::Drop;
             };
@@ -1190,7 +1317,28 @@ fn alternar_dialogo_energia(state: &mut BookosComp) {
     state.needs_redraw = true;
 }
 
+fn marcar_bloqueo_sesion(bloqueada: bool) {
+    if let Some(path) = std::env::var_os("BOOKOS_SESSION_LOCK_FILE") {
+        if bloqueada {
+            // Eliminar el permiso de recuperación antes de bloquear. La
+            // ausencia del fichero se interpreta como bloqueado (fail closed).
+            if let Err(err) = std::fs::remove_file(path) {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    tracing::error!("no se pudo proteger la recuperación: {err}");
+                    // EX_NOPERM: el supervisor obliga a volver al login,
+                    // incluso si quedó un marcador «unlocked» antiguo.
+                    std::process::exit(77);
+                }
+            }
+        } else if let Err(err) = std::fs::write(path, "unlocked") {
+            tracing::warn!("la recuperación requerirá iniciar sesión: {err}");
+        }
+    }
+}
+
 fn bloquear(state: &mut BookosComp) {
+    if state.shell.as_ref().is_some_and(|s| s.esta_bloqueado()) { return; }
+    marcar_bloqueo_sesion(true);
     if let Some(token) = state.tick_bloqueo.take() {
         state.loop_handle.remove(token);
     }
@@ -1203,6 +1351,7 @@ fn bloquear(state: &mut BookosComp) {
     // El bloqueo ya está puesto antes de preguntar por MPRIS: un reproductor
     // lento nunca puede retrasar la barrera de seguridad ni el primer frame.
     state.bloqueo_generacion = state.bloqueo_generacion.wrapping_add(1);
+    comprobar_huella(state);
     let generacion = state.bloqueo_generacion;
     let canal = state.medios_bloqueo.clone();
     std::thread::Builder::new()

@@ -241,6 +241,18 @@ impl Actividad {
         true
     }
 
+    /// Abre la tarjeta compacta o recoge la abierta, con la misma transición
+    /// que al pulsarla.
+    pub fn alternar_vista(&mut self) -> bool {
+        match self.vista {
+            Vista::Compacta => self.abrir_previsualizacion(),
+            Vista::Abierta | Vista::Cola => {
+                self.colapsar();
+                true
+            }
+        }
+    }
+
     fn filas_cola(&self) -> usize {
         self.estado.cola.len().min(COLA_MAX)
     }

@@ -28,6 +28,7 @@ use iced_tiny_skia::Renderer;
 pub mod actividad;
 mod apps;
 pub mod bloqueo;
+pub mod confirmacion;
 pub mod captura;
 mod config;
 /// El conmutador de Alt+Tab. Público porque el compositor le da la lista de
@@ -135,6 +136,11 @@ pub const PANEL_HEIGHT: u32 = 32;
 /// atrás.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Accion {
+    EnergiaConfirmada(confirmacion::Energia),
+    CerrarEmergente,
+    VentanaEncima,
+    VentanaEscritorio(usize),
+    VentanaMonitor(String),
     Lanzar(String),
     /// Traer al frente lo que ya está abierto, en vez de abrirlo otra vez.
     ///
@@ -660,7 +666,8 @@ impl Shell {
             config.centro.as_ref().and_then(construir),
             config.derecha.iter().filter_map(construir).collect(),
         );
-        let dock_items = Dock::from_config(&config.dock);
+        let mut dock_items = Dock::from_config(&config.dock);
+        dock_items.tamano(config.dock_tamano);
         let (dw, dh) = dock_items.size();
         Self {
             // Font::DEFAULT resuelve contra las fuentes del sistema vía fontdb.
@@ -806,6 +813,14 @@ impl Shell {
         let cambio = self.widgets.refrescar();
         let cambio_emergente = self.refresh_emergente();
         cambio || cambio_emergente || !self.panel.painted_once
+    }
+
+    pub fn panel_animando(&self) -> bool {
+        self.widgets.animando()
+    }
+
+    pub fn panel_avanzar(&mut self) {
+        self.widgets.avanzar();
     }
 
     /// Relee solo la tarjeta abierta; no consulta batería ni carpetas.
@@ -979,6 +994,18 @@ impl Shell {
             return false;
         };
         if actividad.app_id() != app_id || !actividad.abrir_previsualizacion() {
+            return false;
+        }
+        let (w, h) = actividad.size();
+        *canvas = Canvas::new(Size::new(w, h), self.panel.scale);
+        true
+    }
+
+    pub fn alternar_actividad(&mut self) -> bool {
+        let Some((actividad, canvas)) = self.actividad.as_mut() else {
+            return false;
+        };
+        if !actividad.alternar_vista() {
             return false;
         }
         let (w, h) = actividad.size();
@@ -2286,6 +2313,20 @@ impl Shell {
         true
     }
 
+    pub fn bloqueo_confirmar_tecla(&mut self, tecla: TeclaPulsada) -> (bool, Option<bloqueo::Peticion>) {
+        let Some((b, canvas)) = self.bloqueo.as_mut() else { return (false, None); };
+        let resultado = b.confirmar_tecla(tecla);
+        if resultado.0 { canvas.painted_once = false; }
+        resultado
+    }
+
+    pub fn bloqueo_huella_mensaje(&mut self, mensaje: &'static str) {
+        if let Some((b, canvas)) = self.bloqueo.as_mut() {
+            b.huella_mensaje = mensaje;
+            canvas.painted_once = false;
+        }
+    }
+
     pub fn bloqueo_caps_lock(&mut self, activo: bool) -> bool {
         let Some((b, canvas)) = self.bloqueo.as_mut() else {
             return false;
@@ -2379,6 +2420,10 @@ impl Shell {
         true
     }
 
+    pub fn menu_ventana(&mut self, opciones: Vec<(String, Accion)>) {
+        self.abrir(Emergente::menu_ventana(opciones));
+    }
+
     /// Ancla una aplicación al dock, o la desancla si ya estaba.
     ///
     /// Devuelve la lista de anclados que hay que guardar, para que el
@@ -2414,6 +2459,12 @@ impl Shell {
         }
         self.dock.painted_once = false;
         true
+    }
+
+    pub fn dock_tamano(&mut self, tamano: u32) {
+        self.dock_items.tamano(tamano);
+        let (w, h) = self.dock_items.size();
+        self.dock = Canvas::new(Size::new(w, h), self.dock.scale);
     }
 
     /// ¿Está esta aplicación anclada al dock?

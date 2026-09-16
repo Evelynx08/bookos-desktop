@@ -959,6 +959,10 @@ impl ShellHost {
         // El dock sí lo conserva: flota sobre las ventanas, y ahí el desenfoque
         // es lo que lo separa de lo que tenga debajo.
         let mut zonas = Vec::with_capacity(2);
+        if self.shell.emergente_nombre() == Some("apagar") {
+            zonas.push((Rectangle::new((0, 0).into(), (self.screen.0, self.screen.1).into()),
+                6.0 * escala, 1.0));
+        }
         // El buscador flota en mitad de la pantalla y ahí debajo hay ventanas:
         // sin cristal, su fondo translúcido deja leer lo que tape. Va antes que
         // el dock para quedar por detrás si llegan a solaparse.
@@ -1562,6 +1566,13 @@ impl ShellHost {
         self.sincronizar_emergente();
     }
 
+    pub fn confirmar_energia(&mut self, accion: bookos_shell::confirmacion::Energia) {
+        self.guard("confirmar energía", |host| {
+            host.shell.abrir(bookos_shell::Emergente::confirmar_energia(accion));
+        });
+        self.sincronizar_emergente();
+    }
+
     /// Abre el permiso de compartir pantalla que pide el portal.
     ///
     /// Cierra lo que hubiera abierto: es un diálogo y tiene que verse.
@@ -2070,6 +2081,15 @@ impl ShellHost {
         abierta
     }
 
+    pub fn alternar_actividad(&mut self) -> bool {
+        let cambiada =
+            self.guard("alternar actividad", |host| host.shell.alternar_actividad()) == Some(true);
+        if cambiada {
+            self.pintar_actividad();
+        }
+        cambiada
+    }
+
     pub fn actividad_app_id(&self) -> Option<&str> {
         self.shell.actividad_app_id()
     }
@@ -2392,6 +2412,14 @@ impl ShellHost {
         });
     }
 
+    pub fn animar_panel(&mut self) {
+        if self.dead || !self.shell.panel_animando() { return; }
+        self.guard("animar widgets", |host| {
+            host.shell.panel_avanzar();
+            paint(&mut host.panel.buffer, |buf| host.shell.draw_panel(buf));
+        });
+    }
+
     /// ¿Sigue el aviso a la vista? De paso lo retira si se le acabó el tiempo.
     ///
     /// Devuelve además si **acaba** de retirarlo, porque entonces hace falta un
@@ -2602,6 +2630,15 @@ impl ShellHost {
 
     /// El chrome modal del selector, separado del resto del shell para que se
     /// siga dibujando encima de una ventana a pantalla completa.
+    pub fn menu_ventana_element<R>(&self, renderer: &mut R) -> Option<MemoryRenderBufferRenderElement<R>>
+    where R: Renderer + ImportMem, R::TextureId: Send + Clone + 'static,
+    {
+        if self.esta_bloqueado() || self.shell.emergente_nombre() != Some("menu-ventana") { return None; }
+        let surface = self.emergente.as_ref()?;
+        MemoryRenderBufferRenderElement::from_buffer(renderer, surface.location, &surface.buffer,
+            Some(1.0), Some(surface.src), Some(surface.logical), Kind::Unspecified).ok()
+    }
+
     pub fn conmutador_element<R>(
         &self,
         renderer: &mut R,
@@ -2866,6 +2903,27 @@ impl ShellHost {
         });
     }
 
+    pub fn bloqueo_confirmar_tecla(&mut self, tecla: bookos_shell::TeclaPulsada) -> (bool, Option<bookos_shell::bloqueo::Peticion>) {
+        self.guard("confirmar en bloqueo", |host| {
+            let resultado = host.shell.bloqueo_confirmar_tecla(tecla);
+            if resultado.0 {
+                if let Some(surface) = host.bloqueo.as_mut() {
+                    paint(&mut surface.buffer, |buf| host.shell.draw_bloqueo(buf));
+                }
+            }
+            resultado
+        }).unwrap_or((true, None))
+    }
+
+    pub fn bloqueo_huella_mensaje(&mut self, mensaje: &'static str) {
+        self.guard("estado de la huella", |host| {
+            host.shell.bloqueo_huella_mensaje(mensaje);
+            if let Some(surface) = host.bloqueo.as_mut() {
+                paint(&mut surface.buffer, |buf| host.shell.draw_bloqueo(buf));
+            }
+        });
+    }
+
     pub fn bloqueo_caps_lock(&mut self, activo: bool) {
         if self.dead {
             return;
@@ -2945,6 +3003,23 @@ impl ShellHost {
             return false;
         }
         self.sincronizar_emergente();
+        true
+    }
+
+    pub fn menu_ventana(&mut self, opciones: Vec<(String, Accion)>) {
+        self.guard("menú de ventana", |host| host.shell.menu_ventana(opciones));
+        self.sincronizar_emergente();
+    }
+
+    pub fn dock_tamano(&mut self, tamano: u32) -> bool {
+        if self.dead || self.shell.dock().tamano_actual() == tamano.clamp(32, 80) {
+            return false;
+        }
+        self.guard("tamaño del dock", |host| host.shell.dock_tamano(tamano));
+        self.dock = Surface::new(self.shell.dock_buffer_size(), self.shell.dock_logical_size());
+        self.place_dock();
+        self.avisar_zona_dock();
+        self.refresh();
         true
     }
 
@@ -3148,12 +3223,19 @@ impl ShellHost {
         if cambio {
             self.escritorio_recolocar();
         }
+        if self.shell.emergente_needs_paint() {
+            self.sincronizar_emergente();
+        }
         dirty || cambio
     }
 
     pub fn refresh_emergente(&mut self) -> bool {
-        self.guard("refrescar tarjeta", |host| host.shell.refresh_emergente())
-            .unwrap_or(false)
+        let cambio = self.guard("refrescar tarjeta", |host| host.shell.refresh_emergente())
+            .unwrap_or(false);
+        if cambio {
+            self.sincronizar_emergente();
+        }
+        cambio
     }
 
     /// Cuánto ha avanzado la animación de entrada, de 0 a 1.
@@ -3213,6 +3295,7 @@ impl ShellHost {
     /// seguir dibujando aunque no pase nada más.
     pub fn animando(&self) -> bool {
         if self.shell.emergente_animando()
+            || self.shell.panel_animando()
             || self.shell.dock_animando()
             || self.shell.conmutador_animando()
             || self.shell.osd_animando()
@@ -3590,6 +3673,37 @@ fn paint(buffer: &mut MemoryRenderBuffer, draw: impl FnOnce(&mut [u8]) -> Vec<Da
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ajustes_del_dock_repintan_y_no_recrean_si_no_cambia() {
+        let mut host = ShellHost::new(1920, 1080, 1.75, Some(bookos_shell::Config::default()));
+        assert!(host.dock_tamano(80));
+        assert_eq!(host.shell.dock().tamano_actual(), 80);
+        assert!(!host.shell.dock_needs_paint(), "la superficie nueva no puede quedar vacía");
+        assert!(!host.dock_tamano(80));
+        assert!(host.dock_tamano(32));
+        assert!(!host.shell.dock_needs_paint());
+    }
+
+    #[test]
+    fn una_actualizacion_externa_repinta_la_tarjeta_abierta() {
+        let anterior = bookos_system::snapshot();
+        let mut datos = anterior.clone();
+        datos.audio = serde_json::json!({"output":{"volume":20,"muted":false}});
+        bookos_system::seed_test_state(datos.clone());
+        let mut host = ShellHost::new(1280, 800, 1.0, Some(bookos_shell::Config::default()));
+        host.abrir_de_widget("volumen");
+        assert!(host.emergente.is_some());
+        datos.audio = serde_json::json!({"output":{"volume":70,"muted":true}});
+        bookos_system::seed_test_state(datos.clone());
+        assert!(host.refresh());
+        assert!(!host.shell.emergente_needs_paint(), "refresh debe subir el dibujo actualizado");
+        datos.audio = serde_json::json!({"output":{"volume":35,"muted":false}});
+        bookos_system::seed_test_state(datos);
+        assert!(host.refresh_emergente());
+        assert!(!host.shell.emergente_needs_paint(), "el refresco de una tarjeta también la pinta");
+        bookos_system::seed_test_state(anterior);
+    }
 
     /// El buscador **no se mueve** mientras escribes.
     ///

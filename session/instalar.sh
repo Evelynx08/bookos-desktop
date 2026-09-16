@@ -12,6 +12,28 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 aqui="$(cd "$(dirname "$0")" && pwd)"
+# La recuperación gráfica necesita un compositor independiente y Qt/Python.
+if ! command -v kwin_wayland >/dev/null 2>&1 || ! python3 -c 'import PySide6.QtWidgets' >/dev/null 2>&1; then
+    echo "La recuperación gráfica requiere kwin_wayland, python3 y PySide6 (QtWidgets)." >&2
+    exit 1
+fi
+comp_bin=""
+if [ -e /etc/pam.d/system-auth ]; then
+    cuenta_pam=system-auth
+elif [ -e /etc/pam.d/common-account ]; then
+    cuenta_pam=common-account
+else
+    echo "No se reconoce la política PAM de cuentas; no se instalará el servicio biométrico." >&2
+    cuenta_pam=""
+fi
+for candidate in "$aqui/../target/release/bookos-comp" "$aqui/../target/debug/bookos-comp"; do
+    [ -x "$candidate" ] || continue
+    if [ -z "$comp_bin" ] || [ "$candidate" -nt "$comp_bin" ]; then comp_bin="$candidate"; fi
+done
+if [ -z "$comp_bin" ]; then
+    echo "Compila primero: cargo build --release -p bookos-comp" >&2
+    exit 1
+fi
 # Build before installing so D-Bus never points to a missing executable.
 system_bin=""
 for candidate in "$aqui/../target/release/bookos-system" "$aqui/../target/debug/bookos-system"; do
@@ -26,6 +48,7 @@ fi
 # binario va a /usr/local/libexec, así que aquí se reescribe al vuelo. Antes
 # era al revés y el paquete instalado quedaba apuntando a /usr/local.
 install -Dm755 "$system_bin" /usr/local/libexec/bookos-system
+install -Dm755 "$comp_bin" /usr/local/bin/bookos-comp
 sed 's|/usr/libexec/bookos-system|/usr/local/libexec/bookos-system|' \
     "$aqui/org.bookos.System1.service" > /tmp/org.bookos.System1.service
 install -Dm644 /tmp/org.bookos.System1.service /usr/local/share/dbus-1/services/org.bookos.System1.service
@@ -35,7 +58,14 @@ install -Dm644 /tmp/bookos-system.service /usr/local/lib/systemd/user/bookos-sys
 rm -f /tmp/org.bookos.System1.service /tmp/bookos-system.service
 
 install -Dm755 "$aqui/bookos-session" /usr/local/bin/bookos-session
+install -Dm644 "$aqui/bookos-recovery.py" /usr/local/libexec/bookos-recovery.py
 install -Dm644 "$aqui/bookos.desktop" /usr/share/wayland-sessions/bookos.desktop
+if [ -n "$cuenta_pam" ] && [ ! -e /etc/pam.d/bookos-fingerprint ]; then
+    temporal_pam="$(mktemp)"
+    sed "s/account include system-auth/account include $cuenta_pam/" "$aqui/bookos-fingerprint.pam" > "$temporal_pam"
+    install -Dm644 "$temporal_pam" /etc/pam.d/bookos-fingerprint
+    rm -f -- "$temporal_pam"
+fi
 
 # El backend de portales. El compositor implementa ScreenCast y Screenshot
 # dentro de su propio proceso, así que aquí solo se declara quién los atiende:
