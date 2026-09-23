@@ -24,10 +24,12 @@
 //! actividades = si
 //! actividades_animaciones = si
 //! alto_contraste = no
+//! brillo_automatico_pantalla = no
+//! brillo_automatico_teclado = no
 //! temporizador_siempre_visible = no
 //! escritorios = 2
 //! nombres_escritorios = Escritorio 1, Escritorio 2
-//! dock = bookos-shell:Terminal:utilities-terminal, bookos-explorer:Archivos:system-file-manager, firefox:Navegador:firefox, bookos-settings:Ajustes:bookos-settings
+//! dock = konsole:Terminal:utilities-terminal, bookos-explorer:Archivos:system-file-manager, firefox:Navegador:firefox, bookos-settings:Ajustes:bookos-settings
 //!
 //! # Cursor y entrada. Las velocidades van en la escala de libinput: [-1, 1].
 //! # Uno para cada tema: el cambio de claro a oscuro se lleva el fondo con él.
@@ -65,6 +67,17 @@ pub enum Efectos {
     #[default]
     Completos,
     Reducidos,
+}
+
+/// Qué luces siguen al sensor de luz ambiente.
+///
+/// Dos interruptores y no un enum de cuatro casos: en la tarjeta de brillo
+/// cada fila tiene su botón y se encienden por separado. Los dos apagados de
+/// serie, porque un brillo que cambia solo sin haberlo pedido parece un fallo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BrilloAutomatico {
+    pub pantalla: bool,
+    pub teclado: bool,
 }
 
 pub struct Config {
@@ -156,6 +169,7 @@ pub struct Config {
     /// Isla de tareas vivas; estas claves quedan preparadas para BookOS
     /// Settings y permiten desactivar movimiento sin apagar la función.
     pub actividades: Actividades,
+    pub brillo_automatico: BrilloAutomatico,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,7 +308,13 @@ impl Default for Config {
                 // El primero, como en el dock de macOS: es el cajón de todo lo
                 // demás y conviene que esté donde siempre.
                 (LAUNCHPAD, "Aplicaciones", "launchpad"),
-                ("bookos-shell", "Terminal", "utilities-terminal"),
+                // El mismo por defecto que Meta+Return (`keybinds::TERMINAL`):
+                // `bookos-shell` —lo que había aquí antes— es la biblioteca del
+                // propio panel, no un programa que lanzar. No se lee
+                // `BOOKOS_TERMINAL` aquí: el exec de un lanzador del dock pasa
+                // por el validador de `ajustes` (`GetConfig`/`ApplyConfig`),
+                // que rechaza `$`, `{` y `}` por ser metacaracteres de shell.
+                ("konsole", "Terminal", "utilities-terminal"),
                 ("bookos-explorer", "Archivos", "system-file-manager"),
                 ("firefox", "Navegador", "firefox"),
                 // Los ajustes son los de BookOS, no los de Plasma: abrir el
@@ -341,6 +361,7 @@ impl Default for Config {
             bloqueo_inactividad: 900,
             suspension_inactividad: 0,
             actividades: Actividades::default(),
+            brillo_automatico: BrilloAutomatico::default(),
         }
     }
 }
@@ -383,9 +404,13 @@ impl Config {
                 "derecha" => config.derecha = items(),
                 "dock" => config.dock = items().iter().filter_map(|s| lanzador(s)).collect(),
                 "dock_tamano" => {
-                    if let Ok(n) = valor.trim().parse::<u32>() { config.dock_tamano = n.clamp(32, 80); }
+                    if let Ok(n) = valor.trim().parse::<u32>() {
+                        config.dock_tamano = n.clamp(32, 80);
+                    }
                 }
-                "bloqueo_huella" => { config.bloqueo_huella = matches!(valor.trim(), "si" | "sí" | "true" | "1"); }
+                "bloqueo_huella" => {
+                    config.bloqueo_huella = matches!(valor.trim(), "si" | "sí" | "true" | "1");
+                }
                 // Un valor absurdo se descarta en vez de aplicarse: una escala
                 // de 0 deja la pantalla en 0x0 píxeles lógicos y el escritorio
                 // no vuelve a arrancar hasta editar el fichero a ciegas.
@@ -492,6 +517,16 @@ impl Config {
                 "alto_contraste" => {
                     if let Some(v) = booleano(valor, ruta, n + 1) {
                         config.alto_contraste = v;
+                    }
+                }
+                "brillo_automatico_pantalla" => {
+                    if let Some(v) = booleano(valor, ruta, n + 1) {
+                        config.brillo_automatico.pantalla = v;
+                    }
+                }
+                "brillo_automatico_teclado" => {
+                    if let Some(v) = booleano(valor, ruta, n + 1) {
+                        config.brillo_automatico.teclado = v;
                     }
                 }
                 "acento" => match crate::tema::Acento::desde_nombre(valor) {
@@ -764,6 +799,15 @@ pub fn guardar_efectos(efectos: Efectos) -> std::io::Result<()> {
         Efectos::Reducidos => "reducidos",
     };
     escribir_claves(&[("efectos", valor.to_string())])
+}
+
+/// Persiste qué luces siguen al sensor.
+pub fn guardar_brillo_automatico(elegido: BrilloAutomatico) -> std::io::Result<()> {
+    let si_no = |v: bool| if v { "si" } else { "no" }.to_string();
+    escribir_claves(&[
+        ("brillo_automatico_pantalla", si_no(elegido.pantalla)),
+        ("brillo_automatico_teclado", si_no(elegido.teclado)),
+    ])
 }
 
 /// Punto único de persistencia para la API estructurada del compositor.
@@ -1174,6 +1218,14 @@ mod tests {
         assert!(!parsear("toque_para_clic = 0").entrada.toque_para_clic);
         // Lo que no entiende deja el valor de serie en vez de inventarse uno.
         assert!(parsear("toque_para_clic = quizá").entrada.toque_para_clic);
+    }
+
+    #[test]
+    fn el_brillo_automatico_se_elige_por_luz() {
+        assert_eq!(parsear("").brillo_automatico, BrilloAutomatico::default());
+        let c = parsear("brillo_automatico_teclado = si");
+        assert!(c.brillo_automatico.teclado);
+        assert!(!c.brillo_automatico.pantalla);
     }
 
     /// Una línea mala no puede llevarse por delante a las demás: el escritorio

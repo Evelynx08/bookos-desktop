@@ -81,7 +81,9 @@ impl Servidor {
             .and_then(|v| u8::try_from(v).ok())
             .is_some_and(|u| u >= 2);
         let acciones = actions
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|par| bookos_shell::notificaciones::Accion {
                 clave: par[0].clone(),
                 etiqueta: par[1].clone(),
@@ -91,8 +93,22 @@ impl Servidor {
             .get("value")
             .and_then(|v| i32::try_from(v).ok())
             .map(|v| v.clamp(0, 100) as u8);
+        // La especificación pone `image-path` por delante de `app_icon`, y no
+        // es un caso raro: `notify-send -i` lo manda **solo** ahí, con
+        // `app_icon` vacío (visto en el servidor: llegaba `app_icon=""` y
+        // `image-path` entre las pistas). Puede ser un nombre del tema o una
+        // ruta, con o sin `file://`.
+        let imagen = hints
+            .get("image-path")
+            .or_else(|| hints.get("image_path"))
+            .and_then(|v| String::try_from(v.try_clone().ok()?).ok())
+            .filter(|s| !s.is_empty());
+        let icono = imagen
+            .as_deref()
+            .map(|s| s.strip_prefix("file://").unwrap_or(s))
+            .unwrap_or(&app_icon);
         let notificacion = bookos_shell::notificaciones::Notificacion::nueva_con_datos(
-            id, app_name, summary, body, &app_icon, critica, acciones, progreso, false,
+            id, app_name, summary, body, icono, critica, acciones, progreso, false,
         );
         // Si el canal está roto es que el compositor se está cerrando; se
         // contesta igual con el identificador para no dejar colgada a la
@@ -178,26 +194,32 @@ pub fn recibir(state: &mut crate::state::BookosComp, aviso: Aviso) {
     despertar_para_la_salida(state);
 }
 
-/// Programa **un** despertar para cuando el aviso empiece a irse.
+/// Programa un despertar para cuando cada aviso empiece a irse.
 ///
 /// Lo mismo que hace el aviso de volumen y por lo mismo: sin esto el compositor
 /// se duerme con el aviso puesto y no vuelve a dibujar, así que se quedaría en
-/// pantalla hasta que otra cosa provocara un frame.
+/// pantalla hasta que otra cosa provocara un frame. Uno **por aviso**: con la
+/// pila, cada uno se va a su hora, y el despertar del primero no sirve para el
+/// segundo.
 fn despertar_para_la_salida(state: &mut crate::state::BookosComp) {
     use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
-    let Some(queda) = state.shell.as_ref().and_then(|s| s.toast_queda()) else {
-        return;
-    };
-    let hasta_la_salida = queda.saturating_sub(bookos_shell::toast::SALIDA);
-    let resultado =
-        state
-            .loop_handle
-            .insert_source(Timer::from_duration(hasta_la_salida), |_, _, state| {
+    let quedan = state
+        .shell
+        .as_ref()
+        .map(|s| s.toasts_quedan())
+        .unwrap_or_default();
+    for queda in quedan {
+        let hasta_la_salida = queda.saturating_sub(bookos_shell::toast::SALIDA);
+        let resultado = state.loop_handle.insert_source(
+            Timer::from_duration(hasta_la_salida),
+            |_, _, state| {
                 state.needs_redraw = true;
                 TimeoutAction::Drop
-            });
-    if let Err(err) = resultado {
-        tracing::error!("no se pudo programar la salida del aviso: {err}");
+            },
+        );
+        if let Err(err) = resultado {
+            tracing::error!("no se pudo programar la salida del aviso: {err}");
+        }
     }
 }
 

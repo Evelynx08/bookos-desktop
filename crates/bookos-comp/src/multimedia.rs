@@ -13,8 +13,6 @@
 //! compositor todavía usa solo la primera: mientras eso no exista, la tecla no
 //! tendría a qué aplicarse.
 
-use std::process::{Command, Stdio};
-
 use crate::state::BookosComp;
 
 pub const XF86_BAJAR_VOLUMEN: u32 = 0x1008FF11;
@@ -58,44 +56,28 @@ pub fn resolver(sym: u32) -> Option<Tecla> {
 }
 
 pub fn ejecutar(state: &mut BookosComp, tecla: Tecla) {
-    let (icono, nivel, texto) = match tecla {
-        Tecla::Volumen(paso) => volumen(paso),
-        Tecla::Silenciar => silenciar("@DEFAULT_AUDIO_SINK@", false),
-        Tecla::SilenciarMicro => silenciar("@DEFAULT_AUDIO_SOURCE@", true),
-        Tecla::Brillo(paso) => brillo(state, paso),
-        Tecla::BrilloTeclado(paso) => brillo_teclado(paso),
-        Tecla::Touchpad => touchpad(state),
+    let osd = match tecla {
+        Tecla::Volumen(paso) => {
+            volumen(paso);
+            None
+        }
+        Tecla::Silenciar => {
+            silenciar("@DEFAULT_AUDIO_SINK@");
+            None
+        }
+        Tecla::SilenciarMicro => {
+            silenciar("@DEFAULT_AUDIO_SOURCE@");
+            None
+        }
+        Tecla::Brillo(paso) => Some(brillo(state, paso)),
+        Tecla::BrilloTeclado(paso) => Some(brillo_teclado(paso)),
+        Tecla::Touchpad => Some(touchpad(state)),
     };
-    // El chasquido al mover el volumen: es lo que dice que la tecla ha hecho
-    // algo cuando no estás mirando la pantalla. Solo con el volumen del
-    // altavoz —al bajar el brillo no suena nada en ningún escritorio— y no al
-    // silenciar, que sonaría justo cuando has pedido silencio.
-    if matches!(tecla, Tecla::Volumen(_)) {
-        chasquido();
-    }
-    if let Some(shell) = state.shell.as_mut() {
+    if let (Some(shell), Some((icono, nivel, texto))) = (state.shell.as_mut(), osd) {
         shell.mostrar_osd(icono, nivel, texto);
+        despertar_para_la_salida(state);
     }
     state.needs_redraw = true;
-    despertar_para_la_salida(state);
-}
-
-/// El sonido de "volumen cambiado" del tema de sonidos de freedesktop.
-///
-/// Se lanza con `canberra-gtk-play`, que es lo que usa Plasma: sabe resolver el
-/// nombre del evento dentro del tema instalado, así que no hay que codificar
-/// una ruta a un `.oga` que en otra distribución está en otro sitio. Va sin
-/// esperar —igual que `wpctl`— porque son 30 ms de proceso y el compositor no
-/// puede quedarse parado mientras suena.
-///
-/// Si el binario no está, no suena nada y ya: un escritorio sin sonidos de
-/// sistema funciona, uno que se bloquea buscándolos no.
-fn chasquido() {
-    let _ = Command::new("canberra-gtk-play")
-        .args(["-i", "audio-volume-change"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
 }
 
 /// Programa **un** despertar para cuando el aviso empiece a irse.
@@ -126,32 +108,51 @@ fn despertar_para_la_salida(state: &mut BookosComp) {
 /// Se lee **antes** de escribir en vez de llevar la cuenta aquí: el volumen lo
 /// puede haber cambiado otro programa, y sumarle el paso a un número viejo da
 /// saltos raros.
-fn volumen(paso: i32) -> (&'static str, Option<u8>, Option<String>) {
+fn volumen(paso: i32) {
     bookos_system::request(bookos_system::Operation::VolumeStep { step: paso });
-    ("volumen-medio", None, Some("Ajustando volumen…".into()))
 }
 
-fn silenciar(destino: &str, micro: bool) -> (&'static str, Option<u8>, Option<String>) {
-    bookos_system::request(bookos_system::Operation::Mute { target: destino.into(), muted: None });
-    (if micro { "micro" } else { "volumen-medio" }, None, Some("Aplicando…".into()))
+fn silenciar(destino: &str) {
+    bookos_system::request(bookos_system::Operation::Mute {
+        target: destino.into(),
+        muted: None,
+    });
 }
 
 pub fn recibir_sistema(state: &mut BookosComp) {
     use bookos_system::Operation;
-    while let Some((operation,result))=bookos_system::take_feedback() {
-        let osd=match result {
-            Err(e)=>Some(("sin-red",None,Some(e))),
-            Ok(())=>match operation {
-                Operation::VolumeStep{..}|Operation::Volume{..}|Operation::Mute{..}=>{
-                    let input=matches!(&operation,Operation::Mute{target,..}|Operation::Volume{target,..} if target=="input"||target=="@DEFAULT_AUDIO_SOURCE@");
-                    bookos_system::volume(input).map(|(level,muted)|
-                        (if input {if muted {"micro-silencio"} else {"micro"}} else {icono_volumen(level,muted)},Some(if muted {0} else {level}),None))
-                }, _=>None,
-            }
+    let mut mostro_osd = false;
+    while let Some((operation, result)) = bookos_system::take_feedback() {
+        let osd = match result {
+            Err(e) => Some(("sin-red", None, Some(e))),
+            Ok(()) => match operation {
+                Operation::VolumeStep { .. }
+                | Operation::Volume { .. }
+                | Operation::Mute { .. } => {
+                    let input = matches!(&operation,Operation::Mute{target,..}|Operation::Volume{target,..} if target=="input"||target=="@DEFAULT_AUDIO_SOURCE@");
+                    bookos_system::volume(input).map(|(level, muted)| {
+                        (
+                            if input {
+                                if muted { "micro-silencio" } else { "micro" }
+                            } else {
+                                icono_volumen(level, muted)
+                            },
+                            Some(if muted { 0 } else { level }),
+                            None,
+                        )
+                    })
+                }
+                _ => None,
+            },
         };
-        if let (Some(shell),Some((icon,level,text)))=(state.shell.as_mut(),osd) {shell.mostrar_osd(icon,level,text);}
+        if let (Some(shell), Some((icon, level, text))) = (state.shell.as_mut(), osd) {
+            shell.mostrar_osd(icon, level, text);
+            mostro_osd = true;
+        }
     }
-    despertar_para_la_salida(state);
+    if mostro_osd {
+        despertar_para_la_salida(state);
+    }
 }
 
 fn icono_volumen(nivel: u8, silenciado: bool) -> &'static str {
@@ -167,7 +168,11 @@ fn icono_volumen(nivel: u8, silenciado: bool) -> &'static str {
 /// permiso: `/sys/class/backlight/*/brightness` es de root.
 fn brillo(state: &mut BookosComp, paso: i32) -> (&'static str, Option<u8>, Option<String>) {
     let Some(actual) = bookos_shell::brillo_actual() else {
-        return ("brillo", None, Some("Brillo de pantalla no disponible".into()));
+        return (
+            "brillo",
+            None,
+            Some("Brillo de pantalla no disponible".into()),
+        );
     };
     let nuevo = (actual as i32 + paso).clamp(5, 100) as u8;
     if let Some((dispositivo, maximo)) = bookos_shell::backlight() {

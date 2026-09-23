@@ -4,18 +4,32 @@ use crate::icono::{self, Icono};
 use crate::state::{Link, Network};
 use crate::tema;
 use crate::view::PanelElement;
-use crate::widget::Widget;
+use crate::widget::{Cruce, Widget};
 
 pub struct Red {
     dato: Option<Network>,
     icono: Option<Icono>,
+    cruce: Cruce,
 }
 
 impl Red {
     pub fn new() -> Self {
         let dato = estado_red();
         let icono = icono::propio(nombre_icono(dato));
-        Self { dato, icono }
+        Self {
+            dato,
+            icono,
+            cruce: Cruce::default(),
+        }
+    }
+
+    /// Caída se atenúa, como el texto que había antes: no es un fallo, es una
+    /// cosa menos encendida.
+    fn color(&self) -> iced_core::Color {
+        match self.dato {
+            Some(red) if red.up => tema::texto(),
+            _ => tema::TEXTO2,
+        }
     }
 }
 
@@ -42,7 +56,11 @@ impl Widget for Red {
     }
 
     fn ancho(&self) -> f32 {
-        if self.dato.is_some() && self.icono.is_some() {tema::ICONO_PANEL} else {0.0}
+        if self.dato.is_some() && self.icono.is_some() {
+            tema::ICONO_PANEL
+        } else {
+            0.0
+        }
     }
 
     fn subsistemas(&self) -> &'static [&'static str] {
@@ -54,9 +72,15 @@ impl Widget for Red {
         if fresco == self.dato {
             return false;
         }
+        let color_previo = self.color();
         self.dato = fresco;
-        self.icono = icono::propio(nombre_icono(self.dato));
+        let previo = std::mem::replace(&mut self.icono, icono::propio(nombre_icono(self.dato)));
+        self.cruce.empezar(previo, color_previo);
         true
+    }
+
+    fn animando(&self) -> bool {
+        self.cruce.animando()
     }
 
     /// Solo el icono, sin texto: "Wi-Fi" escrito al lado de un icono de Wi-Fi
@@ -65,14 +89,8 @@ impl Widget for Red {
         if self.dato.is_none() {
             return crate::widget::vacio();
         }
-        // Caída se atenúa, como el texto que había antes: no es un fallo, es
-        // una cosa menos encendida.
-        let color = match self.dato {
-            Some(red) if red.up => tema::texto(),
-            _ => tema::TEXTO2,
-        };
         match &self.icono {
-            Some(ic) => icono::ver_teñido(ic, tema::ICONO_PANEL, Some(color)),
+            Some(ic) => self.cruce.ver(ic, self.color()),
             None => crate::widget::vacio(),
         }
     }
@@ -80,7 +98,17 @@ impl Widget for Red {
 
 fn estado_red() -> Option<Network> {
     let s = bookos_system::snapshot().network;
-    if s.is_null() { return None; }
-    if s["ethernet"]["connected"] == true { return Some(Network { kind: Link::Cable, up: true }); }
-    Some(Network { kind: Link::Wifi, up: s["ssid"].as_str().is_some_and(|s| !s.is_empty()) })
+    if s.is_null() {
+        return None;
+    }
+    if s["ethernet"]["connected"] == true {
+        return Some(Network {
+            kind: Link::Cable,
+            up: true,
+        });
+    }
+    Some(Network {
+        kind: Link::Wifi,
+        up: s["ssid"].as_str().is_some_and(|s| !s.is_empty()),
+    })
 }

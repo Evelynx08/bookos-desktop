@@ -86,12 +86,11 @@ fn describir(ruta: &Path) -> anyhow::Result<()> {
         for (i, modo) in con.modes().iter().take(4).enumerate() {
             let (w, h) = modo.size();
             println!(
-                "      modo{}: {}×{} @ {} Hz{}",
+                "      modo{}: {}×{} @ {} Hz",
                 if i == 0 { " preferido" } else { "        " },
                 w,
                 h,
                 modo.vrefresh(),
-                if i == 0 { "" } else { "" }
             );
         }
         if con.modes().len() > 4 {

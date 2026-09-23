@@ -83,6 +83,20 @@ impl CompositorHandler for BookosComp {
             root = parent;
         }
 
+        // Un menú de cliente. No es una ventana del `Space` —cuelga de una— y
+        // su primer commit, vacío, es el que espera el `configure` sin el que
+        // no puede dibujarse.
+        self.popups.commit(surface);
+        if let Some(smithay::desktop::PopupKind::Xdg(popup)) = self.popups.find_popup(&root) {
+            if !popup.is_initial_configure_sent()
+                && let Err(err) = popup.send_configure()
+            {
+                tracing::warn!("no se pudo configurar un menú del cliente: {err:?}");
+            }
+            self.needs_redraw = true;
+            return;
+        }
+
         // Las layer-surfaces no son ventanas del `Space`, pero sus commits sí
         // cambian una parte visible de la escena. Reorganizar aquí respeta el
         // tamaño, anclas y zona exclusiva que el cliente acaba de confirmar.
@@ -244,10 +258,14 @@ impl BookosComp {
         // mismo momento en que el dock se entera de que ya no está.
         self.minimizadas.retain(|(w, _)| w.alive());
         self.minimizando.retain(|(w, _)| w.alive());
-        // Las minimizadas y las de otros escritorios cuentan como abiertas: no
-        // están en el `Space`, pero el punto del dock dice «esta aplicación
-        // está en marcha», no «esta aplicación se ve ahora mismo». Sin ellas, el
-        // icono se apagaba al minimizar y volvía a encenderse al restaurar.
+        // Las minimizadas cuentan como abiertas: no están en el `Space`, pero
+        // el punto del dock dice «esta aplicación está en marcha», no «esta
+        // aplicación se ve ahora mismo». Sin ellas, el icono se apagaba al
+        // minimizar y volvía a encenderse al restaurar.
+        //
+        // Las de **otros escritorios** no cuentan, y es a propósito: el dock
+        // enseña lo que hay en el escritorio en el que estás. Viven en
+        // `escritorios::guardadas` y no se consultan aquí.
         let ids: Vec<String> = self
             .space
             .elements()
@@ -379,7 +397,31 @@ impl XdgShellHandler for BookosComp {
         self.actualizar_dock();
     }
 
-    fn toplevel_destroyed(&mut self, _surface: ToplevelSurface) {
+    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        // Lo primero, mientras la superficie sigue viva con sus texturas: en
+        // el mismo lote el cliente destruye la `wl_surface` y ya no quedaría
+        // nada que animar.
+        if let (Some(window), Some(contexto)) =
+            (self.window_de_toplevel(&surface), self.contexto_gl.as_ref())
+            && let Some(loc) = self.space.element_location(&window)
+        {
+            let posicion = crate::ventanas::posicion(&window, loc);
+            let barra = crate::decoracion::decorada(&window)
+                .then(|| crate::decoracion::id(&window))
+                .flatten()
+                .map(|id| crate::cierre::Barra {
+                    id,
+                    ancho: window.geometry().size.w,
+                    estado: crate::decoracion::estado_de(self, &window),
+                });
+            match crate::cierre::Cierre::capturar(contexto, &window, posicion, barra) {
+                Some(cierre) => {
+                    tracing::debug!("ventana cerrada: animando su salida");
+                    self.cierres.push(cierre);
+                }
+                None => tracing::debug!("ventana cerrada sin nada que animar"),
+            }
+        }
         // La lista y sus geometrías dejarían de corresponderse al desaparecer
         // una celda. Cancelar es seguro y evita enfocar o renderizar un destino
         // muerto mientras se mantiene el modificador.
@@ -432,18 +474,18 @@ impl XdgShellHandler for BookosComp {
     }
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
-        if let Some(window) = self.window_de_toplevel(&surface) {
-            if !crate::ventanas::maximizada(&window) {
-                self.alternar_maximizada(&window);
-            }
+        if let Some(window) = self.window_de_toplevel(&surface)
+            && !crate::ventanas::maximizada(&window)
+        {
+            self.alternar_maximizada(&window);
         }
     }
 
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
-        if let Some(window) = self.window_de_toplevel(&surface) {
-            if crate::ventanas::maximizada(&window) {
-                self.alternar_maximizada(&window);
-            }
+        if let Some(window) = self.window_de_toplevel(&surface)
+            && crate::ventanas::maximizada(&window)
+        {
+            self.alternar_maximizada(&window);
         }
     }
 
@@ -466,18 +508,162 @@ impl XdgShellHandler for BookosComp {
         }
     }
 
-    fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {
+    fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
+        self.recolocar_popup(&surface);
+        if let Err(err) = self
+            .popups
+            .track_popup(smithay::desktop::PopupKind::Xdg(surface))
+        {
+            tracing::warn!("un menú de un cliente que ya se fue: {err:?}");
+        }
         self.needs_redraw = true;
     }
 
-    fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {}
+    /// El menú se queda con el ratón y el teclado hasta que se cierra: un clic
+    /// fuera lo descarta en vez de llegar a la ventana de debajo, y las flechas
+    /// lo recorren. Sin esto un menú abierto no se cerraba nunca.
+    fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {
+        use smithay::desktop::{
+            PopupKeyboardGrab, PopupKind, PopupPointerGrab, PopupUngrabStrategy,
+            find_popup_root_surface,
+        };
+        use smithay::input::pointer::Focus;
+        let Some(seat) = Seat::<Self>::from_resource(&seat) else {
+            return;
+        };
+        let kind = PopupKind::Xdg(surface);
+        let Ok(raiz) = find_popup_root_surface(&kind) else {
+            return;
+        };
+        let mut grab = match self.popups.grab_popup(raiz, kind, &seat, serial) {
+            Ok(grab) => grab,
+            Err(err) => {
+                tracing::debug!(?serial, "grab de menú rechazado: {err:?}");
+                return;
+            }
+        };
+        // Un grab solo vale si lo pide el mismo clic que tiene el ratón, o el
+        // del menú padre en un submenú. Si no, es un menú abierto a destiempo
+        // y se cierra entero, que es lo que dice el protocolo.
+        let anterior = grab.previous_serial().unwrap_or(serial);
+        let teclado = seat.get_keyboard();
+        let puntero = seat.get_pointer();
+        // Un grab solo vale si lo pide el mismo clic que tiene el ratón, o el
+        // del menú padre en un submenú. Si no, es un menú abierto a destiempo
+        // y se cierra entero, que es lo que dice el protocolo.
+        let a_destiempo = |agarrado: bool, tiene: &dyn Fn(Serial) -> bool| {
+            agarrado && !(tiene(serial) || tiene(anterior))
+        };
+        if teclado
+            .as_ref()
+            .is_some_and(|t| a_destiempo(t.is_grabbed(), &|s| t.has_grab(s)))
+            || puntero
+                .as_ref()
+                .is_some_and(|p| a_destiempo(p.is_grabbed(), &|s| p.has_grab(s)))
+        {
+            tracing::debug!(?serial, "menú abierto a destiempo");
+            grab.ungrab(PopupUngrabStrategy::All);
+            return;
+        }
+        // El foco del teclado **no** pasa al menú al abrirse: se le da con la
+        // primera tecla (`input::tecla`), que es lo que hace KWin. Dárselo aquí
+        // rompía cambiar de menú por la barra —de «Máquina» a «Ayuda» sin
+        // soltar—: Qt recibía el `wl_keyboard.enter` del menú nuevo mientras
+        // aún devolvía el foco del viejo a su ventana, y cerraba el nuevo.
+        // Visto con `WAYLAND_DEBUG=client`: el `destroy` llegaba 0,3 ms después
+        // del `enter`, sin nada del compositor entre medias; y sin ese `enter`
+        // el menú se queda.
+        //
+        // El teclado se suelta **antes** de sustituir el grab de ratón: al
+        // quitar el viejo, Smithay deshace también el grab de teclado de su
+        // mismo serial y manda el foco a la ventana, que Qt también toma por
+        // una activación.
+        if let Some(teclado) = teclado.as_ref() {
+            teclado.unset_grab(self);
+        }
+        if let Some(puntero) = puntero {
+            puntero.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
+        }
+        if let Some(teclado) = teclado {
+            teclado.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
+        }
+        self.menu_sin_foco = Some(grab);
+    }
+
+    /// Si el menú que se va tenía el teclado, el foco vuelve a su ventana. Sin
+    /// esto el teclado se quedaba sin superficie, Qt lo tomaba por que la
+    /// aplicación había perdido el foco y cerraba también el menú que abría a
+    /// continuación: con la flecha izquierda, de «Ayuda» a «Máquina», el
+    /// segundo menú se destruía 3 ms después de crearse.
+    fn popup_destroyed(&mut self, surface: PopupSurface) {
+        use smithay::desktop::{PopupKind, find_popup_root_surface};
+        let Some(teclado) = self.seat.get_keyboard() else {
+            return;
+        };
+        if teclado.current_focus().as_ref() != Some(surface.wl_surface()) {
+            return;
+        }
+        let Ok(raiz) = find_popup_root_surface(&PopupKind::Xdg(surface)) else {
+            return;
+        };
+        teclado.set_focus(
+            self,
+            Some(raiz),
+            smithay::utils::SERIAL_COUNTER.next_serial(),
+        );
+    }
 
     fn reposition_request(
         &mut self,
-        _surface: PopupSurface,
-        _positioner: PositionerState,
-        _token: u32,
+        surface: PopupSurface,
+        positioner: PositionerState,
+        token: u32,
     ) {
+        surface.with_pending_state(|estado| {
+            estado.geometry = positioner.get_geometry();
+            estado.positioner = positioner;
+        });
+        self.recolocar_popup(&surface);
+        surface.send_repositioned(token);
+        self.needs_redraw = true;
+    }
+}
+
+impl BookosComp {
+    /// Mete el menú dentro de las pantallas donde está su ventana. El cliente
+    /// dice dónde quiere abrirlo respecto a su padre y cómo puede moverse —dar
+    /// la vuelta, deslizarse— si no cabe; el compositor es el único que sabe
+    /// dónde acaba la pantalla. Sin esto, un menú abierto cerca del borde de
+    /// abajo salía cortado.
+    fn recolocar_popup(&self, popup: &PopupSurface) {
+        use smithay::desktop::{PopupKind, find_popup_root_surface, get_popup_toplevel_coords};
+        let kind = PopupKind::Xdg(popup.clone());
+        let Ok(raiz) = find_popup_root_surface(&kind) else {
+            return;
+        };
+        let Some(window) = self.window_for_surface(&raiz) else {
+            return;
+        };
+        let Some(ventana) = self.space.element_geometry(&window) else {
+            return;
+        };
+        let Some(pantallas) = self
+            .space
+            .outputs_for_element(&window)
+            .iter()
+            .filter_map(|o| self.space.output_geometry(o))
+            .reduce(|a, b| a.merge(b))
+        else {
+            return;
+        };
+        // El positioner razona respecto al padre, así que el rectángulo
+        // permitido se lleva a esas coordenadas.
+        let mut permitido = pantallas;
+        permitido.loc -= get_popup_toplevel_coords(&kind);
+        permitido.loc -= ventana.loc;
+        popup.with_pending_state(|estado| {
+            estado.geometry = estado.positioner.get_unconstrained_geometry(permitido);
+        });
     }
 }
 

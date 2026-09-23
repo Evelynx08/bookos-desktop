@@ -1,10 +1,9 @@
 //! El emergente de Sonido, colgado del icono del volumen.
 //!
-//! Es el `fullRepresentation` del plasmoide `bookos-volume`, con sus mismas
-//! medidas: tarjeta de 300 de ancho, márgenes de 16, la píldora gorda de 26 de
-//! alto con el radio a la mitad de su altura, y el botón redondo de 38 al lado.
-//! Dos secciones, Altavoces y Micrófono, cada una con su etiqueta, su
-//! porcentaje a la derecha y su fila de control.
+//! Dos secciones, Altavoces y Micrófono, cada una con su etiqueta y su valor
+//! encima, y debajo el icono, la píldora gruesa de la referencia de Figma y el
+//! botón redondo que silencia. Las medidas son las de las demás tarjetas del
+//! panel: 336 de ancho y 16 de margen.
 //!
 //! **El deslizador es lo primero del shell que se arrastra.** Hasta ahora las
 //! emergentes solo respondían a pulsaciones sueltas: el menú y el calendario se
@@ -17,19 +16,27 @@
 
 use iced_core::Length;
 use iced_core::alignment::Vertical;
-use iced_widget::{Space, column, row, text};
+use iced_widget::{Space, column, container, row, text};
 
 use crate::Accion;
 use crate::tema;
 use crate::view::PanelElement;
 
-use super::control::{self, BOTON, HUECO, MARGEN_AGARRE, PILDORA};
+use super::control::{
+    self, BAJO_ETIQUETA, BOTON, ETIQUETA, FILA_PILDORA, HUECO, ICONO, MARGEN_AGARRE, PILDORA,
+};
+use super::lista::{ANCHO, BAJO_CABECERA, CABECERA, MARGEN};
 use super::{Ancla, Tecla};
 
-const ANCHO: f32 = 300.0;
-const MARGEN: f32 = 16.0;
+/// Cuánto más se meten las secciones que la tarjeta: las deja a 20 del borde,
+/// alineadas con el título.
+const SANGRIA: f32 = 4.0;
+/// Ancho del bloque de las secciones.
+const BLOQUE: f32 = ANCHO - (MARGEN + SANGRIA) * 2.0;
 /// Separación entre las dos secciones.
-const ENTRE_SECCIONES: f32 = 16.0;
+const ENTRE_SECCIONES: f32 = 14.0;
+/// Lo que ocupa una sección: etiqueta, su aire y la fila de la píldora.
+const SECCION: f32 = ETIQUETA + BAJO_ETIQUETA + FILA_PILDORA;
 
 /// Cuánto sube o baja el volumen una muesca de rueda.
 const PASO_RUEDA: i32 = 5;
@@ -45,13 +52,16 @@ pub struct Sonido {
     salida: Canal,
     entrada: Canal,
     /// Qué píldora está agarrada ahora mismo, si alguna.
-    agarrada: Option<Fila>,
+    agarrada: Option<(Fila, u8, bool)>,
     /// El botón de silencio bajo el puntero: 0 la salida, 1 la entrada.
     boton: tema::Realce,
 }
 
 /// Un destino de PipeWire tal y como lo enseña el emergente.
 struct Canal {
+    /// El icono de la izquierda, que dice qué es y no cómo está: el altavoz con
+    /// ondas o el micrófono. El estado lo lleva el botón.
+    icono_fijo: Option<crate::icono::Icono>,
     disponible: bool,
     nivel: u8,
     silenciado: bool,
@@ -74,6 +84,7 @@ impl Canal {
             silenciado,
             destino,
             micro,
+            icono_fijo: crate::icono::propio(if micro { "micro" } else { "volumen-alto" }),
             icono: None,
         };
         canal.actualizar_icono();
@@ -97,28 +108,42 @@ impl Canal {
     }
 
     /// Manda el nivel a PipeWire. No espera: ver la cabecera del módulo.
-    fn poner(&mut self, nivel: u8) {
-        if !self.disponible {return;}
+    fn poner(&mut self, nivel: u8, notificar: bool) {
+        if !self.disponible {
+            return;
+        }
         self.nivel = nivel.min(100);
         // Mover el deslizador de un canal silenciado lo devuelve a la vida: es
         // lo que hace el plasmoide, y lo que espera cualquiera que empuje la
         // barra para volver a oír algo.
         if self.silenciado && self.nivel > 0 {
             self.silenciado = false;
-            let _ = lanzar(&["set-mute", self.destino, "0"]);
+            // El volumen que va justo detrás confirma las dos cosas; si esta
+            // orden avisara también, una sola muesca produciría dos OSD y dos
+            // sonidos.
+            let _ = lanzar(&["set-mute", self.destino, "0"], false);
         }
-        let _ = lanzar(&[
-            "set-volume",
-            self.destino,
-            &format!("{:.2}", self.nivel as f32 / 100.0),
-        ]);
+        self.enviar_volumen(notificar);
         self.actualizar_icono();
     }
 
+    fn enviar_volumen(&self, notificar: bool) {
+        let _ = lanzar(
+            &[
+                "set-volume",
+                self.destino,
+                &format!("{:.2}", self.nivel as f32 / 100.0),
+            ],
+            notificar,
+        );
+    }
+
     fn alternar_silencio(&mut self) {
-        if !self.disponible {return;}
+        if !self.disponible {
+            return;
+        }
         self.silenciado = !self.silenciado;
-        let _ = lanzar(&["set-mute", self.destino, "toggle"]);
+        let _ = lanzar(&["set-mute", self.destino, "toggle"], true);
         self.actualizar_icono();
     }
 
@@ -128,23 +153,30 @@ impl Canal {
         } else if self.silenciado {
             "Silenciado".into()
         } else {
-            format!("{}%", self.nivel)
+            format!("{} %", self.nivel)
         }
     }
 }
 
 impl Sonido {
     pub fn refrescar(&mut self) -> bool {
-        if self.agarrada.is_some() { return false; }
+        if self.agarrada.is_some() {
+            return false;
+        }
         let mut changed = false;
         for canal in [&mut self.salida, &mut self.entrada] {
-            let value=bookos_system::volume(canal.micro);
-            if canal.disponible != value.is_some() {canal.disponible=value.is_some();changed=true;}
-            if let Some((nivel, silenciado)) = value {
-                if canal.nivel != nivel || canal.silenciado != silenciado {
-                    canal.nivel = nivel; canal.silenciado = silenciado;
-                    canal.actualizar_icono(); changed = true;
-                }
+            let value = bookos_system::volume(canal.micro);
+            if canal.disponible != value.is_some() {
+                canal.disponible = value.is_some();
+                changed = true;
+            }
+            if let Some((nivel, silenciado)) = value
+                && (canal.nivel != nivel || canal.silenciado != silenciado)
+            {
+                canal.nivel = nivel;
+                canal.silenciado = silenciado;
+                canal.actualizar_icono();
+                changed = true;
             }
         }
         changed
@@ -160,12 +192,9 @@ impl Sonido {
     }
 
     pub fn size(&self) -> (f32, f32) {
-        // Cabecera + dos secciones. Cada sección es su etiqueta (18) y su fila
-        // de controles, que la marca el botón por ser lo más alto.
-        let seccion = 18.0 + 8.0 + BOTON;
         (
             ANCHO,
-            MARGEN * 2.0 + 22.0 + 14.0 + seccion * 2.0 + ENTRE_SECCIONES,
+            MARGEN * 2.0 + CABECERA + BAJO_CABECERA + SECCION * 2.0 + ENTRE_SECCIONES,
         )
     }
 
@@ -176,19 +205,20 @@ impl Sonido {
 
     /// El rectángulo de la píldora de una fila, relativo a la emergente.
     fn rect_pildora(&self, fila: Fila) -> iced_core::Rectangle {
-        let (_, alto) = self.size();
-        let seccion = 18.0 + 8.0 + BOTON;
-        let y0 = MARGEN + 22.0 + 14.0;
+        let y0 = MARGEN + CABECERA + BAJO_CABECERA;
         let y = match fila {
             Fila::Salida => y0,
-            Fila::Entrada => y0 + seccion + ENTRE_SECCIONES,
-        } + 18.0
-            + 8.0;
-        debug_assert!(y + BOTON <= alto, "la fila se sale de la tarjeta");
+            Fila::Entrada => y0 + SECCION + ENTRE_SECCIONES,
+        } + ETIQUETA
+            + BAJO_ETIQUETA;
+        debug_assert!(
+            y + FILA_PILDORA <= self.size().1,
+            "la fila se sale de la tarjeta"
+        );
         iced_core::Rectangle {
-            x: MARGEN,
-            y: y + (BOTON - PILDORA) / 2.0,
-            width: ANCHO - MARGEN * 2.0 - BOTON - HUECO,
+            x: MARGEN + SANGRIA + ICONO + HUECO,
+            y: y + (FILA_PILDORA - PILDORA) / 2.0,
+            width: control::ancho_pildora(BLOQUE, true),
             height: PILDORA,
         }
     }
@@ -198,9 +228,20 @@ impl Sonido {
         let p = self.rect_pildora(fila);
         iced_core::Rectangle {
             x: p.x + p.width + HUECO,
-            y: p.y - (BOTON - PILDORA) / 2.0,
+            y: p.y - (FILA_PILDORA - PILDORA) / 2.0,
             width: BOTON,
             height: BOTON,
+        }
+    }
+
+    /// El chip «Config» de la cabecera, pegado a la derecha.
+    fn rect_config(&self) -> iced_core::Rectangle {
+        let ancho = control::ancho_chip("Config");
+        iced_core::Rectangle {
+            x: ANCHO - MARGEN - SANGRIA - ancho,
+            y: MARGEN + (CABECERA - control::CHIP) / 2.0,
+            width: ancho,
+            height: control::CHIP,
         }
     }
 
@@ -227,12 +268,12 @@ impl Sonido {
         // Con una píldora agarrada, el puntero es el deslizador y nada más: el
         // ratón puede estar sobre un botón mientras se arrastra, y encenderlo
         // ahí sería prometer una pulsación que no va a ocurrir.
-        if let (Some(fila), Some((x, _))) = (self.agarrada, punto) {
+        if let (Some((fila, _, _)), Some((x, _))) = (self.agarrada, punto) {
             let nivel = self.nivel_en(fila, x);
             if self.canal(fila).nivel == nivel {
                 return false;
             }
-            self.canal(fila).poner(nivel);
+            self.canal(fila).poner(nivel, false);
             return true;
         }
         let sobre = punto.and_then(|(x, y)| {
@@ -251,20 +292,24 @@ impl Sonido {
 
     pub fn pulsar(&mut self, x: f32, y: f32) -> Option<Accion> {
         let punto = iced_core::Point::new(x, y);
+        if self.rect_config().contains(punto) {
+            return Some(Accion::Lanzar("bookos-settings --page sonido".into()));
+        }
         for fila in [Fila::Salida, Fila::Entrada] {
             if self.rect_boton(fila).contains(punto) {
                 self.canal(fila).alternar_silencio();
                 return None;
             }
-            // La zona agarrable es más alta que la píldora: apuntar a 26 px de
+            // La zona agarrable es más alta que la píldora: apuntar a 24 px de
             // alto con el ratón en movimiento falla más de lo que parece.
             let mut zona = self.rect_pildora(fila);
             zona.y -= MARGEN_AGARRE;
             zona.height += MARGEN_AGARRE * 2.0;
             if zona.contains(punto) {
-                self.agarrada = Some(fila);
+                let canal = self.canal(fila);
+                self.agarrada = Some((fila, canal.nivel, canal.silenciado));
                 let nivel = self.nivel_en(fila, x);
-                self.canal(fila).poner(nivel);
+                self.canal(fila).poner(nivel, false);
                 return None;
             }
         }
@@ -273,7 +318,14 @@ impl Sonido {
 
     /// Soltar el botón deja de arrastrar. Devuelve si hay que repintar.
     pub fn soltar(&mut self) -> bool {
-        self.agarrada.take().is_some()
+        let Some((fila, nivel_inicial, silencio_inicial)) = self.agarrada.take() else {
+            return false;
+        };
+        let canal = self.canal(fila);
+        if canal.nivel != nivel_inicial || canal.silenciado != silencio_inicial {
+            canal.enviar_volumen(true);
+        }
+        true
     }
 
     /// La rueda sobre una fila sube y baja su nivel, como en el plasmoide.
@@ -286,7 +338,7 @@ impl Sonido {
         if nivel == self.salida.nivel {
             return false;
         }
-        self.salida.poner(nivel);
+        self.salida.poner(nivel, true);
         true
     }
 
@@ -296,12 +348,12 @@ impl Sonido {
             T::Escape => Tecla::Cerrar,
             T::Izquierda | T::Abajo => {
                 let n = (self.salida.nivel as i32 - PASO_RUEDA).clamp(0, 100) as u8;
-                self.salida.poner(n);
+                self.salida.poner(n, true);
                 Tecla::Consumida
             }
             T::Derecha | T::Arriba => {
                 let n = (self.salida.nivel as i32 + PASO_RUEDA).clamp(0, 100) as u8;
-                self.salida.poner(n);
+                self.salida.poner(n, true);
                 Tecla::Consumida
             }
             _ => Tecla::Ignorada,
@@ -309,47 +361,79 @@ impl Sonido {
     }
 
     pub fn view(&self) -> PanelElement<'_> {
+        let cabecera = container(
+            row![
+                control::titulo("Sonido"),
+                Space::new().width(Length::Fill),
+                control::chip("Config", tema::superficie(), tema::texto()),
+            ]
+            .align_y(Vertical::Center),
+        )
+        .width(Length::Fixed(ANCHO - MARGEN * 2.0))
+        .height(Length::Fixed(CABECERA))
+        .padding([0, SANGRIA as u16])
+        .center_y(Length::Fixed(CABECERA));
         let contenido = column![
-            text("Sonido").size(tema::T_TITULO).color(tema::texto()),
-            Space::new().height(Length::Fixed(14.0)),
-            self.seccion("Altavoces", &self.salida, self.boton.intensidad(0)),
-            Space::new().height(Length::Fixed(ENTRE_SECCIONES)),
-            self.seccion("Micrófono", &self.entrada, self.boton.intensidad(1)),
+            cabecera,
+            Space::new().height(Length::Fixed(BAJO_CABECERA)),
+            container(column![
+                self.seccion("Altavoces", &self.salida, self.boton.intensidad(0)),
+                Space::new().height(Length::Fixed(ENTRE_SECCIONES)),
+                self.seccion("Micrófono", &self.entrada, self.boton.intensidad(1)),
+            ])
+            .padding([0, SANGRIA as u16]),
         ];
         control::tarjeta(contenido.into(), ANCHO, MARGEN)
     }
 
-    /// Una sección: etiqueta y porcentaje arriba, píldora y botón abajo.
+    /// Una sección: etiqueta y valor arriba; icono, píldora y botón abajo.
     fn seccion<'a>(
         &'a self, titulo: &'a str, canal: &'a Canal, señalado: f32
     ) -> PanelElement<'a> {
-        let color = if canal.silenciado {
-            tema::TEXTO2
-        } else {
-            tema::texto()
-        };
-        let cabecera = row![
-            text(titulo).size(tema::T_PEQUENO).color(tema::TEXTO2),
-            Space::new().width(crate::FILL),
-            text(canal.etiqueta()).size(tema::T_CUERPO).color(color),
-        ];
-        let ancho = ANCHO - MARGEN * 2.0 - BOTON - HUECO;
+        let cabecera = control::etiqueta(titulo, canal.etiqueta(), BLOQUE);
         if !canal.disponible {
-            let mensaje=bookos_system::unavailable("audio").map(|_|"Servicio de audio no disponible")
+            let mensaje = bookos_system::unavailable("audio")
+                .map(|_| "Servicio de audio no disponible")
                 .unwrap_or("Esperando dispositivo de audio…");
-            return column![cabecera,Space::new().height(Length::Fixed(8.0)),text(mensaje).size(tema::T_PEQUENO).color(tema::TEXTO2)].into();
+            return column![
+                cabecera,
+                Space::new().height(Length::Fixed(BAJO_ETIQUETA)),
+                container(text(mensaje).size(12.0).color(tema::TEXTO2))
+                    .height(Length::Fixed(FILA_PILDORA))
+                    .center_y(Length::Fixed(FILA_PILDORA)),
+            ]
+            .into();
         }
-        let controles = row![
-            control::pildora(ancho, canal.nivel, canal.silenciado),
-            Space::new().width(Length::Fixed(HUECO)),
-            control::boton(canal.icono.as_ref(), canal.silenciado, señalado),
+        // El botón va en acento mientras el canal suena y en el color del surco
+        // al silenciarlo: su icono es el del estado, así que dice las dos cosas.
+        let controles = control::fila_pildora(
+            canal.icono_fijo.as_ref(),
+            control::pildora(
+                control::ancho_pildora(BLOQUE, true),
+                PILDORA,
+                canal.nivel,
+                canal.silenciado,
+                tema::superficie(),
+            ),
+            Some(control::boton(
+                canal.icono.as_ref(),
+                !canal.silenciado,
+                tema::superficie(),
+                señalado,
+            )),
+        );
+        column![
+            cabecera,
+            Space::new().height(Length::Fixed(BAJO_ETIQUETA)),
+            controles,
         ]
-        .align_y(Vertical::Center);
-        column![cabecera, Space::new().height(Length::Fixed(8.0)), controles].into()
+        .into()
     }
 }
 
-fn lanzar(args: &[&str]) -> bool { bookos_system::audio_request(args) }
+fn lanzar(args: &[&str], notificar: bool) -> bool {
+    bookos_system::audio_request(args, notificar)
+}
 
 #[cfg(test)]
 mod tests {

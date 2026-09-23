@@ -54,12 +54,119 @@ pub struct Bloqueo {
     pub comprobando: Option<crate::autenticar::Comprobacion>,
     pub huella: Option<crate::autenticar::Comprobacion>,
     pub huella_reintentar: Option<Instant>,
+    /// PAM ya dijo que no hay con qué leer una huella en esta máquina. No se
+    /// vuelve a intentar mientras dure el bloqueo: cada intento son varios
+    /// segundos de espera y un mensaje de error por algo que no va a cambiar.
+    pub huella_sin_lector: bool,
     /// El último intento falló y aún no se ha vuelto a escribir.
     pub fallo: bool,
     /// Fallos consecutivos y barrera local adicional a la que aplique PAM.
     /// Evita fuerza bruta incluso con una pila PAM sin `pam_faillock`.
     pub fallos: u32,
     pub reintentar_desde: Option<Instant>,
+}
+
+impl Bloqueo {
+    /// Quita el último carácter y pone a ceros el hueco que deja.
+    ///
+    /// `String::pop()` a secas solo mueve la longitud: el byte del carácter
+    /// borrado se queda tal cual en la capacidad reservada, legible hasta que
+    /// algo lo pise. Con un `Backspace` a media contraseña y luego un cierre
+    /// de sesión sin volver a escribir ahí, ese byte sobrevivía al `clear()`
+    /// de más abajo porque nunca estuvo dentro de la longitud que se pone a
+    /// cero.
+    pub fn borrar_ultimo(&mut self) {
+        self.escrito.pop();
+        zerar_capacidad_no_usada(unsafe { self.escrito.as_mut_vec() });
+    }
+
+    /// Vacía la contraseña escrita, poniendo sus bytes a cero antes de
+    /// soltarlos.
+    ///
+    /// `String::clear()` a secas no basta: pone la longitud a 0 y dejar los
+    /// bytes tal cual en el montón. Es el mismo argumento que
+    /// [`crate::autenticar::borrar`] para la copia que ve PAM, y por lo
+    /// mismo: este compositor vive toda la sesión y puede acabar en un
+    /// volcado, y lo que no se borre queda ahí legible. `write_volatile`
+    /// impide que el optimizador se salte la escritura por creer que nadie
+    /// vuelve a leerla, que es justo el caso.
+    pub fn olvidar_escrito(&mut self) {
+        // SAFETY: cero es un byte UTF-8 válido, así que la cadena sigue siendo
+        // válida en todo momento mientras se pisa su contenido.
+        let bytes = unsafe { self.escrito.as_mut_vec() };
+        for b in bytes.iter_mut() {
+            unsafe { std::ptr::write_volatile(b, 0) };
+        }
+        zerar_capacidad_no_usada(bytes);
+        self.escrito.clear();
+    }
+}
+
+/// Pone a ceros la parte de la capacidad reservada que no cubre la longitud
+/// actual: donde se queda un carácter recién borrado con `pop()`, o el resto
+/// de una asignación más grande que la que hace falta ahora.
+fn zerar_capacidad_no_usada(v: &mut Vec<u8>) {
+    for hueco in v.spare_capacity_mut() {
+        // SAFETY: escribir un byte inicializado sobre memoria reservada pero
+        // no necesariamente inicializada es exactamente para lo que está
+        // `MaybeUninit::as_mut_ptr` aquí.
+        unsafe { std::ptr::write_volatile(hueco.as_mut_ptr(), 0) };
+    }
+}
+
+#[cfg(test)]
+mod tests_bloqueo {
+    use super::Bloqueo;
+
+    /// Mira el montón de verdad, no solo lo que `String` deja ver: la
+    /// capacidad reservada por debajo de la longitud actual, que es donde se
+    /// queda el byte que `String::clear()`/`pop()` no tocan.
+    fn capacidad_a_ceros(s: &String) -> bool {
+        // SAFETY: solo se lee, y `capacity()` es lo que ya reservó el String.
+        let bytes = unsafe { std::slice::from_raw_parts(s.as_ptr(), s.capacity().max(s.len())) };
+        bytes.iter().all(|&b| b == 0)
+    }
+
+    #[test]
+    fn olvidar_escrito_pone_los_bytes_a_cero_y_no_solo_la_longitud() {
+        let mut b = Bloqueo {
+            escrito: String::with_capacity(32),
+            ..Default::default()
+        };
+        b.escrito.push_str("hunter2");
+        assert!(
+            !capacidad_a_ceros(&b.escrito),
+            "la prueba no prueba nada si ya estaba a cero"
+        );
+
+        b.olvidar_escrito();
+
+        assert_eq!(b.escrito.len(), 0);
+        assert!(
+            capacidad_a_ceros(&b.escrito),
+            "quedaron bytes de la contraseña en el montón tras olvidar_escrito"
+        );
+    }
+
+    #[test]
+    fn borrar_ultimo_no_deja_el_caracter_quitado_legible() {
+        let mut b = Bloqueo {
+            escrito: String::with_capacity(32),
+            ..Default::default()
+        };
+        b.escrito.push_str("secreto");
+
+        b.borrar_ultimo();
+
+        assert_eq!(b.escrito, "secret");
+        // La 'o' que se quitó vivía justo después de la longitud nueva: si
+        // sigue ahí, el borrado de la cola no funcionó.
+        let bytes = unsafe { std::slice::from_raw_parts(b.escrito.as_ptr(), b.escrito.capacity()) };
+        assert!(
+            bytes[b.escrito.len()..].iter().all(|&x| x == 0),
+            "queda algo del carácter borrado en la capacidad reservada"
+        );
+    }
 }
 
 /// Correspondencia entre una ventana viva y el identificador estable que ven
@@ -115,6 +222,9 @@ pub struct CapturaPedida {
     pub guardar: bool,
 }
 
+/// Apaga (`false`) o reactiva las superficies KMS.
+pub type AplicarDpms = Box<dyn FnMut(bool) -> Result<(), String>>;
+
 pub struct BookosComp {
     pub display_handle: DisplayHandle,
     pub loop_handle: LoopHandle<'static, BookosComp>,
@@ -126,6 +236,7 @@ pub struct BookosComp {
     /// su punto de dibujo y la limpia; nadie dibuja "por si acaso".
     pub needs_redraw: bool,
     pub brillo_poll_activo: bool,
+    pub brillo_auto: crate::brillo_auto::Estado,
     /// Lo que se lleva escrito en la pantalla de bloqueo.
     pub bloqueo: Bloqueo,
     /// Cuándo llegó el último evento de entrada. Decide si el backend anidado
@@ -146,7 +257,7 @@ pub struct BookosComp {
     pub dpms_encendido: bool,
     /// Backend real: apagar o reactivar las superficies KMS. Anidado queda en
     /// `None`, porque la energía de la pantalla pertenece al anfitrión.
-    pub aplicar_dpms: Option<Box<dyn FnMut(bool) -> Result<(), String>>>,
+    pub aplicar_dpms: Option<AplicarDpms>,
     /// El ritmo de dibujo: qué cuesta cada fotograma y cuántos se pierden.
     pub metricas: crate::metricas::Metricas,
     /// Un despertar por segundo mientras el panel de diagnóstico esté puesto.
@@ -156,6 +267,13 @@ pub struct BookosComp {
     pub tick_diagnostico: Option<smithay::reexports::calloop::RegistrationToken>,
 
     pub space: Space<Window>,
+    /// Los menús y desplegables de los clientes (`xdg_popup`). Sin registrarlos
+    /// aquí no reciben su primer `configure` y el protocolo no les deja
+    /// mostrarse: ningún menú de ninguna aplicación llegaba a aparecer.
+    pub popups: smithay::desktop::PopupManager,
+    /// El menú abierto que aún no tiene el foco del teclado. Se le da con la
+    /// primera tecla y no al abrirse: ver `XdgShellHandler::grab`.
+    pub menu_sin_foco: Option<smithay::desktop::PopupGrab<BookosComp>>,
     pub foreign_toplevel_list_state: ForeignToplevelListState,
     pub toplevels_publicados: Vec<ToplevelPublicado>,
     pub seat: Seat<Self>,
@@ -201,6 +319,9 @@ pub struct BookosComp {
     /// Un clic que empezó sobre el selector no debe entregar su liberación al
     /// cliente que acaba de recibir el foco.
     pub conmutador_clic: bool,
+    /// Cuándo se pulsó Ctrl+Alt+Retroceso la primera vez: la segunda, poco
+    /// después, es la que cierra.
+    pub salida_armada: Option<std::time::Instant>,
     /// Meta se pulsó y desde entonces no ha pasado nada más.
     ///
     /// Es lo que hace que **Meta a secas** abra el launchpad sin robarle
@@ -219,9 +340,25 @@ pub struct BookosComp {
     /// El shader del «magic lamp», compilado al arrancar el backend. `None` si
     /// el driver no lo acepta: entonces el minimizar encoge sin deformar.
     pub genio: Option<crate::genio::Genio>,
+    /// El shader del velo de la captura, compilado al arrancar el backend.
+    /// `None` si el driver no lo acepta: el velo sale con esquinas rectas.
+    pub velo_captura: Option<crate::captura::Velo>,
     /// Las ventanas congeladas que se están yendo al dock —o volviendo—, con la
     /// textura de la que sale su deformación.
     pub capturas: Vec<(smithay::desktop::Window, crate::genio::Captura)>,
+    /// Las ventanas que se están cerrando, pintadas desde las texturas que
+    /// dejaron. Ver [`crate::cierre`].
+    pub cierres: Vec<crate::cierre::Cierre>,
+    /// Una ventana cogida de una miniatura de la vista de escritorios.
+    pub arrastre_vista: Option<crate::escritorios::ArrastreVista>,
+    /// La foto del tema anterior mientras se desvanece. Ver [`crate::fundido`].
+    pub fundido: Option<crate::fundido::Fundido>,
+    pub transicion_vista: crate::escritorios::TransicionVista,
+    /// Con qué contexto GL se subieron las texturas de las superficies. Hace
+    /// falta para pedírselas a Smithay fuera del bucle de pintado.
+    pub contexto_gl: Option<
+        smithay::backend::renderer::ContextId<smithay::backend::renderer::gles::GlesTexture>,
+    >,
     /// Sube en cada frame mientras haya alguna en marcha: el elemento cambia de
     /// forma sin cambiar de sitio, y sin esto el damage tracker lo daría por
     /// quieto y no lo repintaría.
@@ -281,6 +418,12 @@ pub struct BookosComp {
     /// se ve desde aquí. El backend la consulta en su punto de dibujo, donde
     /// sí lo tiene.
     pub recargar_fondo: bool,
+    /// Despertar del próximo fotograma WebP. No existe con fondos estáticos
+    /// ni con movimiento reducido.
+    pub tick_fondo: Option<smithay::reexports::calloop::RegistrationToken>,
+    /// El RGBA cambió y la textura mipmapeada del cristal sigue siendo la del
+    /// fotograma anterior. Se consume una vez al construir la escena.
+    pub fondo_cristal_pendiente: bool,
     /// El fondo que se está yendo y cuándo empezó a irse, mientras dura el
     /// fundido con el que entra. `None` fuera de la transición.
     ///
@@ -553,11 +696,11 @@ impl BookosComp {
             .as_ref()
             .and_then(|s| s.osd_queda())
             .is_some_and(|q| q <= bookos_shell::osd::SALIDA);
-        let toast_saliendo = self
-            .shell
-            .as_ref()
-            .and_then(|s| s.toast_queda())
-            .is_some_and(|q| q <= bookos_shell::toast::SALIDA);
+        let toast_saliendo = self.shell.as_ref().is_some_and(|s| {
+            s.toasts_quedan()
+                .iter()
+                .any(|q| *q <= bookos_shell::toast::SALIDA)
+        });
         osd_saliendo
             || toast_saliendo
             // El fundido entre dos fondos: sin esto el bucle se dormiría a
@@ -657,14 +800,20 @@ impl BookosComp {
         let bus_notificaciones = crate::notificaciones::arrancar(avisos);
 
         let (system_events, system_source) = smithay::reexports::calloop::channel::channel();
-        loop_handle.insert_source(system_source, |event, _, state| {
-            if let smithay::reexports::calloop::channel::Event::Msg(()) = event {
-                if let Some(shell) = state.shell.as_mut() { shell.refresh(); }
-                crate::multimedia::recibir_sistema(state);
-                state.needs_redraw = true;
-            }
-        }).map_err(|e| anyhow::anyhow!("system events: {e}"))?;
-        bookos_system::start(move || { let _ = system_events.send(()); });
+        loop_handle
+            .insert_source(system_source, |event, _, state| {
+                if let smithay::reexports::calloop::channel::Event::Msg(()) = event {
+                    if let Some(shell) = state.shell.as_mut() {
+                        shell.refresh();
+                    }
+                    crate::multimedia::recibir_sistema(state);
+                    state.needs_redraw = true;
+                }
+            })
+            .map_err(|e| anyhow::anyhow!("system events: {e}"))?;
+        bookos_system::start(move || {
+            let _ = system_events.send(());
+        });
 
         // Settings escribe el fichero y solo manda una orden pequeña por
         // D-Bus. La lectura y aplicación se hacen aquí, en el hilo dueño del
@@ -692,7 +841,7 @@ impl BookosComp {
                 }
             })
             .map_err(|err| anyhow::anyhow!("insert_source(portal): {err}"))?;
-        let bus_portal = crate::portal::arrancar(portal);
+        let bus_portal = crate::portal::arrancar(portal, &socket_name);
 
         // MPRIS puede lanzar varios procesos `busctl`; se consulta después de
         // que el bloqueo ya esté visible y en un hilo corto. El resultado
@@ -701,16 +850,18 @@ impl BookosComp {
         loop_handle
             .insert_source(fuente_medios, |evento, _, state| {
                 use smithay::reexports::calloop::channel::Event;
-                if let Event::Msg((generacion, sonando)) = evento {
-                    if generacion == state.bloqueo_generacion {
-                        if let Some(shell) = state.shell.as_mut() {
-                            shell.bloqueo_medio(sonando);
-                            state.needs_redraw = true;
-                        }
-                    }
+                if let Event::Msg((generacion, sonando)) = evento
+                    && generacion == state.bloqueo_generacion
+                    && let Some(shell) = state.shell.as_mut()
+                {
+                    shell.bloqueo_medio(sonando);
+                    state.needs_redraw = true;
                 }
             })
             .map_err(|err| anyhow::anyhow!("insert_source(medios bloqueo): {err}"))?;
+
+        let brillo_auto =
+            crate::brillo_auto::Estado::arrancar(&loop_handle, config.brillo_automatico)?;
 
         let entrada = std::mem::take(&mut config.entrada);
         let cursor_nominal = config.cursor;
@@ -732,6 +883,7 @@ impl BookosComp {
             socket_name,
             needs_redraw: true,
             brillo_poll_activo: false,
+            brillo_auto,
             bloqueo: Bloqueo::default(),
             last_input: None,
             bloqueo_inactividad,
@@ -744,6 +896,8 @@ impl BookosComp {
             metricas: crate::metricas::Metricas::new(),
             tick_diagnostico: None,
             space: Space::default(),
+            popups: smithay::desktop::PopupManager::default(),
+            menu_sin_foco: None,
             foreign_toplevel_list_state,
             toplevels_publicados: Vec::new(),
             seat,
@@ -766,6 +920,7 @@ impl BookosComp {
             conmutador_modo: None,
             conmutador_resolver: false,
             conmutador_clic: false,
+            salida_armada: None,
             meta_sola: false,
             abrir_launchpad: false,
             teclas: crate::teclas::cargar(),
@@ -773,7 +928,13 @@ impl BookosComp {
             captura_tecla: false,
             conmutador_pegado: false,
             genio: None,
+            velo_captura: None,
             capturas: Vec::new(),
+            cierres: Vec::new(),
+            arrastre_vista: None,
+            fundido: None,
+            transicion_vista: Default::default(),
+            contexto_gl: None,
             genio_commit: Default::default(),
             decoracion: crate::decoracion::Interaccion::default(),
             minimizadas: Vec::new(),
@@ -786,6 +947,8 @@ impl BookosComp {
             cursor_nominal,
             fondo_config,
             recargar_fondo: false,
+            tick_fondo: None,
+            fondo_cristal_pendiente: false,
             fondo_saliente: None,
             modo_tema,
             horas_tema,
@@ -972,6 +1135,7 @@ impl BookosComp {
 
     pub fn post_dispatch(&mut self) {
         self.actualizar_foreign_toplevels();
+        self.popups.cleanup();
         // Retira layer-surfaces cuyo cliente desapareció sin dejar residuos
         // en la zona exclusiva ni en el recorrido de render.
         for output in self.space.outputs().cloned().collect::<Vec<_>>() {
@@ -984,10 +1148,13 @@ impl BookosComp {
         // Una emergente entrando pide fotogramas aunque no pase nada más. Es la
         // única vez que este compositor dibuja sin que haya ocurrido un evento,
         // y dura lo que dura la animación: 280 ms.
-        if self
-            .shell
-            .as_ref()
-            .is_some_and(|s| s.animando() || s.barras_animando())
+        if !self.cierres.is_empty()
+            || self.fundido.is_some()
+            || self.transicion_vista.animando()
+            || self
+                .shell
+                .as_ref()
+                .is_some_and(|s| s.animando() || s.barras_animando())
         {
             self.needs_redraw = true;
         } else if let Some(shell) = self.shell.as_mut() {

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Archivos
+Comment=Explorador de archivos de BookOS
+Exec=bookos-explorer %U
+TryExec=bookos-explorer
+Icon=system-file-manager
+Type=Application
+Categories=System;FileTools;FileManager;
+Keywords=archivos;carpetas;ficheros;files;

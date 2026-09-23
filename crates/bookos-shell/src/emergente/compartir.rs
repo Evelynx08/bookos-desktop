@@ -118,7 +118,7 @@ impl Compartir {
 
     /// Qué hay bajo ese punto, ya en coordenadas del **contenido**.
     fn zona(&self, x: f32, y: f32) -> Zona {
-        if y >= FILA_Y && y < FILA_Y + CELDA_H {
+        if (FILA_Y..FILA_Y + CELDA_H).contains(&y) {
             let paso = CELDA_W + HUECO;
             let rel = x - self.celdas_x();
             if rel >= 0.0 && rel % paso <= CELDA_W {
@@ -353,14 +353,9 @@ fn tarjeta(_: &iced_widget::Theme) -> iced_widget::container::Style {
             width: 1.0,
             color: tema::borde(),
         },
-        shadow: iced_core::Shadow {
-            color: Color {
-                a: 0.30,
-                ..Color::BLACK
-            },
-            offset: iced_core::Vector::new(0.0, 10.0),
-            blur_radius: 28.0,
-        },
+        // Popover y no modal aunque sea un diálogo: la de modal pide 56 px
+        // alrededor y el búfer reserva 22.
+        shadow: tema::sombra_popover(),
         ..Default::default()
     }
 }

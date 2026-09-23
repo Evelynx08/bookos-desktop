@@ -84,6 +84,7 @@ pub enum Origen {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccionRemap {
     Actividades,
+    Asistente,
     Buscador,
     Launchpad,
     VistaEscritorios,
@@ -95,6 +96,7 @@ pub enum AccionRemap {
 
 const ACCIONES: &[(&str, AccionRemap)] = &[
     ("actividades", AccionRemap::Actividades),
+    ("asistente", AccionRemap::Asistente),
     ("buscador", AccionRemap::Buscador),
     ("launchpad", AccionRemap::Launchpad),
     ("vista_escritorios", AccionRemap::VistaEscritorios),
@@ -109,6 +111,7 @@ impl AccionRemap {
         use crate::keybinds::Accion;
         match self {
             AccionRemap::Actividades => Accion::Actividades,
+            AccionRemap::Asistente => Accion::Asistente,
             AccionRemap::Buscador => Accion::Buscador,
             AccionRemap::Launchpad => Accion::Launchpad,
             AccionRemap::VistaEscritorios => Accion::VistaEscritorios,
@@ -524,6 +527,18 @@ mod tests {
         assert!(t.traducir(&m, 193, false).is_empty());
         assert!(t.traducir(&m, 42, false).is_empty());
         assert!(t.traducir(&m, 125, false).is_empty());
+    }
+
+    #[test]
+    fn la_tecla_copilot_puede_activar_el_asistente() {
+        let m = mapa("copilot = accion:asistente");
+        let mut t = Traductor::default();
+        t.traducir(&m, 125, true);
+        t.traducir(&m, 42, true);
+        assert_eq!(
+            t.traducir(&m, 193, true).last(),
+            Some(&Evento::Accion(AccionRemap::Asistente))
+        );
     }
 
     #[test]

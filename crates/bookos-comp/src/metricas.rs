@@ -187,8 +187,7 @@ impl Metricas {
     /// números dejan de tener sentido, y dejarlos en el panel confunde más que
     /// ayuda: parecería una pantalla congelada a 0 fps.
     pub fn retener(&mut self, vivas: &[String]) {
-        self.salidas
-            .retain(|s| vivas.iter().any(|v| *v == s.nombre));
+        self.salidas.retain(|s| vivas.contains(&s.nombre));
     }
 
     /// ¿Ha vencido ya la ventana? Se pregunta antes de cerrarla para no armar
@@ -216,7 +215,7 @@ impl Metricas {
         let secs = transcurrido.as_secs_f32().max(f32::EPSILON);
         self.datos = Datos {
             cpu: self.cpu.uso(ahora),
-            gpu: self.gpu.as_ref().and_then(|p| leer_porcentaje(p)),
+            gpu: self.gpu.as_ref().and_then(leer_porcentaje),
             salidas: self
                 .salidas
                 .iter()

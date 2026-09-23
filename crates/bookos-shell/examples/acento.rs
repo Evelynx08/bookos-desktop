@@ -49,7 +49,7 @@ fn main() {
             // el volcado enseña los azules en naranja y manda a buscar un
             // fallo de color que no existe. Es lo mismo que hace `volcar` en
             // los tests.
-            for p in buf.chunks_exact_mut(4) {
+            for p in buf.as_chunks_mut::<4>().0 {
                 p.swap(0, 2);
             }
 

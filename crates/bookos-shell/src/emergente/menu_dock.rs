@@ -51,16 +51,39 @@ pub struct MenuDock {
     entradas: Vec<Entrada>,
     señalada: tema::Realce,
     x: f32,
+    /// Punto lógico donde anclar la esquina superior izquierda, si lo hay.
+    /// `None` es el menú de ventana centrado de toda la vida.
+    punto: Option<(f32, f32)>,
 }
 
 impl MenuDock {
-    pub fn es_ventana(&self) -> bool { self.ventana }
+    pub fn es_ventana(&self) -> bool {
+        self.ventana
+    }
     pub fn ventana(opciones: Vec<(String, Accion)>) -> Self {
+        Self::construir(opciones, None)
+    }
+
+    /// El menú de ventana, anclado a un punto de la pantalla —el clic
+    /// derecho sobre el escritorio— en vez de centrado.
+    pub fn ventana_en(opciones: Vec<(String, Accion)>, punto: (f32, f32)) -> Self {
+        Self::construir(opciones, Some(punto))
+    }
+
+    fn construir(opciones: Vec<(String, Accion)>, punto: Option<(f32, f32)>) -> Self {
         Self {
-            entradas: opciones.into_iter().map(|(etiqueta, accion)| Entrada::Item {
-                etiqueta, icono: "chevron-derecha", accion,
-            }).collect(),
-            señalada: tema::Realce::nuevo(), x: 0.0, ventana: true,
+            entradas: opciones
+                .into_iter()
+                .map(|(etiqueta, accion)| Entrada::Item {
+                    etiqueta,
+                    icono: "chevron-derecha",
+                    accion,
+                })
+                .collect(),
+            señalada: tema::Realce::nuevo(),
+            x: 0.0,
+            ventana: true,
+            punto,
         }
     }
     pub fn new(objetivo: Objetivo) -> Self {
@@ -100,6 +123,7 @@ impl MenuDock {
             entradas,
             señalada: tema::Realce::nuevo(),
             x: objetivo.x,
+            punto: None,
         }
     }
 
@@ -115,11 +139,20 @@ impl MenuDock {
         (self.ancho(), alto + BORDE_SUP + BORDE_INF)
     }
 
-    fn ancho(&self) -> f32 { if self.ventana { 310.0 } else { ANCHO } }
-    fn alto_fila(&self) -> f32 { if self.ventana { 48.0 } else { FILA } }
+    fn ancho(&self) -> f32 {
+        if self.ventana { 310.0 } else { ANCHO }
+    }
+    fn alto_fila(&self) -> f32 {
+        if self.ventana { 48.0 } else { FILA }
+    }
 
     pub fn ancla(&self) -> Ancla {
-        if self.ventana { return Ancla::Centrada; }
+        if let Some((x, y)) = self.punto {
+            return Ancla::Punto { x, y };
+        }
+        if self.ventana {
+            return Ancla::Centrada;
+        }
         Ancla::SobreElDock { x: self.x }
     }
 
@@ -161,21 +194,40 @@ impl MenuDock {
     pub fn tecla(&mut self, tecla: crate::TeclaPulsada) -> Tecla {
         match tecla {
             crate::TeclaPulsada::Escape => Tecla::Cerrar,
-            crate::TeclaPulsada::Arriba | crate::TeclaPulsada::Abajo | crate::TeclaPulsada::Tabulador => {
-                let indices: Vec<_> = self.entradas.iter().enumerate()
-                    .filter_map(|(i, e)| matches!(e, Entrada::Item { .. }).then_some(i)).collect();
-                if indices.is_empty() { return Tecla::Consumida; }
-                let actual = self.señalada.actual().and_then(|a| indices.iter().position(|i| *i == a));
+            crate::TeclaPulsada::Arriba
+            | crate::TeclaPulsada::Abajo
+            | crate::TeclaPulsada::Tabulador => {
+                let indices: Vec<_> = self
+                    .entradas
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, e)| matches!(e, Entrada::Item { .. }).then_some(i))
+                    .collect();
+                if indices.is_empty() {
+                    return Tecla::Consumida;
+                }
+                let actual = self
+                    .señalada
+                    .actual()
+                    .and_then(|a| indices.iter().position(|i| *i == a));
                 let n = if tecla == crate::TeclaPulsada::Arriba {
-                    actual.map_or(indices.len() - 1, |a| (a + indices.len() - 1) % indices.len())
-                } else { actual.map_or(0, |a| (a + 1) % indices.len()) };
+                    actual.map_or(indices.len() - 1, |a| {
+                        (a + indices.len() - 1) % indices.len()
+                    })
+                } else {
+                    actual.map_or(0, |a| (a + 1) % indices.len())
+                };
                 self.señalada.señalar(Some(indices[n]));
                 Tecla::Consumida
             }
             crate::TeclaPulsada::Intro => {
-                if let Some(Entrada::Item { accion, .. }) = self.señalada.actual().and_then(|i| self.entradas.get(i)) {
+                if let Some(Entrada::Item { accion, .. }) =
+                    self.señalada.actual().and_then(|i| self.entradas.get(i))
+                {
                     Tecla::Hacer(accion.clone())
-                } else { Tecla::Consumida }
+                } else {
+                    Tecla::Consumida
+                }
             }
             _ => Tecla::Ignorada,
         }
@@ -187,17 +239,30 @@ impl MenuDock {
             col = col.push(match entrada {
                 Entrada::Item {
                     etiqueta, icono, ..
-                } => if self.ventana {
-                    let realce = self.señalada.intensidad(i);
-                    container(text(super::recortar_texto(etiqueta, 270.0, 14.0))
-                        .size(14).color(tema::texto()))
-                        .padding([14, 20]).width(self.ancho()).height(self.alto_fila())
+                } => {
+                    if self.ventana {
+                        let realce = self.señalada.intensidad(i);
+                        container(
+                            text(super::recortar_texto(etiqueta, 270.0, 14.0))
+                                .size(14)
+                                .color(tema::texto()),
+                        )
+                        .padding([14, 20])
+                        .width(self.ancho())
+                        .height(self.alto_fila())
                         .style(move |_| container::Style {
                             background: Some(tema::alfa(tema::acento(), realce * 0.10).into()),
-                            border: Border { radius: 13.0.into(), ..Default::default() },
+                            border: Border {
+                                radius: 13.0.into(),
+                                ..Default::default()
+                            },
                             ..Default::default()
-                        }).into()
-                } else { fila(etiqueta, None, icono, self.señalada.intensidad(i)) },
+                        })
+                        .into()
+                    } else {
+                        fila(etiqueta, None, icono, self.señalada.intensidad(i))
+                    }
+                }
                 Entrada::Divisor => divisor(),
             });
         }
@@ -230,8 +295,14 @@ mod tests {
         ]);
         menu.tecla(crate::TeclaPulsada::Abajo);
         menu.tecla(crate::TeclaPulsada::Abajo);
-        assert!(matches!(menu.tecla(crate::TeclaPulsada::Intro), Tecla::Hacer(Accion::VentanaEscritorio(1))));
-        assert!(matches!(menu.tecla(crate::TeclaPulsada::Escape), Tecla::Cerrar));
+        assert!(matches!(
+            menu.tecla(crate::TeclaPulsada::Intro),
+            Tecla::Hacer(Accion::VentanaEscritorio(1))
+        ));
+        assert!(matches!(
+            menu.tecla(crate::TeclaPulsada::Escape),
+            Tecla::Cerrar
+        ));
     }
 
     fn objetivo(anclada: bool, abierta: bool) -> Objetivo {

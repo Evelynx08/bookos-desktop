@@ -7,7 +7,10 @@ fn menu_ventana_dibuja_y_envia_el_destino_exacto() {
     let opciones = vec![
         ("Siempre encima".into(), Accion::VentanaEncima),
         ("Mover a Escritorio 2".into(), Accion::VentanaEscritorio(1)),
-        ("Mover a HDMI-A-1".into(), Accion::VentanaMonitor("HDMI-A-1".into())),
+        (
+            "Mover a HDMI-A-1".into(),
+            Accion::VentanaMonitor("HDMI-A-1".into()),
+        ),
     ];
     shell.abrir(Emergente::menu_ventana(opciones.clone()));
     let (w, h) = shell.emergente_buffer_size().unwrap();
@@ -17,6 +20,9 @@ fn menu_ventana_dibuja_y_envia_el_destino_exacto() {
     assert!(comun::tinta(&pixels, w, h, 0, w) > 0);
     for (i, (_, accion)) in opciones.iter().enumerate() {
         shell.abrir(Emergente::menu_ventana(opciones.clone()));
-        assert_eq!(shell.emergente_pulsar(100.0, 4.0 + 48.0 * i as f32 + 24.0), Some(accion.clone()));
+        assert_eq!(
+            shell.emergente_pulsar(100.0, 4.0 + 48.0 * i as f32 + 24.0),
+            Some(accion.clone())
+        );
     }
 }

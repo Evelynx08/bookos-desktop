@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 use iced_core::Length;
 use iced_widget::Space;
 
+use crate::tema;
 use crate::view::PanelElement;
 
 pub trait Widget {
@@ -112,6 +113,93 @@ pub trait Widget {
     fn notificaciones(&mut self, _cuantas: u32) -> bool {
         false
     }
+
+    /// Si «No molestar» está puesto. Solo le importa a la campana.
+    fn no_molestar(&mut self, _activo: bool) -> bool {
+        false
+    }
+
+    /// Si tiene una animación en marcha y necesita más frames.
+    ///
+    /// Cada widget mide su propio tiempo porque solo él sabe qué cambió: un
+    /// icono que cruza dura 250 ms, el aviso de batería crítica casi dos
+    /// segundos. El panel pide frames mientras alguno diga que sí y uno más
+    /// después, para que el último que se pinte sea el del estado final.
+    fn animando(&self) -> bool {
+        false
+    }
+}
+
+/// Lo que dura el cruce de iconos cuando un widget cambia de estado. Es el
+/// `toggle` del sistema de diseño, con su muelle.
+const D_CRUCE: Duration = crate::tema::D_MODAL;
+/// Lo que tarda en irse el icono viejo: menos que lo que tarda en llegar el
+/// nuevo, para que no se vean los dos enteros a la vez.
+const D_CRUCE_SALIDA: Duration = crate::tema::D_HOVER;
+
+/// El cambio de un icono del panel por otro.
+///
+/// El viejo encoge a 0,7 y se funde en 120 ms; el nuevo crece desde 0,7 con
+/// muelle en 250 ms. Sustituye al destello de fondo que había antes, que
+/// pintaba la ranura entera y se leía como un clic que no había hecho nadie.
+#[derive(Default)]
+pub struct Cruce {
+    previo: Option<(crate::icono::Icono, iced_core::Color)>,
+    desde: Option<Instant>,
+}
+
+impl Cruce {
+    /// Empieza el cruce desde `previo`, pintado en `color`. Sin icono previo
+    /// —el primer frame— no hay nada de lo que cruzar.
+    pub fn empezar(&mut self, previo: Option<crate::icono::Icono>, color: iced_core::Color) {
+        if crate::tema::efectos_reducidos() || previo.is_none() {
+            *self = Self::default();
+            return;
+        }
+        self.previo = previo.map(|icono| (icono, color));
+        self.desde = Some(Instant::now());
+    }
+
+    pub fn animando(&self) -> bool {
+        self.desde.is_some_and(|t| t.elapsed() < D_CRUCE)
+    }
+
+    pub fn ver<'a>(
+        &'a self,
+        actual: &'a crate::icono::Icono,
+        color: iced_core::Color,
+    ) -> PanelElement<'a> {
+        use crate::tema::{C_MUELLE, C_SUAVE, ICONO_PANEL, fraccion};
+        let (Some(desde), Some((previo, color_previo))) = (self.desde, &self.previo) else {
+            return crate::icono::ver_teñido(actual, ICONO_PANEL, Some(color));
+        };
+        let pasado = desde.elapsed();
+        if pasado >= D_CRUCE {
+            return crate::icono::ver_teñido(actual, ICONO_PANEL, Some(color));
+        }
+        let sale = C_SUAVE.eval(fraccion(pasado, D_CRUCE_SALIDA));
+        let entra = fraccion(pasado, D_CRUCE);
+        let capa = |icono: &'a crate::icono::Icono, escala: f32, opacidad: f32, color| {
+            iced_widget::container(crate::icono::ver_escalado(
+                icono,
+                ICONO_PANEL * escala,
+                opacidad,
+                color,
+            ))
+            .center_x(Length::Fixed(ICONO_PANEL))
+            .center_y(Length::Fixed(ICONO_PANEL))
+        };
+        iced_widget::stack![
+            capa(previo, 1.0 - 0.3 * sale, 1.0 - sale, *color_previo),
+            capa(
+                actual,
+                0.7 + 0.3 * C_MUELLE.eval(entra),
+                C_SUAVE.eval(entra),
+                color
+            ),
+        ]
+        .into()
+    }
 }
 
 /// Ancho aproximado de un texto del panel, en lógicos, contando caracteres.
@@ -136,6 +224,12 @@ pub fn ancho_texto(caracteres: usize) -> f32 {
 /// pintar, con la fuente y el cuerpo por defecto del shell, así que no es una
 /// estimación paralela: es el mismo motor.
 pub fn ancho_de(texto: &str, tamaño: f32) -> f32 {
+    ancho_con_fuente(texto, tamaño, iced_core::Font::DEFAULT)
+}
+
+/// Lo mismo con otra fuente: un texto en seminegrita ocupa más, y medirlo con
+/// la regular lo dejaría recortado por la derecha.
+pub fn ancho_con_fuente(texto: &str, tamaño: f32, fuente: iced_core::Font) -> f32 {
     use iced_core::text::{Paragraph as _, Shaping, Wrapping};
     use iced_core::{Pixels, Size, alignment};
 
@@ -145,7 +239,7 @@ pub fn ancho_de(texto: &str, tamaño: f32) -> f32 {
         bounds: Size::INFINITE,
         size: Pixels(tamaño),
         line_height: iced_core::text::LineHeight::default(),
-        font: iced_core::Font::DEFAULT,
+        font: fuente,
         align_x: iced_core::text::Alignment::Left,
         align_y: alignment::Vertical::Top,
         // La misma que usa `text()` de iced_widget por defecto.
@@ -172,7 +266,10 @@ struct Ranura {
     /// Un widget que ha entrado en pánico no se vuelve a llamar. Reintentarlo
     /// repetiría el fallo en cada frame y llenaría el log.
     muerto: bool,
-    cambio_desde: Option<Instant>,
+    /// Si en el último frame animaba. Mantiene vivo el bucle un frame más
+    /// cuando el widget termina, para que ese frame pinte el estado final y no
+    /// el penúltimo.
+    animaba: bool,
 }
 
 impl Ranura {
@@ -180,7 +277,7 @@ impl Ranura {
         Self {
             widget,
             muerto: false,
-            cambio_desde: None,
+            animaba: false,
         }
     }
 
@@ -226,6 +323,10 @@ impl Ranura {
 pub struct Panel {
     centro: Option<Ranura>,
     derecha: Vec<Ranura>,
+    /// El widget bajo el puntero, y desde cuándo, para fundir su resalte.
+    señalado: Option<(&'static str, Instant)>,
+    /// El widget cuya tarjeta está abierta.
+    abierto: Option<&'static str>,
 }
 
 impl Panel {
@@ -233,6 +334,8 @@ impl Panel {
         let mut panel = Self {
             centro: centro.map(Ranura::new),
             derecha: derecha.into_iter().map(Ranura::new).collect(),
+            señalado: None,
+            abierto: None,
         };
         // Ya están todos construidos, o sea que las consultas que hayan lanzado
         // están corriendo a la vez: aquí se recogen. Ver
@@ -252,7 +355,6 @@ impl Panel {
         let mut cambio = false;
         for ranura in self.ranuras_mut() {
             if ranura.guard("refrescar", |w| w.refrescar()) == Some(true) {
-                ranura.cambio_desde = (!crate::tema::efectos_reducidos()).then(Instant::now);
                 cambio = true;
             }
         }
@@ -263,18 +365,40 @@ impl Panel {
     /// estuvo parado más que la animación. Nunca consulta hardware por frame.
     pub fn animando(&self) -> bool {
         self.ranuras()
-            .any(|r| !r.muerto && r.cambio_desde.is_some())
+            .any(|r| !r.muerto && (r.animaba || r.widget.animando()))
+            || self.resalte_animando()
     }
 
     pub fn avanzar(&mut self) {
         for r in self.ranuras_mut() {
-            if crate::tema::efectos_reducidos()
-                || r.cambio_desde
-                    .is_some_and(|t| t.elapsed() >= crate::tema::D_TARJETA)
-            {
-                r.cambio_desde = None;
-            }
+            r.animaba = !r.muerto && r.widget.animando();
         }
+    }
+
+    fn resalte_animando(&self) -> bool {
+        // El margen de un frame hace lo mismo que `animaba` en las ranuras.
+        self.señalado.is_some_and(|(_, desde)| {
+            desde.elapsed() < crate::tema::D_HOVER + Duration::from_millis(20)
+        })
+    }
+
+    /// El widget que hay bajo el puntero, o `None` si no hay ninguno. `true`
+    /// si hay que repintar.
+    pub fn señalar(&mut self, nombre: Option<&'static str>) -> bool {
+        if self.señalado.map(|(n, _)| n) == nombre {
+            return false;
+        }
+        self.señalado = nombre.map(|n| (n, Instant::now()));
+        true
+    }
+
+    /// El widget cuya tarjeta está abierta. `true` si hay que repintar.
+    pub fn abrir(&mut self, nombre: Option<&'static str>) -> bool {
+        if self.abierto == nombre {
+            return false;
+        }
+        self.abierto = nombre;
+        true
     }
 
     /// Lo antes que alguno quiere despertar.
@@ -363,6 +487,17 @@ impl Panel {
         cambio
     }
 
+    /// Reparte si «No molestar» está puesto. `true` si hay que repintar.
+    pub fn no_molestar(&mut self, activo: bool) -> bool {
+        let mut cambio = false;
+        for ranura in self.ranuras_mut() {
+            if let Some(si) = ranura.guard("no molestar", |w| w.no_molestar(activo)) {
+                cambio |= si;
+            }
+        }
+        cambio
+    }
+
     /// Reparte el escritorio activo entre los widgets que lo quieran. `true` si
     /// alguno pide repintar.
     pub fn escritorios(&mut self, activo: usize, cuantos: usize) -> bool {
@@ -376,7 +511,7 @@ impl Panel {
     }
 
     pub fn centro(&self) -> Option<PanelElement<'_>> {
-        self.centro.as_ref().and_then(ver)
+        self.centro.as_ref().and_then(|r| ver(r, 0.0))
     }
 
     /// Los que de verdad se dibujan, en orden.
@@ -394,7 +529,35 @@ impl Panel {
         self.derecha
             .iter()
             .filter(|r| r.widget.ancho() > 0.0)
-            .filter_map(ver)
+            .filter_map(|r| {
+                let nombre = r.widget.nombre();
+                let resalte = if self.abierto == Some(nombre) {
+                    tema::alfa(tema::acento(), 0.14)
+                } else if let Some((_, desde)) = self.señalado.filter(|(n, _)| *n == nombre) {
+                    let t = if tema::efectos_reducidos() {
+                        1.0
+                    } else {
+                        tema::C_SUAVE.eval(tema::fraccion(desde.elapsed(), tema::D_HOVER))
+                    };
+                    let hover = tema::hover();
+                    tema::alfa(hover, hover.a * t)
+                } else {
+                    iced_core::Color::TRANSPARENT
+                };
+                ver(r, crate::view::HUECO / 2.0).map(|elemento| {
+                    iced_widget::container(elemento)
+                        .center_y(Length::Fixed(ALTO_RESALTE))
+                        .style(move |_| iced_widget::container::Style {
+                            background: Some(resalte.into()),
+                            border: iced_core::Border {
+                                radius: RADIO_RESALTE.into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        })
+                        .into()
+                })
+            })
             .collect()
     }
 
@@ -414,30 +577,22 @@ impl Panel {
 /// fallo con mutabilidad interior. Un widget que dibuja mal es raro y ya
 /// reventaría en `refrescar`; lo que sí se respeta es no dibujar al que ya
 /// está apagado.
-fn ver(ranura: &Ranura) -> Option<PanelElement<'_>> {
+fn ver(ranura: &Ranura, margen: f32) -> Option<PanelElement<'_>> {
     if ranura.muerto {
         return None;
     }
-    let alfa = ranura.cambio_desde.map_or(0.0, |t| {
-        if crate::tema::efectos_reducidos() {
-            return 0.0;
-        }
-        let progreso = (t.elapsed().as_secs_f32() / crate::tema::D_TARJETA.as_secs_f32()).min(1.0);
-        0.08 * (1.0 - progreso)
-    });
     Some(
         iced_widget::container(ranura.widget.ver())
-            .style(move |_| iced_widget::container::Style {
-                background: Some(crate::tema::alfa(crate::tema::tinta(), alfa).into()),
-                border: iced_core::Border {
-                    radius: 6.0.into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            })
+            .padding(iced_core::Padding::ZERO.left(margen).right(margen))
             .into(),
     )
 }
+
+/// Alto del resalte de un widget: 28 en un panel de 32 deja 2 px arriba y
+/// abajo, y la píldora no toca los bordes.
+const ALTO_RESALTE: f32 = 28.0;
+/// El radio de «hover de iconos pequeños» del sistema de diseño.
+const RADIO_RESALTE: f32 = 8.0;
 
 /// Un hueco de ancho cero, para cuando no hay nada que enseñar.
 pub(crate) fn vacio<'a>() -> PanelElement<'a> {
@@ -572,7 +727,8 @@ mod tests {
     #[test]
     fn el_ultimo_frame_de_la_animacion_no_deja_un_bucle_activo() {
         let mut panel = Panel::new(None, vec![Box::new(Cambiante(1))]);
-        panel.derecha[0].cambio_desde = Some(Instant::now() - Duration::from_secs(1));
+        // El widget ya terminó, pero en el frame anterior animaba: queda uno.
+        panel.derecha[0].animaba = true;
         assert!(panel.animando());
         panel.avanzar();
         assert!(!panel.animando());

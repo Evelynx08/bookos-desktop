@@ -1,7 +1,7 @@
 //! Estado del servicio compartido; abrir la tarjeta nunca espera al sistema.
 
-use serde_json::Value;
 use bookos_system::Operation;
+use serde_json::Value;
 
 use iced_core::Length;
 use iced_widget::{Space, column};
@@ -51,31 +51,54 @@ impl Bluetooth {
 
     fn aplicar(&mut self, data: Value, error: Option<String>) -> bool {
         let status = error.or_else(|| data.is_null().then(|| "Cargando…".into()));
-        if self.ultimo == data && self.estado_carga == status { return false; }
+        if self.ultimo == data && self.estado_carga == status {
+            return false;
+        }
         self.estado_carga = status;
         self.encendido = data["enabled"].as_bool().unwrap_or(false);
-        let devices: Vec<_> = data["devices"].as_array().into_iter().flatten()
-            .filter(|d| d["paired"] == true || d["connected"] == true).take(MAXIMO).collect();
-        self.direcciones = devices.iter().map(|d| d["mac"].as_str().unwrap_or_default().into()).collect();
-        self.entradas = devices.iter().map(|d| {
-            let connected = d["connected"] == true;
-            Entrada { nombre: d["name"].as_str().unwrap_or_default().into(),
-                icono: icono::propio(if connected { "bluetooth" } else { "bluetooth-apagado" }),
-                estado: if connected { "Conectado".into() } else { "Emparejado".into() },
-                derecha: d["battery"].as_u64().map(|v| format!("{v}%")), activa: connected }
-        }).collect();
+        let devices: Vec<_> = data["devices"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|d| d["paired"] == true || d["connected"] == true)
+            .take(MAXIMO)
+            .collect();
+        self.direcciones = devices
+            .iter()
+            .map(|d| d["mac"].as_str().unwrap_or_default().into())
+            .collect();
+        self.entradas = devices
+            .iter()
+            .map(|d| {
+                let connected = d["connected"] == true;
+                Entrada {
+                    nombre: d["name"].as_str().unwrap_or_default().into(),
+                    icono: icono::propio(if connected {
+                        "bluetooth"
+                    } else {
+                        "bluetooth-apagado"
+                    }),
+                    estado: if connected {
+                        "Conectado".into()
+                    } else {
+                        "Emparejado".into()
+                    },
+                    derecha: d["battery"].as_u64().map(|v| format!("{v}%")),
+                    activa: connected,
+                }
+            })
+            .collect();
         self.interruptor.ir_a(self.encendido as u8 as f32);
         self.ultimo = data;
         true
     }
 
-    /// El alto reservado. El `MARGEN` final es el de abajo de la tarjeta:
-    /// `y_lista` solo lleva el de arriba, y sin él el pie se quedaba fuera del
-    /// buffer y se pintaba como dos rayas contra el borde.
+    /// El alto reservado: la lista y el pie van dentro del grupo, así que al
+    /// final se suman su relleno de abajo y el margen de la tarjeta.
     pub fn size(&self) -> (f32, f32) {
         (
             lista::ANCHO,
-            self.y_lista() + self.alto_lista() + 10.0 + lista::PIE + lista::MARGEN,
+            self.y_lista() + self.alto_lista() + lista::PIE + control::GRUPO + lista::MARGEN,
         )
     }
 
@@ -84,8 +107,9 @@ impl Bluetooth {
         n * lista::FILA + (n - 1.0) * lista::HUECO_FILA
     }
 
+    /// La `y` de la primera fila: bajo la cabecera y dentro del grupo.
     fn y_lista(&self) -> f32 {
-        lista::MARGEN + lista::CABECERA
+        lista::MARGEN + lista::CABECERA + lista::BAJO_CABECERA + control::GRUPO
     }
 
     pub fn ancla(&self) -> Ancla {
@@ -108,23 +132,22 @@ impl Bluetooth {
         self.señalada.animando() || self.pie.animando() || self.interruptor.animando()
     }
 
+    /// Sobre qué botón del pie cae el punto.
     fn pie_en(&self, x: f32, y: f32) -> Option<bool> {
-        let y0 = self.y_lista() + self.alto_lista() + 10.0 + lista::PIE_AIRE;
-        if y < y0 || y > y0 + lista::PIE_BOTON {
-            return None;
-        }
-        (x > lista::MARGEN && x < lista::ANCHO - lista::MARGEN).then(|| x > lista::ANCHO / 2.0)
+        lista::pie_en(x, y, self.y_lista() + self.alto_lista() + lista::PIE_AIRE)
     }
 
     pub fn pulsar(&mut self, x: f32, y: f32) -> Option<Accion> {
         if self.pie_en(x, y).is_some() {
-            return Some(Accion::Lanzar("bookos-settings --bluetooth".into()));
+            return Some(Accion::Lanzar("bookos-settings --page bluetooth".into()));
         }
         let i = lista::fila_en(x, y, self.y_lista(), self.entradas.len())?;
         let address = self.direcciones.get(i)?.clone();
         bookos_system::request(if self.entradas[i].activa {
             Operation::BluetoothDisconnect { address }
-        } else { Operation::BluetoothConnect { address } });
+        } else {
+            Operation::BluetoothConnect { address }
+        });
         None
     }
 
@@ -141,11 +164,12 @@ impl Bluetooth {
     }
 
     pub fn view(&self) -> PanelElement<'_> {
-        let mut contenido = column![lista::cabecera("Bluetooth", Some(self.interruptor.valor()))];
+        let mut filas = column![];
+        let cabecera = lista::cabecera("Bluetooth", Some(self.interruptor.valor()));
         if let Some(status) = &self.estado_carga {
-            contenido = contenido.push(lista::vacia(status));
+            filas = filas.push(lista::vacia(status));
         } else if self.entradas.is_empty() {
-            contenido = contenido.push(lista::vacia(if self.encendido {
+            filas = filas.push(lista::vacia(if self.encendido {
                 "No hay dispositivos emparejados"
             } else {
                 "Bluetooth apagado"
@@ -153,15 +177,20 @@ impl Bluetooth {
         } else {
             for (i, entrada) in self.entradas.iter().enumerate() {
                 if i > 0 {
-                    contenido =
-                        contenido.push(Space::new().height(Length::Fixed(lista::HUECO_FILA)));
+                    filas = filas.push(Space::new().height(Length::Fixed(lista::HUECO_FILA)));
                 }
-                contenido = contenido.push(lista::fila(entrada, self.señalada.intensidad(i)));
+                filas = filas.push(lista::fila(entrada, self.señalada.intensidad(i)));
             }
         }
-        contenido = contenido
-            .push(Space::new().height(Length::Fixed(10.0)))
-            .push(lista::pie("Detalles", "Configuración", &self.pie));
+        let contenido = column![
+            cabecera,
+            Space::new().height(Length::Fixed(lista::BAJO_CABECERA)),
+            lista::grupo(
+                filas
+                    .push(lista::pie("Detalles", "Configuración", &self.pie))
+                    .into()
+            ),
+        ];
         control::tarjeta(contenido.into(), lista::ANCHO, lista::MARGEN)
     }
 }

@@ -339,6 +339,30 @@ pub fn region_gl(
     )
 }
 
+/// ¿Hay que darle la vuelta a las filas de esta salida al leerlas del
+/// framebuffer?
+///
+/// **No se puede preguntar a `TextureMapping::flipped`**, que es lo que se hacía
+/// y es la causa de que las capturas salieran espejadas en vertical: en el
+/// renderizador GLES de Smithay esa función devuelve la constante `true`, así
+/// que la vuelta se daba siempre.
+///
+/// Lo que decide de verdad es el `Transform` de la salida, porque es lo que
+/// orienta la escena dentro del framebuffer. Las dos que hay:
+///
+/// - **udev**, la sesión de verdad, va en `Transform::Normal`: la escena se
+///   dibuja de arriba abajo y las filas salen ya en orden. Voltearlas era
+///   justo lo que rompía la captura.
+/// - **winit**, el compositor anidado para desarrollo, va en
+///   `Transform::Flipped180` —lo pide la superficie EGL del anfitrión—, y ahí
+///   la escena sí queda al revés y hay que darle la vuelta.
+///
+/// Por eso el fallo no se veía probando en anidado, que es donde se comprobó
+/// en su día: las dos vueltas se compensaban y el PNG salía bien.
+pub fn hay_que_voltear(output: &Output) -> bool {
+    output.current_transform().flipped()
+}
+
 /// El tamaño del buffer de una salida, que es lo que se copia.
 pub fn tamano_de(output: &Output) -> Size<i32, BufferCoord> {
     let modo = output.current_mode().map(|m| m.size).unwrap_or_default();
@@ -354,12 +378,12 @@ pub fn tamano_de(output: &Output) -> Size<i32, BufferCoord> {
 /// copia **fila a fila** y no de un tirón.
 ///
 /// Con `invertida`, las filas de `pixeles` vienen de abajo arriba y se le dan
-/// la vuelta al copiarlas. Es lo que devuelve OpenGL, cuyo origen está en la
-/// esquina **inferior** izquierda: sin esto la captura sale del revés, con el
-/// panel abajo y el dock arriba —comprobado mirando el PNG—. Se invierte aquí y
-/// no con la bandera `YInvert` del protocolo porque la copia ya va fila a fila:
-/// darles la vuelta no cuesta nada y así el cliente recibe siempre lo mismo, sin
-/// depender de que sepa interpretar la bandera.
+/// la vuelta al copiarlas. Lo decide [`hay_que_voltear`], **no**
+/// `TextureMapping::flipped`, que es una constante y por eso volteaba las
+/// capturas de la sesión de verdad. Se invierte aquí y no con la bandera
+/// `YInvert` del protocolo porque la copia ya va fila a fila: darles la vuelta
+/// no cuesta nada y así el cliente recibe siempre lo mismo, sin depender de que
+/// sepa interpretar la bandera.
 ///
 /// Devuelve `false` si el buffer se murió entre medias, que pasa cuando el
 /// cliente se va justo después de pedir la copia.
@@ -427,4 +451,199 @@ pub fn contestar(pendiente: &Pendiente, tamano: Size<i32, BufferCoord>) {
         (secs & 0xFFFF_FFFF) as u32,
         ahora.subsec_nanos(),
     );
+}
+
+/// El velo de la capa de captura, con el agujero y el marco **redondeados**.
+///
+/// Un shader y no rectángulos de color porque una esquina curva no se hace con
+/// rectángulos. Es un solo elemento a pantalla completa que calcula, píxel a
+/// píxel, la distancia al rectángulo redondeado: fuera oscurece, en la franja
+/// del borde pinta el acento y dentro no pinta nada. El borde sale suavizado
+/// sin coste, que con rectángulos tampoco se podía.
+///
+/// El elemento vive aquí y no se crea en cada fotograma: su `Id` y su contador
+/// de commits son los que le dicen al damage tracker si ha cambiado, y solo
+/// se tocan cuando cambian el recuadro, la pantalla o el acento.
+pub struct Velo {
+    elemento: smithay::backend::renderer::gles::element::PixelShaderElement,
+    /// Lo último que se le pasó al shader, para no subir el contador de commits
+    /// —y repintar la pantalla entera— cuando no ha cambiado nada.
+    ultimo: Option<[f32; 11]>,
+}
+
+const FRAGMENTO_VELO: &str = r#"
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+
+uniform vec2 size;
+uniform float alpha;
+varying vec2 v_coords;
+#if defined(DEBUG_FLAGS)
+uniform float tint;
+#endif
+
+// En lógicos: x, y, ancho, alto. Ancho 0 es «no hay nada marcado».
+uniform vec4 recuadro;
+uniform float radio;
+uniform float borde;
+// Cuántos píxeles físicos mide un lógico: el suavizado es de un píxel físico.
+uniform float escala;
+uniform float velo;
+uniform vec3 acento;
+
+// Distancia con signo a un rectángulo redondeado: negativa dentro.
+float caja(vec2 p, vec2 centro, vec2 medio, float r) {
+    vec2 q = abs(p - centro) - medio + vec2(r);
+    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+}
+
+void main() {
+    vec2 p = v_coords * size;
+    vec4 color = vec4(0.0, 0.0, 0.0, velo);
+    if (recuadro.z > 0.0) {
+        float aa = 0.5 / escala;
+        vec2 medio = recuadro.zw * 0.5;
+        float r = min(radio, min(medio.x, medio.y));
+        float d = caja(p, recuadro.xy + medio, medio, r);
+        float dentro = 1.0 - smoothstep(-aa, aa, d);
+        // El marco va **dentro** del recuadro, como iba el borde de iced: lo
+        // que queda bajo la línea sí sale en la foto.
+        float marco = dentro * smoothstep(-borde - aa, -borde + aa, d);
+        color = vec4(0.0, 0.0, 0.0, velo) * (1.0 - dentro) + vec4(acento, 1.0) * marco;
+    }
+    gl_FragColor = color * alpha;
+#if defined(DEBUG_FLAGS)
+    if (tint == 1.0)
+        gl_FragColor = vec4(0.0, 0.3, 0.0, 0.2) + gl_FragColor * 0.8;
+#endif
+}
+"#;
+
+impl Velo {
+    /// Compila el shader. `None` si el driver no lo acepta: el velo sale igual,
+    /// con las esquinas rectas de `ShellHost::velo_captura`.
+    pub fn new(renderer: &mut smithay::backend::renderer::gles::GlesRenderer) -> Option<Self> {
+        use smithay::backend::renderer::element::Kind;
+        use smithay::backend::renderer::gles::element::PixelShaderElement;
+        use smithay::backend::renderer::gles::{UniformName, UniformType};
+
+        let programa = renderer
+            .compile_custom_pixel_shader(
+                FRAGMENTO_VELO,
+                &[
+                    UniformName::new("recuadro", UniformType::_4f),
+                    UniformName::new("radio", UniformType::_1f),
+                    UniformName::new("borde", UniformType::_1f),
+                    UniformName::new("escala", UniformType::_1f),
+                    UniformName::new("velo", UniformType::_1f),
+                    UniformName::new("acento", UniformType::_3f),
+                ],
+            )
+            .inspect_err(|err| {
+                tracing::warn!(
+                    "el velo de la captura irá sin redondear, el driver no compiló el shader: {err}"
+                )
+            })
+            .ok()?;
+        Some(Self {
+            elemento: PixelShaderElement::new(
+                programa,
+                Rectangle::default(),
+                None,
+                1.0,
+                Vec::new(),
+                Kind::Unspecified,
+            ),
+            ultimo: None,
+        })
+    }
+
+    /// El elemento para este fotograma. `pantalla` va en físicos y el recuadro
+    /// en lógicos, que es lo que da `ShellHost::datos_velo_captura`.
+    pub fn elemento(
+        &mut self,
+        pantalla: (i32, i32),
+        escala: f64,
+        marcado: Option<bookos_shell::captura::Recuadro>,
+    ) -> smithay::backend::renderer::gles::element::PixelShaderElement {
+        use bookos_shell::captura::{BORDE, VELO};
+        use smithay::backend::renderer::gles::Uniform;
+
+        // Hacia arriba: con escala fraccional, redondear a lo más cercano podía
+        // dejar la última fila de píxeles de la pantalla sin velo.
+        let logico = (
+            (pantalla.0 as f64 / escala).ceil() as i32,
+            (pantalla.1 as f64 / escala).ceil() as i32,
+        );
+        let r = marcado.map_or([0.0; 4], |r| [r.x, r.y, r.w, r.h]);
+        let acento = bookos_shell::tema::acento();
+        let valores = [
+            r[0],
+            r[1],
+            r[2],
+            r[3],
+            logico.0 as f32,
+            logico.1 as f32,
+            escala as f32,
+            acento.r,
+            acento.g,
+            acento.b,
+            // El radio de un control del sistema: el recuadro es una selección
+            // que se toca, no una tarjeta.
+            bookos_shell::tema::R_CONTROL,
+        ];
+        if self.ultimo != Some(valores) {
+            self.elemento
+                .resize(Rectangle::from_size(logico.into()), None);
+            self.elemento.update_uniforms(vec![
+                Uniform::new("recuadro", (r[0], r[1], r[2], r[3])),
+                Uniform::new("radio", valores[10]),
+                Uniform::new("borde", BORDE),
+                Uniform::new("escala", escala as f32),
+                Uniform::new("velo", VELO),
+                Uniform::new("acento", (acento.r, acento.g, acento.b)),
+            ]);
+            self.ultimo = Some(valores);
+        }
+        self.elemento.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smithay::utils::Transform;
+
+    fn salida(transform: Transform) -> Output {
+        let output = Output::new(
+            "prueba".into(),
+            smithay::output::PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: smithay::output::Subpixel::Unknown,
+                make: "BookOS".into(),
+                model: "prueba".into(),
+            },
+        );
+        output.change_current_state(None, Some(transform), None, None);
+        output
+    }
+
+    /// Lo que decide la vuelta es la orientación de la salida, y las dos que hay
+    /// en marcha dan respuestas distintas. Este test existe porque durante un
+    /// tiempo la decisión salió de `TextureMapping::flipped`, que es la
+    /// constante `true`, y las capturas de la sesión de verdad salían espejadas
+    /// mientras que las del anidado —donde se probaba— salían bien.
+    #[test]
+    fn la_vuelta_depende_de_la_orientacion_de_la_salida() {
+        // udev, la sesión de verdad.
+        assert!(!hay_que_voltear(&salida(Transform::Normal)));
+        // winit, el compositor anidado de desarrollo.
+        assert!(hay_que_voltear(&salida(Transform::Flipped180)));
+        // Una pantalla girada no está espejada: no lleva vuelta.
+        assert!(!hay_que_voltear(&salida(Transform::_90)));
+        assert!(!hay_que_voltear(&salida(Transform::_180)));
+    }
 }

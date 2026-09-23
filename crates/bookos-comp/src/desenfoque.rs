@@ -199,8 +199,8 @@ impl Cristal {
         }
     }
 
-    /// Sube el fondo del escritorio con mipmaps. Se llama una vez, al cargar
-    /// el fondo: a partir de ahí el cristal no vuelve a tocar la GPU.
+    /// Sube el fondo del escritorio con mipmaps. Se llama al cargarlo y cuando
+    /// cambia el fotograma de una animación.
     pub fn preparar(&mut self, renderer: &mut GlesRenderer, rgba: &[u8], tam: (i32, i32)) {
         self.fondo = crear_textura(renderer, rgba, tam).map(|t| (t, tam));
     }
@@ -301,6 +301,9 @@ pub struct Desenfoque {
 }
 
 impl Desenfoque {
+    // Un argumento por campo: una estructura intermedia solo repetiría esta
+    // misma lista.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: Id,
         commit: CommitCounter,

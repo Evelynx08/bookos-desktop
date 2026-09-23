@@ -60,7 +60,19 @@ frame** as the compositor: there is no loading screen when you log in.
 
 **Windows** — xdg-shell and XWayland, click-to-focus, move and resize with
 <kbd>Meta</kbd>+drag, maximise, snapping to halves and quarters by dragging to an
-edge or a corner, and an animation on resize.
+edge or a corner, and animations on open, resize and close. The close animation
+works however the window goes away — the title bar button, <kbd>Meta</kbd>+<kbd>Q</kbd>
+or the application quitting — because it keeps the textures the client left
+behind at the moment it destroys its window.
+
+Menus and submenus (`xdg_popup`) are positioned inside the screen and chain like
+they do on KDE: moving along a Qt menu bar — VirtualBox, Dolphin — goes from one
+menu to the next without closing. Keyboard focus reaches a menu on the first key
+press and not when it opens, which is what KWin does and what Qt expects.
+
+The title bar buttons sit quietly: no background at rest, a dimmed glyph —
+dimmer still on an inactive window — and they only light up under the pointer,
+the close one in red.
 
 **Virtual desktops** — two out of the box (`escritorios = N` in the config, one
 to five), with shortcuts, gestures and a panel indicator. The switch **slides**,
@@ -68,10 +80,18 @@ macOS style: both sets of windows move at once and you can see where you are
 going. Windows on desktops that are off-screen leave the `Space` and come back to
 their exact position; the client never notices.
 
-<kbd>Meta</kbd>+<kbd>W</kbd> opens the overview with live thumbnails. From there
-you can create and delete desktops without closing their windows, and a double
-click on the name renames it. Clicking the active dot in the panel opens that
-same view.
+<kbd>Meta</kbd>+<kbd>W</kbd> opens the overview: a strip of live thumbnails
+along the top and, below it, **every window of the current desktop in a grid**,
+each with its title bar. On opening, the windows travel from where they are to
+their cell, and on closing they travel back. From there you can create and
+delete desktops without closing their windows, and a double click on the name
+renames it. Dragging a window — from the grid or from a thumbnail — onto
+another thumbnail moves it to that desktop; a plain click on it goes to its
+desktop and brings it to the front. Clicking the active dot in the panel opens
+that same view.
+
+The **dock only shows the windows of the desktop you are on**: an application
+open on another desktop does not light up its dot here.
 
 **Touchpad gestures** — four fingers sideways switch desktop; four down push the
 windows aside and up brings them back — or, if none are pushed aside, open the
@@ -100,6 +120,20 @@ away: it only leaves the `Space`, the same as one on another desktop.
 **Panel** — clock, battery, network, Bluetooth, volume, brightness,
 notifications and control centre. Each widget is a module with its own refresh,
 its own alarm and the udev subsystems it cares about.
+
+**Light and dark** — switching theme crossfades the whole screen instead of
+flipping in one frame: the compositor photographs the scene with the old theme
+and fades that photo out over the new one.
+
+**Notifications** — the toasts **stack**, up to three at a time under the panel
+with the newest on top. Each one leaves on its own timer, a fourth pushes the
+oldest out with its exit animation, and the rest slide to close the gap. An
+update to the same notification (`replaces_id`, a progress bar) stays in its
+place. The body gets two lines, and the icon comes from `image-path` too, which
+is where `notify-send -i` puts it. Opening any panel card sends the toasts away
+— they fell right on top of the notifications card and its Do Not Disturb
+switch — and while a card is open new ones go straight to the list; critical
+ones still show.
 
 **Popover cards** — clicking a widget opens its own: power with PPD profiles,
 Wi-Fi networks, Bluetooth devices, sound, brightness, calendar, notifications,
@@ -138,6 +172,14 @@ password field and the line that says what is going on. The picture comes from
 that, from the initials. It authenticates through the system PAM stack on a
 separate worker, so a slow check cannot freeze the compositor.
 
+<kbd>Meta</kbd>+<kbd>L</kbd> locks straight away. With the **fingerprint** on,
+the reader listens the whole time the screen is locked: a finger that does not
+match shakes the sign-in block and says so in red while the reader keeps
+waiting, and a match says «Huella reconocida» before letting you in. **Unlocking
+fades** the lock out and lifts it slightly over the desktop instead of cutting to
+it; the windows are already there underneath, so the animation never delays the
+security boundary.
+
 **OSD** — the capsule that appears when you touch volume, brightness, keyboard
 backlight or the touchpad.
 
@@ -165,17 +207,17 @@ from what still needs integration work for a production session.
 | Area | State | What is there today |
 |---|---|---|
 | Wayland and X11 windows | ✅ Working | xdg-shell, XWayland, focus, move, resize, maximise, fullscreen and snapping to halves/quarters |
-| Window animations | ✅ Working | Open, resize and a reversible Magic Lamp towards the dock |
-| Desktops and Exposé | ✅ Working | 1–5 desktops, names, overview, live thumbnails and gestures |
+| Window animations | ✅ Working | Open, close, resize, a reversible Magic Lamp towards the dock and a crossfade between light and dark |
+| Desktops and Exposé | ✅ Working | 1–5 desktops, names, overview with the current desktop's windows in an animated grid, live thumbnails, drag between desktops, per-desktop dock and gestures |
 | Panel, dock and launchpad | ✅ Working | Modular widgets, folders, search, pinning and context menus |
-| Notifications | 🟡 Partial | D-Bus server, toast, history, Do Not Disturb, `ActionInvoked` actions, progress, visual grouping per application and keyboard navigation; persistent reply and per-application preferences are missing |
-| Lock screen | 🟡 Partial | PAM password authentication, optional fingerprint, automatic lock and lock on resume; physical fingerprint validation and advanced policies remain |
+| Notifications | 🟡 Partial | D-Bus server, stacked toasts (up to three), history, Do Not Disturb, `ActionInvoked` actions, progress, visual grouping per application and keyboard navigation; images sent as pixels (`image-data`), persistent reply and per-application preferences are missing |
+| Lock screen | 🟡 Partial | PAM password and fingerprint authentication (validated with a real Egis reader: a non-matching finger shakes in red, a match fades the lock out), Meta+L locks straight away, automatic lock and lock on resume; advanced policies remain |
 | Displays | ✅ Working | Several DRM/KMS outputs, 2D layout, independent scale/mode/Hz/VRR, primary output, EDID profiles and hotplug; panel and dock follow the primary |
 | BookOS Settings | 🟡 Partial | Displays, appearance, wallpaper, lock screen, fingerprint preference, live dock icon size and activity reload; further panel/gesture controls remain |
 | Dynamic activities | 🟡 Partial | Player, Timer and Voice Recorder; hardening the D-Bus identity and the final app integration are missing |
 | Screenshots | ✅ Working | Region selector on Print, to file or to the clipboard, and `zwlr_screencopy_v1` v3 for `grim` and friends (`wl_shm` only) |
 | Screen sharing | 🟡 Partial | `impl.portal.ScreenCast` and `Screenshot` inside the compositor, a PipeWire node driven by frames, backpressure, `Request` cancellation, `Session.Closed` and a permission card of its own. Tested nested with `gst-launch-1.0 pipewiresrc`: correct image at 2240×1400. Whole displays only, the cursor is always included, and frames go through the CPU: the DMA-BUF path is missing |
-| Foreign applications | 🟡 Partial | The portal serves `impl.portal.Settings`, so GTK, Qt and Tauri follow BookOS's theme, accent, contrast and reduced motion live. `xdg-activation`, server-side decoration, text-input/input-method, idle-notify, layer-shell and foreign-toplevel are integrated |
+| Foreign applications | 🟡 Partial | The portal serves `impl.portal.Settings`, so GTK, Qt and Tauri follow BookOS's theme, accent, contrast and reduced motion live, and `impl.portal.FileChooser`, so their open and save dialogs are BookOS's own file explorer. Menus and submenus (`xdg_popup`) work, including Qt menu bars. `xdg-activation`, server-side decoration, text-input/input-method, idle-notify, layer-shell and foreign-toplevel are integrated. There is no polkit agent yet |
 | Accessibility | 🟡 Partial | Reduced motion, high contrast, focus and keyboard navigation of notifications; global text scaling and AT-SPI are missing |
 
 > [!NOTE]
@@ -225,7 +267,7 @@ and if it could not be verified, it says that too.
 
 ```bash
 cargo build                                  # debug
-cargo test                                   # 370 tests, green as of 2026-09-13
+cargo test --workspace                       # 433 tests, green as of 2026-09-23
 
 # Nested inside an existing graphical session, with a test client
 cargo run -p bookos-comp -- -f konsole
@@ -306,17 +348,19 @@ translates the saved floating geometry using logical coordinates.
 | <kbd>Meta</kbd>+<kbd>Return</kbd> | Open a terminal (`BOOKOS_TERMINAL`, `konsole` by default) |
 | <kbd>Meta</kbd> alone | Open or close the launchpad |
 | <kbd>Meta</kbd>+<kbd>Space</kbd> | Central search: applications, settings, commands and states |
-| <kbd>Meta</kbd>+<kbd>W</kbd> | The desktop strip with its thumbnails |
+| <kbd>Meta</kbd>+<kbd>W</kbd> | The overview: desktop thumbnails and the current desktop's windows in a grid |
 | <kbd>Alt</kbd>+<kbd>Tab</kbd> · <kbd>Meta</kbd>+<kbd>Tab</kbd> | Window switcher: icons or live thumbnails (with <kbd>Shift</kbd>, backwards) |
 | <kbd>Meta</kbd>+<kbd>1</kbd>…<kbd>9</kbd> | Go to that desktop |
 | <kbd>Meta</kbd>+<kbd>Ctrl</kbd>+<kbd>←</kbd>/<kbd>→</kbd> | Previous or next desktop |
+| <kbd>Meta</kbd>+<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>←</kbd>/<kbd>→</kbd> | Send the focused window to the previous or next desktop |
 | <kbd>Meta</kbd>+<kbd>Ctrl</kbd>+<kbd>D</kbd> | Push the windows aside to see the desktop, or bring them back |
 | <kbd>Meta</kbd>+<kbd>F</kbd> | Maximise the focused window, or restore it |
 | <kbd>Meta</kbd>+<kbd>H</kbd> | Minimise to the dock; its icon toggles minimise/restore with Magic Lamp |
 | <kbd>Meta</kbd>+<kbd>←→↑↓</kbd> | Snap to half the screen; another arrow, to a quarter |
 | <kbd>Meta</kbd>+<kbd>Q</kbd> | Close the focused window |
-| <kbd>Meta</kbd>+<kbd>L</kbd> | Throw up the lock screen (your account password unlocks it) |
+| <kbd>Meta</kbd>+<kbd>L</kbd> | Lock straight away (password or fingerprint unlocks it) |
 | <kbd>Meta</kbd>+<kbd>Esc</kbd> · power button | The power dialog: sleep, lock, log out, restart, shut down |
+| <kbd>Meta</kbd>+<kbd>Alt</kbd>+<kbd>A</kbd> | Start or finish a spoken command for the BookOS assistant |
 | <kbd>Meta</kbd>+<kbd>Alt</kbd>+<kbd>B</kbd> / <kbd>D</kbd> | The panel / the dock: dodge windows or always visible |
 | <kbd>Meta</kbd>+<kbd>Alt</kbd>+<kbd>F</kbd> | Diagnostics overlay: fps, frame cost and dropped frames per monitor |
 | <kbd>Meta</kbd>+drag | Move the window (with the right button, resize) |
@@ -336,8 +380,10 @@ appears; <kbd>Meta</kbd>+<kbd>Esc</kbd> opens it either way.
 
 And only in a real session on a TTY:
 <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>F1</kbd>…<kbd>F12</kbd> to switch virtual
-terminal, and <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Backspace</kbd> to end the
-compositor.
+terminal, and <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Backspace</kbd> **twice within two seconds** to
+end the compositor. One press only shows a warning: on a laptop Ctrl and Alt sit
+side by side, and deleting a word with Ctrl+Backspace used to brush Alt and close
+the whole session.
 
 ---
 
@@ -371,6 +417,13 @@ avatar = /path/to/avatar.png
 # charger it turns itself on, without touching this key.
 efectos = completos
 
+# Automatic brightness, per light, from the ambient light sensor (through
+# iio-sensor-proxy). Also toggled with the «A» buttons in the brightness card.
+# Adjusting by hand while it is on is remembered: the screen keeps the offset,
+# the keyboard keeps its level until the light crosses from dark to bright.
+brillo_automatico_pantalla = no
+brillo_automatico_teclado = no
+
 # Lock screen. The positions are fractions of the logical height: 0.36 is 36 %,
 # so the composition survives HiDPI and other resolutions.
 bloqueo_animaciones = si
@@ -400,6 +453,9 @@ launchpad_dock = si
 # with it. `fondo` on its own still works and applies to both.
 fondo_claro = /usr/share/wallpapers/BookOS/Light/blue.png
 fondo_oscuro = /usr/share/wallpapers/BookOS/Dark/blue_dark.png
+
+# Se aceptan PNG, JPEG, WebP, SVG y WebP animado. Los fondos animados se
+# congelan mientras está activado «Reducir efectos».
 
 # Cursor and input. The speeds use libinput's scale: [-1, 1].
 cursor = 24
@@ -446,8 +502,16 @@ read-only: `ApplyConfig` ignores it rather than rejecting it, so a client can
 hand back the object it read without the whole call failing.
 
 **XDG portals**, served from inside the compositor:
-`org.freedesktop.impl.portal.ScreenCast`, `Screenshot`, `Request`, `Session` and
-`Settings`. The last one is what makes a GTK, Qt or Tauri application follow
+`org.freedesktop.impl.portal.ScreenCast`, `Screenshot`, `FileChooser`, `Request`,
+`Session` and `Settings`.
+
+`FileChooser` answers `OpenFile`, `SaveFile` and `SaveFiles` by launching the
+BookOS file explorer (`../explorer`) in picker mode on this compositor's display:
+filters, multiple selection, the current folder and the suggested name all
+arrive, and closing the request closes the picker. `session/bookos-portals.conf`
+routes `FileChooser=bookos`.
+
+The `Settings` portal is what makes a GTK, Qt or Tauri application follow
 BookOS's dark mode: it answers the `org.freedesktop.appearance` namespace with
 `color-scheme` (1 dark, 2 light), `accent-color`, `contrast` and
 `reduced-motion`, and emits `SettingChanged` when any of them changes.
@@ -489,8 +553,11 @@ crates/
 │   ├── shell.rs            # the shell surfaces inside the Space
 │   ├── ventanas.rs         # snapping, resize animation, focus
 │   ├── decoracion.rs       # title bar and window buttons
-│   ├── escritorios.rs      # virtual desktops and "show desktop"
+│   ├── escritorios.rs      # virtual desktops, the overview grid and "show desktop"
 │   ├── genio.rs            # the magic lamp: capture to texture and warp shader
+│   ├── cierre.rs           # the close animation, from the textures a window leaves
+│   ├── fundido.rs          # the light/dark crossfade
+│   ├── handlers.rs         # xdg-shell: toplevels, menus and popup grabs
 │   ├── gestos.rs           # touchpad gestures, without depending on Smithay
 │   ├── input.rs            # libinput: pointer, keyboard, touchpad
 │   ├── keybinds.rs         # shortcuts and actions
@@ -499,14 +566,14 @@ crates/
 │   ├── ajustes.rs          # the org.bookos.Desktop contract
 │   ├── apariencia.rs       # theme, accent and wallpaper applied live
 │   ├── pantallas.rs        # output model, validation and persistence
-│   ├── portal.rs           # ScreenCast, Screenshot and Settings portals
+│   ├── portal.rs           # ScreenCast, Screenshot, FileChooser and Settings portals
 │   ├── pw.rs · emision.rs  # PipeWire node and the frame stream
 │   ├── captura.rs          # screenshots and zwlr_screencopy
 │   ├── notificaciones.rs   # org.freedesktop.Notifications server
 │   ├── multimedia.rs       # MPRIS
 │   ├── metricas.rs         # fps, frame cost, dropped frames
 │   ├── xwayland.rs         # X11 clients
-│   └── selftest.rs         # input checks in a real session
+│   └── selftest.rs         # input checks and the hand-written script
 ├── bookos-shell/           # the desktop
 │   ├── widget.rs           # the Widget trait and its isolation
 │   ├── widgets/            # clock, battery, network, bluetooth, volume, brightness…
@@ -518,7 +585,7 @@ crates/
 │   ├── actividad.rs        # Player, Timer and Voice Recorder island
 │   ├── conmutador.rs       # Alt+Tab, Meta+Tab and Exposé
 │   ├── notificaciones.rs   # notification model and history
-│   ├── toast.rs            # the pop-in notification
+│   ├── toast.rs            # the stacked pop-in notifications
 │   ├── bloqueo.rs          # lock screen
 │   ├── diagnostico.rs      # the metrics overlay
 │   └── osd.rs              # the volume and brightness capsule
@@ -543,7 +610,7 @@ that.
 ## Testing
 
 ```bash
-cargo test                                        # 370 tests
+cargo test --workspace                            # 433 tests
 
 # Actually look at what gets painted, instead of assuming
 BOOKOS_PANEL_PNG=/tmp/panel.png cargo test --test panel
@@ -556,7 +623,22 @@ BOOKOS_INPUT_SELFTEST=1 BOOKOS_SELFTEST_ESCRITORIOS=1 cargo run -p bookos-comp -
 
 # The per-widget isolation: kill one and the panel carries on
 BOOKOS_SHELL_PANIC_TEST=reloj cargo run -p bookos-comp -- -f
+
+# A hand-written walk through real applications (menus, overview, lock…)
+BOOKOS_INPUT_SELFTEST=1 BOOKOS_SELFTEST_GUION=/tmp/guion.txt \
+  ./target/debug/bookos-comp 'konsole --separate'
 ```
+
+The script takes one order per line: `espera ms`, `mover x y`, `clic x y [der]`,
+`pulsar x y` / `soltar` for drags, `tecla meta+w` (combinations with `+`),
+`tema claro|oscuro`, `captura` and `fin`. `mover`, `clic` and `tecla` accept a
+trailing wait in milliseconds — the default 250 ms swallows short animations
+whole. Coordinates are logical; screenshots go to `$XDG_PICTURES_DIR/Capturas`.
+Launch `konsole` with `--separate` and give it about eight seconds, or it reuses
+the host's konsole and the window never shows up nested.
+
+For the notifications, run it under `dbus-run-session`: the host desktop already
+owns `org.freedesktop.Notifications` on the normal bus.
 
 Nearly every popover has its own `BOOKOS_*_PNG` variable to dump what it draws.
 **If you touch something visible, look at it** — a test that only checks nothing
@@ -586,15 +668,18 @@ secure platform. The work is organised in these stages:
   `ext-idle-notify`, layer shell and `ext-foreign-toplevel-list`.
 - **Portals.** `ScreenCast`, `Screenshot` and `Settings` are in, inside the
   compositor itself, with cancellation, session close and per-stream
-  backpressure. Left to do: picking a single window, the file chooser, and
-  getting rid of the CPU round trip — today every shared frame is composed
+  backpressure, and `FileChooser` opens the BookOS file explorer. Left to do:
+  picking a single window, and getting rid of the CPU round trip — today every shared frame is composed
   separately and read back from the GPU with `glReadPixels`; the right path is
   exporting a DMA-BUF and handing it to PipeWire untouched.
 - **Lock-screen security.** Already there: PAM on a worker, automatic lock and
   lock on resume, KMS DPMS, respect for `idle-inhibit`, a Caps Lock warning,
   progressive backoff after failures, and configurable automatic suspend that
-  also respects inhibitors. Left: fingerprint and switching layout from the lock
-  screen.
+  also respects inhibitors, and fingerprint unlocking validated on a real
+  reader. Left: switching keyboard layout from the lock screen.
+- **A polkit agent and a keyring.** Without an agent, anything that asks for
+  administrator rights fails without a dialog; without a keyring started with
+  the session, browsers and editors cannot keep their passwords and tokens.
 - **Advanced multi-display shell.** The primary output carries the panel, the
   dock and the interactive surfaces; what is left is allowing them to be
   duplicated, or the panel and dock split across monitors, from Settings.
@@ -606,8 +691,9 @@ secure platform. The work is organised in these stages:
   `busctl` and `systemctl`.
 - Verify the D-Bus owner of dynamic activities; a list of allowed `app_id`s does
   not on its own prove which process is publishing.
-- Finish grouping, persistent reply and per-application preferences in
-  notifications; `ActionInvoked` actions and progress already work.
+- Finish persistent reply, per-application preferences and `image-data` images
+  (album art, chat avatars) in notifications; stacking, grouping, `ActionInvoked`
+  actions and progress already work.
 - Turn the search box into a provider system: applications, files, settings,
   calculator, conversions, commands, history and actions.
 - Complete Wi-Fi with a password, Bluetooth pairing and audio profiles without
@@ -617,8 +703,9 @@ secure platform. The work is organised in these stages:
 
 - Global text scaling and full keyboard navigation; after that, AT-SPI
   integration for a screen reader.
-- Per-window rules, remembered geometry, always on top, move to desktop, and a
-  close animation from a prior capture.
+- Per-window rules and remembered geometry. Always on top, moving to another
+  desktop (menu, shortcut or dragging in the overview) and the close animation
+  are already in.
 - Clipboard history with special handling for sensitive content.
 - Careful support for touchscreen, stylus and on-screen keyboard.
 
@@ -637,6 +724,17 @@ secure platform. The work is organised in these stages:
   itself.
 - Extend the diagnostics overlay with damage, texture uploads and GPU memory;
   validate at 60, 120 and 144 Hz.
+- Move the overview's hover highlight to the GPU. The strip is repainted in
+  full on the CPU for every frame of the hover fade: measured nested at scale
+  1.75, 31 ms per frame, down to 14 ms by clearing the buffer with the strip's
+  colour instead of blending a translucent fill over it. The rest is iced
+  clearing a full-size clip mask per layer.
+- A power-saving profile: cap drawing at 60 fps on battery with VRR on (the
+  laptop's panel goes down to 48 Hz), reduced effects and a paused animated
+  wallpaper, switched on from power-profiles-daemon or low battery. At rest the
+  compositor already draws nothing — measured nested, 0 fps with only the clock
+  ticking — so the saving is in active use, and it has to be measured with
+  `power_now` in a real session.
 
 ### What "ready for daily use" means
 
@@ -688,16 +786,25 @@ hotplug or crash-recovery test.
 
 ## Desktop improvements: confirmation, fingerprint and live controls
 
-Manual power actions now use a HIG confirmation with Cancel selected initially.
-This covers the BookOS menu, energy chooser, Meta+L, Ctrl+Alt+Delete and the
-lock-screen power menu. Tab/left/right select a button; Enter activates it;
-Escape cancels. Automatic locking and suspend handling do not wait for a dialog.
-Ctrl+Alt+Backspace remains the explicit emergency exit.
+Power actions that lose work use a HIG confirmation with Cancel selected
+initially: suspend, log out, restart and shut down, from the BookOS menu, the
+energy chooser, Ctrl+Alt+Delete and the lock-screen power menu. Tab/left/right
+select a button; Enter activates it; Escape cancels. **Locking is not
+confirmed**: nothing is lost and the password undoes it, so Meta+L locks at once,
+as it does everywhere else. Automatic locking and suspend handling do not wait
+for a dialog. Ctrl+Alt+Backspace, pressed twice, remains the explicit emergency
+exit.
 
 Settings → Desktop exposes `dock_tamano` (32–80 logical pixels, default 50).
 Saving resizes, repaints and repositions the dock without restarting the session;
 hit testing and the reserved window area follow the new size. The number of
 desktops still requires a session restart when changed from this Settings page.
+
+Password unlocking uses the dedicated `/etc/pam.d/bookos` service. Keeping it
+separate from the distribution's general `system-auth`/`common-auth` stack
+prevents an enabled `pam_fprintd` module from delaying or replacing an explicit
+password attempt. The development installer creates it without overwriting a
+local administrator's existing policy.
 
 Settings → Lock screen exposes `bloqueo_huella` (off by default). It requires an
 enrolled fingerprint, fprintd and the dedicated `/etc/pam.d/bookos-fingerprint`
@@ -708,7 +815,14 @@ The biometric policy uses `pam_fprintd.so max-tries=3 timeout=15`, following the
 [upstream module manual](https://manpages.debian.org/trixie/libpam-fprintd/pam_fprintd.8.en.html).
 
 Fingerprint checking runs separately from password checking, so the password
-field stays usable. F9 retries after a failure (with a 3-second local delay).
+field stays usable. Each finger that does not match reaches the screen as it
+happens — `pam_fprintd` reports it as a `PAM_ERROR_MSG` while it keeps waiting —
+and shakes the sign-in block. When the 15-second `timeout` runs out with nobody
+touching the reader, `pam_fprintd` answers exactly what it answers with no
+reader at all; the two are told apart by time (measured: 0.26 s with nothing
+enrolled, 15.4 s for a timeout), and a timeout starts a new wait instead of
+switching the fingerprint off. F9 retries after three failed fingers (with a
+3-second local delay).
 Only one sensor worker can run at a time, and results are tied to the current
 lock generation. Unlocking discards outstanding results; a previous sensor
 worker can retain the device until its bounded PAM timeout. PAM authentication
@@ -732,8 +846,9 @@ BOOKOS_INPUT_SELFTEST=1 BOOKOS_SELFTEST_MEJORAS=1 cargo run -p bookos-comp
 
 The tests cover confirmation/cancellation, fractional-scale rendering, live
 dock resizing, open-card repainting, config validation and fail-closed auth
-results. A real enrolled fingerprint reader and actual suspend/resume still
-need interactive validation after installation. No system PAM files or installed
+results. Fingerprint unlocking, the non-matching finger and the timeout were
+validated with a real reader (Egis Match-on-Chip) in a nested session; actual
+suspend/resume still needs interactive validation after installation. No system PAM files or installed
 compositor binaries are changed by the tests.
 
 ## License

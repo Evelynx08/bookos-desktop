@@ -232,22 +232,38 @@ fn token(nombre: &str, claro: Color, oscuro: Color) -> Color {
     }
     match nombre {
         "bg" => {
-            if es_claro() { Color::WHITE } else { Color::BLACK }
+            if es_claro() {
+                Color::WHITE
+            } else {
+                Color::BLACK
+            }
         }
         "card" => {
-            if es_claro() { Color::WHITE } else { hex(0x101010) }
+            if es_claro() {
+                Color::WHITE
+            } else {
+                hex(0x101010)
+            }
         }
         "texto" => {
-            if es_claro() { Color::BLACK } else { Color::WHITE }
+            if es_claro() {
+                Color::BLACK
+            } else {
+                Color::WHITE
+            }
         }
         "divisor" => hexa(if es_claro() { 0x000000 } else { 0xffffff }, 0.42),
         "hover" => hexa(if es_claro() { 0x000000 } else { 0xffffff }, 0.16),
         "surco" => hexa(if es_claro() { 0x000000 } else { 0xffffff }, 0.30),
         "control_apagado" => {
-            if es_claro() { hex(0xb8b8b8) } else { hex(0x5a5a5a) }
+            if es_claro() {
+                hex(0xb8b8b8)
+            } else {
+                hex(0x5a5a5a)
+            }
         }
         "borde" => hexa(if es_claro() { 0x000000 } else { 0xffffff }, 0.55),
-        "panel" => hexa(if es_claro() { 0xffffff } else { 0x000000 }, 0.90),
+        "panel" => hex(if es_claro() { 0xffffff } else { 0x000000 }),
         _ => normal,
     }
 }
@@ -576,15 +592,38 @@ tokens! {
     /// Borde de un popup.
     borde: claro hexa(0x000000, 0.10), oscuro hexa(0xffffff, 0.09);
 
-    /// Fondo del panel. Es el `bg` del sistema con transparencia: el panel se
-    /// apoya sobre el escritorio y taparlo del todo lo despega de él.
-    ///
-    /// 0,55. Estuvo en 0,35 mientras el compositor dibujaba un cristal
-    /// esmerilado debajo —con más opacidad el desenfoque quedaba tapado y solo
-    /// costaba GPU—. Ese cristal ya no está, y sin él un 35 % deja el texto del
-    /// panel sobre lo que haya en el escritorio: no se leería. En claro tira a
-    /// blanco por lo mismo, que es lo que hace legible la tinta negra.
-    panel: claro hexa(0xffffff, 0.72), oscuro hexa(0x000000, 0.55);
+    /// Fondo totalmente opaco del panel. En claro es blanco y en oscuro es
+    /// negro, para que los widgets no mezclen su fondo con el escritorio.
+    panel: claro hex(0xffffff), oscuro hex(0x000000);
+}
+
+// --- Sombras ---------------------------------------------------------------
+//
+// Los cuatro niveles del sistema de diseño y ninguno más. `reposo` no está: en
+// oscuro no lleva sombra y en claro ninguna superficie del shell la usa todavía.
+
+fn sombra(y: f32, desenfoque: f32, a: f32) -> iced_core::Shadow {
+    iced_core::Shadow {
+        color: Color { a, ..Color::BLACK },
+        offset: iced_core::Vector::new(0.0, y),
+        blur_radius: desenfoque,
+    }
+}
+
+/// Avisos que flotan solos: el OSD.
+pub fn sombra_toast() -> iced_core::Shadow {
+    sombra(4.0, 20.0, 0.15)
+}
+
+/// Tarjetas flotantes: la isla de actividades y la de medios del bloqueo.
+pub fn sombra_popover() -> iced_core::Shadow {
+    sombra(6.0, 22.0, 0.18)
+}
+
+/// Diálogos. Pide 56 px de margen alrededor; quien pinte en un búfer justo
+/// tiene que usar [`sombra_popover`].
+pub fn sombra_modal() -> iced_core::Shadow {
+    sombra(20.0, 56.0, 0.30)
 }
 
 // --- Radios ----------------------------------------------------------------
@@ -603,6 +642,9 @@ pub const R_TARJETA: f32 = 22.0;
 /// HIG le da el radio mayor para que se lea como una superficie temporal.
 pub const R_DIALOGO: f32 = 26.0;
 pub const R_POPOVER: f32 = 18.0;
+/// Lo que va dentro de un popover: los grupos grises de las tarjetas que
+/// cuelgan del panel.
+pub const R_ITEM_POPOVER: f32 = 13.0;
 /// Controles: conmutadores, campos, botones de diálogo.
 pub const R_CONTROL: f32 = 14.0;
 /// Botones estándar y selects.
@@ -619,9 +661,11 @@ pub const R_PILL: f32 = 999.0;
 
 // --- Tipografía ------------------------------------------------------------
 
-/// Lado de un icono en el panel. El panel mide 32 px lógicos; 18 deja aire
-/// arriba y abajo sin que el icono se pierda.
-pub const ICONO_PANEL: f32 = 18.0;
+/// Lado de un icono en el panel. El panel mide 32 px lógicos; 20 deja 6 de aire
+/// arriba y abajo. Con 18 los iconos se quedaban por debajo de los del panel de
+/// Plasma puesto al lado —comparado en capturas a la misma escala— y la barra
+/// se leía apagada.
+pub const ICONO_PANEL: f32 = 20.0;
 
 /// Cuerpo del panel y de las listas.
 /// Título de una superficie emergente. El "Sonido" del plasmoide de volumen

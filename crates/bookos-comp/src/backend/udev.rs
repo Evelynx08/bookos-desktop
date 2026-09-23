@@ -226,9 +226,12 @@ pub fn run(
     ));
     state.cristal = crate::desenfoque::Cristal::new(&mut renderer);
     state.genio = crate::genio::Genio::new(&mut renderer);
+    state.contexto_gl = Some(smithay::backend::renderer::Renderer::context_id(&renderer));
+    state.velo_captura = crate::captura::Velo::new(&mut renderer);
     state.fondo = crate::fondo::Fondo::cargar(&state.fondo_config);
+    crate::backend::programar_fondo_animado(state);
     // El cristal desenfoca el fondo, así que necesita su propia copia con
-    // mipmaps. Se sube aquí, una vez, y no se vuelve a tocar.
+    // mipmaps. En fondos animados se sustituye al avanzar el fotograma.
     if let (Some(fondo), Some(cristal)) = (state.fondo.as_ref(), state.cristal.as_ref()) {
         let (rgba, tam) = fondo.rgba();
         cristal.borrow_mut().preparar(&mut renderer, rgba, tam);
@@ -693,10 +696,10 @@ fn crear_salidas(
                 continue;
             }
         };
-        if guardada.as_ref().is_some_and(|g| g.vrr) {
-            if let Err(err) = surface.with_compositor(|c| c.use_vrr(true)) {
-                tracing::warn!(pantalla = %nombre, "no se pudo activar VRR: {err}");
-            }
+        if guardada.as_ref().is_some_and(|g| g.vrr)
+            && let Err(err) = surface.with_compositor(|c| c.use_vrr(true))
+        {
+            tracing::warn!(pantalla = %nombre, "no se pudo activar VRR: {err}");
         }
         let (lw, _) = pantallas::tamano_logico(
             w as u32,

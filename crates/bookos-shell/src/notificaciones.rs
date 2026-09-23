@@ -79,6 +79,9 @@ impl Notificacion {
         )
     }
 
+    // Son los campos de Notify tal cual llegan por D-Bus; agruparlos en una
+    // estructura solo movería la misma lista a otro sitio.
+    #[allow(clippy::too_many_arguments)]
     pub fn nueva_con_datos(
         id: u32,
         app: String,

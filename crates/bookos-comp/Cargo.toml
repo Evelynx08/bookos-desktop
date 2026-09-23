@@ -37,6 +37,11 @@ smithay = { workspace = true, features = [
     "xwayland",
 ] }
 bookos-shell = { path = "../bookos-shell" }
+# Los dos ya forman parte del árbol de Iced. Se declaran aquí porque el
+# compositor necesita los píxeles del fondo, no un widget: `resvg` rasteriza
+# SVG y `image` entrega los fotogramas WebP sin cargar la animación entera.
+resvg = "0.45"
+image = { version = "0.25", default-features = false, features = ["webp"] }
 # Para dibujar el cursor del tema del sistema. Un compositor tiene que pintar
 # el cursor él mismo; si no, el puntero funciona pero es invisible.
 xcursor = "0.3"
@@ -80,3 +85,6 @@ libloading = "0.8"
 # y no la más alta para no exigir un PipeWire recién sacado.
 pipewire = { version = "0.10", features = ["v0_3_34"] }
 libspa = "0.10"
+
+[dev-dependencies]
+bookos-system = { path = "../bookos-system", features = ["test-fixtures"] }

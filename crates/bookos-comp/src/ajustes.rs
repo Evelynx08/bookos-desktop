@@ -10,14 +10,16 @@
 //! ```text
 //! ReloadConfig(s seccion) -> b
 //!     Relee `panel.conf`. Secciones: "lockscreen"/"bloqueo",
-//!     "activities"/"actividades", "keys"/"teclas" (este, `teclas.conf`), "all".
+//!     "activities"/"actividades", "keys"/"teclas" (este, `teclas.conf`),
+//!     "brightness"/"brillo", "all".
 //!
 //! GetCapabilities() -> a{sv}
 //!     Qué sabe hacer este backend. Diccionario a propósito: añadir una
 //!     capacidad no rompe a quien ya lee las que conoce. Claves de la v1:
 //!     version(u) backend(s) live_apply(b) fractional_scale(b)
 //!     per_output_scale(b) position(b) rotation(b) mode(b) refresh(b) vrr(b)
-//!     multi_output(b) primary(b) hdr(b) icc(b) night_light(b) escalas(ad).
+//!     multi_output(b) primary(b) hdr(b) icc(b) night_light(b) escalas(ad)
+//!     ambient_light(b).
 //!
 //! GetConfig() -> s / ApplyConfig(s json) -> (b ok, s error)
 //!     Configuración estructurada y versionada. Settings edita JSON y nunca
@@ -134,6 +136,8 @@ fn config_json(config: &bookos_shell::Config) -> serde_json::Value {
         "acento": config.acento.nombre(),
         "efectos": efectos,
         "alto_contraste": config.alto_contraste,
+        "brillo_automatico_pantalla": config.brillo_automatico.pantalla,
+        "brillo_automatico_teclado": config.brillo_automatico.teclado,
         "avatar": config.avatar,
         "bloqueo_animaciones": config.bloqueo.animaciones,
         "bloqueo_fecha": config.bloqueo.fecha,
@@ -161,10 +165,10 @@ fn validar_config_json(json: &str) -> Result<Vec<(String, String)>, String> {
     let objeto = valor
         .as_object()
         .ok_or_else(|| "la configuración debe ser un objeto JSON".to_string())?;
-    if let Some(version) = objeto.get("version") {
-        if version.as_u64() != Some(1) {
-            return Err("versión de configuración no compatible".into());
-        }
+    if let Some(version) = objeto.get("version")
+        && version.as_u64() != Some(1)
+    {
+        return Err("versión de configuración no compatible".into());
     }
 
     let texto = |v: &serde_json::Value, clave: &str| {
@@ -326,7 +330,10 @@ fn validar_config_json(json: &str) -> Result<Vec<(String, String)>, String> {
                 }
                 v
             }
-            "alto_contraste" | "bloqueo_huella" => booleano(valor, clave)?,
+            "alto_contraste"
+            | "bloqueo_huella"
+            | "brillo_automatico_pantalla"
+            | "brillo_automatico_teclado" => booleano(valor, clave)?,
             "dock_tamano" => entero(valor, clave, 32, 80)?,
             "acento" => {
                 let v = texto(valor, clave)?;
@@ -430,9 +437,12 @@ struct Servidor {
 
 impl Servidor {
     fn do_not_disturb(&self, value: Option<bool>) -> zbus::fdo::Result<bool> {
-        let (tx,rx) = mpsc::channel();
-        self.canal.send(Aviso::NoMolestar(value,tx)).map_err(|e|zbus::fdo::Error::Failed(e.to_string()))?;
-        rx.recv_timeout(ESPERA).map_err(|e|zbus::fdo::Error::Failed(e.to_string()))
+        let (tx, rx) = mpsc::channel();
+        self.canal
+            .send(Aviso::NoMolestar(value, tx))
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        rx.recv_timeout(ESPERA)
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
     }
 }
 
@@ -614,8 +624,13 @@ impl Servidor {
 pub fn recibir(state: &mut crate::state::BookosComp, aviso: Aviso) {
     match aviso {
         Aviso::NoMolestar(value, reply) => {
-            let enabled = state.shell.as_mut().map(|s|s.no_molestar(value)).unwrap_or(false);
-            let _ = reply.send(enabled); state.needs_redraw = true;
+            let enabled = state
+                .shell
+                .as_mut()
+                .map(|s| s.no_molestar(value))
+                .unwrap_or(false);
+            let _ = reply.send(enabled);
+            state.needs_redraw = true;
         }
         Aviso::Recargar(seccion) => recargar(state, &seccion),
         Aviso::Salidas(peticion, respuesta) => {
@@ -701,6 +716,8 @@ fn recargar(state: &mut crate::state::BookosComp, seccion: &str) {
         "teclas",
         "desktop",
         "escritorio",
+        "brightness",
+        "brillo",
         "all",
     ];
     if !CONOCIDAS.contains(&seccion) {
@@ -712,11 +729,14 @@ fn recargar(state: &mut crate::state::BookosComp, seccion: &str) {
     }
     let config = bookos_shell::Config::cargar();
 
-    if matches!(seccion, "desktop" | "escritorio" | "all") {
-        if state.shell.as_mut().is_some_and(|shell| shell.dock_tamano(config.dock_tamano)) {
-            state.recolocar_encajadas();
-            state.revisar_barras();
-        }
+    if matches!(seccion, "desktop" | "escritorio" | "all")
+        && state
+            .shell
+            .as_mut()
+            .is_some_and(|shell| shell.dock_tamano(config.dock_tamano))
+    {
+        state.recolocar_encajadas();
+        state.revisar_barras();
     }
 
     // El tema se aplica **antes** de tocar el fondo: `Eleccion::para_el_tema`
@@ -770,6 +790,12 @@ fn recargar(state: &mut crate::state::BookosComp, seccion: &str) {
         if matches!(seccion, "appearance" | "apariencia" | "all") {
             shell.aplicar_efectos_config(config.efectos);
         }
+    }
+    if matches!(seccion, "appearance" | "apariencia" | "all") {
+        crate::backend::programar_fondo_animado(state);
+    }
+    if matches!(seccion, "brightness" | "brillo" | "all") {
+        crate::brillo_auto::elegir(state, config.brillo_automatico);
     }
     if matches!(seccion, "lockscreen" | "bloqueo" | "all") {
         state.bloqueo_inactividad = std::time::Duration::from_secs(config.bloqueo_inactividad);
@@ -841,23 +867,21 @@ fn redetectar(state: &mut crate::state::BookosComp) {
         let (w, _) = crate::pantallas::tamano_logico(p.ancho, p.alto, p.escala, &p.transformacion);
         derecha += w;
     }
-    if !peticion.iter().any(|p| p.activa) {
-        if let Some((p, salida)) = peticion.first_mut().zip(salidas.first()) {
-            if let Some(modo) = salida
-                .modos
-                .iter()
-                .find(|m| m.preferido)
-                .or_else(|| salida.modos.first())
-            {
-                p.activa = true;
-                p.principal = true;
-                p.ancho = modo.ancho;
-                p.alto = modo.alto;
-                p.refresco_mhz = modo.refresco_mhz;
-                p.x = 0;
-                p.y = 0;
-            }
-        }
+    if !peticion.iter().any(|p| p.activa)
+        && let Some((p, salida)) = peticion.first_mut().zip(salidas.first())
+        && let Some(modo) = salida
+            .modos
+            .iter()
+            .find(|m| m.preferido)
+            .or_else(|| salida.modos.first())
+    {
+        p.activa = true;
+        p.principal = true;
+        p.ancho = modo.ancho;
+        p.alto = modo.alto;
+        p.refresco_mhz = modo.refresco_mhz;
+        p.x = 0;
+        p.y = 0;
     }
     crate::pantallas::normalizar(&mut peticion);
     if crate::pantallas::validar(&salidas, &peticion).is_err() {
@@ -1014,7 +1038,12 @@ mod pruebas {
             .is_err()
         );
         assert!(validar_config_json(r#"{"inventada":true}"#).is_err());
-        for json in [r#"{"dock_tamano":31}"#, r#"{"dock_tamano":81}"#, r#"{"dock_tamano":50.5}"#, r#"{"bloqueo_huella":"si"}"#] {
+        for json in [
+            r#"{"dock_tamano":31}"#,
+            r#"{"dock_tamano":81}"#,
+            r#"{"dock_tamano":50.5}"#,
+            r#"{"bloqueo_huella":"si"}"#,
+        ] {
             assert!(validar_config_json(json).is_err(), "{json}");
         }
         assert!(validar_config_json(r#"{"dock_tamano":80,"bloqueo_huella":true}"#).is_ok());
@@ -1038,8 +1067,10 @@ mod pruebas {
         use bookos_shell::tema::{self, ModoTema, Tema};
 
         let antes = tema::actual();
-        let mut config = bookos_shell::Config::default();
-        config.modo_tema = ModoTema::Automatico;
+        let config = bookos_shell::Config {
+            modo_tema: ModoTema::Automatico,
+            ..Default::default()
+        };
 
         tema::aplicar(Tema::Claro);
         let json = config_json(&config);

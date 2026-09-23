@@ -1,6 +1,55 @@
 //! Escrituras de brillo serializadas fuera del hilo de renderizado.
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+
+use crate::config::BrilloAutomatico;
+
+/// Lo que eligió el usuario, visible para la tarjeta sin pasarle la `Config`.
+/// Lo escribe el compositor al arrancar y al cambiarlo; es el mismo reparto
+/// que `tema::aplicar_modo`. Bit 0 pantalla, bit 1 teclado.
+static AUTOMATICO: AtomicU8 = AtomicU8::new(0);
+
+pub fn automatico() -> BrilloAutomatico {
+    let bits = AUTOMATICO.load(Ordering::Relaxed);
+    BrilloAutomatico {
+        pantalla: bits & 1 != 0,
+        teclado: bits & 2 != 0,
+    }
+}
+
+pub fn aplicar_automatico(elegido: BrilloAutomatico) {
+    let bits = u8::from(elegido.pantalla) | u8::from(elegido.teclado) << 1;
+    AUTOMATICO.store(bits, Ordering::Relaxed);
+}
+
+/// El brillo de pantalla que pide la luz ahora mismo, sin el ajuste a mano. 0
+/// es «no se sabe»: sin automático o sin lectura todavía. El compositor lo
+/// escribe cada vez que evalúa; la tarjeta lo lee para enseñar cuánto se ha
+/// movido el usuario respecto a él.
+static OBJETIVO_SENSOR: AtomicU8 = AtomicU8::new(0);
+
+pub fn objetivo_sensor() -> Option<u8> {
+    Some(OBJETIVO_SENSOR.load(Ordering::Relaxed)).filter(|&n| n > 0)
+}
+
+pub fn poner_objetivo_sensor(nivel: Option<u8>) {
+    OBJETIVO_SENSOR.store(nivel.unwrap_or(0), Ordering::Relaxed);
+}
+
+/// ¿Hay sensor de luz ambiente? Se mira en sysfs y no en iio-sensor-proxy para
+/// que la tarjeta no espere al bus: un `readdir` de `/sys/bus/iio/devices`.
+pub fn hay_sensor_luz() -> bool {
+    std::fs::read_dir("/sys/bus/iio/devices").is_ok_and(|dir| {
+        // `raw` en los sensores HID, como el del ISH; `input` en otros
+        // controladores que ya dan lux.
+        dir.filter_map(Result::ok).any(|e| {
+            ["in_illuminance_raw", "in_illuminance_input"]
+                .iter()
+                .any(|f| e.path().join(f).exists())
+        })
+    })
+}
 
 type Cola = (Mutex<BTreeMap<(String, String), u32>>, Condvar);
 

@@ -48,7 +48,7 @@ use std::collections::HashMap;
 
 use smithay::desktop::Window;
 use smithay::output::Output;
-use smithay::utils::{Logical, Point};
+use smithay::utils::{Logical, Point, Rectangle, Size};
 
 use crate::state::BookosComp;
 
@@ -352,8 +352,8 @@ pub fn eliminar(state: &mut BookosComp, indice: usize) -> bool {
     let ultima = state
         .space
         .elements()
+        .filter(|&w| salida_de(state, w).as_deref() == Some(aqui.as_str()))
         .cloned()
-        .filter(|w| salida_de(state, w).as_deref() == Some(aqui.as_str()))
         .next_back();
     if let Some(window) = ultima {
         state.enfocar(&window);
@@ -411,8 +411,8 @@ fn ventanas_de(state: &BookosComp, salida: &str) -> Vec<Apartada> {
     state
         .space
         .elements()
+        .filter(|&w| salida_de(state, w).as_deref() == Some(salida))
         .cloned()
-        .filter(|w| salida_de(state, w).as_deref() == Some(salida))
         .filter_map(|w| state.space.element_location(&w).map(|p| (w, p)))
         .collect()
 }
@@ -613,8 +613,8 @@ fn terminar_deslizamiento(state: &mut BookosComp, salida: &str) {
     let ultima = state
         .space
         .elements()
+        .filter(|&w| salida_de(state, w).as_deref() == Some(salida))
         .cloned()
-        .filter(|w| salida_de(state, w).as_deref() == Some(salida))
         .next_back();
     match ultima {
         Some(window) => state.enfocar(&window),
@@ -624,6 +624,11 @@ fn terminar_deslizamiento(state: &mut BookosComp, salida: &str) {
             }
         }
     }
+    // El dock enseña las aplicaciones del escritorio en el que estás, y el
+    // `Space` acaba de cambiar de juego de ventanas. Sin esto se quedaba con la
+    // lista del escritorio anterior: un escritorio vacío seguía enseñando con
+    // su punto una aplicación abierta en el de al lado.
+    state.actualizar_dock();
     state.needs_redraw = true;
 }
 
@@ -639,27 +644,46 @@ pub fn terminar_todos(state: &mut BookosComp) {
 
 /// Envía una ventana al escritorio de su monitor sin cambiar la vista.
 pub fn mover_ventana(state: &mut BookosComp, window: &Window, destino: usize) {
-    if state.minimizando.iter().any(|(w, _)| w == window) { return; }
-    if destino >= state.escritorios.cuantos() { return; }
+    if state.minimizando.iter().any(|(w, _)| w == window) {
+        return;
+    }
+    if destino >= state.escritorios.cuantos() {
+        return;
+    }
     terminar_todos(state);
-    let Some(salida) = salida_de(state, window) else { return; };
-    if destino == state.escritorios.activo_en(&salida) { return; }
-    let Some(posicion) = state.space.element_location(window) else { return; };
+    let Some(salida) = salida_de(state, window) else {
+        return;
+    };
+    if destino == state.escritorios.activo_en(&salida) {
+        return;
+    }
+    let Some(posicion) = state.space.element_location(window) else {
+        return;
+    };
     let tenia_foco = state.ventana_con_foco().as_ref() == Some(window);
     state.space.unmap_elem(window);
     state.escritorios.guardadas_de(&salida)[destino].push((window.clone(), posicion));
-    if window.set_activated(false) {
-        if let Some(toplevel) = window.toplevel() { toplevel.send_pending_configure(); }
+    if window.set_activated(false)
+        && let Some(toplevel) = window.toplevel()
+    {
+        toplevel.send_pending_configure();
     }
     if tenia_foco {
-        let siguiente = state.space.elements().rev()
-            .find(|w| salida_de(state, w).as_deref() == Some(&salida)).cloned();
-        if let Some(w) = siguiente { state.enfocar(&w); }
-        else if let Some(kbd) = state.seat.get_keyboard() {
+        let siguiente = state
+            .space
+            .elements()
+            .rev()
+            .find(|w| salida_de(state, w).as_deref() == Some(&salida))
+            .cloned();
+        if let Some(w) = siguiente {
+            state.enfocar(&w);
+        } else if let Some(kbd) = state.seat.get_keyboard() {
             kbd.set_focus(state, None, smithay::utils::SERIAL_COUNTER.next_serial());
         }
     }
     state.revisar_barras();
+    // Se ha ido del escritorio que se ve: su punto en el dock también.
+    state.actualizar_dock();
     state.needs_redraw = true;
 }
 
@@ -1007,4 +1031,392 @@ mod tests {
             "a mitad el fondo está en {sale}"
         );
     }
+}
+
+/// Dónde cae cada ventana dentro de las miniaturas de la vista de escritorios:
+/// el escritorio, la ventana y su rectángulo, en lógicos de pantalla. Dentro de
+/// cada escritorio van de abajo arriba, como en el `Space`.
+///
+/// Es la misma cuenta para pintarlas y para saber qué hay bajo un clic: si
+/// fueran dos cuentas, arrastrar cogería una ventana distinta de la que se ve.
+pub fn ventanas_en_vista(state: &BookosComp) -> Vec<(usize, Window, Rectangle<i32, Logical>)> {
+    let huecos = state
+        .shell
+        .as_ref()
+        .map(|s| s.escritorios_miniaturas())
+        .unwrap_or_default();
+    let salida = salida_para_vista(state);
+    let (ancho, alto) = state.pantalla_logica();
+    ventanas_para_vista(state, &salida)
+        .into_iter()
+        .zip(huecos)
+        .enumerate()
+        .flat_map(|(i, (ventanas, hueco))| {
+            let factor = (hueco.size.w as f64 / ancho.max(1.0) as f64)
+                .min(hueco.size.h as f64 / alto.max(1.0) as f64);
+            ventanas.into_iter().map(move |(window, posicion)| {
+                let geo = window.geometry();
+                let rect = Rectangle::new(
+                    (
+                        hueco.loc.x + (posicion.x as f64 * factor).round() as i32,
+                        hueco.loc.y + (posicion.y as f64 * factor).round() as i32,
+                    )
+                        .into(),
+                    (
+                        (geo.size.w as f64 * factor).round().max(1.0) as i32,
+                        (geo.size.h as f64 * factor).round().max(1.0) as i32,
+                    )
+                        .into(),
+                );
+                (i, window, rect)
+            })
+        })
+        .collect()
+}
+
+/// Las ventanas del escritorio actual repartidas bajo la franja de la vista,
+/// para verlas enteras y poder cogerlas: con la franja abierta encima, las
+/// ventanas de verdad quedan tapadas por el cristal, y sin esto solo se
+/// podían mover desde su miniatura, que es diminuta.
+///
+/// Una rejilla de filas iguales, con cada ventana a escala dentro de su celda y
+/// **nunca más grande** que en pantalla: agrandar una ventana pequeña la haría
+/// parecer otra cosa. Van en el orden del `Space`, de abajo arriba, para que la
+/// que tenías delante no salte de sitio cada vez que se abre la vista.
+pub fn exposicion(state: &BookosComp) -> Vec<(Window, Rectangle<i32, Logical>)> {
+    // El aire entre ventanas y hasta los bordes, en lógicos.
+    const AIRE: i32 = 32;
+    let Some(arriba) = state
+        .shell
+        .as_ref()
+        .and_then(|s| s.vista_escritorios_fondo())
+    else {
+        return Vec::new();
+    };
+    let salida = salida_para_vista(state);
+    let Some(pantalla) = state
+        .space
+        .outputs()
+        .find(|o| o.name() == salida)
+        .and_then(|o| state.space.output_geometry(o))
+    else {
+        return Vec::new();
+    };
+    let ventanas = ventanas_de(state, &salida);
+    let n = ventanas.len() as i32;
+    if n == 0 {
+        return Vec::new();
+    }
+    let zona = Rectangle::<i32, Logical>::new(
+        (pantalla.loc.x + AIRE, arriba + AIRE).into(),
+        (
+            pantalla.size.w - AIRE * 2,
+            pantalla.loc.y + pantalla.size.h - arriba - AIRE * 2,
+        )
+            .into(),
+    );
+    if zona.size.w <= 0 || zona.size.h <= 0 {
+        return Vec::new();
+    }
+    // Tantas columnas como haga falta para que las celdas salgan lo más
+    // parecidas posible a la proporción de la pantalla.
+    let columnas = (1..=n)
+        .min_by(|a, b| {
+            let desvio = |c: i32| {
+                let filas = (n + c - 1) / c;
+                let proporcion =
+                    (zona.size.w as f64 / c as f64) / (zona.size.h as f64 / filas as f64);
+                (proporcion - pantalla.size.w as f64 / pantalla.size.h as f64).abs()
+            };
+            desvio(*a).total_cmp(&desvio(*b))
+        })
+        .unwrap_or(1);
+    let filas = (n + columnas - 1) / columnas;
+    let (celda_w, celda_h) = (zona.size.w / columnas, zona.size.h / filas);
+    ventanas
+        .into_iter()
+        .enumerate()
+        .map(|(i, (window, _))| {
+            let (fila, col) = (i as i32 / columnas, i as i32 % columnas);
+            // La última fila, si va incompleta, se centra.
+            let en_fila = if fila == filas - 1 {
+                n - fila * columnas
+            } else {
+                columnas
+            };
+            let sangria = (columnas - en_fila) * celda_w / 2;
+            let geo = window.geometry().size;
+            let factor = ((celda_w - AIRE) as f64 / geo.w.max(1) as f64)
+                .min((celda_h - AIRE) as f64 / geo.h.max(1) as f64)
+                .min(1.0);
+            let (w, h) = (
+                ((geo.w as f64 * factor).round() as i32).max(1),
+                ((geo.h as f64 * factor).round() as i32).max(1),
+            );
+            let x = zona.loc.x + sangria + col * celda_w + (celda_w - w) / 2;
+            let y = zona.loc.y + fila * celda_h + (celda_h - h) / 2;
+            (window, Rectangle::new((x, y).into(), (w, h).into()))
+        })
+        .collect()
+}
+
+/// El paso de las ventanas entre su sitio en el escritorio y su casilla en la
+/// vista general. Sin esto saltaban de golpe al abrir y al cerrar, y no se
+/// veía qué casilla era qué ventana.
+#[derive(Default)]
+pub enum TransicionVista {
+    #[default]
+    Cerrada,
+    /// Guarda la rejilla del último fotograma: al cerrar, la franja ya no
+    /// existe y sin ella no se sabría desde dónde vuelven.
+    Abierta {
+        desde: std::time::Instant,
+        rejilla: Vec<(Window, Rectangle<i32, Logical>)>,
+    },
+    Cerrando {
+        desde: std::time::Instant,
+        rejilla: Vec<(Window, Rectangle<i32, Logical>)>,
+    },
+}
+
+impl TransicionVista {
+    /// Lo que dura el viaje: el de una tarjeta, que es lo que tarda en
+    /// asentarse la franja con su muelle.
+    const DURACION: std::time::Duration = bookos_shell::tema::D_TARJETA;
+
+    pub fn animando(&self) -> bool {
+        match self {
+            Self::Cerrada => false,
+            Self::Abierta { desde, .. } | Self::Cerrando { desde, .. } => {
+                desde.elapsed() < Self::DURACION
+            }
+        }
+    }
+}
+
+/// Las ventanas de la vista general en este fotograma, con el rectángulo por
+/// el que van de camino. Vacío cuando ni está abierta ni se está cerrando.
+pub fn expuestas_ahora(
+    state: &mut BookosComp,
+    abierta: bool,
+) -> Vec<(Window, Rectangle<i32, Logical>)> {
+    use bookos_shell::tema;
+
+    let ahora = std::time::Instant::now();
+    let estado = std::mem::take(&mut state.transicion_vista);
+    let (siguiente, rejilla, hacia_rejilla, desde) = match (estado, abierta) {
+        (TransicionVista::Abierta { desde, .. }, true) => (true, exposicion(state), true, desde),
+        (_, true) => (true, exposicion(state), true, ahora),
+        (TransicionVista::Abierta { rejilla, .. }, false) => (false, rejilla, false, ahora),
+        (TransicionVista::Cerrando { desde, rejilla }, false)
+            if desde.elapsed() < TransicionVista::DURACION =>
+        {
+            (false, rejilla, false, desde)
+        }
+        (_, false) => return Vec::new(),
+    };
+    let t = if tema::efectos_reducidos() {
+        1.0
+    } else {
+        tema::C_SUAVE.eval(tema::avance(desde.elapsed(), TransicionVista::DURACION)) as f64
+    };
+    // Cuánto de la rejilla hay en este fotograma: sube al abrir y baja al
+    // cerrar.
+    let peso = if hacia_rejilla { t } else { 1.0 - t };
+    let lista = rejilla
+        .iter()
+        .filter_map(|(w, casilla)| {
+            // Sin sitio en el escritorio —se cerró la vista cambiando de
+            // escritorio y la ventana ya no está mapeada— no hay adónde volver:
+            // se queda en su casilla y desaparece con la vista.
+            let origen = state.space.element_geometry(w)?;
+            let mezcla = |a: i32, b: i32| (a as f64 + (b - a) as f64 * peso).round() as i32;
+            Some((
+                w.clone(),
+                Rectangle::new(
+                    (
+                        mezcla(origen.loc.x, casilla.loc.x),
+                        mezcla(origen.loc.y, casilla.loc.y),
+                    )
+                        .into(),
+                    (
+                        mezcla(origen.size.w, casilla.size.w).max(1),
+                        mezcla(origen.size.h, casilla.size.h).max(1),
+                    )
+                        .into(),
+                ),
+            ))
+        })
+        .collect();
+    state.transicion_vista = if siguiente {
+        TransicionVista::Abierta { desde, rejilla }
+    } else {
+        TransicionVista::Cerrando { desde, rejilla }
+    };
+    lista
+}
+
+/// Qué ventana de la vista hay bajo un punto: primero las repartidas bajo la
+/// franja, que son las grandes, y luego las de las miniaturas. Devuelve su
+/// escritorio, la ventana y dónde se ve.
+fn ventana_bajo(
+    state: &BookosComp,
+    punto: Point<f64, Logical>,
+) -> Option<(usize, Window, Rectangle<i32, Logical>)> {
+    let activo = state.escritorios.activo_en(&salida_para_vista(state));
+    exposicion(state)
+        .into_iter()
+        .rev()
+        .map(|(w, r)| (activo, w, r))
+        .chain(ventanas_en_vista(state).into_iter().rev())
+        .find(|(_, _, r)| r.to_f64().contains(punto))
+}
+
+/// Una ventana cogida de una miniatura de la vista de escritorios.
+pub struct ArrastreVista {
+    pub window: Window,
+    origen: usize,
+    pulsado: Point<f64, Logical>,
+    /// Distancia del puntero a la esquina de la miniatura: la miniatura sigue
+    /// al puntero sin saltar a ponerle la esquina debajo.
+    agarre: Point<f64, Logical>,
+    tamano: Size<i32, Logical>,
+    /// Ya pasó del umbral: es un arrastre y no un clic.
+    pub moviendo: bool,
+}
+
+impl ArrastreVista {
+    /// El rectángulo de la miniatura que va con el puntero.
+    pub fn rect(&self, puntero: Point<f64, Logical>) -> Rectangle<i32, Logical> {
+        Rectangle::new((puntero - self.agarre).to_i32_round(), self.tamano)
+    }
+}
+
+/// El botón izquierdo con la vista de escritorios abierta. `true` si era para
+/// esto y no hay que pasárselo a nadie más.
+///
+/// Pulsar sobre una ventana de una miniatura la coge, pero todavía no decide
+/// nada: la vista cambia de escritorio **al pulsar**, así que el compositor se
+/// queda la pulsación hasta saber si es un clic o un arrastre. Al soltar sin
+/// haberla movido es un clic, y hace lo de siempre —ir a ese escritorio— y
+/// además trae delante esa ventana, que es la que se ha señalado.
+pub fn boton_en_vista(state: &mut BookosComp, pulsado: bool) -> bool {
+    if pulsado {
+        if !state
+            .shell
+            .as_ref()
+            .is_some_and(|s| s.vista_escritorios_abierta())
+        {
+            return false;
+        }
+        let puntero = state.pointer_location;
+        let Some((origen, window, rect)) = ventana_bajo(state, puntero) else {
+            return false;
+        };
+        // Lo que se lleva el puntero no pasa del 60 % del ancho de una
+        // miniatura: una ventana cogida de la rejilla de abajo es grande, y a
+        // su tamaño taparía la franja entera; al ancho justo de la miniatura
+        // tapaba el marco resaltado del escritorio sobre el que se va a
+        // soltar, que es lo único que dice adónde va. El punto por donde se
+        // agarró se conserva a escala.
+        let ancho_maximo = state
+            .shell
+            .as_ref()
+            .and_then(|s| {
+                s.escritorios_miniaturas()
+                    .first()
+                    .map(|h| h.size.w as f64 * 0.6)
+            })
+            .unwrap_or(rect.size.w as f64);
+        let reduccion = (ancho_maximo / rect.size.w.max(1) as f64).min(1.0);
+        let agarre = puntero - rect.loc.to_f64();
+        state.arrastre_vista = Some(ArrastreVista {
+            window,
+            origen,
+            pulsado: puntero,
+            agarre: (agarre.x * reduccion, agarre.y * reduccion).into(),
+            tamano: (
+                ((rect.size.w as f64 * reduccion).round() as i32).max(1),
+                ((rect.size.h as f64 * reduccion).round() as i32).max(1),
+            )
+                .into(),
+            moviendo: false,
+        });
+        return true;
+    }
+    let Some(arrastre) = state.arrastre_vista.take() else {
+        return false;
+    };
+    state.needs_redraw = true;
+    let puntero = state.pointer_location;
+    if !arrastre.moviendo {
+        // Lo mismo que un clic en la miniatura cuando le llega al shell: cerrar
+        // la vista e ir a ese escritorio.
+        crate::keybinds::hacer(state, bookos_shell::Accion::VistaEscritorios);
+        crate::keybinds::hacer(state, bookos_shell::Accion::Escritorio(arrastre.origen));
+        if state.space.elements().any(|w| *w == arrastre.window) {
+            state.enfocar(&arrastre.window);
+        }
+        return true;
+    }
+    let destino = state
+        .shell
+        .as_ref()
+        .map(|s| s.escritorios_miniaturas())
+        .unwrap_or_default()
+        .iter()
+        .position(|h| h.to_f64().contains(puntero));
+    if let Some(destino) = destino.filter(|d| *d != arrastre.origen) {
+        trasladar(state, &arrastre.window, arrastre.origen, destino);
+    }
+    true
+}
+
+/// El puntero se mueve con una ventana cogida en la vista. `true` si hay que
+/// repintar.
+pub fn mover_en_vista(state: &mut BookosComp) -> bool {
+    let puntero = state.pointer_location;
+    let Some(arrastre) = state.arrastre_vista.as_mut() else {
+        return false;
+    };
+    if !arrastre.moviendo {
+        let d = puntero - arrastre.pulsado;
+        // El mismo umbral que arrastrar un icono del launchpad: por debajo, el
+        // temblor de un clic normal no se confunde con un arrastre.
+        if (d.x.hypot(d.y) as f32) < bookos_shell::UMBRAL_ARRASTRE {
+            return false;
+        }
+        arrastre.moviendo = true;
+    }
+    true
+}
+
+/// Lleva una ventana de un escritorio a otro de la salida que enseña la vista,
+/// esté donde esté: en el activo —mapeada en el `Space`— o apartada en otro.
+pub fn trasladar(state: &mut BookosComp, window: &Window, origen: usize, destino: usize) {
+    let salida = salida_para_vista(state);
+    let activo = state.escritorios.activo_en(&salida);
+    if origen == activo {
+        mover_ventana(state, window, destino);
+        return;
+    }
+    let guardadas = state.escritorios.guardadas_de(&salida);
+    let Some(i) = guardadas
+        .get(origen)
+        .and_then(|g| g.iter().position(|(w, _)| w == window))
+    else {
+        return;
+    };
+    let (window, posicion) = guardadas[origen].remove(i);
+    if destino == activo {
+        // Al escritorio que se está viendo: vuelve al `Space` donde estaba y
+        // se trae delante, que es adonde se ha llevado.
+        state.space.map_element(window.clone(), posicion, true);
+        state.enfocar(&window);
+        state.revisar_barras();
+    } else if let Some(g) = state.escritorios.guardadas_de(&salida).get_mut(destino) {
+        g.push((window, posicion));
+    }
+    state.actualizar_dock();
+    state.needs_redraw = true;
 }

@@ -404,14 +404,12 @@ impl Rejilla {
 
         let celda_ancho = ((ancho - PREVIA_HUECO * (columnas.saturating_sub(1)) as f32)
             / columnas as f32)
-            .min(PREVIA_ANCHO_MAX)
-            .max(36.0);
+            .clamp(36.0, PREVIA_ANCHO_MAX);
         let alto_por_proporcion = celda_ancho * proporcion;
         let cabe_de_alto = (alto - PREVIA_HUECO * (filas.saturating_sub(1)) as f32) / filas as f32;
         let celda_alto = alto_por_proporcion
             .min(cabe_de_alto)
-            .min(PREVIA_ALTO_MAX)
-            .max(28.0);
+            .clamp(28.0, PREVIA_ALTO_MAX);
         // Y si el alto es el que manda, el ancho se recorta con él para que la
         // celda no acabe siendo un rectángulo apaisado con la ventana flotando.
         let celda_ancho = celda_ancho.min(celda_alto / proporcion.max(0.01));

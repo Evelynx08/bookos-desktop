@@ -76,6 +76,29 @@ pub fn ver_teñido_propio(
     }
 }
 
+/// Como [`ver_teñido`], con opacidad: lo que necesita un icono a medio cruzar.
+pub fn ver_escalado(
+    icono: &Icono,
+    px: f32,
+    opacidad: f32,
+    color: iced_core::Color,
+) -> crate::view::PanelElement<'static> {
+    use iced_core::Length;
+    match icono {
+        Icono::Svg(handle) => svg(handle.clone())
+            .width(Length::Fixed(px))
+            .height(Length::Fixed(px))
+            .opacity(opacidad)
+            .style(move |_theme, _status| svg::Style { color: Some(color) })
+            .into(),
+        Icono::Raster(handle) => iced_image(handle.clone())
+            .width(Length::Fixed(px))
+            .height(Length::Fixed(px))
+            .opacity(opacidad)
+            .into(),
+    }
+}
+
 /// Un icono a partir de un SVG construido en memoria.
 ///
 /// Lo usan los widgets que se dibujan solos —la batería— en vez de tirar del
@@ -161,6 +184,15 @@ const PROPIOS: &[(&str, &[u8])] = &[
     ),
     ("control", include_bytes!("../assets/iconos/control.svg")),
     ("brillo", include_bytes!("../assets/iconos/brillo.svg")),
+    (
+        "brillo-auto",
+        include_bytes!("../assets/iconos/brillo-auto.svg"),
+    ),
+    // El sol del panel con el automático puesto: la «A» en lugar del núcleo.
+    (
+        "brillo-automatico",
+        include_bytes!("../assets/iconos/brillo-automatico.svg"),
+    ),
     // Los dos del buscador: la lupa del campo y la terminal de un comando.
     ("buscar", include_bytes!("../assets/iconos/buscar.svg")),
     ("terminal", include_bytes!("../assets/iconos/terminal.svg")),
@@ -186,6 +218,10 @@ const PROPIOS: &[(&str, &[u8])] = &[
     (
         "bluetooth-apagado",
         include_bytes!("../assets/iconos/bluetooth-apagado.svg"),
+    ),
+    (
+        "bluetooth-conectado",
+        include_bytes!("../assets/iconos/bluetooth-conectado.svg"),
     ),
     (
         "micro-silencio",
@@ -265,6 +301,10 @@ const PROPIOS: &[(&str, &[u8])] = &[
     (
         "chevron-derecha",
         include_bytes!("../assets/iconos/chevron-derecha.svg"),
+    ),
+    (
+        "chevron-izquierda",
+        include_bytes!("../assets/iconos/chevron-izquierda.svg"),
     ),
 ];
 
@@ -525,17 +565,17 @@ fn directorios() -> &'static [PathBuf] {
                             let Ok(nombre_b) = b.file_name().into_string() else {
                                 continue;
                             };
-                            if let Some(tam) = tamano_de(&nombre_b) {
-                                if b.path().is_dir() {
-                                    del_tema.push((tam, b.path()));
-                                }
+                            if let Some(tam) = tamano_de(&nombre_b)
+                                && b.path().is_dir()
+                            {
+                                del_tema.push((tam, b.path()));
                             }
                         }
                     }
                 }
                 // De mayor a menor dentro del tema; los temas conservan entre
                 // sí el orden de preferencia de `TEMAS`.
-                del_tema.sort_by(|a, b| b.0.cmp(&a.0));
+                del_tema.sort_by_key(|d| std::cmp::Reverse(d.0));
                 dirs.extend(del_tema.into_iter().map(|(_, d)| d));
             }
         }

@@ -1,23 +1,33 @@
 //! La capa de captura de pantalla: elegir qué se captura.
 //!
-//! Es una superficie a pantalla completa, como el bloqueo, y por el mismo
-//! motivo: tiene que taparlo todo y quedarse con el ratón y el teclado mientras
-//! dura. Se abre con Impr y se va con Escape.
+//! Tapa la pantalla entera, como el bloqueo, y por el mismo motivo: tiene que
+//! taparlo todo y quedarse con el ratón y el teclado mientras dura. Se abre con Impr y se va con Escape.
 //!
-//! ## El velo son cuatro bandas
+//! ## El velo son cuatro bandas, y no las pinta el shell
 //!
 //! Lo que se recorta se ve **sin velo** y el resto atenuado, que es como se
-//! entiende de un vistazo qué va a salir en la foto. Un contenedor de iced no
-//! sabe hacerle un agujero a otro, así que el velo se dibuja como cuatro
-//! rectángulos alrededor de la selección —arriba, abajo, izquierda y derecha—.
-//! Es lo que hace cualquier selector de región y sale gratis.
+//! entiende de un vistazo qué va a salir en la foto. El velo son cuatro
+//! rectángulos alrededor de la selección —arriba, abajo, izquierda y derecha—
+//! y el recuadro otros cuatro, y **los compone el compositor** con la GPU a
+//! partir de [`Captura::marcado`].
 //!
-//! ## Por qué el recuadro no lleva esquinas redondeadas
+//! Antes eran contenedores de iced dentro de un lienzo a pantalla completa, y
+//! eso hacía que arrastrar fuera a tirones: medido en release a 2880×1800 y
+//! escala 1,75, cada movimiento del ratón costaba **24,5 ms** de rasterizado en
+//! CPU, y se pagaba por evento, no por fotograma. El coste de `tiny-skia` va con
+//! el tamaño del buffer —ver `Shell::paint`—, así que lo que queda aquí son dos
+//! lienzos pequeños: la barra de modos, que casi nunca cambia, y la pastilla de
+//! las medidas, que cambia con cada píxel pero mide 132×26.
 //!
-//! Todo lo demás del escritorio las lleva, y aquí no: el recuadro es una
-//! **medida**, dice exactamente qué píxeles entran, y una esquina curva
-//! mentiría sobre los que quedan fuera. La pastilla de las dimensiones y la
-//! barra de modos sí las llevan, porque esas sí son tarjetas.
+//! ## Marcar no es capturar
+//!
+//! Soltar el arrastre deja el recuadro marcado y ahí se queda: la foto la hacen
+//! los botones «Copiar» y «Guardar» de la barra, o Intro, que copia. Así se
+//! decide qué hacer con la captura **viéndola ya encuadrada**, y se puede
+//! rehacer el recuadro las veces que haga falta antes de elegir.
+//!
+//! El recuadro lleva las esquinas redondeadas, con el radio de un control del
+//! sistema: las redondea el shader del velo en el compositor.
 
 use iced_core::alignment::{Horizontal, Vertical};
 use iced_core::{Border, Length};
@@ -29,16 +39,16 @@ use crate::tema;
 use crate::view::PanelElement;
 use crate::{Accion, TeclaPulsada};
 
-/// Grosor del recuadro de la selección.
-const BORDE: f32 = 2.0;
+/// Grosor del recuadro de la selección, en lógicos.
+pub const BORDE: f32 = 2.0;
 /// Lo oscuro que se pone lo que **no** entra en la captura.
 ///
 /// 0,45 y no el 0,82 del launchpad: aquí lo de debajo hay que **verlo** para
 /// poder encuadrar. Es el mismo velo que el buscador.
-const VELO: f32 = 0.45;
+pub const VELO: f32 = 0.45;
 /// Alto de la pastilla con las medidas.
-const PASTILLA_ALTO: f32 = 26.0;
-const PASTILLA_ANCHO: f32 = 132.0;
+pub const PASTILLA_ALTO: f32 = 26.0;
+pub const PASTILLA_ANCHO: f32 = 132.0;
 /// Aire entre la selección y la pastilla.
 const PASTILLA_HUECO: f32 = 8.0;
 
@@ -60,11 +70,12 @@ const DIVISOR_HUECO: f32 = DIVISOR_ANCHO + DIVISOR_AIRE * 2.0;
 /// umbral, pulsar para cancelar acababa guardando una captura de tres píxeles.
 const MINIMO: f32 = 8.0;
 
-/// A dónde va la captura.
+/// A dónde va la captura. Son los dos botones que la **hacen**: marcar solo
+/// encuadra, y lo que pase con la foto se decide después de verla marcada.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Destino {
-    /// Al portapapeles, para pegarla donde sea. Es lo normal: la mayoría de las
-    /// capturas se pegan en un chat y no se vuelven a mirar.
+    /// Al portapapeles, para pegarla donde sea. Es lo que hace Intro: la
+    /// mayoría de las capturas se pegan en un chat y no se vuelven a mirar.
     Portapapeles,
     /// A un fichero en la carpeta de capturas.
     Guardar,
@@ -75,7 +86,7 @@ impl Destino {
 
     fn nombre(self) -> &'static str {
         match self {
-            Self::Portapapeles => "Portapapeles",
+            Self::Portapapeles => "Copiar",
             Self::Guardar => "Guardar",
         }
     }
@@ -147,7 +158,6 @@ pub struct Captura {
     /// La pantalla, en lógicos.
     pantalla: (f32, f32),
     modo: Modo,
-    destino: Destino,
     /// El arrastre en curso: dónde empezó y por dónde va.
     arrastre: Option<((f32, f32), (f32, f32))>,
     /// Lo último que se marcó y sigue marcado tras soltar.
@@ -161,7 +171,6 @@ impl Captura {
         Self {
             pantalla,
             modo: Modo::Seleccion,
-            destino: Destino::Portapapeles,
             arrastre: None,
             hecho: None,
             señalada: None,
@@ -192,6 +201,50 @@ impl Captura {
         match self.arrastre {
             Some((a, b)) => Some(Recuadro::entre(a, b)),
             None => self.hecho,
+        }
+    }
+
+    /// Lo marcado que se ve: el velo tiene el agujero ahí. Es lo mismo que se
+    /// capturaría, así que en modo pantalla es la pantalla entera y el marco
+    /// la rodea por dentro: es como se ve que la foto va a ser toda.
+    pub fn marcado(&self) -> Option<Recuadro> {
+        self.recuadro()
+    }
+
+    /// Esquina de la barra de modos, en lógicos de la pantalla.
+    pub fn origen_barra(&self) -> (f32, f32) {
+        (self.x_barra(), self.y_barra())
+    }
+
+    pub fn tamano_barra(&self) -> (f32, f32) {
+        (self.ancho_barra(), BARRA_ALTO)
+    }
+
+    /// Esquina de la pastilla de las medidas. Debajo del recuadro si cabe y
+    /// dentro si no: en una selección que llega al borde de abajo, fuera se
+    /// saldría de la pantalla.
+    ///
+    /// En modo pantalla no hay pastilla: las medidas son las de la pantalla, y
+    /// abajo del todo se montaría encima de la barra.
+    pub fn origen_pastilla(&self) -> Option<(f32, f32)> {
+        let (pw, ph) = self.pantalla;
+        let r = self.medidas().and(self.marcado())?;
+        let cabe_debajo = r.y + r.h + PASTILLA_HUECO + PASTILLA_ALTO <= ph;
+        let py = if cabe_debajo {
+            r.y + r.h + PASTILLA_HUECO
+        } else {
+            (r.y + r.h - PASTILLA_ALTO - PASTILLA_HUECO).max(0.0)
+        };
+        let px = (r.x + (r.w - PASTILLA_ANCHO) / 2.0).clamp(0.0, (pw - PASTILLA_ANCHO).max(0.0));
+        Some((px, py))
+    }
+
+    /// Lo que pone la pastilla. Solo cambia cuando cambian los píxeles
+    /// enteros, que es lo que decide si hay que repintarla.
+    pub fn medidas(&self) -> Option<(i32, i32)> {
+        match self.modo {
+            Modo::Pantalla => None,
+            Modo::Seleccion => self.marcado().map(|r| (r.w as i32, r.h as i32)),
         }
     }
 
@@ -254,39 +307,29 @@ impl Captura {
             && y <= self.y_barra() + BARRA_ALTO
     }
 
-    /// Mueve el puntero. `true` si hay que repintar.
+    /// Mueve el puntero. `true` si hay que repintar **la barra**: lo que
+    /// cambie en el recuadro lo dicen [`Self::marcado`] y [`Self::medidas`].
     pub fn puntero(&mut self, x: f32, y: f32) -> bool {
         let señalada = self.celda_en(x, y);
         let cambio_señal = señalada != self.señalada;
         self.señalada = señalada;
-        match self.arrastre.as_mut() {
-            Some((_, hasta)) => {
-                let nuevo = (x.clamp(0.0, self.pantalla.0), y.clamp(0.0, self.pantalla.1));
-                let cambio = *hasta != nuevo;
-                *hasta = nuevo;
-                cambio || cambio_señal
-            }
-            None => cambio_señal,
+        if let Some((_, hasta)) = self.arrastre.as_mut() {
+            *hasta = (x.clamp(0.0, self.pantalla.0), y.clamp(0.0, self.pantalla.1));
         }
+        cambio_señal
     }
 
-    /// Empieza un arrastre o pulsa un botón de la barra. `Some` si la
-    /// pulsación ya resuelve la captura.
+    /// Empieza un arrastre o pulsa un botón de la barra. `Some` solo al pulsar
+    /// «Copiar» o «Guardar» con algo que capturar.
     pub fn pulsar(&mut self, x: f32, y: f32) -> Option<Accion> {
         if let Some(i) = self.celda_en(x, y) {
             // Las primeras celdas son los modos y las de después los destinos.
             if let Some(destino) = Destino::TODOS.get(i.wrapping_sub(Modo::TODOS.len())) {
-                self.destino = *destino;
-                return None;
+                return self.accion(*destino);
             }
-            let elegido = Modo::TODOS[i];
-            // Pulsar «Pantalla» captura directamente: no hay nada más que
-            // elegir y pedir un segundo clic sería pedirlo por pedir.
-            if elegido == Modo::Pantalla {
-                self.modo = Modo::Pantalla;
-                return self.accion();
-            }
-            self.modo = elegido;
+            // Elegir modo no captura: «Pantalla» deja la pantalla entera
+            // marcada, y qué hacer con ella se decide con los botones.
+            self.modo = Modo::TODOS[i];
             return None;
         }
         if self.en_la_barra(x, y) {
@@ -299,31 +342,25 @@ impl Captura {
         None
     }
 
-    /// Suelta el arrastre. `Some` cuando lo marcado vale y hay que capturarlo.
+    /// Suelta el arrastre. **No captura**: deja el recuadro marcado para
+    /// elegir después si va al portapapeles o a un fichero.
     ///
-    /// Se captura **al soltar** y no con un segundo clic de confirmación: es lo
-    /// que hacen macOS y GNOME, y el recuadro ya se ha visto mientras se
-    /// arrastraba.
-    pub fn soltar(&mut self) -> Option<Accion> {
-        let (a, b) = self.arrastre.take()?;
-        let recuadro = Recuadro::entre(a, b);
-        if !recuadro.vale() {
-            // Un clic suelto sobre el velo: se entiende como «no quiero nada
-            // de aquí» y se deja la capa abierta para volver a intentarlo.
-            return None;
+    /// Un clic suelto sobre el velo no deja nada marcado: se entiende como «no
+    /// quiero nada de aquí» y la capa sigue abierta para volver a intentarlo.
+    pub fn soltar(&mut self) {
+        if let Some((a, b)) = self.arrastre.take() {
+            self.hecho = Some(Recuadro::entre(a, b)).filter(Recuadro::vale);
         }
-        self.hecho = Some(recuadro);
-        self.accion()
     }
 
-    fn accion(&self) -> Option<Accion> {
+    fn accion(&self, destino: Destino) -> Option<Accion> {
         let r = self.recuadro()?;
         Some(Accion::Capturar {
             x: r.x as i32,
             y: r.y as i32,
             ancho: r.w as i32,
             alto: r.h as i32,
-            guardar: matches!(self.destino, Destino::Guardar),
+            guardar: destino == Destino::Guardar,
         })
     }
 
@@ -331,18 +368,18 @@ impl Captura {
         use crate::Tecla;
         match tecla {
             TeclaPulsada::Escape => Tecla::Cerrar,
-            // Intro captura lo que haya: la pantalla entera si no se ha
-            // marcado nada, que es lo que se espera de abrir y darle a Intro.
-            TeclaPulsada::Intro => match self.accion() {
-                Some(accion) => Tecla::Hacer(accion),
-                None => {
+            // Intro copia lo que haya: la pantalla entera si no se ha marcado
+            // nada, que es lo que se espera de abrir y darle a Intro. Es el
+            // atajo del botón «Copiar»; guardar pide el clic.
+            TeclaPulsada::Intro => {
+                if self.recuadro().is_none() {
                     self.modo = Modo::Pantalla;
-                    match self.accion() {
-                        Some(accion) => Tecla::Hacer(accion),
-                        None => Tecla::Consumida,
-                    }
                 }
-            },
+                match self.accion(Destino::Portapapeles) {
+                    Some(accion) => Tecla::Hacer(accion),
+                    None => Tecla::Consumida,
+                }
+            }
             TeclaPulsada::Izquierda | TeclaPulsada::Derecha => {
                 let i = Modo::TODOS
                     .iter()
@@ -366,97 +403,36 @@ impl Captura {
         self.arrastre.is_some()
     }
 
-    pub fn view(&self) -> PanelElement<'_> {
-        let (pw, ph) = self.pantalla;
-        let velo = tema::alfa(iced_core::Color::BLACK, VELO);
-        let banda = move |w: f32, h: f32| -> PanelElement<'static> {
-            container(Space::new())
-                .width(Length::Fixed(w.max(0.0)))
-                .height(Length::Fixed(h.max(0.0)))
-                .style(move |_| iced_widget::container::Style {
-                    background: Some(velo.into()),
-                    ..Default::default()
-                })
-                .into()
-        };
-
-        // El velo: entero si no hay nada marcado, y en cuatro bandas alrededor
-        // del recuadro si lo hay.
-        let fondo: PanelElement<'_> = match self.marcando().filter(Recuadro::vale) {
-            None => banda(pw, ph),
-            Some(r) => column![
-                banda(pw, r.y),
-                row![
-                    banda(r.x, r.h),
-                    // El agujero: nada dibujado, solo el hueco que ocupa.
-                    container(Space::new())
-                        .width(Length::Fixed(r.w))
-                        .height(Length::Fixed(r.h))
-                        .style(move |_| iced_widget::container::Style {
-                            border: Border {
-                                width: BORDE,
-                                color: tema::acento(),
-                                ..Default::default()
-                            },
-                            ..Default::default()
-                        }),
-                    banda(pw - r.x - r.w, r.h),
-                ],
-                banda(pw, ph - r.y - r.h),
-            ]
-            .into(),
-        };
-
-        let mut capas = iced_widget::stack![fondo];
-
-        // La pastilla con las medidas, pegada al recuadro. Debajo si cabe y
-        // dentro si no: en una selección que llega al borde de abajo, fuera se
-        // saldría de la pantalla.
-        if let Some(r) = self.marcando().filter(Recuadro::vale) {
-            let cabe_debajo = r.y + r.h + PASTILLA_HUECO + PASTILLA_ALTO <= ph;
-            let py = if cabe_debajo {
-                r.y + r.h + PASTILLA_HUECO
-            } else {
-                (r.y + r.h - PASTILLA_ALTO - PASTILLA_HUECO).max(0.0)
-            };
-            let px =
-                (r.x + (r.w - PASTILLA_ANCHO) / 2.0).clamp(0.0, (pw - PASTILLA_ANCHO).max(0.0));
-            let pastilla = container(
-                text(format!("{} × {}", r.w as i32, r.h as i32))
-                    .size(tema::T_PEQUENO)
-                    .color(tema::texto()),
-            )
-            .width(Length::Fixed(PASTILLA_ANCHO))
-            .height(Length::Fixed(PASTILLA_ALTO))
-            .align_x(Horizontal::Center)
-            .align_y(Vertical::Center)
-            // El mismo fondo y el mismo trato que cualquier tarjeta del shell
-            // (`emergente::control::tarjeta`): `card()` opaco y sin borde. Lo
-            // único propio es el radio, porque esto es una pastilla.
-            .style(|_| iced_widget::container::Style {
-                background: Some(tema::card().into()),
-                border: Border {
-                    radius: tema::R_PILL.into(),
-                    ..Default::default()
-                },
+    /// La pastilla con las medidas, sola en su lienzo.
+    pub fn vista_pastilla(&self) -> PanelElement<'_> {
+        let (w, h) = self.medidas().unwrap_or_default();
+        container(
+            text(format!("{w} × {h}"))
+                .size(tema::T_PEQUENO)
+                .color(tema::texto()),
+        )
+        .width(Length::Fixed(PASTILLA_ANCHO))
+        .height(Length::Fixed(PASTILLA_ALTO))
+        .align_x(Horizontal::Center)
+        .align_y(Vertical::Center)
+        // El mismo fondo y el mismo trato que cualquier tarjeta del shell
+        // (`emergente::control::tarjeta`): `card()` opaco y sin borde. Lo
+        // único propio es el radio, porque esto es una pastilla.
+        .style(|_| iced_widget::container::Style {
+            background: Some(tema::card().into()),
+            border: Border {
+                radius: tema::R_PILL.into(),
                 ..Default::default()
-            });
-            capas = capas.push(column![
-                Space::new().height(Length::Fixed(py)),
-                row![Space::new().width(Length::Fixed(px)), pastilla],
-            ]);
-        }
-
-        capas = capas.push(self.barra());
-        container(capas)
-            .width(Length::Fixed(pw))
-            .height(Length::Fixed(ph))
-            .into()
+            },
+            ..Default::default()
+        })
+        .into()
     }
 
-    /// La barra, abajo y centrada: los modos a la izquierda y a dónde va la
-    /// captura a la derecha, separados por un divisor.
-    fn barra(&self) -> PanelElement<'_> {
+    /// La barra, sola en su lienzo: los modos a la izquierda y a dónde va la
+    /// captura a la derecha, separados por un divisor. Dónde va en la pantalla
+    /// lo dice [`Self::origen_barra`].
+    pub fn vista_barra(&self) -> PanelElement<'_> {
         let mut celdas = row![];
         for i in 0..Self::CELDAS {
             if i > 0 {
@@ -478,15 +454,18 @@ impl Captura {
                     )
                     .push(Space::new().width(Length::Fixed(DIVISOR_AIRE)));
             }
-            let (simbolo, nombre, activa) =
+            // Los modos se encienden cuando están elegidos. Los destinos son
+            // botones: no se quedan encendidos, y se apagan mientras no haya
+            // nada marcado que capturar.
+            let (simbolo, nombre, activa, apagada) =
                 match Destino::TODOS.get(i.wrapping_sub(Modo::TODOS.len())) {
-                    Some(d) => (d.simbolo(), d.nombre(), *d == self.destino),
+                    Some(d) => (d.simbolo(), d.nombre(), false, self.recuadro().is_none()),
                     None => {
                         let m = Modo::TODOS[i];
-                        (m.simbolo(), m.nombre(), m == self.modo)
+                        (m.simbolo(), m.nombre(), m == self.modo, false)
                     }
                 };
-            let señalada = self.señalada == Some(i);
+            let señalada = self.señalada == Some(i) && !apagada;
             celdas = celdas.push(
                 container(
                     column![
@@ -496,7 +475,11 @@ impl Captura {
                             tema::TEXTO2
                         }),
                         Space::new().height(Length::Fixed(2.0)),
-                        text(nombre).size(tema::T_PEQUENO).color(tema::texto()),
+                        text(nombre).size(tema::T_PEQUENO).color(if apagada {
+                            tema::TEXTO2
+                        } else {
+                            tema::texto()
+                        }),
                     ]
                     .align_x(Horizontal::Center),
                 )
@@ -530,10 +513,11 @@ impl Captura {
             );
         }
 
-        let tarjeta = container(celdas)
+        container(celdas)
             .padding(BARRA_PADDING)
-            // Medida a lo suyo por lo mismo: dentro de una capa a pantalla
-            // completa, un contenedor sin ancho se come la pantalla.
+            // Medida a lo suyo y no a `Fill`: el lienzo se redondea hacia
+            // arriba a píxel entero, y la barra tiene que medir lo mismo que
+            // usa `celda_en` para que el clic caiga donde se ve.
             .width(Length::Fixed(self.ancho_barra()))
             .height(Length::Fixed(BARRA_ALTO))
             .style(|_| iced_widget::container::Style {
@@ -543,13 +527,8 @@ impl Captura {
                     ..Default::default()
                 },
                 ..Default::default()
-            });
-
-        column![
-            Space::new().height(Length::Fixed(self.y_barra())),
-            row![Space::new().width(Length::Fixed(self.x_barra())), tarjeta,],
-        ]
-        .into()
+            })
+            .into()
     }
 }
 
@@ -661,28 +640,30 @@ mod tests {
         let mut c = Captura::new(PANTALLA);
         c.pulsar(400.0, 400.0);
         c.puntero(402.0, 401.0);
-        assert_eq!(c.soltar(), None);
+        c.soltar();
         assert_eq!(c.recuadro(), None, "no puede quedar nada marcado");
     }
 
-    /// Arrastrar marca, y al soltar se pide la captura de lo marcado.
+    /// Arrastrar marca, y soltar **no** captura: el recuadro se queda marcado
+    /// hasta que se elige qué hacer con él.
     #[test]
-    fn arrastrar_marca_y_captura() {
+    fn soltar_deja_marcado_y_no_captura() {
         let mut c = Captura::new(PANTALLA);
         c.pulsar(200.0, 150.0);
         c.puntero(600.0, 450.0);
         let r = c.recuadro().expect("hay recuadro mientras se arrastra");
         assert_eq!((r.w, r.h), (400.0, 300.0));
-        assert_eq!(
-            c.soltar(),
-            Some(Accion::Capturar {
-                x: 200,
-                y: 150,
-                ancho: 400,
-                alto: 300,
-                guardar: false
-            })
-        );
+        c.soltar();
+        assert_eq!(c.recuadro(), Some(r), "lo marcado sigue ahí al soltar");
+        assert!(!c.animando());
+    }
+
+    /// El centro de la celda `i` de la barra.
+    fn celda(c: &Captura, i: usize) -> (f32, f32) {
+        (
+            c.x_celda(i) + CELDA_W / 2.0,
+            c.y_barra() + BARRA_PADDING + CELDA_H / 2.0,
+        )
     }
 
     /// El arrastre se queda dentro de la pantalla: sacar el ratón por el borde
@@ -717,37 +698,55 @@ mod tests {
         assert!(c.x_barra() + c.ancho_barra() < PANTALLA.0);
     }
 
-    /// El destino por defecto es el portapapeles, y pulsar «Guardar» lo cambia
-    /// sin capturar nada: elegir a dónde va no es pedir la foto.
+    /// Con algo marcado, «Copiar» y «Guardar» capturan eso mismo, cada uno a
+    /// su sitio.
     #[test]
-    fn el_destino_se_elige_y_no_captura() {
+    fn copiar_y_guardar_capturan_lo_marcado() {
         let mut c = Captura::new(PANTALLA);
-        let y = c.y_barra() + BARRA_PADDING + 4.0;
-        let guardar = Modo::TODOS.len() + 1;
-        assert_eq!(c.pulsar(c.x_celda(guardar) + 2.0, y), None);
-        assert_eq!(c.destino, Destino::Guardar);
-        // Y a partir de ahí, lo que se capture va al fichero.
         c.pulsar(200.0, 150.0);
         c.puntero(600.0, 450.0);
-        assert_eq!(
-            c.soltar(),
+        c.soltar();
+        let esperada = |guardar| {
             Some(Accion::Capturar {
                 x: 200,
                 y: 150,
                 ancho: 400,
                 alto: 300,
-                guardar: true
+                guardar,
             })
+        };
+        let copiar = celda(&c, Modo::TODOS.len());
+        let guardar = celda(&c, Modo::TODOS.len() + 1);
+        assert_eq!(c.pulsar(copiar.0, copiar.1), esperada(false));
+        assert_eq!(c.pulsar(guardar.0, guardar.1), esperada(true));
+    }
+
+    /// Sin nada marcado los botones no hacen nada: no hay foto que decidir.
+    #[test]
+    fn sin_marcar_los_botones_no_capturan() {
+        let mut c = Captura::new(PANTALLA);
+        let (x, y) = celda(&c, Modo::TODOS.len() + 1);
+        assert_eq!(c.pulsar(x, y), None);
+        assert!(
+            c.arrastre.is_none(),
+            "pulsar un botón no empieza un arrastre"
         );
     }
 
-    /// «Pantalla» captura la pantalla entera de una sola pulsación.
+    /// «Pantalla» marca la pantalla entera y espera a que se elija qué hacer.
     #[test]
-    fn pantalla_captura_de_un_clic() {
+    fn pantalla_marca_todo_y_espera() {
         let mut c = Captura::new(PANTALLA);
-        let x = c.x_barra() + BARRA_PADDING + 4.0;
-        let y = c.y_barra() + BARRA_PADDING + 4.0;
-        assert_eq!(c.celda_en(x, y), Some(0));
+        let (x, y) = celda(&c, 0);
+        assert_eq!(c.pulsar(x, y), None, "elegir el modo no captura");
+        let r = c.marcado().expect("la pantalla queda marcada");
+        assert_eq!((r.w, r.h), PANTALLA);
+        assert_eq!(
+            c.origen_pastilla(),
+            None,
+            "en pantalla entera no hay pastilla"
+        );
+        let (x, y) = celda(&c, Modo::TODOS.len() + 1);
         assert_eq!(
             c.pulsar(x, y),
             Some(Accion::Capturar {
@@ -755,9 +754,24 @@ mod tests {
                 y: 0,
                 ancho: 1920,
                 alto: 1080,
-                guardar: false
+                guardar: true
             })
         );
+    }
+
+    /// Intro copia sin más: lo marcado, o la pantalla entera si no hay nada.
+    #[test]
+    fn intro_copia() {
+        let mut c = Captura::new(PANTALLA);
+        assert!(matches!(
+            c.tecla(TeclaPulsada::Intro),
+            crate::Tecla::Hacer(Accion::Capturar {
+                ancho: 1920,
+                alto: 1080,
+                guardar: false,
+                ..
+            })
+        ));
     }
 
     /// Y la barra no marca recuadro: ir a pulsar un botón no puede dejar una

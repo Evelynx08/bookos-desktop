@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=BookOS Store
+Comment=Instala y actualiza aplicaciones
+Exec=bookos-store
+TryExec=bookos-store
+Icon=system-software-install
+Type=Application
+Categories=System;PackageManager;
+Keywords=tienda;aplicaciones;instalar;store;

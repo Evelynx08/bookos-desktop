@@ -89,11 +89,11 @@ impl Emisiones {
 
     /// El emisor, arrancando el hilo si hacía falta.
     pub fn hilo(&mut self) -> Option<&Emisor> {
-        if self.emisor.is_none() {
-            if let Some((emisor, reciclado)) = crate::pw::arrancar() {
-                self.emisor = Some(emisor);
-                self.reciclado = Some(reciclado);
-            }
+        if self.emisor.is_none()
+            && let Some((emisor, reciclado)) = crate::pw::arrancar()
+        {
+            self.emisor = Some(emisor);
+            self.reciclado = Some(reciclado);
         }
         self.emisor.as_ref()
     }
@@ -132,8 +132,10 @@ impl Emisiones {
 
     /// Manda un fotograma ya en BGRx. `indice` sale de [`Self::tocan`].
     ///
-    /// `invertida` es lo que dice `TextureMapping::flipped`: el readback de GL
-    /// sale de abajo arriba, y hay que darle la vuelta fila a fila.
+    /// `invertida` sale de [`crate::captura::hay_que_voltear`], que mira el
+    /// `Transform` de la salida. Antes salía de `TextureMapping::flipped`, que
+    /// es una constante, y por eso quien miraba la pantalla compartida desde una
+    /// sesión de verdad la veía espejada en vertical.
     pub fn emitir(
         &mut self,
         indice: usize,
@@ -142,9 +144,7 @@ impl Emisiones {
         invertida: bool,
         ahora: Instant,
     ) -> Option<zbus::zvariant::OwnedObjectPath> {
-        let Some(emision) = self.activas.get(indice) else {
-            return None;
-        };
+        let emision = self.activas.get(indice)?;
         let sesion = emision.sesion;
         if tamano != emision.tamano {
             // La salida ha cambiado de modo por debajo. Se para en vez de

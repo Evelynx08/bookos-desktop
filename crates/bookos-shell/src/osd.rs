@@ -54,13 +54,16 @@ const ANCHO_BARRA: f32 = 171.0;
 /// encima del dock, no encima de él: taparlo al subir el volumen es justo lo
 /// que molesta del OSD de otros.
 ///
-/// 190 y no los 170 de antes. Con 170 la cápsula acababa a 90 del borde y el
-/// dock llega a 87 —12 de margen más sus 75 de alto—, o sea tres píxeles de
-/// aire: bastaba para no solaparse cuando el aviso era un rectángulo plano,
-/// pero ahora arrastra una sombra de 24 px de desenfoque y la sombra sí caía
-/// encima del dock. Con 190 quedan 23, que es donde la sombra ya no pinta
-/// nada. Lo comprueba `el_aviso_no_toca_el_dock`.
-pub const MARGEN_INFERIOR: f32 = 190.0;
+/// 202 y no los 170 de hace dos versiones. Con 170 la cápsula acababa a 90
+/// del borde y el dock llegaba a 87 —12 de margen más sus 75 de alto—, o sea
+/// tres píxeles de aire: bastaba para no solaparse cuando el aviso era un
+/// rectángulo plano, pero arrastra una sombra de 24 px de desenfoque y la
+/// sombra sí caía encima del dock. Se subió a 190 para dejar 23. El dock creció
+/// 12 px más al repartir su padding vertical (`dock::PAD_V`) del horizontal
+/// —el mismo cambio que evitó que el icono se leyera pegado a la esquina
+/// redondeada—, así que esto sube con él para no perder ese aire.
+/// Lo comprueba `el_aviso_no_toca_el_dock`.
+pub const MARGEN_INFERIOR: f32 = 202.0;
 /// Alto de la barra de nivel.
 const BARRA: f32 = 9.0;
 
@@ -197,7 +200,15 @@ impl Osd {
     fn ancho(&self) -> f32 {
         match (&self.texto, self.nivel) {
             (Some(t), None) => {
-                let texto = crate::widget::ancho_texto(t.chars().count());
+                // `ancho_de` y no `ancho_texto`: esa es la estimación por
+                // carácter que su propio comentario dice que no vale para
+                // esto —"desalineaba los clics"— y aquí desalineaba el
+                // relleno. Medido: "Touchpad desactivado" estimaba 146 y mide
+                // 136 de verdad; "Escritorio 2" estimaba 88 y mide 68, casi un
+                // 30 % de más. La cápsula salía siempre más ancha que su
+                // texto, con el icono y la frase pegados a la izquierda y un
+                // hueco vacío a la derecha que no pertenecía a ningún margen.
+                let texto = crate::widget::ancho_de(t, tema::T_CUERPO);
                 (MARGEN_IZQ + LADO_ICONO + HUECO_ICONO + texto + MARGEN_IZQ).max(ALTO * 2.0)
             }
             _ => ANCHO,
@@ -244,18 +255,10 @@ impl Osd {
                 width: 1.0,
                 color: tema::alfa(tema::tinta(), 0.10),
             },
-            // La sombra es lo que lo despega del escritorio. Va hacia abajo y
-            // muy difusa —24 px de desenfoque para 8 de desplazamiento— porque
-            // el aviso flota sobre cualquier cosa: una sombra dura se leería
-            // como un borde negro sobre un fondo oscuro.
-            shadow: iced_core::Shadow {
-                color: Color {
-                    a: 0.35,
-                    ..Color::BLACK
-                },
-                offset: iced_core::Vector::new(0.0, 8.0),
-                blur_radius: 24.0,
-            },
+            // La sombra es lo que lo despega del escritorio. La de toast es
+            // difusa y clara: el aviso flota sobre cualquier cosa, y una sombra
+            // dura se leería como un borde negro sobre un fondo oscuro.
+            shadow: tema::sombra_toast(),
             ..Default::default()
         });
         // El margen de la sombra: el buffer es más grande que la cápsula y esto
@@ -397,5 +400,39 @@ mod tests {
         assert_eq!(osd.escala(), 1.0);
         assert_eq!(osd.alfa(), 1.0);
         assert!(!osd.animando());
+    }
+}
+
+#[cfg(test)]
+mod pruebas_ancho_texto {
+    use super::*;
+
+    /// La cápsula de un OSD de texto tiene que ceñirse a lo que dice, no a una
+    /// estimación por carácter.
+    ///
+    /// Antes usaba `ancho_texto` —7,3 px por carácter—, que ese mismo módulo
+    /// documenta como no válida para nada que tenga que cuadrar con el dibujo.
+    /// Con "Escritorio 2" se notaba: la cápsula salía casi un 30 % más ancha
+    /// que el texto, con el icono y la frase pegados a la izquierda y un
+    /// hueco vacío a la derecha.
+    #[test]
+    fn la_capsula_de_texto_se_ciñe_al_texto_de_verdad() {
+        for t in [
+            "Touchpad desactivado",
+            "Touchpad activado",
+            "Escritorio 2",
+            "Escritorio 10",
+            "Fn lock",
+        ] {
+            let o = Osd::new("touchpad", None, Some(t.to_string()));
+            let ancho_capsula = o.ancho();
+            let real = crate::widget::ancho_de(t, tema::T_CUERPO);
+            let esperado =
+                (MARGEN_IZQ + LADO_ICONO + HUECO_ICONO + real + MARGEN_IZQ).max(ALTO * 2.0);
+            assert!(
+                (ancho_capsula - esperado).abs() < 0.5,
+                "{t:?}: cápsula={ancho_capsula:.1} esperado={esperado:.1}"
+            );
+        }
     }
 }

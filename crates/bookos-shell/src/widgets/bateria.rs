@@ -31,8 +31,8 @@ use crate::widget::Widget;
 ///
 /// El dibujo tiene su tinta entre y=6.75 y 18.75, centrada en 12.75.
 const VIEWBOX: &str = "0 3.75 30 18";
-const ANCHO_ICONO: f32 = 30.0;
-const ALTO_ICONO: f32 = 18.0;
+const ANCHO_ICONO: f32 = 33.0;
+const ALTO_ICONO: f32 = 20.0;
 
 /// El color en `#rrggbb`, que es lo que entiende el SVG.
 fn hex(c: iced_core::Color) -> String {
@@ -181,6 +181,8 @@ pub struct Bateria {
     minutos_leidos: Instant,
     /// Evita pedir `power-saver` en cada aviso de udev mientras siga baja.
     ahorro_automatico: bool,
+    /// Cuándo cruzó el 15 %, para los dos latidos de la cifra.
+    alerta_desde: Option<Instant>,
 }
 
 /// Cada cuánto se vuelven a leer las dos fuentes lentas.
@@ -195,6 +197,9 @@ pub struct Bateria {
 /// suavizados y redondeados a cinco, así que leerlos más de una vez cada medio
 /// minuto no cambia ni un píxel de lo dibujado.
 const CADA_PERFIL: Duration = Duration::from_secs(5);
+/// Un latido del aviso de batería crítica, y cuántos da.
+const D_ALERTA: Duration = Duration::from_millis(900);
+const LATIDOS: u32 = 2;
 const CADA_MINUTOS: Duration = Duration::from_secs(30);
 
 impl Bateria {
@@ -210,6 +215,7 @@ impl Bateria {
             perfil_leido: Instant::now() - CADA_PERFIL,
             minutos_leidos: Instant::now() - CADA_MINUTOS,
             ahorro_automatico: false,
+            alerta_desde: None,
         };
         b.refrescar();
         b
@@ -384,7 +390,9 @@ impl Bateria {
     /// Está aparte de `ver` porque `ancho` necesita contar sus caracteres, y
     /// dos copias de esta regla se desincronizan a la primera.
     fn etiqueta(bat: &crate::state::Battery) -> String {
-        let mut etiqueta = format!("{}%", bat.percent);
+        // Con espacio, como se escribe el tanto por ciento en castellano, y
+        // como lo escribe el diseño («67 %»).
+        let mut etiqueta = format!("{} %", bat.percent);
         // El tiempo solo aparece cuando la cuenta sale y aún tiene sentido
         // enseñarla: a punto de llenarse, "0:04 para el 100%" es ruido.
         if let Some(min) = bat.minutes.filter(|_| !bat.charging || bat.percent < 95) {
@@ -419,6 +427,10 @@ impl Widget for Bateria {
         if fresco == self.dato && perfil == self.perfil {
             return false;
         }
+        let critica = |b: &Option<Battery>| b.is_some_and(|b| b.percent <= 15 && !b.plugged);
+        if critica(&fresco) && !critica(&self.dato) && !tema::efectos_reducidos() {
+            self.alerta_desde = Some(Instant::now());
+        }
         self.dato = fresco;
         self.perfil = perfil;
         let dato = self.dato;
@@ -427,7 +439,12 @@ impl Widget for Bateria {
         true
     }
 
-    /// Icono, su hueco y el texto, que puede ser "85%" o "85% 2:15".
+    fn animando(&self) -> bool {
+        self.alerta_desde
+            .is_some_and(|t| t.elapsed() < D_ALERTA * LATIDOS)
+    }
+
+    /// Icono, su hueco y el texto, que puede ser "85 %" o "85 % 2:15".
     fn ancho(&self) -> f32 {
         let Some(bat) = &self.dato else {
             return 0.0;
@@ -443,11 +460,22 @@ impl Widget for Bateria {
         // va en blanco con la batería amarilla, porque quien indica el estado
         // es el dibujo y el número solo es el dato. Solo bajo mínimos se pinta
         // también el texto, que ahí sí conviene que grite.
-        let color = if bat.percent <= 15 && !bat.plugged {
+        let mut color = if bat.percent <= 15 && !bat.plugged {
             PELIGRO()
         } else {
             TEXT()
         };
+        // Al cruzar el 15 % la cifra late dos veces y se queda quieta. Latir
+        // siempre sería un reclamo que no se puede apagar mientras se busca el
+        // cargador.
+        if let Some(desde) = self.alerta_desde {
+            let pasado = desde.elapsed();
+            if pasado < D_ALERTA * LATIDOS {
+                let ciclo =
+                    (pasado.as_secs_f32() % D_ALERTA.as_secs_f32()) / D_ALERTA.as_secs_f32();
+                color.a *= 1.0 - 0.55 * (std::f32::consts::PI * ciclo).sin();
+            }
+        }
         let etiqueta = Self::etiqueta(bat);
 
         let mut fila = row![]
@@ -491,7 +519,11 @@ mod tests {
         if let Some(d) = &destino {
             std::fs::create_dir_all(d).expect("el directorio de volcado");
         }
-        for (simbolo, umbral) in [(Simbolo::Ac, 64u8), (Simbolo::Rayo, 66), (Simbolo::Alerta, 54)] {
+        for (simbolo, umbral) in [
+            (Simbolo::Ac, 64u8),
+            (Simbolo::Rayo, 66),
+            (Simbolo::Alerta, 54),
+        ] {
             for nivel in [5, 35, 50, umbral - 1, umbral, 95] {
                 let svg = pictograma(nivel, simbolo, tema::acento());
                 let negro = svg.contains(r##"fill="#000000""##);

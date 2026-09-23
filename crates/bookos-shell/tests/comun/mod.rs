@@ -84,7 +84,7 @@ pub fn distinto_del_fondo(luma_px: i32, fondo: i32) -> bool {
 /// mil. Sirve para preguntar "¿hay algo dibujado *ahí*?" sin fijar colores.
 pub fn tinta(buf: &[u8], w: u32, h: u32, desde: u32, hasta: u32) -> u32 {
     let fondo = fondo_luma(buf, w, h);
-    let mut con_tinta = 0;
+    let mut con_tinta: u32 = 0;
     let mut total = 0;
     for y in 0..h {
         for x in desde..hasta.min(w) {
@@ -94,11 +94,7 @@ pub fn tinta(buf: &[u8], w: u32, h: u32, desde: u32, hasta: u32) -> u32 {
             }
         }
     }
-    if total == 0 {
-        0
-    } else {
-        con_tinta * 1000 / total
-    }
+    (con_tinta * 1000).checked_div(total).unwrap_or(0)
 }
 
 /// Pone `src` encima de `dst` con alfa, para componer el volcado igual que
@@ -135,7 +131,7 @@ pub fn volcar(variable: &str, buf: &[u8], w: u32, h: u32) {
     // cambio el volcado enseña los azules en naranja y manda a buscar un
     // fallo de color que no existe.
     let mut rgba = buf.to_vec();
-    for p in rgba.chunks_exact_mut(4) {
+    for p in rgba.as_chunks_mut::<4>().0 {
         p.swap(0, 2);
     }
     let fichero = std::fs::File::create(&destino).unwrap();

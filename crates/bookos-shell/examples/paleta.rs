@@ -42,7 +42,7 @@ fn main() {
         let mut buf = vec![0u8; (w * h * 4) as usize];
         shell.draw_emergente(&mut buf);
         // B,G,R,A a R,G,B,A, igual que `volcar` en los tests.
-        for p in buf.chunks_exact_mut(4) {
+        for p in buf.as_chunks_mut::<4>().0 {
             p.swap(0, 2);
         }
         let ruta = salida.join(format!("{}.png", format!("{acento:?}").to_lowercase()));

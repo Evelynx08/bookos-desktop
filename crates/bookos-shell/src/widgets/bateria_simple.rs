@@ -24,7 +24,7 @@ use crate::icono::{self, Icono};
 use crate::state::Battery;
 use crate::tema;
 use crate::view::{OK, PELIGRO, PanelElement, TEXT};
-use crate::widget::Widget;
+use crate::widget::{Cruce, Widget};
 
 pub struct BateriaSimple {
     dato: Option<Battery>,
@@ -33,6 +33,7 @@ pub struct BateriaSimple {
     icono_nombre: &'static str,
     /// Media suavizada de los minutos restantes, igual que en la otra.
     minutos: Option<f32>,
+    cruce: Cruce,
 }
 
 impl BateriaSimple {
@@ -42,6 +43,7 @@ impl BateriaSimple {
             icono: None,
             icono_nombre: "",
             minutos: None,
+            cruce: Cruce::default(),
         };
         b.refrescar();
         b
@@ -101,7 +103,7 @@ impl BateriaSimple {
     /// tienen a la izquierda; el tiempo está a un clic, en el emergente de
     /// energía.
     fn etiqueta(bat: &Battery) -> String {
-        format!("{}%", bat.percent)
+        format!("{} %", bat.percent)
     }
 }
 
@@ -127,15 +129,30 @@ impl Widget for BateriaSimple {
         if fresco == self.dato {
             return false;
         }
+        let color_previo = self.dato.as_ref().map(Self::color);
         self.dato = fresco;
         let nombre = self.dato.as_ref().map(Self::nombre_icono).unwrap_or("");
+        let color = self.dato.as_ref().map(Self::color);
         if nombre != self.icono_nombre {
-            self.icono = (!nombre.is_empty())
+            let nuevo = (!nombre.is_empty())
                 .then(|| icono::propio(nombre))
                 .flatten();
+            let previo = std::mem::replace(&mut self.icono, nuevo);
+            self.cruce
+                .empezar(previo, color_previo.unwrap_or_else(TEXT));
             self.icono_nombre = nombre;
+        } else if color != color_previo {
+            // Mismo dibujo en otro color —al bajar del 15 % sin cambiar de
+            // escalón—: también cruza, que un cambio a rojo de golpe se lee
+            // como un parpadeo.
+            self.cruce
+                .empezar(self.icono.clone(), color_previo.unwrap_or_else(TEXT));
         }
         true
+    }
+
+    fn animando(&self) -> bool {
+        self.cruce.animando()
     }
 
     fn ancho(&self) -> f32 {
@@ -154,7 +171,7 @@ impl Widget for BateriaSimple {
             .spacing(5)
             .align_y(iced_core::alignment::Vertical::Center);
         if let Some(ic) = &self.icono {
-            fila = fila.push(icono::ver_teñido(ic, tema::ICONO_PANEL, Some(color)));
+            fila = fila.push(self.cruce.ver(ic, color));
         }
         fila.push(text(Self::etiqueta(bat)).size(tema::T_CUERPO).color(color))
             .into()

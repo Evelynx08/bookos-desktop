@@ -6,10 +6,15 @@
 //!
 //! **Todo sale de sysfs y de `/proc`**, sin procesos hijos ni D-Bus, igual que
 //! el panel: el equipo de DMI, la CPU de `/proc/cpuinfo`, la memoria de
-//! `/proc/meminfo` y la distribución de `/etc/os-release`. El único fichero
-//! grande es `pci.ids`, que se lee una vez al abrir la ventana y solo para
-//! traducir el identificador de la tarjeta gráfica a su nombre comercial —el
-//! kernel no lo sabe, solo tiene `0x64a0`.
+//! `/proc/meminfo` y la base de `/etc/os-release`. El único fichero grande es
+//! `pci.ids`, que se lee una vez al abrir la ventana y solo para traducir el
+//! identificador de la tarjeta gráfica a su nombre comercial —el kernel no lo
+//! sabe, solo tiene `0x64a0`.
+//!
+//! El sistema que se enseña bajo el título es **BookOS**, con la versión del
+//! propio compositor. `/etc/os-release` describe Fedora, que es lo que hay
+//! debajo, no lo que el usuario está usando; eso sale en su propio renglón,
+//! «Base», más abajo.
 //!
 //! El número de serie **no se enseña**: está en `/sys/class/dmi/id/product_serial`
 //! y ese fichero es 0400 de root, así que aquí siempre saldría vacío. Se deja
@@ -62,8 +67,15 @@ impl Acerca {
         let modelo = dmi("product_family")
             .or_else(|| dmi("product_name"))
             .unwrap_or_else(|| "Este equipo".into());
-        let sistema = os_release("PRETTY_NAME").unwrap_or_else(|| "Linux".into());
-        let version = os_release("VERSION_ID").unwrap_or_default();
+        // El subtítulo dice **BookOS**, no la distribución de base. BookOS no
+        // es una distro aparte —es un escritorio que corre sobre Fedora—, así
+        // que `/etc/os-release` describe el sistema anfitrión, no lo que el
+        // usuario está viendo en pantalla; enseñar "Fedora Linux 44 (KDE
+        // Plasma Desktop Edition)" ahí es tan equivocado como que un Mac
+        // dijera "Darwin" en su «Acerca de este Mac». La versión sale del
+        // paquete del propio compositor, que es la única versión de BookOS
+        // que existe todavía.
+        let sistema = format!("BookOS {}", env!("CARGO_PKG_VERSION"));
         let datos = vec![
             Dato {
                 etiqueta: "Chip",
@@ -82,15 +94,11 @@ impl Acerca {
                 valor: dmi("product_serial").unwrap_or_else(|| "—".into()),
             },
             Dato {
-                etiqueta: "BookOS",
-                // La versión y la variante, no el `PRETTY_NAME` entero: ese ya
-                // está bajo el título y repetirlo dejaba el renglón en
-                // "44 (Fedora Linux 44 (KDE Plasma Desktop Edition))".
-                valor: match (version.is_empty(), os_release("VARIANT")) {
-                    (true, _) => sistema.clone(),
-                    (false, Some(variante)) => format!("{version} ({variante})"),
-                    (false, None) => version.clone(),
-                },
+                // Aquí sí es sitio para la base: a quien le importe qué hay
+                // debajo del escritorio, aquí lo tiene completo y sin recortar
+                // —ya no compite con el subtítulo por decir lo mismo.
+                etiqueta: "Base",
+                valor: os_release("PRETTY_NAME").unwrap_or_else(|| "Linux".into()),
             },
         ];
         Self {
@@ -459,6 +467,26 @@ mod tests {
             assert!(!dato.valor.trim().is_empty(), "{} sin valor", dato.etiqueta);
         }
         assert!(!a.modelo.is_empty());
+    }
+
+    /// El subtítulo dice BookOS, no la distribución de base. Es justo el
+    /// bug que se reportó: la ficha enseñaba «Fedora Linux 44 (KDE Plasma
+    /// Desktop Edition)», que es verdad de la máquina pero no de lo que el
+    /// usuario tiene delante.
+    #[test]
+    fn el_subtitulo_es_bookos_y_no_la_distro_de_base() {
+        let a = Acerca::new();
+        assert!(a.sistema.starts_with("BookOS "), "subtítulo: {}", a.sistema);
+        assert!(!a.sistema.to_lowercase().contains("fedora"));
+        let base = a
+            .datos
+            .iter()
+            .find(|d| d.etiqueta == "Base")
+            .expect("hay un renglón de base");
+        // La base sí puede —y en esta máquina, debe— decir Fedora: ese
+        // renglón es justo el sitio para la verdad incómoda que no pertenece
+        // al título.
+        assert!(!base.valor.is_empty());
     }
 
     /// La memoria se redondea a lo que de verdad hay puesto: el kernel

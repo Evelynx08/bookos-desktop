@@ -139,13 +139,14 @@ fn boton(cual: Boton, estado: &Estado) -> PanelElement<'static> {
     // entera, que es lo que dice «esto responde».
     let tinta = match (estado.activa, señalado || pulsado) {
         (_, true) => tema::texto(),
-        (true, false) => tema::alfa(tema::texto(), 0.72),
-        (false, false) => tema::alfa(tema::texto(), 0.34),
+        (true, false) => tema::alfa(tema::texto(), 0.55),
+        (false, false) => tema::alfa(tema::texto(), 0.30),
     };
-    // La referencia mantiene las tarjetas visibles en reposo. El hover y el
-    // press elevan bastante su contraste para que el cambio se perciba incluso
-    // en paneles HiDPI. El cierre solo se vuelve rojo al señalarlo: en reposo
-    // es una tarjeta neutra idéntica a las otras dos.
+    // En reposo no hay placa, solo el glifo: con una tarjeta gris detrás de
+    // cada uno, los tres botones pesaban más que el título y se veían en todas
+    // las ventanas a la vez. La placa sale al señalar, que es cuando dice
+    // «esto responde», con contraste de sobra para notarse en HiDPI. El cierre
+    // solo se vuelve rojo al señalarlo.
     let fondo = match (cual, señalado, pulsado) {
         (Boton::Cerrar, _, true) => Some(tema::alfa(tema::rojo(), 1.0)),
         (Boton::Cerrar, true, false) => Some(tema::alfa(tema::rojo(), 0.95)),
@@ -154,10 +155,7 @@ fn boton(cual: Boton, estado: &Estado) -> PanelElement<'static> {
             tema::tinta(),
             if tema::es_claro() { 0.14 } else { 0.17 },
         )),
-        (_, false, false) => Some(tema::alfa(
-            tema::tinta(),
-            if tema::es_claro() { 0.06 } else { 0.08 },
-        )),
+        (_, false, false) => None,
     };
     // Solo la variante destructiva lleva la tinta calculada sobre rojo. En el
     // estado normal la X sigue el mismo color que los demás glifos.

@@ -89,6 +89,9 @@ pub struct Apariencia {
     /// `view`: recorrer tres directorios sesenta veces por segundo para una
     /// lista que no cambia mientras la tarjeta está abierta es trabajo por nada.
     fondos: Vec<crate::fondos::Familia>,
+    /// La miniatura de cada familia ya en píxeles y con las esquinas
+    /// recortadas, en el mismo orden que `fondos`. Ver [`vistas_de`].
+    vistas: Vec<Option<iced_core::image::Handle>>,
     hover_fondo: Realce,
     marca_fondo: Realce,
 }
@@ -104,15 +107,7 @@ impl Apariencia {
         // apagado y las marcas entrando, como si nadie hubiera elegido nada.
         marca_tema.señalar(MODOS.iter().position(|m| *m == modo));
         marca_color.señalar(indice(acento));
-        let mut fondos = crate::fondos::instaladas(tema::es_claro());
-        ordenar_por_afinidad(&mut fondos, acento);
-        // Cuál marcar. Se compara por **nombre de familia** y no por ruta: con
-        // el tema oscuro puesto, el fichero cargado es el `_dark` de la pareja,
-        // y comparar rutas no encontraría la miniatura de su propia familia.
-        let puesta = crate::fondos::elegida();
-        let elegido = puesta
-            .as_deref()
-            .and_then(|nombre| fondos.iter().position(|f| f.nombre == nombre));
+        let (fondos, elegido) = Self::fondos_para(tema::es_claro(), acento);
         let mut marca_fondo = Realce::nuevo();
         marca_fondo.señalar(elegido);
         marca_tema.terminar();
@@ -125,10 +120,27 @@ impl Apariencia {
             hover_color: Realce::nuevo(),
             marca_tema,
             marca_color,
+            vistas: vistas_de(&fondos),
             fondos,
             hover_fondo: Realce::nuevo(),
             marca_fondo,
         }
+    }
+
+    /// Los fondos instalados para ese tema, ordenados por afinidad con el
+    /// acento, y el índice del que ya está puesto.
+    ///
+    /// Se compara por **nombre de familia** y no por ruta: con el tema oscuro
+    /// puesto, el fichero cargado es el `_dark` de la pareja, y comparar rutas
+    /// no encontraría la miniatura de su propia familia.
+    fn fondos_para(es_claro: bool, acento: Acento) -> (Vec<crate::fondos::Familia>, Option<usize>) {
+        let mut fondos = crate::fondos::instaladas(es_claro);
+        ordenar_por_afinidad(&mut fondos, acento);
+        let puesta = crate::fondos::elegida();
+        let elegido = puesta
+            .as_deref()
+            .and_then(|nombre| fondos.iter().position(|f| f.nombre == nombre));
+        (fondos, elegido)
     }
 
     /// Ancho de una miniatura: la fila se reparte entre las familias que haya.
@@ -251,6 +263,19 @@ impl Apariencia {
         if let Some(i) = self.muestra_en(x, y) {
             self.modo = MODOS[i];
             self.marca_tema.señalar(Some(i));
+            // Con «Automático» no se sabe aquí qué toca sin la hora y la
+            // configuración de horas, que esta tarjeta no lleva: se deja tal
+            // cual hasta que el compositor la reabra. Con Claro u Oscuro sí
+            // se sabe sin ambigüedad, y las miniaturas de fondo son la
+            // pareja del tema anterior si no se refrescan aquí.
+            if let ModoTema::Claro | ModoTema::Oscuro = self.modo {
+                let es_claro = self.modo == ModoTema::Claro;
+                let (fondos, elegido) = Self::fondos_para(es_claro, self.acento);
+                self.vistas = vistas_de(&fondos);
+                self.fondos = fondos;
+                self.marca_fondo.señalar(elegido);
+                self.marca_fondo.terminar();
+            }
             return Some(self.accion());
         }
         if let Some(i) = self.fondo_en(x, y) {
@@ -336,19 +361,23 @@ impl Apariencia {
         let contenido = if self.fondos.is_empty() {
             contenido
         } else {
-            let fila = self.fondos.iter().enumerate().fold(row![], |fila, (i, f)| {
-                let fila = if i > 0 {
-                    fila.push(Space::new().width(Length::Fixed(FONDO_HUECO)))
-                } else {
-                    fila
-                };
-                fila.push(miniatura(
-                    f,
-                    self.ancho_fondo(),
-                    self.marca_fondo.intensidad(i),
-                    self.hover_fondo.intensidad(i),
-                ))
-            });
+            let fila = self
+                .vistas
+                .iter()
+                .enumerate()
+                .fold(row![], |fila, (i, vista)| {
+                    let fila = if i > 0 {
+                        fila.push(Space::new().width(Length::Fixed(FONDO_HUECO)))
+                    } else {
+                        fila
+                    };
+                    fila.push(miniatura(
+                        vista.as_ref(),
+                        self.ancho_fondo(),
+                        self.marca_fondo.intensidad(i),
+                        self.hover_fondo.intensidad(i),
+                    ))
+                });
             contenido
                 .push(separador())
                 .push(
@@ -441,49 +470,46 @@ fn mini<'a>(
     radio: iced_core::border::Radius,
 ) -> PanelElement<'a> {
     let (fondo, tarjeta) = colores(claro);
-    let dibujo = column![
-        // El `clip` del lienzo recorta en rectángulo, no por el radio, así que
-        // la barra lleva sus propias esquinas: sin esto, la muestra clara
-        // asomaba dos cuadraditos blancos por encima de la curva.
+    // La barra del panel no se dibuja como una pieza de 7 px con las esquinas
+    // de arriba redondeadas: tiny-skia limita el radio a la mitad del lado más
+    // corto, así que un radio de 12 en 7 px de alto se quedaba en 3,5 y la
+    // barra asomaba en pico por encima de la curva. Se hace al revés: el
+    // contenedor de fuera pinta el color de la barra con el radio entero, y el
+    // cuerpo de debajo tapa el resto redondeando solo por abajo.
+    let abajo = iced_core::border::Radius {
+        top_left: 0.0,
+        top_right: 0.0,
+        ..radio
+    };
+    let cuerpo = container(
         container(Space::new())
-            .width(Length::Fill)
-            .height(Length::Fixed(7.0))
+            .width(Length::Fixed(ancho * 0.5))
+            .height(Length::Fixed(14.0))
             .style(move |_| container::Style {
                 background: Some(tarjeta.into()),
                 border: Border {
-                    radius: iced_core::border::Radius::default()
-                        .top_left(tema::R_BOTON)
-                        .top_right(tema::R_BOTON),
+                    radius: tema::R_CHIP.into(),
                     ..Default::default()
                 },
                 ..Default::default()
             }),
-        container(
-            container(Space::new())
-                .width(Length::Fixed(ancho * 0.5))
-                .height(Length::Fixed(14.0))
-                .style(move |_| container::Style {
-                    background: Some(tarjeta.into()),
-                    border: Border {
-                        radius: tema::R_CHIP.into(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                })
-        )
-        .padding(8)
-    ];
-    // El radio lo lleva **este** contenedor porque es el que pinta el fondo: el
-    // `clip` del lienzo de fuera recorta en rectángulo, no por la curva, así
-    // que si el redondeo se dejara allí las muestras saldrían con las esquinas
-    // en pico. En la muestra partida cada mitad redondea solo su lado, que es
-    // lo que hace que las dos juntas se lean como una sola pastilla.
-    container(dibujo)
+    )
+    .padding(8)
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .style(move |_| container::Style {
+        background: Some(fondo.into()),
+        border: Border {
+            radius: abajo,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    container(column![Space::new().height(Length::Fixed(7.0)), cuerpo])
         .width(Length::Fixed(ancho))
         .height(Length::Fixed(alto))
-        .clip(true)
         .style(move |_| container::Style {
-            background: Some(fondo.into()),
+            background: Some(tarjeta.into()),
             border: Border {
                 radius: radio,
                 ..Default::default()
@@ -562,16 +588,74 @@ fn muestra<'a>(cual: ModoTema, elegida: f32, señalada: f32) -> PanelElement<'a>
     .into()
 }
 
-/// La miniatura de una familia de fondos.
+/// Las miniaturas de las familias, rasterizadas **una vez** al abrir la
+/// tarjeta y con las esquinas ya recortadas.
 ///
 /// Se dibuja el **SVG** y no la foto: decodificar los cuatro PNG de 2880×1800
-/// cuesta 152 ms medidos, y eso sería lo que tardaría la tarjeta en abrirse.
-/// Los SVG de al lado son de cuatro kilobytes y los rasteriza resvg al tamaño
-/// que se le pida, por el mismo camino que los iconos del dock. Una familia sin
-/// vectorial se queda con un rectángulo liso: se puede elegir igual, que es lo
-/// que importa.
+/// cuesta 152 ms medidos, y los SVG de al lado son de cuatro kilobytes. Pero no
+/// se le pasan a iced como SVG: su renderizador de CPU no recorta las imágenes
+/// por el radio, y la miniatura salía con las esquinas en pico dentro del
+/// anillo redondeado. Tapar las esquinas con una capa encima tampoco sirvió:
+/// iced coloca un SVG y una imagen con un píxel de diferencia —medido: el SVG
+/// empezaba en (100, 320) y la capa en (101, 321)— y quedaba una raya.
+fn vistas_de(fondos: &[crate::fondos::Familia]) -> Vec<Option<iced_core::image::Handle>> {
+    let n = fondos.len().max(1) as f32;
+    let ancho = (ANCHO - MARGEN * 2.0 - FONDO_HUECO * (n - 1.0)) / n;
+    let (iw, ih) = (ancho - HUECO_ANILLO * 2.0, FONDO_ALTO - HUECO_ANILLO * 2.0);
+    fondos
+        .iter()
+        .map(|f| {
+            f.vista
+                .as_deref()
+                .and_then(|ruta| vista_redondeada(ruta, iw, ih))
+        })
+        .collect()
+}
+
+fn vista_redondeada(
+    ruta: &std::path::Path,
+    ancho: f32,
+    alto: f32,
+) -> Option<iced_core::image::Handle> {
+    use resvg::tiny_skia::{Color as Tinta, Pixmap, Transform};
+    // A 3× del tamaño lógico: cubre hasta escala 3 sin que la miniatura se
+    // vea borrosa, y son cuatro imágenes de 200×100.
+    const RESOLUCION: f32 = 3.0;
+    let (pw, ph) = (
+        (ancho * RESOLUCION).round() as u32,
+        (alto * RESOLUCION).round() as u32,
+    );
+    let datos = std::fs::read(ruta).ok()?;
+    let arbol = resvg::usvg::Tree::from_data(&datos, &resvg::usvg::Options::default()).ok()?;
+    let t = arbol.size();
+    // Como `ContentFit::Cover`: llena el hueco y recorta lo que sobra.
+    let escala = (pw as f32 / t.width()).max(ph as f32 / t.height());
+    let dx = (pw as f32 - t.width() * escala) / 2.0;
+    let dy = (ph as f32 - t.height() * escala) / 2.0;
+    let mut pixmap = Pixmap::new(pw, ph)?;
+    // Opaco, como el fondo de verdad: así el alfa premultiplicado de tiny-skia
+    // y el recto que espera iced coinciden en todo menos en las esquinas.
+    pixmap.fill(Tinta::BLACK);
+    resvg::render(
+        &arbol,
+        Transform::from_row(escala, 0.0, 0.0, escala, dx, dy),
+        &mut pixmap.as_mut(),
+    );
+    let mut rgba = pixmap.take();
+    crate::redondear_esquinas(
+        &mut rgba,
+        pw,
+        ph,
+        tema::R_BOTON * RESOLUCION,
+        crate::Alfa::Recto,
+    );
+    Some(iced_core::image::Handle::from_rgba(pw, ph, rgba))
+}
+
+/// La miniatura de una familia de fondos. Una familia sin vectorial se queda
+/// con un rectángulo liso: se puede elegir igual, que es lo que importa.
 fn miniatura<'a>(
-    familia: &crate::fondos::Familia,
+    vista: Option<&iced_core::image::Handle>,
     ancho: f32,
     elegida: f32,
     señalada: f32,
@@ -580,31 +664,25 @@ fn miniatura<'a>(
     // círculos de acento. Pegado a la imagen no se vería: el anillo es del color
     // de acento y con el acento azul sobre la miniatura azul son el mismo color.
     let (iw, ih) = (ancho - HUECO_ANILLO * 2.0, FONDO_ALTO - HUECO_ANILLO * 2.0);
-    let dentro: PanelElement<'a> = match familia.vista.as_ref() {
-        Some(ruta) => iced_widget::svg(iced_core::svg::Handle::from_path(ruta))
+    let imagen: PanelElement<'a> = match vista {
+        Some(vista) => iced_widget::image(vista.clone())
             .width(Length::Fixed(iw))
             .height(Length::Fixed(ih))
-            .content_fit(iced_core::ContentFit::Cover)
+            .content_fit(iced_core::ContentFit::Fill)
             .into(),
-        None => Space::new()
+        None => container(Space::new())
             .width(Length::Fixed(iw))
             .height(Length::Fixed(ih))
+            .style(move |_| container::Style {
+                background: Some(tema::hover().into()),
+                border: Border {
+                    radius: tema::R_BOTON.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
             .into(),
     };
-    let imagen = container(dentro)
-        .width(Length::Fixed(iw))
-        .height(Length::Fixed(ih))
-        .clip(true)
-        .style(move |_| container::Style {
-            // El liso de debajo se ve solo cuando no hay SVG; con él encima
-            // queda tapado y no cuesta nada.
-            background: Some(tema::hover().into()),
-            border: Border {
-                radius: tema::R_BOTON.into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        });
 
     container(imagen)
         .width(Length::Fixed(ancho))

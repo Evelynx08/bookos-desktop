@@ -366,8 +366,6 @@ fn comprobar_bordes(state: &mut BookosComp, paso: u32) {
 /// ninguna tecla llegaba a resolverse como atajo, así que ni Escape ni el
 /// cambio de TTY funcionaban y la sesión se quedaba muerta.
 fn comprobar_encierro(state: &mut BookosComp) {
-    use smithay::input::keyboard::{ModifiersState, keysyms};
-
     tracing::info!("--- salidas del bloqueo ---");
     crate::keybinds::ejecutar(state, crate::keybinds::Accion::Bloquear);
     let echado = state.shell.as_ref().is_some_and(|s| s.esta_bloqueado());
@@ -396,15 +394,16 @@ fn comprobar_encierro(state: &mut BookosComp) {
             tracing::info!(nombre, "se traga, correcto");
         }
     }
-    let _ = (keysyms::KEY_Escape, ModifiersState::default());
-
-    // Y Escape lo quita.
+    // Y así se quita. Esto **no** prueba la autenticación: la llamada salta
+    // directamente a la acción, que en una sesión de verdad solo se alcanza
+    // cuando PAM ha dicho que sí. Lo que se comprueba aquí es que el
+    // desbloqueo deja el escritorio utilizable, no que el bloqueo proteja.
     crate::keybinds::ejecutar(state, Accion::Desbloquear);
     let sigue = state.shell.as_ref().is_some_and(|s| s.esta_bloqueado());
     if sigue {
-        tracing::error!("Escape no quitó el bloqueo");
+        tracing::error!("el desbloqueo no quitó el bloqueo");
     } else {
-        tracing::info!("Escape quita el bloqueo");
+        tracing::info!("el desbloqueo quita el bloqueo");
     }
     tracing::info!("--- fin ---");
 }
@@ -973,15 +972,17 @@ fn comprobar_captura(state: &mut BookosComp) {
     tracing::info!("capa abierta");
 
     // Un recuadro a mano, por el mismo camino que el ratón: pulsar, mover y
-    // soltar. Las coordenadas son lógicas de la pantalla.
+    // soltar. Las coordenadas son lógicas de la pantalla. Soltar solo marca;
+    // la captura la pide Intro, que es el atajo de «Copiar».
     let (x0, y0, x1, y1) = (200.0, 150.0, 600.0, 450.0);
     let accion = state.shell.as_mut().and_then(|s| {
         s.captura_pulsar(x0, y0);
         s.captura_puntero(x1, y1);
-        s.captura_soltar()
+        s.captura_soltar();
+        s.captura_tecla(bookos_shell::TeclaPulsada::Intro).1
     });
     let Some(accion) = accion else {
-        tracing::error!("soltar el arrastre no pidió ninguna captura");
+        tracing::error!("Intro con un recuadro marcado no pidió ninguna captura");
         return;
     };
     tracing::info!(?accion, "recuadro marcado");
@@ -1875,23 +1876,38 @@ fn comprobar_ventanas(state: &mut BookosComp) {
 }
 
 fn comprobar_organizacion(state: &mut BookosComp, intento: u32) {
-    use smithay::output::{Output, PhysicalProperties, Subpixel, Mode, Scale};
     use crate::escritorios;
+    use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
     let ventanas: Vec<_> = state.space.elements().cloned().collect();
     if ventanas.len() < 2 && intento < 8 {
-        if intento == 0 { crate::keybinds::lanzar(state, "konsole --separate"); }
-        state.loop_handle.insert_source(Timer::from_duration(Duration::from_secs(1)), move |_, _, state| {
-            comprobar_organizacion(state, intento + 1);
-            TimeoutAction::Drop
-        }).unwrap();
+        if intento == 0 {
+            crate::keybinds::lanzar(state, "konsole --separate");
+        }
+        state
+            .loop_handle
+            .insert_source(
+                Timer::from_duration(Duration::from_secs(1)),
+                move |_, _, state| {
+                    comprobar_organizacion(state, intento + 1);
+                    TimeoutAction::Drop
+                },
+            )
+            .unwrap();
         return;
     }
-    assert!(ventanas.len() >= 2, "organización: hacen falta dos clientes");
+    assert!(
+        ventanas.len() >= 2,
+        "organización: hacen falta dos clientes"
+    );
     let window = &ventanas[0];
     let otra = &ventanas[1];
     state.alternar_encima(window);
     state.enfocar(otra);
-    assert_eq!(state.space.elements().next_back(), Some(window), "enfocar otra ventana no tapa la fijada");
+    assert_eq!(
+        state.space.elements().next_back(),
+        Some(window),
+        "enfocar otra ventana no tapa la fijada"
+    );
     let origen = state.space.outputs().next().unwrap().clone();
     let posicion = state.space.element_location(window).unwrap();
     state.enfocar(window);
@@ -1903,16 +1919,32 @@ fn comprobar_organizacion(state: &mut BookosComp, intento: u32) {
     assert_eq!(state.space.element_location(window), Some(posicion));
     assert!(crate::ventanas::siempre_encima(window));
     // Monitor lógico para probar traslado, escala y coordenadas negativas.
-    let monitor = Output::new("selftest-monitor".into(), PhysicalProperties {
-        size: (0, 0).into(), subpixel: Subpixel::Unknown, make: "BookOS".into(), model: "Test".into(),
-    });
-    monitor.change_current_state(Some(Mode { size: (1920, 1080).into(), refresh: 60000 }),
-        None, Some(Scale::Fractional(1.5)), Some((-1280, 0).into()));
+    let monitor = Output::new(
+        "selftest-monitor".into(),
+        PhysicalProperties {
+            size: (0, 0).into(),
+            subpixel: Subpixel::Unknown,
+            make: "BookOS".into(),
+            model: "Test".into(),
+        },
+    );
+    monitor.change_current_state(
+        Some(Mode {
+            size: (1920, 1080).into(),
+            refresh: 60000,
+        }),
+        None,
+        Some(Scale::Fractional(1.5)),
+        Some((-1280, 0).into()),
+    );
     state.space.map_output(&monitor, (-1280, 0));
     let puntero = state.pointer_location;
     state.mover_a_monitor(window, "selftest-monitor");
     assert_eq!(state.pointer_location, puntero);
-    assert_eq!(escritorios::salida_de(state, window).as_deref(), Some("selftest-monitor"));
+    assert_eq!(
+        escritorios::salida_de(state, window).as_deref(),
+        Some("selftest-monitor")
+    );
     state.mover_a_monitor(window, &origen.name());
     state.alternar_maximizada(window);
     state.mover_a_monitor(window, "selftest-monitor");
@@ -1921,27 +1953,314 @@ fn comprobar_organizacion(state: &mut BookosComp, intento: u32) {
     state.pantalla_completa(window, true);
     state.mover_a_monitor(window, "selftest-monitor");
     assert!(crate::ventanas::completa(window));
-    assert_eq!(state.space.element_location(window), Some((-1280, 0).into()));
+    assert_eq!(
+        state.space.element_location(window),
+        Some((-1280, 0).into())
+    );
     state.mover_a_monitor(window, &origen.name());
     state.pantalla_completa(window, false);
     state.space.unmap_output(&monitor);
     state.alternar_encima(window);
     assert!(!crate::ventanas::siempre_encima(window));
-    tracing::info!("BOOKOS_ORGANIZACION_OK: encima, foco, escritorios, monitor, maximizado y fullscreen");
+    tracing::info!(
+        "BOOKOS_ORGANIZACION_OK: encima, foco, escritorios, monitor, maximizado y fullscreen"
+    );
     state.loop_signal.stop();
 }
 
+/// Echa el bloqueo, teclea una contraseña **incorrecta** y mira qué contesta
+/// PAM.
+///
+/// `BOOKOS_SELFTEST_BLOQUEO=1`. No comprueba que se pueda entrar —eso pediría
+/// la contraseña de verdad—, sino lo otro, que es lo que estaba sin comprobar:
+/// que el camino entero desde la tecla hasta PAM **llega a alguna parte**. Un
+/// bloqueo que se queda pensando para siempre y uno que rechaza bien se ven
+/// igual desde fuera, y hasta ahora ninguno de los dos dejaba rastro.
+///
+/// Lo que se espera es que el intento termine en «fallo» en unos segundos.
+fn comprobar_bloqueo_pam(state: &mut BookosComp) {
+    use crate::keybinds::Accion;
+
+    tracing::info!("--- bloqueo: camino hasta PAM ---");
+    crate::keybinds::ejecutar(state, Accion::Bloquear);
+    if !state.shell.as_ref().is_some_and(|s| s.esta_bloqueado()) {
+        tracing::error!("SELFTEST_BLOQUEO_FALLO: el bloqueo no se echó");
+        state.loop_signal.stop();
+        return;
+    }
+    for c in "contraseña-incorrecta".chars() {
+        crate::keybinds::ejecutar(state, Accion::BloqueoEscribir(c));
+    }
+    let escrito = state.bloqueo.escrito.chars().count();
+    if escrito != "contraseña-incorrecta".chars().count() {
+        tracing::error!(escrito, "SELFTEST_BLOQUEO_FALLO: el campo perdió teclas");
+        state.loop_signal.stop();
+        return;
+    }
+    crate::keybinds::ejecutar(state, Accion::BloqueoComprobar);
+    if state.bloqueo.comprobando.is_none() {
+        tracing::error!("SELFTEST_BLOQUEO_FALLO: Intro no lanzó la comprobación de PAM");
+        state.loop_signal.stop();
+        return;
+    }
+    tracing::info!("comprobación lanzada; esperando el veredicto de PAM");
+    // `pam_unix` se toma sus segundos al fallar, a propósito. Se le da margen
+    // de sobra y se mira si contestó: quedarse sin contestar es el fallo que
+    // este autotest existe para ver.
+    let plazo = std::time::Instant::now() + Duration::from_secs(20);
+    let r = state.loop_handle.insert_source(
+        Timer::from_duration(Duration::from_millis(200)),
+        move |_, _, state: &mut BookosComp| {
+            if state.bloqueo.fallo {
+                tracing::info!("SELFTEST_BLOQUEO_OK: PAM rechazó la contraseña incorrecta");
+                state.loop_signal.stop();
+                return TimeoutAction::Drop;
+            }
+            if !state.shell.as_ref().is_some_and(|s| s.esta_bloqueado()) {
+                tracing::error!("SELFTEST_BLOQUEO_FALLO: se desbloqueó con la contraseña mala");
+                state.loop_signal.stop();
+                return TimeoutAction::Drop;
+            }
+            if std::time::Instant::now() >= plazo {
+                tracing::error!("SELFTEST_BLOQUEO_FALLO: PAM no contestó en 20 s");
+                state.loop_signal.stop();
+                return TimeoutAction::Drop;
+            }
+            TimeoutAction::ToDuration(Duration::from_millis(200))
+        },
+    );
+    if let Err(err) = r {
+        tracing::error!("no se pudo esperar a PAM: {err}");
+        state.loop_signal.stop();
+    }
+}
+
+/// Un recorrido escrito a mano: `BOOKOS_SELFTEST_GUION=/ruta/guion.txt`.
+///
+/// Sirve para mirar aplicaciones de verdad —los menús y submenús de
+/// VirtualBox, un diálogo de GTK— sin sesión en un TTY ni herramientas de
+/// fuera: el clic entra por [`crate::input::boton`], el mismo camino que uno de
+/// libinput. Una orden por línea, `#` comenta:
+///
+/// ```text
+/// espera 3000          # milisegundos
+/// mover 400 300        # coordenadas lógicas del escritorio
+/// clic 400 300         # botón izquierdo; `clic 400 300 der` para el derecho
+///                      # (mover, clic y tecla aceptan al final los ms de espera)
+/// tecla meta+w         # combinaciones con `+`; ver `codigo` más abajo
+/// tema claro           # o `oscuro`; guarda en panel.conf, usar otro XDG_CONFIG_HOME
+/// pulsar 400 300        # baja el botón izquierdo ahí y lo deja pulsado
+/// soltar               # lo suelta donde esté el puntero
+/// captura              # pantalla entera a $XDG_PICTURES_DIR/Capturas
+/// fin                  # cierra el compositor
+/// ```
+fn guion(state: &mut BookosComp, ruta: &str) {
+    let pasos: Vec<String> = match std::fs::read_to_string(ruta) {
+        Ok(texto) => texto
+            .lines()
+            .map(|l| l.split('#').next().unwrap_or("").trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect(),
+        Err(err) => {
+            tracing::error!(ruta, "no se pudo leer el guion: {err}");
+            return;
+        }
+    };
+    paso_de_guion(state, std::rc::Rc::new(pasos), 0);
+}
+
+fn paso_de_guion(state: &mut BookosComp, pasos: std::rc::Rc<Vec<String>>, i: usize) {
+    use smithay::backend::input::ButtonState;
+    const BTN_IZQUIERDO: u32 = 0x110;
+    const BTN_DERECHO: u32 = 0x111;
+    // Entre órdenes, lo justo para que el cliente conteste a la anterior.
+    const RESPIRO: u64 = 250;
+
+    let Some(linea) = pasos.get(i) else {
+        tracing::info!("guion terminado");
+        return;
+    };
+    tracing::info!(paso = i, linea, "guion");
+    let partes: Vec<&str> = linea.split_whitespace().collect();
+    let numero = |n: usize| partes.get(n).and_then(|v| v.parse::<f64>().ok());
+    // La espera hasta la orden siguiente: la última pieza, si es un número y va
+    // detrás de las `fijas`. Para capturar a mitad de una animación de 180 ms
+    // el respiro de siempre llega tarde.
+    let despues = |fijas: usize| {
+        partes
+            .get(fijas..)
+            .and_then(|resto| resto.last())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(RESPIRO)
+    };
+    // Los tiempos solo tienen que crecer: los clientes los usan para ordenar.
+    let t = 100_000 + i as u32 * 50;
+    let espera = match partes.as_slice() {
+        ["espera", ms] => ms.parse::<u64>().unwrap_or(RESPIRO),
+        ["pulsar", ..] => {
+            let (Some(x), Some(y)) = (numero(1), numero(2)) else {
+                tracing::error!(linea, "faltan las coordenadas");
+                return;
+            };
+            crate::input::set_pointer(state, (x, y).into(), t);
+            crate::input::boton(state, BTN_IZQUIERDO, ButtonState::Pressed, t + 1);
+            state.needs_redraw = true;
+            despues(3)
+        }
+        ["soltar", ..] => {
+            crate::input::boton(state, BTN_IZQUIERDO, ButtonState::Released, t);
+            state.needs_redraw = true;
+            despues(1)
+        }
+        ["mover", ..] | ["clic", ..] => {
+            let (Some(x), Some(y)) = (numero(1), numero(2)) else {
+                tracing::error!(linea, "faltan las coordenadas");
+                return;
+            };
+            crate::input::set_pointer(state, (x, y).into(), t);
+            let espera = despues(3);
+            if partes[0] == "clic" {
+                let boton = if partes.get(3) == Some(&"der") {
+                    BTN_DERECHO
+                } else {
+                    BTN_IZQUIERDO
+                };
+                crate::input::boton(state, boton, ButtonState::Pressed, t + 1);
+                crate::input::boton(state, boton, ButtonState::Released, t + 2);
+            }
+            state.needs_redraw = true;
+            espera
+        }
+        ["tecla", combinacion, ..] => {
+            use smithay::backend::input::KeyState;
+            // `meta+w`: se pulsan en orden y se sueltan al revés, como con las
+            // manos, para que los modificadores estén puestos al llegar la tecla.
+            let Some(teclas) = combinacion
+                .split('+')
+                .map(|n| codigo_tecla(n).map(|c| smithay::input::keyboard::Keycode::new(c + 8)))
+                .collect::<Option<Vec<_>>>()
+            else {
+                tracing::error!(combinacion, "tecla de guion desconocida");
+                return;
+            };
+            for (n, tecla) in teclas.iter().enumerate() {
+                crate::input::tecla(state, *tecla, KeyState::Pressed, t + n as u32);
+            }
+            for (n, tecla) in teclas.iter().rev().enumerate() {
+                crate::input::tecla(state, *tecla, KeyState::Released, t + 20 + n as u32);
+            }
+            state.needs_redraw = true;
+            despues(2)
+        }
+        // Letra a letra, para escribir en un buscador: `escribir fondo`.
+        ["escribir", palabra, ..] => {
+            use smithay::backend::input::KeyState;
+            for (n, letra) in palabra.chars().enumerate() {
+                let Some(c) = codigo_tecla(&letra.to_string()) else {
+                    tracing::error!(%letra, "letra de guion desconocida");
+                    return;
+                };
+                let tecla = smithay::input::keyboard::Keycode::new(c + 8);
+                let t = t + n as u32 * 4;
+                crate::input::tecla(state, tecla, KeyState::Pressed, t);
+                crate::input::tecla(state, tecla, KeyState::Released, t + 2);
+            }
+            state.needs_redraw = true;
+            despues(2)
+        }
+        ["tema", cual, ..] => {
+            // Por la misma acción que la tarjeta de Apariencia, que además lo
+            // guarda en `panel.conf`: el guion debe correr con un
+            // `XDG_CONFIG_HOME` de prueba.
+            let modo = match *cual {
+                "claro" => bookos_shell::tema::ModoTema::Claro,
+                "oscuro" => bookos_shell::tema::ModoTema::Oscuro,
+                otro => {
+                    tracing::error!(tema = otro, "tema de guion desconocido");
+                    return;
+                }
+            };
+            crate::keybinds::hacer(
+                state,
+                bookos_shell::Accion::Apariencia {
+                    modo,
+                    acento: bookos_shell::tema::acento_actual(),
+                },
+            );
+            despues(2)
+        }
+        ["captura"] => {
+            let Some(g) = state
+                .space
+                .outputs()
+                .next()
+                .and_then(|o| state.space.output_geometry(o))
+            else {
+                tracing::error!("sin salida que capturar");
+                return;
+            };
+            state.captura_pedida = Some(crate::state::CapturaPedida {
+                x: 0,
+                y: 0,
+                ancho: g.size.w,
+                alto: g.size.h,
+                guardar: true,
+            });
+            // Pedida como la pide el portal, que es la vía que no notifica:
+            // si no, el aviso de «Captura guardada» saldría en la siguiente.
+            let (emisario, _) = crate::portal::promesa();
+            state.captura_portal = Some(emisario);
+            state.needs_redraw = true;
+            // El nombre del fichero lleva la hora al segundo: dos capturas en
+            // el mismo segundo se pisarían.
+            1100
+        }
+        ["fin"] => {
+            state.loop_signal.stop();
+            return;
+        }
+        _ => {
+            tracing::error!(linea, "orden de guion desconocida");
+            RESPIRO
+        }
+    };
+    let programado = state.loop_handle.insert_source(
+        Timer::from_duration(Duration::from_millis(espera)),
+        move |_, _, state| {
+            paso_de_guion(state, pasos.clone(), i + 1);
+            TimeoutAction::Drop
+        },
+    );
+    if let Err(err) = programado {
+        tracing::error!("no se pudo programar el siguiente paso del guion: {err}");
+    }
+}
+
 fn run(state: &mut BookosComp) {
+    if let Ok(ruta) = std::env::var("BOOKOS_SELFTEST_GUION") {
+        guion(state, &ruta);
+        return;
+    }
     if std::env::var_os("BOOKOS_SELFTEST_MEJORAS").is_some() {
         use bookos_shell::{Accion, TeclaPulsada};
-        for accion in [Accion::Bloquear, Accion::CerrarSesion,
-            Accion::Lanzar("systemctl poweroff".into()), Accion::Lanzar("systemctl reboot".into()),
-            Accion::Lanzar("systemctl suspend".into())] {
+        for accion in [
+            Accion::Bloquear,
+            Accion::CerrarSesion,
+            Accion::Lanzar("systemctl poweroff".into()),
+            Accion::Lanzar("systemctl reboot".into()),
+            Accion::Lanzar("systemctl suspend".into()),
+        ] {
             crate::keybinds::hacer(state, accion);
             let shell = state.shell.as_mut().expect("shell");
-            assert!(!shell.esta_bloqueado(), "una petición no debe ejecutarse sin confirmar");
+            assert!(
+                !shell.esta_bloqueado(),
+                "una petición no debe ejecutarse sin confirmar"
+            );
             assert_eq!(shell.emergente_nombre(), Some("apagar"));
-            assert!(matches!(shell.tecla(TeclaPulsada::Intro), (true, None)), "Intro cancela por defecto");
+            assert!(
+                matches!(shell.tecla(TeclaPulsada::Intro), (true, None)),
+                "Intro cancela por defecto"
+            );
             assert!(shell.emergente_nombre().is_none());
         }
         let shell = state.shell.as_mut().unwrap();
@@ -1956,6 +2275,10 @@ fn run(state: &mut BookosComp) {
     }
     if std::env::var_os("BOOKOS_SELFTEST_ORGANIZAR").is_some() {
         comprobar_organizacion(state, 0);
+        return;
+    }
+    if std::env::var_os("BOOKOS_SELFTEST_BLOQUEO").is_some() {
+        comprobar_bloqueo_pam(state);
         return;
     }
     tracing::info!("--- autotest de entrada ---");
@@ -2321,4 +2644,34 @@ fn muestrear_resize(state: &mut BookosComp, window: smithay::desktop::Window, i:
             TimeoutAction::Drop
         },
     );
+}
+
+/// El código evdev de una tecla del guion; xkb los numera 8 más arriba. Las
+/// letras van por filas de un teclado QWERTY, que es donde están en evdev.
+fn codigo_tecla(nombre: &str) -> Option<u32> {
+    const FILAS: [(&str, u32); 3] = [("qwertyuiop", 16), ("asdfghjkl", 30), ("zxcvbnm", 44)];
+    if let [letra] = nombre.as_bytes() {
+        return FILAS.iter().find_map(|(fila, primero)| {
+            fila.bytes()
+                .position(|b| b == *letra)
+                .map(|i| primero + i as u32)
+        });
+    }
+    Some(match nombre {
+        "esc" => 1,
+        "retroceso" => 14,
+        "tab" => 15,
+        "intro" => 28,
+        "ctrl" => 29,
+        "shift" => 42,
+        "alt" => 56,
+        "espacio" => 57,
+        "arriba" => 103,
+        "izquierda" => 105,
+        "derecha" => 106,
+        "abajo" => 108,
+        "supr" => 111,
+        "meta" => 125,
+        _ => return None,
+    })
 }

@@ -34,7 +34,7 @@ fn cambiar_dock_redimensiona_y_repinta_a_escala_fraccionaria() {
         let (w, h) = shell.dock_buffer_size();
         let mut buf = vec![0; (w * h * 4) as usize];
         assert!(!shell.draw_dock(&mut buf).is_empty());
-        assert!(buf.chunks_exact(4).any(|p| p[3] != 0));
+        assert!(buf.as_chunks::<4>().0.iter().any(|p| p[3] != 0));
         assert!(!shell.dock_needs_paint());
         assert_eq!(shell.dock().tamano_actual(), tamano);
     }

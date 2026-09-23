@@ -10,14 +10,15 @@
 //! terminan en el mismo sitio, [`set_pointer`].
 
 use smithay::backend::input::{
-    AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, GestureBeginEvent,
-    GesturePinchUpdateEvent, GestureSwipeUpdateEvent, InputBackend, InputEvent, KeyState,
-    KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
+    AbsolutePositionEvent, Axis, ButtonState, Event, GestureBeginEvent, GesturePinchUpdateEvent,
+    GestureSwipeUpdateEvent, InputBackend, InputEvent, KeyState, KeyboardKeyEvent,
+    PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
 };
 use smithay::input::keyboard::{FilterResult, Keycode, keysyms};
 use smithay::input::pointer::RelativeMotionEvent;
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
 use smithay::utils::{Logical, Point, SERIAL_COUNTER};
+use smithay::wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint};
 
 use bookos_shell::TeclaPulsada;
 
@@ -55,12 +56,26 @@ fn modificador_conmutador_suelto(
 /// `codigo` es el de xkb (evdev + 8). Se conserva el código y no solo el keysym
 /// porque algunas teclas Fn llegan sin keysym aunque el kernel sí haya
 /// identificado correctamente su botón físico.
-fn tecla(state: &mut BookosComp, codigo: Keycode, estado: KeyState, time: u32) {
+/// Una tecla, venga de libinput, de winit o de un autotest.
+pub fn tecla(state: &mut BookosComp, codigo: Keycode, estado: KeyState, time: u32) {
     let Some(kbd) = state.seat.get_keyboard() else {
         return;
     };
     let serial = SERIAL_COUNTER.next_serial();
     let pulsada = estado == KeyState::Pressed;
+    // Hay un menú abierto que aún no tiene el teclado: se le da ahora, antes
+    // de que la tecla salga hacia el cliente. El grab de popups ignora los
+    // cambios de foco mientras está puesto, así que se quita y se vuelve a
+    // poner con el mismo serial.
+    if pulsada && let Some(grab) = state.menu_sin_foco.take().filter(|g| !g.has_ended()) {
+        kbd.unset_grab(state);
+        kbd.set_focus(state, grab.current_grab(), serial);
+        kbd.set_grab(
+            state,
+            smithay::desktop::PopupKeyboardGrab::new(&grab),
+            grab.serial(),
+        );
+    }
     // El filtro corre con las teclas **antes** de reenviarlas, así que
     // los atajos del compositor funcionan aunque el cliente con foco
     // esté colgado. Esa es justamente la propiedad que hace que el
@@ -191,7 +206,9 @@ fn tecla(state: &mut BookosComp, codigo: Keycode, estado: KeyState, time: u32) {
                 let sym = handle.modified_sym();
                 let tecla = match sym.raw() {
                     keysyms::KEY_Escape => bookos_shell::TeclaPulsada::Escape,
-                    keysyms::KEY_Return | keysyms::KEY_KP_Enter => bookos_shell::TeclaPulsada::Intro,
+                    keysyms::KEY_Return | keysyms::KEY_KP_Enter => {
+                        bookos_shell::TeclaPulsada::Intro
+                    }
                     keysyms::KEY_Left => bookos_shell::TeclaPulsada::Izquierda,
                     keysyms::KEY_Right => bookos_shell::TeclaPulsada::Derecha,
                     keysyms::KEY_Tab => bookos_shell::TeclaPulsada::Tabulador,
@@ -201,7 +218,9 @@ fn tecla(state: &mut BookosComp, codigo: Keycode, estado: KeyState, time: u32) {
                     let (consumida, peticion) = shell.bloqueo_confirmar_tecla(tecla);
                     if consumida {
                         state.needs_redraw = true;
-                        return FilterResult::Intercept(peticion.map(crate::keybinds::Accion::Energia));
+                        return FilterResult::Intercept(
+                            peticion.map(crate::keybinds::Accion::Energia),
+                        );
                     }
                 }
                 let accion = match sym.raw() {
@@ -371,257 +390,7 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
         }
 
         InputEvent::PointerButton { event } => {
-            // Meta+clic mueve y redimensiona ventanas: si hubo clic, la tecla
-            // era un modificador y no debe abrir nada al soltarla.
-            state.meta_sola = false;
-            // Bloqueado, los clics no salen hacia los clientes: lo único que
-            // atienden es el botón de apagado de la propia pantalla de bloqueo.
-            // La capa de captura se queda con el ratón mientras está: se está
-            // encuadrando una foto y un clic no puede llegar a la ventana de
-            // debajo. Va antes que el bloqueo porque son excluyentes y esta es
-            // la que puede estar abierta con el escritorio en uso.
-            if state.shell.as_ref().is_some_and(|s| s.hay_captura()) {
-                let (x, y) = (state.pointer_location.x, state.pointer_location.y);
-                let accion = match event.state() {
-                    ButtonState::Pressed => {
-                        state.shell.as_mut().and_then(|s| s.captura_pulsar(x, y))
-                    }
-                    ButtonState::Released => state.shell.as_mut().and_then(|s| s.captura_soltar()),
-                };
-                if let Some(accion) = accion {
-                    crate::keybinds::hacer(state, accion);
-                }
-                state.needs_redraw = true;
-                return;
-            }
-            if state.shell.as_ref().is_some_and(|s| s.esta_bloqueado()) {
-                if event.state() == ButtonState::Pressed {
-                    let (x, y) = (state.pointer_location.x, state.pointer_location.y);
-                    let peticion = state
-                        .shell
-                        .as_mut()
-                        .and_then(|shell| shell.bloqueo_pulsado(x, y));
-                    if let Some(peticion) = peticion {
-                        crate::keybinds::ejecutar(
-                            state,
-                            crate::keybinds::Accion::Energia(peticion),
-                        );
-                    }
-                    state.needs_redraw = true;
-                }
-                return;
-            }
-            let serial = SERIAL_COUNTER.next_serial();
-            let button = event.button_code();
-            let pulsado = event.state();
-
-            if pulsado == ButtonState::Released && std::mem::take(&mut state.conmutador_clic) {
-                return;
-            }
-            if pulsado == ButtonState::Pressed
-                && state.shell.as_ref().is_some_and(|s| s.hay_conmutador())
-            {
-                state.conmutador_clic = true;
-                let elegida = (button == BTN_LEFT)
-                    .then(|| {
-                        state.shell.as_ref().and_then(|s| {
-                            s.conmutador_en(state.pointer_location.x, state.pointer_location.y)
-                        })
-                    })
-                    .flatten();
-                if let Some(i) = elegida {
-                    if let Some(shell) = state.shell.as_mut() {
-                        shell.conmutador_elegir(i);
-                    }
-                    crate::keybinds::ejecutar(state, crate::keybinds::Accion::ConmutarFin);
-                } else {
-                    crate::keybinds::ejecutar(state, crate::keybinds::Accion::ConmutarCancelar);
-                }
-                return;
-            }
-
-            // Soltar cierra el arrastre y encaja la ventana si el cursor estaba
-            // en un borde. Que el evento llegue o no al cliente depende de quién
-            // empezó: con Meta+ratón el clic nunca existió para él, pero si fue
-            // él quien pidió el movimiento, ya vio la pulsación y **necesita**
-            // ver el soltar — sin eso se queda creyendo que sigues pulsando y no
-            // vuelve a pedir otro movimiento nunca más.
-            if pulsado == ButtonState::Released {
-                if button == BTN_RIGHT && std::mem::take(&mut state.menu_ventana_suelta) {
-                    return;
-                }
-                // La banda elástica o los iconos agarrados se cierran aquí, y
-                // ese soltar no es de nadie más: empezó sobre el escritorio.
-                if soltar_escritorio(state) {
-                    return;
-                }
-                // El shell primero: si tenía un deslizador agarrado, el soltar
-                // es suyo aunque el puntero esté ya fuera de su superficie.
-                if let Some(accion) = state.shell.as_mut().and_then(|s| s.soltar()) {
-                    crate::keybinds::hacer(state, accion);
-                }
-                // Un botón de la barra de título se dispara al soltar y sobre
-                // el mismo botón donde se pulsó, como cualquier botón del
-                // sistema: bajar el ratón en la ✕ y salirse antes de soltar no
-                // cierra nada.
-                if let Some((window, boton)) =
-                    crate::decoracion::soltar(state, state.pointer_location)
-                {
-                    crate::decoracion::accionar(state, &window, boton);
-                    return;
-                }
-                if state.soltar_arrastre() {
-                    return;
-                }
-            }
-
-            // Meta + botón mueve o redimensiona sin necesidad de acertarle a un
-            // borde. Es el gesto de KWin y de casi todos los gestores de
-            // ventanas de Wayland, y aquí es además la **única** forma de mover
-            // una ventana que se dibuje sin decoración cliente.
-            if pulsado == ButtonState::Pressed && modificadores(state).logo {
-                let modo = match button {
-                    BTN_LEFT => Some(crate::ventanas::Modo::Mover),
-                    BTN_RIGHT => Some(crate::ventanas::Modo::Redimensionar {
-                        izquierda: false,
-                        arriba: false,
-                    }),
-                    _ => None,
-                };
-                if let Some(modo) = modo {
-                    if state.empezar_arrastre(modo) {
-                        return;
-                    }
-                }
-            }
-
-            // El shell se dibuja por encima de las ventanas, así que se mira
-            // primero: un clic en el dock es del dock, no de lo que haya
-            // debajo.
-            let punto = state.pointer_location;
-            // Clic derecho en el dock: menú contextual del icono, como en
-            // Plasma. Fijar y cerrar salen de ahí, no del propio clic.
-            // Y en el launchpad: el botón derecho saca las ✕ para quitar
-            // aplicaciones de la rejilla, que es el mismo gesto de «esto tiene
-            // más opciones» que en el dock.
-            if pulsado == ButtonState::Pressed
-                && button == BTN_RIGHT
-                && !modificadores(state).logo
-                && state.shell.as_mut().is_some_and(|s| s.launchpad_menu())
-            {
-                state.needs_redraw = true;
-                return;
-            }
-            if pulsado == ButtonState::Pressed
-                && button == BTN_RIGHT
-                && !modificadores(state).logo
-                && state
-                    .shell
-                    .as_ref()
-                    .is_some_and(|s| s.en_el_dock(punto.x, punto.y))
-            {
-                if state
-                    .shell
-                    .as_mut()
-                    .is_some_and(|s| s.menu_dock_en(punto.x, punto.y))
-                {
-                    state.needs_redraw = true;
-                    return;
-                }
-            }
-            if state
-                .shell
-                .as_ref()
-                .is_some_and(|s| s.contiene(punto.x, punto.y))
-            {
-                // Ni la pulsación ni el soltar llegan al cliente: para él este
-                // clic no ha existido. Reenviar solo el soltar le dejaría un
-                // botón que se levanta sin haberse pulsado nunca.
-                if pulsado == ButtonState::Pressed {
-                    if button == BTN_RIGHT
-                        && state.shell.as_mut().is_some_and(|s| s.editar_launchpad())
-                    {
-                        state.needs_redraw = true;
-                        return;
-                    }
-                    if let Some(accion) = state
-                        .shell
-                        .as_mut()
-                        .and_then(|s| s.pulsar(punto.x, punto.y))
-                    {
-                        crate::keybinds::hacer(state, accion);
-                    }
-                }
-                return;
-            }
-
-            // La barra de título que dibujamos nosotros: sus clics no son de
-            // nadie más. Va después del shell —el panel manda sobre la barra de
-            // una ventana que llegue hasta él— y antes del reenvío, porque para
-            // el cliente este clic no existe.
-            if pulsado == ButtonState::Pressed && button == BTN_RIGHT {
-                if let Some((window, _)) = crate::decoracion::barra_en(state, punto) {
-                    state.menu_ventana_suelta = true;
-                    crate::keybinds::menu_ventana(state, window);
-                    return;
-                }
-            }
-            if pulsado == ButtonState::Pressed && button == BTN_LEFT {
-                if let Some((window, boton)) = crate::decoracion::barra_en(state, punto) {
-                    state.enfocar(&window);
-                    match boton {
-                        Some(boton) => crate::decoracion::pulsar(state, &window, boton),
-                        // Fuera de los botones, la barra es para agarrar la
-                        // ventana; y dos clics seguidos, para maximizarla.
-                        None if doble_clic_en_barra(state) => {
-                            state.alternar_maximizada(&window);
-                        }
-                        None => {
-                            state.arrastrar_ventana(&window, crate::ventanas::Modo::Mover, false);
-                        }
-                    }
-                    state.needs_redraw = true;
-                    return;
-                }
-            }
-
-            // El escritorio pelado: aquí no hay ventana ni barra ni shell, así
-            // que el clic es de los iconos. Va lo último de todo porque el
-            // escritorio está **detrás** de todo lo demás.
-            if pulsado == ButtonState::Pressed
-                && button == BTN_LEFT
-                && state.space.element_under(punto).is_none()
-            {
-                if pulsar_escritorio(state, punto) {
-                    state.needs_redraw = true;
-                    return;
-                }
-            }
-
-            // Doble clic en la franja de arriba: maximiza y restaura, como en
-            // cualquier escritorio. Va antes del reenvío porque si el clic llega
-            // al cliente, la terminal lo entiende como seleccionar una palabra.
-            if pulsado == ButtonState::Pressed && button == BTN_LEFT && doble_clic(state) {
-                return;
-            }
-
-            // Pulsar sobre una ventana le da también el foco de teclado y la
-            // eleva: es lo que espera cualquiera al hacer clic.
-            if pulsado == ButtonState::Pressed {
-                focus_under_pointer(state);
-            }
-
-            let pointer = state.pointer.clone();
-            pointer.button(
-                state,
-                &ButtonEvent {
-                    button,
-                    state: pulsado,
-                    serial,
-                    time: event.time_msec(),
-                },
-            );
-            pointer.frame(state);
+            boton(state, event.button_code(), event.state(), event.time_msec());
         }
 
         InputEvent::PointerAxis { event } => {
@@ -637,7 +406,12 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
                 return;
             }
 
-            let mut frame = AxisFrame::new(event.time_msec()).source(AxisSource::Wheel);
+            // No todo desplazamiento es una rueda. Firefox, entre otros,
+            // mantiene estados distintos para una rueda (pasos) y un touchpad
+            // (gesto continuo): etiquetar siempre como `Wheel` hace que un
+            // gesto de dos dedos pueda quedarse abierto y el siguiente deje
+            // de llegar. Se conserva la fuente real que da libinput.
+            let mut frame = AxisFrame::new(event.time_msec()).source(event.source());
             for axis in [Axis::Horizontal, Axis::Vertical] {
                 if let Some(discreto) = event.amount_v120(axis) {
                     frame = frame.v120(axis, discreto as i32);
@@ -787,6 +561,280 @@ fn traducir_tecla(handle: &smithay::input::keyboard::KeysymHandle<'_>) -> Option
     Some(tecla)
 }
 
+/// Un botón del ratón, venga de libinput, de winit o de un autotest: todos
+/// pasan por aquí para que el clic de prueba recorra el mismo camino.
+pub fn boton(state: &mut BookosComp, button: u32, pulsado: ButtonState, time: u32) {
+    // Meta+clic mueve y redimensiona ventanas: si hubo clic, la tecla
+    // era un modificador y no debe abrir nada al soltarla.
+    state.meta_sola = false;
+    // Bloqueado, los clics no salen hacia los clientes: lo único que
+    // atienden es el botón de apagado de la propia pantalla de bloqueo.
+    // La capa de captura se queda con el ratón mientras está: se está
+    // encuadrando una foto y un clic no puede llegar a la ventana de
+    // debajo. Va antes que el bloqueo porque son excluyentes y esta es
+    // la que puede estar abierta con el escritorio en uso.
+    if state.shell.as_ref().is_some_and(|s| s.hay_captura()) {
+        let (x, y) = (state.pointer_location.x, state.pointer_location.y);
+        let accion = match pulsado {
+            ButtonState::Pressed => state.shell.as_mut().and_then(|s| s.captura_pulsar(x, y)),
+            ButtonState::Released => {
+                if let Some(shell) = state.shell.as_mut() {
+                    shell.captura_soltar();
+                }
+                None
+            }
+        };
+        if let Some(accion) = accion {
+            crate::keybinds::hacer(state, accion);
+        }
+        state.needs_redraw = true;
+        return;
+    }
+    if state.shell.as_ref().is_some_and(|s| s.esta_bloqueado()) {
+        if pulsado == ButtonState::Pressed {
+            let (x, y) = (state.pointer_location.x, state.pointer_location.y);
+            let peticion = state
+                .shell
+                .as_mut()
+                .and_then(|shell| shell.bloqueo_pulsado(x, y));
+            if let Some(peticion) = peticion {
+                crate::keybinds::ejecutar(state, crate::keybinds::Accion::Energia(peticion));
+            }
+            state.needs_redraw = true;
+        }
+        return;
+    }
+    let serial = SERIAL_COUNTER.next_serial();
+
+    if pulsado == ButtonState::Released && std::mem::take(&mut state.conmutador_clic) {
+        return;
+    }
+    if pulsado == ButtonState::Pressed && state.shell.as_ref().is_some_and(|s| s.hay_conmutador()) {
+        state.conmutador_clic = true;
+        let elegida = (button == BTN_LEFT)
+            .then(|| {
+                state.shell.as_ref().and_then(|s| {
+                    s.conmutador_en(state.pointer_location.x, state.pointer_location.y)
+                })
+            })
+            .flatten();
+        if let Some(i) = elegida {
+            if let Some(shell) = state.shell.as_mut() {
+                shell.conmutador_elegir(i);
+            }
+            crate::keybinds::ejecutar(state, crate::keybinds::Accion::ConmutarFin);
+        } else {
+            crate::keybinds::ejecutar(state, crate::keybinds::Accion::ConmutarCancelar);
+        }
+        return;
+    }
+
+    // Con la vista de escritorios abierta, una ventana de una miniatura se
+    // coge para llevarla a otro escritorio. Va antes que el shell porque la
+    // vista cambia de escritorio al pulsar, y eso acabaría el arrastre antes
+    // de empezar.
+    if button == BTN_LEFT
+        && crate::escritorios::boton_en_vista(state, pulsado == ButtonState::Pressed)
+    {
+        return;
+    }
+
+    // Soltar cierra el arrastre y encaja la ventana si el cursor estaba
+    // en un borde. Que el evento llegue o no al cliente depende de quién
+    // empezó: con Meta+ratón el clic nunca existió para él, pero si fue
+    // él quien pidió el movimiento, ya vio la pulsación y **necesita**
+    // ver el soltar — sin eso se queda creyendo que sigues pulsando y no
+    // vuelve a pedir otro movimiento nunca más.
+    if pulsado == ButtonState::Released {
+        if button == BTN_RIGHT && std::mem::take(&mut state.menu_ventana_suelta) {
+            return;
+        }
+        // La banda elástica o los iconos agarrados se cierran aquí, y
+        // ese soltar no es de nadie más: empezó sobre el escritorio.
+        if soltar_escritorio(state) {
+            return;
+        }
+        // El shell primero: si tenía un deslizador agarrado, el soltar
+        // es suyo aunque el puntero esté ya fuera de su superficie.
+        if let Some(accion) = state.shell.as_mut().and_then(|s| s.soltar()) {
+            crate::keybinds::hacer(state, accion);
+        }
+        // Un botón de la barra de título se dispara al soltar y sobre
+        // el mismo botón donde se pulsó, como cualquier botón del
+        // sistema: bajar el ratón en la ✕ y salirse antes de soltar no
+        // cierra nada.
+        if let Some((window, boton)) = crate::decoracion::soltar(state, state.pointer_location) {
+            crate::decoracion::accionar(state, &window, boton);
+            return;
+        }
+        if state.soltar_arrastre() {
+            return;
+        }
+    }
+
+    // Meta + botón mueve o redimensiona sin necesidad de acertarle a un
+    // borde. Es el gesto de KWin y de casi todos los gestores de
+    // ventanas de Wayland, y aquí es además la **única** forma de mover
+    // una ventana que se dibuje sin decoración cliente.
+    if pulsado == ButtonState::Pressed && modificadores(state).logo {
+        let modo = match button {
+            BTN_LEFT => Some(crate::ventanas::Modo::Mover),
+            BTN_RIGHT => Some(crate::ventanas::Modo::Redimensionar {
+                izquierda: false,
+                arriba: false,
+            }),
+            _ => None,
+        };
+        if let Some(modo) = modo
+            && state.empezar_arrastre(modo)
+        {
+            return;
+        }
+    }
+
+    // El shell se dibuja por encima de las ventanas, así que se mira
+    // primero: un clic en el dock es del dock, no de lo que haya
+    // debajo.
+    let punto = state.pointer_location;
+    // Clic derecho en el dock: menú contextual del icono, como en
+    // Plasma. Fijar y cerrar salen de ahí, no del propio clic.
+    // Y en el launchpad: el botón derecho saca las ✕ para quitar
+    // aplicaciones de la rejilla, que es el mismo gesto de «esto tiene
+    // más opciones» que en el dock.
+    if pulsado == ButtonState::Pressed
+        && button == BTN_RIGHT
+        && !modificadores(state).logo
+        && state.shell.as_mut().is_some_and(|s| s.launchpad_menu())
+    {
+        state.needs_redraw = true;
+        return;
+    }
+    if pulsado == ButtonState::Pressed
+        && button == BTN_RIGHT
+        && !modificadores(state).logo
+        && state
+            .shell
+            .as_ref()
+            .is_some_and(|s| s.en_el_dock(punto.x, punto.y))
+        && state
+            .shell
+            .as_mut()
+            .is_some_and(|s| s.menu_dock_en(punto.x, punto.y))
+    {
+        state.needs_redraw = true;
+        return;
+    }
+    if state
+        .shell
+        .as_ref()
+        .is_some_and(|s| s.contiene(punto.x, punto.y))
+    {
+        // Ni la pulsación ni el soltar llegan al cliente: para él este
+        // clic no ha existido. Reenviar solo el soltar le dejaría un
+        // botón que se levanta sin haberse pulsado nunca.
+        if pulsado == ButtonState::Pressed {
+            if button == BTN_RIGHT && state.shell.as_mut().is_some_and(|s| s.editar_launchpad()) {
+                state.needs_redraw = true;
+                return;
+            }
+            // Solo el botón principal activa controles. Antes cualquier
+            // botón caía por este camino cuando su menú contextual no
+            // encontraba un item; en el dock eso convertía un clic
+            // derecho en «activar» y minimizaba la app con la lámpara.
+            if button == BTN_LEFT
+                && let Some(accion) = state
+                    .shell
+                    .as_mut()
+                    .and_then(|s| s.pulsar(punto.x, punto.y))
+            {
+                crate::keybinds::hacer(state, accion);
+            }
+        }
+        return;
+    }
+
+    // La barra de título que dibujamos nosotros: sus clics no son de
+    // nadie más. Va después del shell —el panel manda sobre la barra de
+    // una ventana que llegue hasta él— y antes del reenvío, porque para
+    // el cliente este clic no existe.
+    if pulsado == ButtonState::Pressed
+        && button == BTN_RIGHT
+        && let Some((window, _)) = crate::decoracion::barra_en(state, punto)
+    {
+        state.menu_ventana_suelta = true;
+        crate::keybinds::menu_ventana(state, window);
+        return;
+    }
+    if pulsado == ButtonState::Pressed
+        && button == BTN_LEFT
+        && let Some((window, boton)) = crate::decoracion::barra_en(state, punto)
+    {
+        state.enfocar(&window);
+        match boton {
+            Some(boton) => crate::decoracion::pulsar(state, &window, boton),
+            // Fuera de los botones, la barra es para agarrar la
+            // ventana; y dos clics seguidos, para maximizarla.
+            None if doble_clic_en_barra(state) => {
+                state.alternar_maximizada(&window);
+            }
+            None => {
+                state.arrastrar_ventana(&window, crate::ventanas::Modo::Mover, false);
+            }
+        }
+        state.needs_redraw = true;
+        return;
+    }
+
+    // El escritorio pelado: aquí no hay ventana ni barra ni shell, así
+    // que el clic es de los iconos. Va lo último de todo porque el
+    // escritorio está **detrás** de todo lo demás.
+    if pulsado == ButtonState::Pressed
+        && button == BTN_LEFT
+        && state.space.element_under(punto).is_none()
+        && pulsar_escritorio(state, punto)
+    {
+        state.needs_redraw = true;
+        return;
+    }
+    // Y el mismo escritorio con el botón derecho: el menú de «Nueva
+    // carpeta» y «Eliminar». El soltar que sigue se traga con el mismo
+    // `menu_ventana_suelta` que usa el menú de la barra de título, dos
+    // líneas más abajo de este bloque.
+    if pulsado == ButtonState::Pressed
+        && button == BTN_RIGHT
+        && state.space.element_under(punto).is_none()
+        && pulsar_derecho_escritorio(state, punto)
+    {
+        state.menu_ventana_suelta = true;
+        return;
+    }
+
+    // Doble clic en la franja de arriba: maximiza y restaura, como en
+    // cualquier escritorio. Va antes del reenvío porque si el clic llega
+    // al cliente, la terminal lo entiende como seleccionar una palabra.
+    if pulsado == ButtonState::Pressed && button == BTN_LEFT && doble_clic(state) {
+        return;
+    }
+
+    // Pulsar sobre una ventana le da también el foco de teclado y la
+    // eleva: es lo que espera cualquiera al hacer clic.
+    if pulsado == ButtonState::Pressed {
+        focus_under_pointer(state);
+    }
+
+    let pointer = state.pointer.clone();
+    pointer.button(
+        state,
+        &ButtonEvent {
+            button,
+            state: pulsado,
+            serial,
+            time,
+        },
+    );
+    pointer.frame(state);
+}
+
 /// Mueve el cursor a un punto lógico, lo confina al escritorio y reenvía el
 /// movimiento al cliente que haya debajo.
 pub fn set_pointer(state: &mut BookosComp, destino: Point<f64, Logical>, time: u32) {
@@ -800,7 +848,52 @@ pub fn set_pointer(state: &mut BookosComp, destino: Point<f64, Logical>, time: u
         .filter_map(|o| state.space.output_geometry(o))
         .collect();
     let anterior = state.pointer_location;
-    let location = confinar_a_salidas(destino, &geometrías);
+    let delta_fisico = destino - anterior;
+    let mut location = confinar_a_salidas(destino, &geometrías);
+
+    // Juegos, máquinas virtuales y escritorios remotos usan
+    // pointer-constraints junto con relative-pointer. Publicar esos globales y
+    // activar la restricción no basta: el compositor tiene que obedecerla al
+    // calcular la nueva posición. Antes el protocolo contestaba «locked» pero
+    // el cursor seguía escapando de la ventana, dejando a VirtualBox con una
+    // mitad de la captura (teclado o ratón) en un estado incoherente.
+    let foco_anterior = state.pointer.current_focus().and_then(|surface| {
+        state
+            .surface_under(anterior)
+            .filter(|(bajo, _)| *bajo == surface)
+    });
+    let pointer = state.pointer.clone();
+    let mut bloqueado = false;
+    if let Some((surface, origen)) = foco_anterior.as_ref() {
+        let decision = with_pointer_constraint(surface, &pointer, |constraint| {
+            let constraint = constraint.filter(|c| c.is_active())?;
+            match &*constraint {
+                PointerConstraint::Locked(_) => Some((true, false)),
+                PointerConstraint::Confined(_) => {
+                    let dentro = match constraint.region() {
+                        Some(region) => {
+                            let local = location - *origen;
+                            region.contains((local.x.floor() as i32, local.y.floor() as i32))
+                        }
+                        // Sin región explícita, la propia superficie es la
+                        // región. El hit-test incluye su input_region.
+                        None => state
+                            .surface_under(location)
+                            .is_some_and(|(bajo, _)| bajo == *surface),
+                    };
+                    Some((false, dentro))
+                }
+            }
+        });
+        match decision {
+            Some((true, _)) => {
+                bloqueado = true;
+                location = anterior;
+            }
+            Some((false, false)) => location = anterior,
+            _ => {}
+        }
+    }
     state.pointer_location = location;
     // Mover el cursor **es** un cambio en pantalla. Sin esto el puntero solo se
     // repinta cuando algo más provoca un frame, y se arrastra a tirones.
@@ -854,6 +947,9 @@ pub fn set_pointer(state: &mut BookosComp, destino: Point<f64, Logical>, time: u
         state.needs_redraw = true;
         return;
     }
+    if crate::escritorios::mover_en_vista(state) {
+        state.needs_redraw = true;
+    }
     if let Some(shell) = state.shell.as_mut() {
         shell.puntero(location.x, location.y);
     }
@@ -893,23 +989,53 @@ pub fn set_pointer(state: &mut BookosComp, destino: Point<f64, Logical>, time: u
         state.needs_redraw = true;
     }
 
-    let focus = state.surface_under(location);
+    let focus = if bloqueado {
+        foco_anterior
+    } else {
+        state.surface_under(location)
+    };
     let pointer = state.pointer.clone();
-    pointer.motion(
-        state,
-        focus,
-        &MotionEvent {
-            location,
-            serial: SERIAL_COUNTER.next_serial(),
-            time,
-        },
-    );
+    // Un puntero bloqueado no cambia sus coordenadas absolutas; el cliente
+    // recibe solo el movimiento relativo. Mandarle además `wl_pointer.motion`
+    // contradice el bloqueo que acabamos de confirmar.
+    if !bloqueado {
+        pointer.motion(
+            state,
+            focus.clone(),
+            &MotionEvent {
+                location,
+                serial: SERIAL_COUNTER.next_serial(),
+                time,
+            },
+        );
+        // Una restricción persistente se desactiva al perder el foco (por
+        // ejemplo, al abrir la capa de captura). Al volver a entrar en la
+        // superficie hay que activarla de nuevo; `new_constraint` no vuelve a
+        // llamarse porque el objeto del cliente sigue siendo el mismo.
+        if let Some((surface, origen)) = focus.as_ref() {
+            with_pointer_constraint(surface, &pointer, |constraint| {
+                let Some(constraint) = constraint.filter(|c| !c.is_active()) else {
+                    return;
+                };
+                let local = location - *origen;
+                let dentro = constraint.region().is_none_or(|region| {
+                    region.contains((local.x.floor() as i32, local.y.floor() as i32))
+                });
+                if dentro {
+                    constraint.activate();
+                }
+            });
+        }
+    }
     pointer.relative_motion(
         state,
-        state.surface_under(location),
+        focus,
         &RelativeMotionEvent {
-            delta: location - anterior,
-            delta_unaccel: location - anterior,
+            // La posición puede quedarse quieta por un lock, un borde o una
+            // región confinada; el movimiento físico no. Ese delta es justo lo
+            // que consumen una VM o un juego para mover su cursor interno.
+            delta: delta_fisico,
+            delta_unaccel: delta_fisico,
             utime: u64::from(time) * 1_000,
         },
     );
@@ -1092,10 +1218,8 @@ fn pulsar_escritorio(state: &mut BookosComp, punto: Point<f64, Logical>) -> bool
                     .unwrap_or_default(),
                 false => Vec::new(),
             };
-            if !ctrl {
-                if let Some(shell) = state.shell.as_mut() {
-                    shell.escritorio_seleccionar(None, false);
-                }
+            if !ctrl && let Some(shell) = state.shell.as_mut() {
+                shell.escritorio_seleccionar(None, false);
             }
             state.arrastre_escritorio = Some(ArrastreEscritorio::Banda {
                 origen: punto,
@@ -1103,6 +1227,68 @@ fn pulsar_escritorio(state: &mut BookosComp, punto: Point<f64, Logical>) -> bool
             });
         }
     }
+    true
+}
+
+/// El clic derecho sobre el escritorio pelado: el menú de «Nueva carpeta» y
+/// «Eliminar».
+///
+/// Reutiliza `MenuDock::ventana_en` —el mismo menú genérico que ya usa el
+/// clic derecho de una barra de título, pero anclado al punto del clic en vez
+/// de centrado— en vez de montar una emergente propia: montar una entera para
+/// dos entradas es más superficie de la que hace falta.
+///
+/// `true` si el clic era del escritorio y no debe llegar a nadie más.
+fn pulsar_derecho_escritorio(state: &mut BookosComp, punto: Point<f64, Logical>) -> bool {
+    if !state
+        .shell
+        .as_ref()
+        .is_some_and(|s| s.escritorio_alcanza(punto.x, punto.y))
+    {
+        return false;
+    }
+    // Clic derecho sobre un icono que no estaba seleccionado: lo selecciona
+    // solo, como el clic izquierdo. Sobre uno que ya lo estaba, se deja la
+    // selección tal cual, para poder eliminar varios a la vez.
+    let icono = state
+        .shell
+        .as_ref()
+        .and_then(|s| s.escritorio_en(punto.x, punto.y));
+    if let Some(i) = icono {
+        let ya = state
+            .shell
+            .as_ref()
+            .map(|s| s.escritorio_seleccion())
+            .and_then(|sel| sel.get(i).copied())
+            .unwrap_or(false);
+        if !ya && let Some(shell) = state.shell.as_mut() {
+            shell.escritorio_seleccionar(Some(i), false);
+        }
+    }
+    let hay_seleccion = state
+        .shell
+        .as_ref()
+        .is_some_and(|s| s.escritorio_seleccion().iter().any(|&s| s));
+    let mut opciones = vec![(
+        "Nueva carpeta".to_string(),
+        bookos_shell::Accion::EscritorioNuevaCarpeta,
+    )];
+    if hay_seleccion {
+        opciones.push((
+            "Eliminar".to_string(),
+            bookos_shell::Accion::EscritorioEliminarSeleccion,
+        ));
+    }
+    // Sobre un icono, el menú sale debajo de él, no encima tapando lo que se
+    // acaba de seleccionar. En hueco vacío, junto al propio clic.
+    let origen = icono
+        .and_then(|i| state.shell.as_ref().and_then(|s| s.escritorio_rect(i)))
+        .map(|(rx, ry, _, rh)| (rx, ry + rh))
+        .unwrap_or((punto.x as f32, punto.y as f32));
+    if let Some(shell) = state.shell.as_mut() {
+        shell.menu_ventana_en(opciones, origen);
+    }
+    state.needs_redraw = true;
     true
 }
 

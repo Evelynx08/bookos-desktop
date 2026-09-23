@@ -47,6 +47,15 @@ smithay::render_elements! {
     /// La ventana congelada y deformada del minimizar «magic lamp». Es la
     /// única que dibuja con un shader propio sobre una textura nuestra.
     Genio=crate::genio::Elemento,
+    /// Una textura nuestra con alfa: las ventanas que se están cerrando
+    /// —[`crate::cierre`]— y la foto del tema anterior al cambiar de claro a
+    /// oscuro —[`crate::fundido`]—.
+    Textura=smithay::backend::renderer::element::texture::TextureRenderElement<
+        smithay::backend::renderer::gles::GlesTexture,
+    >,
+    /// El velo de la capa de captura, con el recuadro redondeado. Ver
+    /// [`crate::captura::Velo`].
+    Velo=smithay::backend::renderer::gles::element::PixelShaderElement,
     /// Un rectángulo de color, para el velo del launchpad. Va aparte porque
     /// pintarlo dentro del buffer del shell obligaría a rasterizar la pantalla
     /// entera en CPU; aquí lo compone la GPU y no cuesta nada.
@@ -376,42 +385,6 @@ fn a_logico((w, h): (u32, u32), del_fichero: u32, nominal: u32) -> (i32, i32) {
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// La flecha de BookOS, tal como está en el fichero: el nominal 48 mide
-    /// 42×48 px de verdad, y el 64 mide 57×64.
-    const FLECHA_48: (u32, u32) = (42, 48);
-    const FLECHA_64: (u32, u32) = (57, 64);
-
-    #[test]
-    fn el_cursor_mide_lo_que_se_pide_aunque_el_tema_no_lo_tenga() {
-        // El caso normal: se piden 24 lógicos y el tema tiene la imagen justa.
-        // El lienzo pasa a medir 24, y el contenido lo que le toque.
-        assert_eq!(a_logico(FLECHA_48, 48, 24), (21, 24));
-        // El caso que salía mal: `cursor = 48` a escala 1,75 pide 84 px y el
-        // tema llega hasta 64. Antes se dibujaba la de 64 a su resolución
-        // nativa y quedaba un 24% pequeña; ahora se declara con el doble de
-        // lógicos que el caso de arriba, que es lo que significa pedir 48.
-        assert_eq!(a_logico(FLECHA_64, 64, 48), (43, 48));
-    }
-
-    #[test]
-    fn el_doble_de_tamano_da_el_doble_de_cursor() {
-        let (w24, h24) = a_logico(FLECHA_48, 48, 24);
-        let (w48, h48) = a_logico(FLECHA_48, 48, 48);
-        assert_eq!((w48, h48), (w24 * 2, h24 * 2));
-    }
-
-    #[test]
-    fn una_imagen_diminuta_no_desaparece() {
-        // Redondear hacia abajo daría 0, y un elemento de tamaño cero no se
-        // dibuja: cursor invisible.
-        assert_eq!(a_logico((1, 1), 64, 8), (1, 1));
-    }
-}
-
 /// Flecha mínima dibujada a mano, por si el sistema no tiene tema de cursores.
 fn fallback_arrow(size: u32, nominal: u32) -> Imagen {
     let size = size.max(8);
@@ -504,5 +477,41 @@ pub fn elements(
                 );
             elements.into_iter().map(OverlayElement::Surface).collect()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// La flecha de BookOS, tal como está en el fichero: el nominal 48 mide
+    /// 42×48 px de verdad, y el 64 mide 57×64.
+    const FLECHA_48: (u32, u32) = (42, 48);
+    const FLECHA_64: (u32, u32) = (57, 64);
+
+    #[test]
+    fn el_cursor_mide_lo_que_se_pide_aunque_el_tema_no_lo_tenga() {
+        // El caso normal: se piden 24 lógicos y el tema tiene la imagen justa.
+        // El lienzo pasa a medir 24, y el contenido lo que le toque.
+        assert_eq!(a_logico(FLECHA_48, 48, 24), (21, 24));
+        // El caso que salía mal: `cursor = 48` a escala 1,75 pide 84 px y el
+        // tema llega hasta 64. Antes se dibujaba la de 64 a su resolución
+        // nativa y quedaba un 24% pequeña; ahora se declara con el doble de
+        // lógicos que el caso de arriba, que es lo que significa pedir 48.
+        assert_eq!(a_logico(FLECHA_64, 64, 48), (43, 48));
+    }
+
+    #[test]
+    fn el_doble_de_tamano_da_el_doble_de_cursor() {
+        let (w24, h24) = a_logico(FLECHA_48, 48, 24);
+        let (w48, h48) = a_logico(FLECHA_48, 48, 48);
+        assert_eq!((w48, h48), (w24 * 2, h24 * 2));
+    }
+
+    #[test]
+    fn una_imagen_diminuta_no_desaparece() {
+        // Redondear hacia abajo daría 0, y un elemento de tamaño cero no se
+        // dibuja: cursor invisible.
+        assert_eq!(a_logico((1, 1), 64, 8), (1, 1));
     }
 }

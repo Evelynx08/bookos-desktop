@@ -47,6 +47,14 @@ use crate::state::BookosComp;
 /// dos pantallas deslizaban desfasadas entre sí. Se llama una sola vez por
 /// vuelta, antes de componer ninguna salida.
 pub fn avanzar_animaciones(state: &mut BookosComp) {
+    if state
+        .fondo
+        .as_mut()
+        .is_some_and(crate::fondo::Fondo::avanzar)
+    {
+        state.fondo_cristal_pendiente = true;
+        state.needs_redraw = true;
+    }
     if !state.brillo_poll_activo && tarjeta_brillo_abierta(state) {
         state.brillo_poll_activo = true;
         let result = state.loop_handle.insert_source(
@@ -62,7 +70,9 @@ pub fn avanzar_animaciones(state: &mut BookosComp) {
                 TimeoutAction::ToDuration(std::time::Duration::from_millis(500))
             },
         );
-        if result.is_err() { state.brillo_poll_activo = false; }
+        if result.is_err() {
+            state.brillo_poll_activo = false;
+        }
     }
     let app_en_foco = state
         .seat
@@ -89,7 +99,7 @@ pub fn avanzar_animaciones(state: &mut BookosComp) {
         }
         // Y lo mismo con el aviso de una notificación: su superficie vive aquí
         // y nadie más la suelta cuando se le acaba el tiempo.
-        if shell.toast_vivo().1 {
+        if shell.toasts_vivos().1 {
             state.needs_redraw = true;
         }
         shell.animar_toast();
@@ -127,6 +137,49 @@ pub fn escena(
     renderer: &mut GlesRenderer,
     output: &Output,
 ) -> Vec<OverlayElement> {
+    // Si se acaba de pasar de claro a oscuro, antes de pintar el tema nuevo se
+    // vuelve un instante al viejo para fotografiar la pantalla tal como está.
+    // Ver `crate::fundido`.
+    if let Some((tema, acento)) = state.shell.as_mut().and_then(|s| s.tema_anterior.take()) {
+        let nuevo = (
+            bookos_shell::tema::actual(),
+            bookos_shell::tema::acento_actual(),
+        );
+        if let Some(shell) = state.shell.as_mut() {
+            shell.aplicar_apariencia(tema, acento);
+        }
+        let viejos = componer(state, renderer, output);
+        state.fundido = crate::fundido::Fundido::fotografiar(renderer, &viejos, output);
+        if let Some(shell) = state.shell.as_mut() {
+            shell.aplicar_apariencia(nuevo.0, nuevo.1);
+            // Reponer el nuevo lo vuelve a apuntar como un cambio: ya está
+            // fotografiado.
+            shell.tema_anterior = None;
+        }
+    }
+    let mut elementos = componer(state, renderer, output);
+    if state.fundido.as_ref().is_some_and(|f| f.terminado()) {
+        state.fundido = None;
+    }
+    if let (Some(fundido), Some(contexto)) = (state.fundido.as_ref(), state.contexto_gl.as_ref()) {
+        elementos.insert(0, OverlayElement::Textura(fundido.elemento(contexto)));
+    }
+    elementos
+}
+
+/// La escena de un fotograma, de delante hacia atrás.
+fn componer(
+    state: &mut BookosComp,
+    renderer: &mut GlesRenderer,
+    output: &Output,
+) -> Vec<OverlayElement> {
+    if std::mem::take(&mut state.fondo_cristal_pendiente)
+        && let (Some(fondo), Some(cristal)) = (state.fondo.as_ref(), state.cristal.as_ref())
+    {
+        let (rgba, tam) = fondo.rgba();
+        cristal.borrow_mut().preparar(renderer, rgba, tam);
+        state.cristal_commit.increment();
+    }
     let scale = output.current_scale().fractional_scale();
     let cursor_en = (
         state.pointer_location.x * scale,
@@ -227,35 +280,44 @@ pub fn escena(
         // tiene el puntero, que es sobre la que van a actuar el clic y el
         // gesto. Mezclar las ventanas de los dos monitores en las mismas
         // miniaturas no describiría ningún estado que exista.
-        let salida_vista = crate::escritorios::salida_para_vista(state);
-        let escritorios = crate::escritorios::ventanas_para_vista(state, &salida_vista);
-        let (pantalla_w, pantalla_h) = state.pantalla_logica();
-        for (i, (ventanas, hueco)) in escritorios.iter().zip(huecos).enumerate() {
-            let factor = (hueco.size.w as f64 / pantalla_w.max(1.0) as f64)
-                .min(hueco.size.h as f64 / pantalla_h.max(1.0) as f64);
+        let colocadas = crate::escritorios::ventanas_en_vista(state);
+        let arrastrada = state
+            .arrastre_vista
+            .as_ref()
+            .filter(|a| a.moviendo)
+            .map(|a| (a.window.clone(), a.rect(state.pointer_location)));
+        // La que se lleva el puntero va delante de todo lo de la vista, y sale
+        // de su miniatura mientras tanto: verla en los dos sitios diría que se
+        // está copiando, no moviendo.
+        if let Some((window, destino)) = arrastrada.as_ref() {
+            elementos.extend(constrain_space_element::<GlesRenderer, _, OverlayElement>(
+                renderer,
+                window,
+                destino.loc,
+                1.0,
+                Scale::from(scale),
+                *destino,
+                ConstrainBehavior {
+                    reference: ConstrainReference::Geometry,
+                    behavior: ConstrainScaleBehavior::Fit,
+                    align: ConstrainAlign::CENTER,
+                },
+            ));
+        }
+        for (i, hueco) in huecos.into_iter().enumerate() {
             // El orden original se conserva: la última ventana del Space es
             // la que está arriba, y los elementos se entregan de delante atrás.
-            for (window, posicion) in ventanas.iter().rev() {
-                let geo = window.geometry();
-                let destino = Rectangle::new(
-                    (
-                        hueco.loc.x + (posicion.x as f64 * factor).round() as i32,
-                        hueco.loc.y + (posicion.y as f64 * factor).round() as i32,
-                    )
-                        .into(),
-                    (
-                        (geo.size.w as f64 * factor).round().max(1.0) as i32,
-                        (geo.size.h as f64 * factor).round().max(1.0) as i32,
-                    )
-                        .into(),
-                );
+            for (_, window, destino) in colocadas.iter().rev().filter(|(e, _, _)| *e == i) {
+                if arrastrada.as_ref().is_some_and(|(w, _)| w == window) {
+                    continue;
+                }
                 elementos.extend(constrain_space_element::<GlesRenderer, _, OverlayElement>(
                     renderer,
                     window,
                     destino.loc,
                     1.0,
                     Scale::from(scale),
-                    destino,
+                    *destino,
                     ConstrainBehavior {
                         reference: ConstrainReference::Geometry,
                         behavior: ConstrainScaleBehavior::Fit,
@@ -266,22 +328,103 @@ pub fn escena(
             // Y detrás de sus ventanas, el fondo de pantalla: es lo que hace
             // que un escritorio vacío se vea como un escritorio y no como un
             // agujero negro en la franja.
-            if let Some(fondo) = state.fondo.as_ref() {
-                if let Some(elemento) = fondo.miniatura(
+            if let Some(fondo) = state.fondo.as_ref()
+                && let Some(elemento) = fondo.miniatura(
                     renderer,
                     i,
                     (hueco.loc.x as f64 * scale, hueco.loc.y as f64 * scale),
                     (hueco.size.w, hueco.size.h),
-                ) {
-                    elementos.push(OverlayElement::Memory(elemento));
-                }
+                )
+            {
+                elementos.push(OverlayElement::Memory(elemento));
             }
         }
     }
 
-    if completa && !vista_escritorios {
-        if let Some(elemento) = state.shell.as_ref().and_then(|s| s.menu_ventana_element(renderer)) {
-            elementos.push(OverlayElement::Memory(elemento));
+    // Las del escritorio actual, repartidas bajo la franja. Van fuera del
+    // `if` de la vista porque también se pintan mientras se cierra, volviendo
+    // a su sitio.
+    let expuestas = crate::escritorios::expuestas_ahora(state, vista_escritorios);
+    let arrastrada_vista = state
+        .arrastre_vista
+        .as_ref()
+        .filter(|a| a.moviendo)
+        .map(|a| a.window.clone());
+    for (window, destino) in expuestas.iter().rev() {
+        if arrastrada_vista.as_ref() == Some(window) {
+            continue;
+        }
+        // Con su barra de título, a la misma escala: sin ella, una ventana
+        // decorada por BookOS se veía sin nombre y no se sabía cuál era.
+        if crate::decoracion::decorada(window)
+            && let Some(id) = crate::decoracion::id(window)
+        {
+            let geo = window.geometry().size;
+            let factor = destino.size.w as f64 / geo.w.max(1) as f64;
+            let alto = (crate::decoracion::ALTO as f64 * factor).round() as i32;
+            let esquina = Point::<i32, Logical>::from((destino.loc.x, destino.loc.y - alto))
+                .to_f64()
+                .to_physical_precise_round(scale);
+            let estado = crate::decoracion::estado_de(state, window);
+            if let Some(shell) = state.shell.as_mut()
+                && let Some(barra) = shell.barra_ventana(renderer, id, geo.w, estado, esquina, 1.0)
+            {
+                elementos.push(OverlayElement::MemoriaEscalada(
+                    RescaleRenderElement::from_element(
+                        barra,
+                        esquina.to_i32_round(),
+                        Scale::from(factor),
+                    ),
+                ));
+            }
+        }
+        elementos.extend(constrain_space_element::<GlesRenderer, _, OverlayElement>(
+            renderer,
+            window,
+            destino.loc,
+            1.0,
+            Scale::from(scale),
+            *destino,
+            ConstrainBehavior {
+                reference: ConstrainReference::Geometry,
+                behavior: ConstrainScaleBehavior::Fit,
+                align: ConstrainAlign::CENTER,
+            },
+        ));
+    }
+
+    if completa
+        && !vista_escritorios
+        && let Some(elemento) = state
+            .shell
+            .as_ref()
+            .and_then(|s| s.menu_ventana_element(renderer))
+    {
+        elementos.push(OverlayElement::Memory(elemento));
+    }
+    // La capa de captura, y detrás su velo: delante del resto del shell, que
+    // queda atenuado por debajo igual que el escritorio.
+    if let Some(shell) = state
+        .shell
+        .as_ref()
+        .filter(|_| !completa || vista_escritorios)
+    {
+        elementos.extend(
+            shell
+                .captura_elements(renderer)
+                .into_iter()
+                .map(OverlayElement::Memory),
+        );
+        match (state.velo_captura.as_mut(), shell.datos_velo_captura()) {
+            (Some(velo), Some((pantalla, escala, marcado))) => {
+                elementos.push(OverlayElement::Velo(
+                    velo.elemento(pantalla, escala, marcado),
+                ));
+            }
+            (None, Some(_)) => {
+                elementos.extend(shell.velo_captura().into_iter().map(OverlayElement::Color));
+            }
+            (_, None) => {}
         }
     }
     elementos.extend(
@@ -384,29 +527,30 @@ pub fn escena(
     // que dibuja este compositor —copia el framebuffer y lo vuelve a muestrear
     // por cada zona— y el panel y el dock se ven igual de bien con su color
     // plano, que es lo que hacían antes de que existiera.
-    if !completa && !vista_escritorios && !bookos_shell::tema::efectos_reducidos() {
-        if let (Some(cristal), Some(shell)) = (state.cristal.clone(), state.shell.as_ref()) {
-            let zonas = shell.zonas_cristal();
-            // El commit **no** sube por frame: el cristal desenfoca el fondo,
-            // que no cambia. Solo se invalida cuando la barra se mueve, y de eso
-            // se encarga el propio rectángulo del elemento.
-            // Sin fondo subido no hay nada que desenfocar: el panel y el dock
-            // se dibujan con su color, que es lo que hacían antes del cristal.
-            if let Some((textura, fondo_tam)) = cristal.borrow().textura() {
-                let pantalla = (ancho_pantalla, alto_pantalla);
-                for (i, (rect, radio, fuerza)) in zonas.into_iter().enumerate() {
-                    elementos.push(OverlayElement::Cristal(crate::desenfoque::Desenfoque::new(
-                        id_cristal(i),
-                        state.cristal_commit,
-                        rect,
-                        radio,
-                        fondo_tam,
-                        pantalla,
-                        textura.clone(),
-                        cristal.clone(),
-                        fuerza,
-                    )));
-                }
+    if (vista_escritorios || !completa)
+        && !bookos_shell::tema::efectos_reducidos()
+        && let (Some(cristal), Some(shell)) = (state.cristal.clone(), state.shell.as_ref())
+    {
+        let zonas = shell.zonas_cristal();
+        // El commit **no** sube por frame: el cristal desenfoca el fondo,
+        // que no cambia. Solo se invalida cuando la barra se mueve, y de eso
+        // se encarga el propio rectángulo del elemento.
+        // Sin fondo subido no hay nada que desenfocar: el panel y el dock
+        // se dibujan con su color, que es lo que hacían antes del cristal.
+        if let Some((textura, fondo_tam)) = cristal.borrow().textura() {
+            let pantalla = (ancho_pantalla, alto_pantalla);
+            for (i, (rect, radio, fuerza)) in zonas.into_iter().enumerate() {
+                elementos.push(OverlayElement::Cristal(crate::desenfoque::Desenfoque::new(
+                    id_cristal(i),
+                    state.cristal_commit,
+                    rect,
+                    radio,
+                    fondo_tam,
+                    pantalla,
+                    textura.clone(),
+                    cristal.clone(),
+                    fuerza,
+                )));
             }
         }
     }
@@ -415,6 +559,41 @@ pub fn escena(
     // se dibujan, el escritorio se ve por debajo de la pantalla de bloqueo y
     // esta deja de proteger nada. Se comprobó en pantalla — konsole se veía
     // entera detrás del reloj.
+
+    // Las ventanas que se están cerrando, encima de las demás: es la última
+    // imagen de algo que ya no está, y lo que tapaba se ve a través mientras se
+    // desvanece.
+    state.cierres.retain(|c| !c.terminado());
+    if let Some(contexto) = state.contexto_gl.clone().filter(|_| !bloqueado) {
+        for cierre in &state.cierres {
+            if let (Some(barra), Some(ahora), Some(shell)) = (
+                cierre.barra.as_ref(),
+                cierre.barra_ahora(scale),
+                state.shell.as_mut(),
+            ) && let Some(elemento) = shell.barra_ventana(
+                renderer,
+                barra.id,
+                barra.ancho,
+                barra.estado.clone(),
+                ahora.origen,
+                ahora.alfa,
+            ) {
+                elementos.push(OverlayElement::MemoriaEscalada(
+                    RescaleRenderElement::from_element(
+                        elemento,
+                        ahora.centro,
+                        Scale::from(ahora.zoom),
+                    ),
+                ));
+            }
+            elementos.extend(
+                cierre
+                    .elementos(&contexto, scale)
+                    .into_iter()
+                    .map(OverlayElement::Textura),
+            );
+        }
+    }
 
     // Y por último las ventanas, que quedan debajo de todo lo anterior.
     //
@@ -432,6 +611,14 @@ pub fn escena(
             .collect()
     };
     for (window, loc) in ventanas {
+        // Las que están en la rejilla de la vista general, o volviendo de
+        // ella, ya se han pintado allí. Pintarlas también aquí las duplicaba;
+        // con la vista abierta no se notaba solo porque comparten id con su
+        // copia y el damage tracker no volvía a pintar su sitio, que es
+        // casualidad y no garantía.
+        if expuestas.iter().any(|(w, _)| *w == window) {
+            continue;
+        }
         // Una ventana que se va al dock —o que vuelve— manda sobre las demás
         // animaciones: su recorrido, su tamaño y su desvanecido salen de un
         // solo sitio, y mezclarlo con el zoom de entrada daría dos escalas
@@ -442,10 +629,10 @@ pub fn escena(
         // sus superficies. Sin shader se sigue por el camino de abajo, que la
         // encoge sin deformarla.
         if let (Some(e), Some(genio)) = (encogido, state.genio.as_ref()) {
-            if !state.capturas.iter().any(|(w, _)| *w == window) {
-                if let Some(captura) = crate::genio::capturar(renderer, &window, scale) {
-                    state.capturas.push((window.clone(), captura));
-                }
+            if !state.capturas.iter().any(|(w, _)| *w == window)
+                && let Some(captura) = crate::genio::capturar(renderer, &window, scale)
+            {
+                state.capturas.push((window.clone(), captura));
             }
             if let Some((_, captura)) = state.capturas.iter().find(|(w, _)| *w == window) {
                 elementos.push(OverlayElement::Genio(crate::genio::Elemento::new(
@@ -532,33 +719,32 @@ pub fn escena(
                 animada.y - crate::decoracion::ALTO as f64,
             ))
             .to_physical_precise_round(scale);
-            if let (Some(id), Some(shell)) = (id, state.shell.as_mut()) {
-                if let Some(elemento) =
+            if let (Some(id), Some(shell)) = (id, state.shell.as_mut())
+                && let Some(elemento) =
                     shell.barra_ventana(renderer, id, geo.w, barra, origen_barra, alfa)
-                {
-                    // La barra acompaña el ancho, pero mantiene sus 32 px de
-                    // alto durante el resize; escalarla en Y haría que los
-                    // botones engordasen y se separasen del cliente.
-                    let escala_barra = if redimensionando {
-                        Scale::from((escala_ventana.x, zoom_entrada))
-                    } else {
-                        escala_ventana
-                    };
-                    let ancla_barra = if redimensionando {
-                        origen_barra.to_i32_round()
-                    } else {
-                        centro
-                    };
-                    elementos.push(if escala_barra.x == 1.0 && escala_barra.y == 1.0 {
-                        OverlayElement::Memory(elemento)
-                    } else {
-                        OverlayElement::MemoriaEscalada(RescaleRenderElement::from_element(
-                            elemento,
-                            ancla_barra,
-                            escala_barra,
-                        ))
-                    });
-                }
+            {
+                // La barra acompaña el ancho, pero mantiene sus 32 px de
+                // alto durante el resize; escalarla en Y haría que los
+                // botones engordasen y se separasen del cliente.
+                let escala_barra = if redimensionando {
+                    Scale::from((escala_ventana.x, zoom_entrada))
+                } else {
+                    escala_ventana
+                };
+                let ancla_barra = if redimensionando {
+                    origen_barra.to_i32_round()
+                } else {
+                    centro
+                };
+                elementos.push(if escala_barra.x == 1.0 && escala_barra.y == 1.0 {
+                    OverlayElement::Memory(elemento)
+                } else {
+                    OverlayElement::MemoriaEscalada(RescaleRenderElement::from_element(
+                        elemento,
+                        ancla_barra,
+                        escala_barra,
+                    ))
+                });
             }
         }
 
@@ -647,12 +833,11 @@ pub fn escena(
             Some((s, e)) => (s, Some(e)),
             None => (0, None),
         };
-        if let Some(x) = entrante {
-            if let Some(elemento) =
+        if let Some(x) = entrante
+            && let Some(elemento) =
                 fondo.elemento_gemelo_en(renderer, (geo.loc.x + x, geo.loc.y), (lw, lh))
-            {
-                elementos.push(OverlayElement::Memory(elemento));
-            }
+        {
+            elementos.push(OverlayElement::Memory(elemento));
         }
         if let Some(elemento) = fondo.elemento_con_alfa(
             renderer,
@@ -670,21 +855,21 @@ pub fn escena(
     // Y debajo de todo, el fondo que se está yendo. Va el último de la lista
     // —los elementos se apilan de delante hacia atrás— para que el nuevo se
     // mezcle **sobre** él y no al revés.
-    if fundido.is_some() {
-        if let Some((saliente, _)) = state.fondo_saliente.as_ref() {
-            let geo = state
-                .space
-                .output_geometry(output)
-                .unwrap_or_else(|| Rectangle::new((0, 0).into(), (1, 1).into()));
-            // Su buffer propio, no el gemelo: son dos `Fondo` distintos, así
-            // que los identificadores ya son distintos y el seguimiento de daño
-            // los ve como dos rectángulos. Pedir el gemelo aquí sería una
-            // segunda copia de veinte megas para nada.
-            if let Some(elemento) =
-                saliente.elemento_en(renderer, (geo.loc.x, geo.loc.y), (geo.size.w, geo.size.h))
-            {
-                elementos.push(OverlayElement::Memory(elemento));
-            }
+    if fundido.is_some()
+        && let Some((saliente, _)) = state.fondo_saliente.as_ref()
+    {
+        let geo = state
+            .space
+            .output_geometry(output)
+            .unwrap_or_else(|| Rectangle::new((0, 0).into(), (1, 1).into()));
+        // Su buffer propio, no el gemelo: son dos `Fondo` distintos, así
+        // que los identificadores ya son distintos y el seguimiento de daño
+        // los ve como dos rectángulos. Pedir el gemelo aquí sería una
+        // segunda copia de veinte megas para nada.
+        if let Some(elemento) =
+            saliente.elemento_en(renderer, (geo.loc.x, geo.loc.y), (geo.size.w, geo.size.h))
+        {
+            elementos.push(OverlayElement::Memory(elemento));
         }
     }
 
@@ -803,7 +988,7 @@ const DPI_OBJETIVO: f64 = 138.0;
 /// dos backends** y no toca nada de lo que hay dibujando.
 pub fn servir_capturas(state: &mut BookosComp, renderer: &mut GlesRenderer, output: &Output) {
     use smithay::backend::renderer::damage::OutputDamageTracker;
-    use smithay::backend::renderer::{ExportMem, Offscreen, TextureMapping};
+    use smithay::backend::renderer::{ExportMem, Offscreen};
 
     // Solo las de esta salida; las de otra esperan a que le toque dibujar.
     let mias: Vec<usize> = state
@@ -864,7 +1049,9 @@ pub fn servir_capturas(state: &mut BookosComp, renderer: &mut GlesRenderer, outp
 
     // De atrás hacia delante para que quitarlas no mueva los índices que
     // quedan por mirar.
-    let mut resultados: Vec<(crate::captura::Pendiente, Option<(Vec<u8>, bool)>)> = Vec::new();
+    // Píxeles e inversión vertical, o `None` si la copia falló.
+    type Resultado = (crate::captura::Pendiente, Option<(Vec<u8>, bool)>);
+    let mut resultados: Vec<Resultado> = Vec::new();
     for i in mias.into_iter().rev() {
         let pendiente = state.capturas_pantalla.remove(i);
         let mapeo = match renderer.copy_framebuffer(
@@ -885,7 +1072,9 @@ pub fn servir_capturas(state: &mut BookosComp, renderer: &mut GlesRenderer, outp
                 continue;
             }
         };
-        let invertida = TextureMapping::flipped(&mapeo);
+        // Del `Transform` de la salida y no de `TextureMapping::flipped`, que es
+        // una constante: ver `crate::captura::hay_que_voltear`.
+        let invertida = crate::captura::hay_que_voltear(&pendiente.output);
         match renderer.map_texture(&mapeo) {
             // Se copia a un `Vec` en vez de usar el préstamo: el mapeo toma
             // prestado el renderizador y `volcar` no lo necesita, pero
@@ -906,7 +1095,7 @@ pub fn servir_capturas(state: &mut BookosComp, renderer: &mut GlesRenderer, outp
             smithay::backend::allocator::Fourcc::Xrgb8888,
         ) {
             Ok(mapeo) => {
-                let invertida = TextureMapping::flipped(&mapeo);
+                let invertida = crate::captura::hay_que_voltear(output);
                 match renderer.map_texture(&mapeo) {
                     // Aquí sí se pasa el préstamo en vez de copiar a un `Vec`
                     // como hace el bucle de arriba: `emitir` copia a su propio
@@ -956,7 +1145,7 @@ pub fn servir_capturas(state: &mut BookosComp, renderer: &mut GlesRenderer, outp
 /// tanda.
 pub fn servir_captura_propia(state: &mut BookosComp, renderer: &mut GlesRenderer, output: &Output) {
     use smithay::backend::renderer::damage::OutputDamageTracker;
-    use smithay::backend::renderer::{ExportMem, Offscreen, TextureMapping};
+    use smithay::backend::renderer::{ExportMem, Offscreen};
 
     let Some(pedida) = state.captura_pedida else {
         return;
@@ -1026,15 +1215,11 @@ pub fn servir_captura_propia(state: &mut BookosComp, renderer: &mut GlesRenderer
             // vuelta y no cuesta nada más.
             smithay::backend::allocator::Fourcc::Xrgb8888,
         )
-        .and_then(|mapeo| {
-            let invertida = TextureMapping::flipped(&mapeo);
-            renderer
-                .map_texture(&mapeo)
-                .map(|pixeles| (pixeles.to_vec(), invertida))
-        });
+        .and_then(|mapeo| renderer.map_texture(&mapeo).map(<[u8]>::to_vec));
+    let invertida = crate::captura::hay_que_voltear(output);
     drop(framebuffer);
 
-    let (pixeles, invertida) = match leido {
+    let pixeles = match leido {
         Ok(v) => v,
         Err(err) => {
             tracing::error!("no se pudo leer la captura: {err}");
@@ -1044,9 +1229,9 @@ pub fn servir_captura_propia(state: &mut BookosComp, renderer: &mut GlesRenderer
     let (w, h) = (region.size.w as u32, region.size.h as u32);
     // De B,G,R,X a R,G,B,A, y de abajo arriba a arriba abajo si hace falta.
     //
-    // Lo de la vuelta es porque OpenGL tiene el origen en la esquina inferior
-    // izquierda: sin invertir, la captura sale del revés. Se hace aquí y no al
-    // guardar porque el PNG no tiene forma de decir «esto va invertido».
+    // La vuelta depende del `Transform` de la salida, no del readback: ver
+    // `crate::captura::hay_que_voltear`. Se hace aquí y no al guardar porque el
+    // PNG no tiene forma de decir «esto va invertido».
     let fila = w as usize * 4;
     let mut rgba = vec![0u8; fila * h as usize];
     for y in 0..h as usize {
@@ -1191,7 +1376,40 @@ pub fn recargar_fondo(state: &mut BookosComp, renderer: &mut GlesRenderer) {
         state.fondo_saliente = Some((anterior, std::time::Instant::now()));
     }
     state.fondo = Some(fondo);
+    programar_fondo_animado(state);
     state.needs_redraw = true;
+}
+
+/// Deja un único temporizador en el instante del siguiente fotograma.
+///
+/// Tras marcar el redibujo espera 16 ms: para entonces `avanzar_animaciones`
+/// ya ha decodificado el fotograma y ha dejado programado su retraso real. Así
+/// no hay un sondeo a 60 Hz mientras un WebP enseña un fotograma durante 5 s.
+pub fn programar_fondo_animado(state: &mut BookosComp) {
+    if let Some(token) = state.tick_fondo.take() {
+        state.loop_handle.remove(token);
+    }
+    let Some(espera) = state.fondo.as_ref().and_then(|f| f.hasta_siguiente()) else {
+        return;
+    };
+    let resultado = state
+        .loop_handle
+        .insert_source(Timer::from_duration(espera), |_, _, state| {
+            let Some(espera) = state.fondo.as_ref().and_then(|f| f.hasta_siguiente()) else {
+                state.tick_fondo = None;
+                return TimeoutAction::Drop;
+            };
+            if espera.is_zero() {
+                state.needs_redraw = true;
+                TimeoutAction::ToDuration(std::time::Duration::from_millis(16))
+            } else {
+                TimeoutAction::ToDuration(espera)
+            }
+        });
+    match resultado {
+        Ok(token) => state.tick_fondo = Some(token),
+        Err(err) => tracing::warn!(%err, "no se pudo programar el fondo animado"),
+    }
 }
 
 /// Cuánto dura el fundido entre dos fondos.
@@ -1320,58 +1538,6 @@ pub fn escala_sugerida(px: (i32, i32), mm: (i32, i32)) -> f64 {
     // Por debajo de 1 no se baja: encoger el escritorio no arregla ninguna
     // pantalla, y sí rompe el panel, que tiene alturas pensadas en lógicos.
     escala.clamp(1.0, 3.0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::escala_sugerida;
-
-    #[test]
-    fn esta_pantalla_pide_el_175_por_ciento() {
-        // El Book5 Pro: 2880×1800 en 300×190 mm, leído con `--drm-info`. 175 %
-        // es lo que se elige a mano en KDE en esta misma máquina, y es el caso
-        // contra el que está calibrada la constante.
-        assert_eq!(escala_sugerida((2880, 1800), (300, 190)), 1.75);
-    }
-
-    #[test]
-    fn las_pantallas_normales_se_quedan_al_cien() {
-        // Un portátil de 15,6" a 1080p y un monitor de 27" a 1440p: los dos
-        // rondan los 110-140 DPI y no necesitan escalado. Si alguno de estos dos
-        // sale a 1,25, el escritorio se ve enorme en media España.
-        assert_eq!(escala_sugerida((1920, 1080), (345, 194)), 1.0);
-        assert_eq!(escala_sugerida((2560, 1440), (597, 336)), 1.0);
-    }
-
-    #[test]
-    fn el_4k_sube_segun_el_tamano_del_panel() {
-        // El mismo número de píxeles pide cosas distintas según cuánto midan:
-        // en 27" basta un cuarto más, en un portátil de 15,6" hace falta el
-        // doble. Es justo lo que se pierde al cablear una escala fija.
-        assert_eq!(escala_sugerida((3840, 2160), (597, 336)), 1.25);
-        assert_eq!(escala_sugerida((3840, 2160), (345, 194)), 2.0);
-    }
-
-    #[test]
-    fn sin_tamano_fisico_no_se_inventa_nada() {
-        // Proyectores y algunas KVM anuncian 0×0. Deducir una escala de un dato
-        // que no existe es peor que quedarse en la que siempre funciona.
-        assert_eq!(escala_sugerida((1920, 1080), (0, 0)), 1.0);
-        assert_eq!(escala_sugerida((0, 0), (300, 190)), 1.0);
-    }
-
-    #[test]
-    fn siempre_sale_un_cuarto_exacto() {
-        // De esto depende que los tamaños en lógicos caigan redondos. Se barren
-        // pantallas plausibles en vez de un par de casos elegidos.
-        for ancho in [1366, 1920, 2256, 2880, 3840] {
-            for mm in [200, 250, 300, 345, 600] {
-                let e = escala_sugerida((ancho, ancho * 10 / 16), (mm, mm * 10 / 16));
-                assert_eq!(e * 4.0, (e * 4.0).round(), "{ancho}px en {mm}mm da {e}");
-                assert!((1.0..=3.0).contains(&e));
-            }
-        }
-    }
 }
 
 /// Programa el siguiente repintado del panel.
@@ -1551,6 +1717,7 @@ pub fn programar_dpms_bloqueo(state: &mut BookosComp) {
 pub fn despertar_dpms(state: &mut BookosComp) {
     if !state.dpms_encendido {
         cambiar_dpms(state, true);
+        crate::brillo_auto::evaluar(state);
         state.needs_redraw = true;
     }
     if state
@@ -1581,7 +1748,10 @@ fn cambiar_dpms(state: &mut BookosComp, encendido: bool) {
 
 /// Relee los estados y marca repintado **solo** si algo cambió de verdad.
 fn tarjeta_brillo_abierta(state: &BookosComp) -> bool {
-    state.shell.as_ref().is_some_and(|s| matches!(s.emergente_nombre(), Some("brillo" | "centro")))
+    state
+        .shell
+        .as_ref()
+        .is_some_and(|s| matches!(s.emergente_nombre(), Some("brillo" | "centro")))
 }
 
 fn refresh_panel(state: &mut BookosComp) {
@@ -1663,6 +1833,58 @@ pub fn watch_hardware(state: &mut BookosComp) {
         });
     if let Err(err) = result {
         tracing::error!("no se pudo escuchar los cambios de hardware: {err}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escala_sugerida;
+
+    #[test]
+    fn esta_pantalla_pide_el_175_por_ciento() {
+        // El Book5 Pro: 2880×1800 en 300×190 mm, leído con `--drm-info`. 175 %
+        // es lo que se elige a mano en KDE en esta misma máquina, y es el caso
+        // contra el que está calibrada la constante.
+        assert_eq!(escala_sugerida((2880, 1800), (300, 190)), 1.75);
+    }
+
+    #[test]
+    fn las_pantallas_normales_se_quedan_al_cien() {
+        // Un portátil de 15,6" a 1080p y un monitor de 27" a 1440p: los dos
+        // rondan los 110-140 DPI y no necesitan escalado. Si alguno de estos dos
+        // sale a 1,25, el escritorio se ve enorme en media España.
+        assert_eq!(escala_sugerida((1920, 1080), (345, 194)), 1.0);
+        assert_eq!(escala_sugerida((2560, 1440), (597, 336)), 1.0);
+    }
+
+    #[test]
+    fn el_4k_sube_segun_el_tamano_del_panel() {
+        // El mismo número de píxeles pide cosas distintas según cuánto midan:
+        // en 27" basta un cuarto más, en un portátil de 15,6" hace falta el
+        // doble. Es justo lo que se pierde al cablear una escala fija.
+        assert_eq!(escala_sugerida((3840, 2160), (597, 336)), 1.25);
+        assert_eq!(escala_sugerida((3840, 2160), (345, 194)), 2.0);
+    }
+
+    #[test]
+    fn sin_tamano_fisico_no_se_inventa_nada() {
+        // Proyectores y algunas KVM anuncian 0×0. Deducir una escala de un dato
+        // que no existe es peor que quedarse en la que siempre funciona.
+        assert_eq!(escala_sugerida((1920, 1080), (0, 0)), 1.0);
+        assert_eq!(escala_sugerida((0, 0), (300, 190)), 1.0);
+    }
+
+    #[test]
+    fn siempre_sale_un_cuarto_exacto() {
+        // De esto depende que los tamaños en lógicos caigan redondos. Se barren
+        // pantallas plausibles en vez de un par de casos elegidos.
+        for ancho in [1366, 1920, 2256, 2880, 3840] {
+            for mm in [200, 250, 300, 345, 600] {
+                let e = escala_sugerida((ancho, ancho * 10 / 16), (mm, mm * 10 / 16));
+                assert_eq!(e * 4.0, (e * 4.0).round(), "{ancho}px en {mm}mm da {e}");
+                assert!((1.0..=3.0).contains(&e));
+            }
+        }
     }
 }
 

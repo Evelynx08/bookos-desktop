@@ -210,6 +210,11 @@ impl Compartido {
         poner("live_apply", Value::from(true));
         // `teclas.conf`: GetKeyRemaps, ApplyKeyRemaps y CaptureKey.
         poner("key_remap", Value::from(true));
+        // Hay sensor de luz: Settings puede ofrecer `brillo_automatico_*`.
+        poner(
+            "ambient_light",
+            Value::from(bookos_shell::retroiluminacion::hay_sensor_luz()),
+        );
         poner("fractional_scale", Value::from(true));
         poner("per_output_scale", Value::from(true));
         // El modelo entiende un escritorio lógico bidimensional aunque el
@@ -277,16 +282,16 @@ pub fn transformacion(t: &str) -> Option<smithay::utils::Transform> {
 
 /// El nombre de un `Transform`, para el camino de vuelta.
 pub fn nombre_transformacion(t: smithay::utils::Transform) -> &'static str {
-    use smithay::utils::Transform::*;
+    use smithay::utils::Transform as T;
     match t {
-        Normal => "normal",
-        _90 => "90",
-        _180 => "180",
-        _270 => "270",
-        Flipped => "flipped",
-        Flipped90 => "flipped-90",
-        Flipped180 => "flipped-180",
-        Flipped270 => "flipped-270",
+        T::Normal => "normal",
+        T::_90 => "90",
+        T::_180 => "180",
+        T::_270 => "270",
+        T::Flipped => "flipped",
+        T::Flipped90 => "flipped-90",
+        T::Flipped180 => "flipped-180",
+        T::Flipped270 => "flipped-270",
     }
 }
 
@@ -300,6 +305,24 @@ fn gira_un_cuarto(t: &str) -> bool {
 /// Se redondea hacia arriba y no al entero más próximo: a la baja, una pantalla
 /// de 2880 px a 1,75 daría 1645 lógicos y la última fila de píxeles físicos no
 /// tendría a nadie que la pintara.
+/// El nombre que ve el usuario. El del conector —`HDMI-A-1`, `eDP-1`— es el
+/// del kernel y no dice qué monitor es; el modelo del EDID sí. El panel
+/// interno se llama por lo que es, porque su EDID suele traer un código de
+/// pieza (`ATNA40YK`) que nadie reconoce.
+pub fn nombre_visible(conector: &str, modelo: &str) -> String {
+    let interno = ["eDP", "LVDS", "DSI"]
+        .iter()
+        .any(|prefijo| conector.starts_with(prefijo));
+    if interno {
+        "Pantalla integrada".into()
+    } else if modelo.is_empty() || modelo == "KMS" {
+        // "KMS" es el relleno de `udev.rs` cuando no hay EDID.
+        conector.into()
+    } else {
+        modelo.into()
+    }
+}
+
 pub fn tamano_logico(ancho: u32, alto: u32, escala: f64, transformacion: &str) -> (i32, i32) {
     let (w, h) = if gira_un_cuarto(transformacion) {
         (alto, ancho)
@@ -466,10 +489,10 @@ fn salidas_conectadas(a: &Peticion, b: &Peticion) -> bool {
 /// la primera encendida. Se hace después de validar para que el hueco no se
 /// confunda con un error.
 pub fn normalizar(peticion: &mut [Peticion]) {
-    if !peticion.iter().any(|p| p.principal && p.activa) {
-        if let Some(p) = peticion.iter_mut().find(|p| p.activa) {
-            p.principal = true;
-        }
+    if !peticion.iter().any(|p| p.principal && p.activa)
+        && let Some(p) = peticion.iter_mut().find(|p| p.activa)
+    {
+        p.principal = true;
     }
 
     // El origen del escritorio siempre es la principal. Así las superficies
@@ -713,10 +736,10 @@ pub fn aplicar(
             // Volver atrás con lo que sí funcionaba. Si tampoco se puede, no
             // hay nada más que hacer aquí: se avisa y se deja el hardware como
             // esté, que es lo que el usuario está viendo.
-            if !anterior.is_empty() {
-                if let Err(err2) = aplicador(&anterior) {
-                    tracing::error!("no se pudo volver a la configuración anterior: {err2}");
-                }
+            if !anterior.is_empty()
+                && let Err(err2) = aplicador(&anterior)
+            {
+                tracing::error!("no se pudo volver a la configuración anterior: {err2}");
             }
             state.pantallas.ultima = anterior;
             state.aplicar_pantallas = Some(aplicador);
@@ -889,6 +912,15 @@ pub fn tras_aplicar(state: &mut crate::state::BookosComp, aplicado: Aplicado) {
 
 #[cfg(test)]
 mod pruebas {
+
+    #[test]
+    fn el_monitor_se_llama_por_su_modelo_y_no_por_el_conector() {
+        assert_eq!(nombre_visible("eDP-1", "ATNA40YK"), "Pantalla integrada");
+        assert_eq!(nombre_visible("HDMI-A-1", "DELL U2720Q"), "DELL U2720Q");
+        assert_eq!(nombre_visible("DP-2", "KMS"), "DP-2");
+        assert_eq!(nombre_visible("DP-3", ""), "DP-3");
+    }
+
     use super::*;
 
     fn modo(ancho: u32, alto: u32, hz: u32, actual: bool) -> Modo {

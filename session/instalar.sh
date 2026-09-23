@@ -23,7 +23,7 @@ if [ -e /etc/pam.d/system-auth ]; then
 elif [ -e /etc/pam.d/common-account ]; then
     cuenta_pam=common-account
 else
-    echo "No se reconoce la política PAM de cuentas; no se instalará el servicio biométrico." >&2
+    echo "No se reconoce la política PAM de cuentas; no se instalarán los servicios de bloqueo." >&2
     cuenta_pam=""
 fi
 for candidate in "$aqui/../target/release/bookos-comp" "$aqui/../target/debug/bookos-comp"; do
@@ -49,17 +49,39 @@ fi
 # era al revés y el paquete instalado quedaba apuntando a /usr/local.
 install -Dm755 "$system_bin" /usr/local/libexec/bookos-system
 install -Dm755 "$comp_bin" /usr/local/bin/bookos-comp
+# Por `mktemp` y no por una ruta fija de /tmp: esto corre como root, y un
+# `> /tmp/nombre-que-se-sabe` lo puede haber dejado preparado cualquiera como
+# enlace a un fichero del sistema, que es entonces lo que se sobrescribe. Los
+# ficheros PAM de más abajo ya lo hacían así.
+temporal_unidad="$(mktemp)"
 sed 's|/usr/libexec/bookos-system|/usr/local/libexec/bookos-system|' \
-    "$aqui/org.bookos.System1.service" > /tmp/org.bookos.System1.service
-install -Dm644 /tmp/org.bookos.System1.service /usr/local/share/dbus-1/services/org.bookos.System1.service
+    "$aqui/org.bookos.System1.service" > "$temporal_unidad"
+install -Dm644 "$temporal_unidad" /usr/local/share/dbus-1/services/org.bookos.System1.service
 sed 's|/usr/libexec/bookos-system|/usr/local/libexec/bookos-system|' \
-    "$aqui/bookos-system.service" > /tmp/bookos-system.service
-install -Dm644 /tmp/bookos-system.service /usr/local/lib/systemd/user/bookos-system.service
-rm -f /tmp/org.bookos.System1.service /tmp/bookos-system.service
+    "$aqui/bookos-system.service" > "$temporal_unidad"
+install -Dm644 "$temporal_unidad" /usr/local/lib/systemd/user/bookos-system.service
+rm -f -- "$temporal_unidad"
+# El target que declara la sesión gráfica. Sin él no arranca el portal: ver el
+# comentario de bookos-session.target.
+install -Dm644 "$aqui/bookos-session.target" /usr/local/lib/systemd/user/bookos-session.target
 
 install -Dm755 "$aqui/bookos-session" /usr/local/bin/bookos-session
 install -Dm644 "$aqui/bookos-recovery.py" /usr/local/libexec/bookos-recovery.py
 install -Dm644 "$aqui/bookos.desktop" /usr/share/wayland-sessions/bookos.desktop
+# Lanzadores del launchpad: solo la entrada, no el binario —cada app de
+# BookOS se instala por su cuenta y esto es lo que la hace aparecer en el
+# launchpad y resolverle el icono. Si la app en sí no está instalada, el
+# lanzador queda ahí sin más: el mismo trato que le da freedesktop a
+# cualquier .desktop huérfano.
+for lanzador in "$aqui"/../data/applications/*.desktop; do
+    install -Dm644 "$lanzador" "/usr/local/share/applications/$(basename "$lanzador")"
+done
+if [ -n "$cuenta_pam" ] && [ ! -e /etc/pam.d/bookos ]; then
+    temporal_pam="$(mktemp)"
+    sed "s/account include system-auth/account include $cuenta_pam/" "$aqui/bookos.pam" > "$temporal_pam"
+    install -Dm644 "$temporal_pam" /etc/pam.d/bookos
+    rm -f -- "$temporal_pam"
+fi
 if [ -n "$cuenta_pam" ] && [ ! -e /etc/pam.d/bookos-fingerprint ]; then
     temporal_pam="$(mktemp)"
     sed "s/account include system-auth/account include $cuenta_pam/" "$aqui/bookos-fingerprint.pam" > "$temporal_pam"

@@ -47,29 +47,47 @@ impl Red {
 
     fn aplicar(&mut self, data: Value, error: Option<String>) -> bool {
         let status = error.or_else(|| data.is_null().then(|| "Cargando…".into()));
-        if self.ultimo == data && self.estado_carga == status { return false; }
+        if self.ultimo == data && self.estado_carga == status {
+            return false;
+        }
         self.estado_carga = status;
         self.encendida = data["enabled"].as_bool().unwrap_or(false);
-        self.entradas = data["networks"].as_array().into_iter().flatten().take(MAXIMO).map(|n| {
-            let signal = n["signal"].as_u64().unwrap_or(0);
-            let active = n["active"].as_bool().unwrap_or(false);
-            Entrada { nombre: n["ssid"].as_str().unwrap_or_default().into(),
-                icono: icono::propio(if active || signal >= 40 { "wifi" } else { "sin-red" }),
-                estado: if active { "Conectado".into() } else { String::new() },
-                derecha: Some(format!("{signal}%")), activa: active }
-        }).collect();
+        self.entradas = data["networks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(MAXIMO)
+            .map(|n| {
+                let signal = n["signal"].as_u64().unwrap_or(0);
+                let active = n["active"].as_bool().unwrap_or(false);
+                Entrada {
+                    nombre: n["ssid"].as_str().unwrap_or_default().into(),
+                    icono: icono::propio(if active || signal >= 40 {
+                        "wifi"
+                    } else {
+                        "sin-red"
+                    }),
+                    estado: if active {
+                        "Conectado".into()
+                    } else {
+                        String::new()
+                    },
+                    derecha: Some(format!("{signal}%")),
+                    activa: active,
+                }
+            })
+            .collect();
         self.interruptor.ir_a(self.encendida as u8 as f32);
         self.ultimo = data;
         true
     }
 
-    /// El alto reservado. El `MARGEN` final es el de abajo de la tarjeta:
-    /// `y_lista` solo lleva el de arriba, y sin él el pie se quedaba fuera del
-    /// buffer y se pintaba como dos rayas contra el borde.
+    /// El alto reservado: la lista y el pie van dentro del grupo, así que al
+    /// final se suman su relleno de abajo y el margen de la tarjeta.
     pub fn size(&self) -> (f32, f32) {
         (
             lista::ANCHO,
-            self.y_lista() + self.alto_lista() + 10.0 + lista::PIE + lista::MARGEN,
+            self.y_lista() + self.alto_lista() + lista::PIE + control::GRUPO + lista::MARGEN,
         )
     }
 
@@ -78,8 +96,9 @@ impl Red {
         n * lista::FILA + (n - 1.0) * lista::HUECO_FILA
     }
 
+    /// La `y` de la primera fila: bajo la cabecera y dentro del grupo.
     fn y_lista(&self) -> f32 {
-        lista::MARGEN + lista::CABECERA
+        lista::MARGEN + lista::CABECERA + lista::BAJO_CABECERA + control::GRUPO
     }
 
     pub fn ancla(&self) -> Ancla {
@@ -104,22 +123,19 @@ impl Red {
 
     /// Sobre qué botón del pie cae el punto.
     fn pie_en(&self, x: f32, y: f32) -> Option<bool> {
-        let y0 = self.y_lista() + self.alto_lista() + 10.0 + lista::PIE_AIRE;
-        if y < y0 || y > y0 + lista::PIE_BOTON {
-            return None;
-        }
-        let mitad = lista::ANCHO / 2.0;
-        (x > lista::MARGEN && x < lista::ANCHO - lista::MARGEN).then(|| x > mitad)
+        lista::pie_en(x, y, self.y_lista() + self.alto_lista() + lista::PIE_AIRE)
     }
 
     pub fn pulsar(&mut self, x: f32, y: f32) -> Option<Accion> {
         if self.pie_en(x, y).is_some() {
-            return Some(Accion::Lanzar("bookos-settings --red".into()));
+            return Some(Accion::Lanzar("bookos-settings --page wifi".into()));
         }
         let i = lista::fila_en(x, y, self.y_lista(), self.entradas.len())?;
-        if self.entradas[i].activa { return None; }
+        if self.entradas[i].activa {
+            return None;
+        }
         // Settings owns the credentials UI; never put SSIDs or passwords in shell code.
-        Some(Accion::Lanzar("bookos-settings --wifi".into()))
+        Some(Accion::Lanzar("bookos-settings --page wifi".into()))
     }
 
     pub fn tecla(&mut self, tecla: crate::TeclaPulsada) -> Tecla {
@@ -135,23 +151,29 @@ impl Red {
     }
 
     pub fn view(&self) -> PanelElement<'_> {
-        let mut contenido = column![lista::cabecera("Wi-Fi", Some(self.interruptor.valor()))];
+        let mut filas = column![];
+        let cabecera = lista::cabecera("Wi-Fi", Some(self.interruptor.valor()));
         if let Some(status) = &self.estado_carga {
-            contenido = contenido.push(lista::vacia(status));
+            filas = filas.push(lista::vacia(status));
         } else if self.entradas.is_empty() {
-            contenido = contenido.push(lista::vacia("No hay redes a la vista"));
+            filas = filas.push(lista::vacia("No hay redes a la vista"));
         } else {
             for (i, entrada) in self.entradas.iter().enumerate() {
                 if i > 0 {
-                    contenido =
-                        contenido.push(Space::new().height(Length::Fixed(lista::HUECO_FILA)));
+                    filas = filas.push(Space::new().height(Length::Fixed(lista::HUECO_FILA)));
                 }
-                contenido = contenido.push(lista::fila(entrada, self.señalada.intensidad(i)));
+                filas = filas.push(lista::fila(entrada, self.señalada.intensidad(i)));
             }
         }
-        contenido = contenido
-            .push(Space::new().height(Length::Fixed(10.0)))
-            .push(lista::pie("Detalles", "Configuración", &self.pie));
+        let contenido = column![
+            cabecera,
+            Space::new().height(Length::Fixed(lista::BAJO_CABECERA)),
+            lista::grupo(
+                filas
+                    .push(lista::pie("Detalles", "Configuración", &self.pie))
+                    .into()
+            ),
+        ];
         control::tarjeta(contenido.into(), lista::ANCHO, lista::MARGEN)
     }
 }

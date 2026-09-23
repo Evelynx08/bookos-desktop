@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Bloc de notas
+Comment=Editor de texto sencillo de BookOS
+Exec=bookos-notepad %F
+TryExec=bookos-notepad
+Icon=accessories-text-editor
+Type=Application
+Categories=Utility;TextEditor;
+Keywords=notas;texto;editor;notepad;

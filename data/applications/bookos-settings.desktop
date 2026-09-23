@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Ajustes
+Comment=Preferencias del sistema BookOS
+Exec=bookos-settings
+TryExec=bookos-settings
+Icon=bookos-settings
+Type=Application
+Categories=Settings;
+Keywords=ajustes;preferencias;configuracion;settings;

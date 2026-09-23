@@ -1,10 +1,9 @@
 //! Bluetooth almacenado por el cliente del servicio compartido.
 
-
 use crate::icono::{self, Icono};
 use crate::tema;
 use crate::view::{PanelElement, TEXT};
-use crate::widget::Widget;
+use crate::widget::{Cruce, Widget};
 
 /// En qué estado está el adaptador.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +22,7 @@ pub struct Bluetooth {
     estado: Estado,
     icono: Option<Icono>,
     icono_nombre: &'static str,
+    cruce: Cruce,
 }
 
 impl Bluetooth {
@@ -31,6 +31,7 @@ impl Bluetooth {
             estado: Estado::SinAdaptador,
             icono: None,
             icono_nombre: "",
+            cruce: Cruce::default(),
         };
         b.refrescar();
         b
@@ -40,19 +41,35 @@ impl Bluetooth {
         if estado == self.estado {
             return false;
         }
+        let color_previo = self.color();
         self.estado = estado;
         let nombre = match estado {
             Estado::SinAdaptador => "",
             Estado::Apagado => "bluetooth-apagado",
-            Estado::Encendido | Estado::Conectado => "bluetooth",
+            Estado::Encendido => "bluetooth",
+            Estado::Conectado => "bluetooth-conectado",
         };
         if nombre != self.icono_nombre {
-            self.icono = (!nombre.is_empty())
+            let nuevo = (!nombre.is_empty())
                 .then(|| icono::propio(nombre))
                 .flatten();
+            let previo = std::mem::replace(&mut self.icono, nuevo);
+            self.cruce.empezar(previo, color_previo);
             self.icono_nombre = nombre;
         }
         true
+    }
+
+    /// Solo lo conectado va en acento: el azul del sistema de diseño es «esto
+    /// está activo», y un adaptador encendido sin nada enganchado no lo está.
+    /// Antes encendido y conectado salían iguales, en azul, y no había forma de
+    /// saber de un vistazo si los auriculares estaban puestos.
+    fn color(&self) -> iced_core::Color {
+        match self.estado {
+            Estado::Apagado => tema::TEXTO2,
+            Estado::Conectado => tema::acento(),
+            Estado::Encendido | Estado::SinAdaptador => TEXT(),
+        }
     }
 }
 
@@ -67,10 +84,18 @@ impl Widget for Bluetooth {
 
     fn refrescar(&mut self) -> bool {
         let s = bookos_system::snapshot().bluetooth;
-        let estado = if s["present"] != true { Estado::SinAdaptador }
-            else if s["enabled"] != true { Estado::Apagado }
-            else if s["devices"].as_array().is_some_and(|ds| ds.iter().any(|d| d["connected"] == true)) { Estado::Conectado }
-            else { Estado::Encendido };
+        let estado = if s["present"] != true {
+            Estado::SinAdaptador
+        } else if s["enabled"] != true {
+            Estado::Apagado
+        } else if s["devices"]
+            .as_array()
+            .is_some_and(|ds| ds.iter().any(|d| d["connected"] == true))
+        {
+            Estado::Conectado
+        } else {
+            Estado::Encendido
+        };
         self.aplicar(estado)
     }
 
@@ -89,14 +114,30 @@ impl Widget for Bluetooth {
         let Some(ic) = &self.icono else {
             return crate::widget::vacio();
         };
-        // Encendido va en acento, como en el diseño y como en Plasma: el azul
-        // **es** el bluetooth, no una marca de "hay algo conectado". Apagado se
-        // queda en gris, que es lo que distingue de un vistazo.
-        let color = match self.estado {
-            Estado::Apagado => tema::TEXTO2,
-            Estado::Encendido | Estado::Conectado => tema::acento(),
-            Estado::SinAdaptador => TEXT(),
-        };
-        icono::ver_teñido(ic, tema::ICONO_PANEL, Some(color))
+        self.cruce.ver(ic, self.color())
+    }
+
+    fn animando(&self) -> bool {
+        self.cruce.animando()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Encendido y conectado tienen que distinguirse de un vistazo: antes los
+    /// dos salían en acento y con el mismo dibujo.
+    #[test]
+    fn solo_lo_conectado_va_en_acento() {
+        let mut b = Bluetooth::new();
+        b.aplicar(Estado::Encendido);
+        assert_eq!(b.color(), TEXT());
+        assert_eq!(b.icono_nombre, "bluetooth");
+        b.aplicar(Estado::Conectado);
+        assert_eq!(b.color(), tema::acento());
+        assert_eq!(b.icono_nombre, "bluetooth-conectado");
+        b.aplicar(Estado::Apagado);
+        assert_eq!(b.color(), tema::TEXTO2);
     }
 }

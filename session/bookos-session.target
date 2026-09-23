@@ -1,0 +1,24 @@
+# La unidad que le dice a systemd --user que hay una sesión gráfica en marcha.
+#
+# Sin esto, `xdg-desktop-portal.service` **no arranca nunca** en BookOS: su
+# unidad lleva `Requisite=graphical-session.target`, que falla el trabajo en el
+# acto si ese target no está ya activo. El síntoma no parece tener nada que ver
+# con systemd —lo que se ve es que el tema oscuro no llega a las aplicaciones,
+# que no hay diálogo de abrir fichero y que compartir pantalla no va—, y en el
+# registro de la sesión sale como
+# «Could not activate remote peer 'org.freedesktop.portal.Desktop': startup job
+# failed».
+#
+# `graphical-session.target` tiene `RefuseManualStart=yes`, así que no se puede
+# arrancar a mano: solo se activa como dependencia de otro. Esta unidad es ese
+# otro, y es el mismo patrón que usan sway, labwc y Hyprland.
+#
+# `BindsTo` y no `Wants`: al parar esta unidad se para también el target, y con
+# él todo lo que cuelga de `WantedBy=graphical-session.target` —el portal y
+# bookos-system—. Salir de la sesión deja de dejar servicios sueltos por detrás.
+[Unit]
+Description=Sesión gráfica de BookOS
+BindsTo=graphical-session.target
+Wants=graphical-session-pre.target
+After=graphical-session-pre.target
+Before=graphical-session.target

@@ -2,28 +2,49 @@
 //!
 //! Pantalla y teclado se detectan de nuevo al refrescar. Las escrituras
 //! se agrupan en un hilo dedicado para no interrumpir el renderizado.
+//!
+//! Con sensor de luz, cada fila lleva un botón «A» que la deja en manos del
+//! compositor. La tarjeta solo cambia la preferencia: quien lee el sensor y
+//! mueve el brillo es el compositor, que sigue haciéndolo con la tarjeta
+//! cerrada.
 
 use iced_core::alignment::Vertical;
-use iced_core::{Border, Color, Length};
-use iced_widget::{Space, column, container, row, text};
+use iced_core::font::Weight;
+use iced_core::{Border, Length};
+use iced_widget::{Space, column, container, row, stack, text};
 
 use crate::Accion;
+use crate::config::BrilloAutomatico;
 use crate::icono::Icono;
 use crate::tema;
 use crate::view::PanelElement;
 
-use super::control::{self, BOTON, HUECO, MARGEN_AGARRE, PILDORA};
+use super::control::{
+    self, BAJO_ETIQUETA, BOTON, ETIQUETA, FILA_PILDORA, GRUPO, HUECO, ICONO, MARGEN_AGARRE, PILDORA,
+};
+use super::lista::{ANCHO, BAJO_CABECERA, CABECERA, FILA, MARGEN};
 use super::{Ancla, Tecla};
 
-const ANCHO: f32 = 300.0;
-const MARGEN: f32 = 16.0;
-/// Ancho de la píldora dentro de la tarjeta.
-const BARRA: f32 = ANCHO - MARGEN * 2.0 - BOTON - HUECO;
+/// Cuánto más se meten las píldoras que el grupo de abajo: las deja a 20 del
+/// borde, alineadas con el título.
+const SANGRIA: f32 = 4.0;
+/// Ancho del bloque de las píldoras.
+const BLOQUE: f32 = ANCHO - (MARGEN + SANGRIA) * 2.0;
+/// Hueco entre la fila de la pantalla y la etiqueta del teclado.
+const SEPARACION_FILAS: f32 = 14.0;
+/// Lo que ocupa una sección: etiqueta, su aire y la fila de la píldora.
+const SECCION: f32 = ETIQUETA + BAJO_ETIQUETA + FILA_PILDORA;
 
-/// Hueco entre la fila de la pantalla y la del teclado.
-const SEPARACION_FILAS: f32 = 18.0;
-/// Alto de la tarjeta de la luz nocturna, al final.
-const NOCTURNA: f32 = 52.0;
+/// Alto de la línea de ayuda bajo una fila en automático: 6 de aire y 15 de
+/// texto a 11 px.
+const AYUDA: f32 = 21.0;
+/// Lo que tarda la píldora en seguir un cambio que no hizo la mano. El
+/// automático sube en rampa, pero la tarjeta solo se entera de algunos pasos:
+/// sin esto la píldora iría a saltos.
+const D_BARRA: std::time::Duration = std::time::Duration::from_millis(440);
+/// Desde cuánto ajuste a mano se enseña la marca del sensor. Por debajo es
+/// el umbral con el que el propio automático deja de mover la pantalla.
+const UMBRAL_AJUSTE: u8 = 4;
 
 /// Cuánto sube o baja una muesca de rueda o una flecha.
 const PASO: i32 = 5;
@@ -48,7 +69,11 @@ struct Teclado {
 /// atender la tecla XF86: el primer `led` cuyo nombre lleve `kbd_backlight`.
 fn leds_teclado() -> Option<Teclado> {
     let (dispositivo, nivel, maximo) = crate::brillo_teclado_actual()?;
-    Some(Teclado { dispositivo, nivel, maximo })
+    Some(Teclado {
+        dispositivo,
+        nivel,
+        maximo,
+    })
 }
 
 /// Qué píldora se está arrastrando. Sin esto, agarrar la del teclado movía la
@@ -73,6 +98,24 @@ pub struct Brillo {
     /// segunda fila ni se dibuja, en vez de enseñar un control muerto.
     teclado: Option<Teclado>,
     icono_teclado: Option<Icono>,
+    /// Sin sensor no hay botón «A»: uno que no puede hacer nada promete lo que
+    /// no hay, como la luz nocturna de abajo.
+    sensor: bool,
+    automatico: BrilloAutomatico,
+    /// El nivel que pide la luz sin el ajuste a mano, si el compositor lo sabe.
+    objetivo: Option<u8>,
+    /// De qué nivel viene la píldora y desde cuándo, cuando el cambio no lo hizo
+    /// la mano.
+    transicion: Option<(u8, std::time::Instant)>,
+    icono_auto: Option<Icono>,
+    /// El puntero sobre el botón «A» de cada fila: 0 pantalla, 1 teclado.
+    boton: tema::Realce,
+}
+
+#[derive(Clone, Copy)]
+enum Fila {
+    Pantalla,
+    Teclado,
 }
 
 impl Brillo {
@@ -90,32 +133,113 @@ impl Brillo {
             maximo,
             teclado: leds_teclado(),
             icono_teclado: crate::icono::propio("teclado"),
+            sensor: crate::retroiluminacion::hay_sensor_luz(),
+            automatico: crate::retroiluminacion::automatico(),
+            objetivo: crate::retroiluminacion::objetivo_sensor(),
+            transicion: None,
+            icono_auto: crate::icono::propio("brillo-auto"),
+            boton: tema::Realce::nuevo(),
         }
     }
 
     pub fn refrescar(&mut self) -> bool {
-        if self.agarrado() { return false; }
+        if self.agarrado() {
+            return false;
+        }
         let device = crate::backlight();
         let (dispositivo, maximo) = device.map(|(d, m)| (Some(d), m)).unwrap_or((None, 0));
         let nivel = crate::brillo_actual().unwrap_or(0);
         let teclado = leds_teclado();
-        let changed = self.dispositivo != dispositivo || self.maximo != maximo
-            || self.nivel != nivel || self.teclado != teclado;
-        self.dispositivo = dispositivo; self.maximo = maximo;
-        self.nivel = nivel; self.teclado = teclado;
+        let sensor = crate::retroiluminacion::hay_sensor_luz();
+        let automatico = crate::retroiluminacion::automatico();
+        let objetivo = crate::retroiluminacion::objetivo_sensor();
+        if nivel != self.nivel && !tema::efectos_reducidos() {
+            self.transicion = Some((self.nivel_visible(), std::time::Instant::now()));
+        }
+        let changed = self.objetivo != objetivo
+            || self.dispositivo != dispositivo
+            || self.maximo != maximo
+            || self.nivel != nivel
+            || self.teclado != teclado
+            || self.sensor != sensor
+            || self.automatico != automatico;
+        self.dispositivo = dispositivo;
+        self.maximo = maximo;
+        self.nivel = nivel;
+        self.teclado = teclado;
+        self.sensor = sensor;
+        self.automatico = automatico;
+        self.objetivo = objetivo;
         changed
     }
 
+    /// El nivel que dibuja la píldora: el real, o de camino hacia él.
+    fn nivel_visible(&self) -> u8 {
+        match self.transicion {
+            Some((desde, t)) if t.elapsed() < D_BARRA => {
+                let avance = tema::C_ENTRADA.eval(tema::fraccion(t.elapsed(), D_BARRA));
+                (f32::from(desde) + (f32::from(self.nivel) - f32::from(desde)) * avance).round()
+                    as u8
+            }
+            _ => self.nivel,
+        }
+    }
+
+    fn pantalla_automatica(&self) -> bool {
+        self.sensor && self.automatico.pantalla && self.dispositivo.is_some()
+    }
+
+    /// Cuánto se ha movido la pantalla a mano respecto a lo que pide la luz,
+    /// si es bastante para enseñarlo.
+    fn ajuste(&self) -> Option<(u8, i32)> {
+        let objetivo = self.objetivo.filter(|_| self.pantalla_automatica())?;
+        let ajuste = i32::from(self.nivel) - i32::from(objetivo);
+        (ajuste.unsigned_abs() >= u32::from(UMBRAL_AJUSTE)).then_some((objetivo, ajuste))
+    }
+
+    /// La línea gris bajo la pantalla. Corta a propósito: a 11 px caben unos
+    /// 45 caracteres en el ancho de la tarjeta, y una segunda línea movería
+    /// todo lo de abajo.
+    fn ayuda_pantalla(&self) -> Option<String> {
+        if !self.pantalla_automatica() {
+            return None;
+        }
+        Some(match self.ajuste() {
+            Some((_, ajuste)) => format!(
+                "Ajustado {}{} % sobre la luz",
+                if ajuste > 0 { "+" } else { "−" },
+                ajuste.unsigned_abs()
+            ),
+            None => "Sigue la luz ambiente".into(),
+        })
+    }
+
+    fn ayuda_teclado(&self) -> Option<&'static str> {
+        (self.sensor && self.automatico.teclado && self.teclado.is_some())
+            .then_some("Se enciende con poca luz")
+    }
+
+    fn alto_ayuda<T>(ayuda: &Option<T>) -> f32 {
+        if ayuda.is_some() { AYUDA } else { 0.0 }
+    }
+
     pub fn size(&self) -> (f32, f32) {
-        let fila = 18.0 + 8.0 + BOTON;
         let teclado = if self.teclado.is_some() {
-            SEPARACION_FILAS + fila
+            SEPARACION_FILAS + SECCION + Self::alto_ayuda(&self.ayuda_teclado())
         } else {
             0.0
         };
         (
             ANCHO,
-            MARGEN * 2.0 + 22.0 + 14.0 + fila + teclado + SEPARACION_FILAS + NOCTURNA,
+            MARGEN * 2.0
+                + CABECERA
+                + BAJO_CABECERA
+                + SECCION
+                + Self::alto_ayuda(&self.ayuda_pantalla())
+                + teclado
+                + BAJO_CABECERA
+                + GRUPO * 2.0
+                + FILA,
         )
     }
 
@@ -126,19 +250,56 @@ impl Brillo {
     /// El rectángulo de la píldora, relativo a la emergente.
     fn rect_pildora(&self) -> iced_core::Rectangle {
         iced_core::Rectangle {
-            x: MARGEN,
-            y: MARGEN + 22.0 + 14.0 + 18.0 + 8.0 + (BOTON - PILDORA) / 2.0,
-            width: BARRA,
+            x: MARGEN + SANGRIA + ICONO + HUECO,
+            y: MARGEN
+                + CABECERA
+                + BAJO_CABECERA
+                + ETIQUETA
+                + BAJO_ETIQUETA
+                + (FILA_PILDORA - PILDORA) / 2.0,
+            width: control::ancho_pildora(BLOQUE, self.sensor),
             height: PILDORA,
         }
+    }
+
+    /// El botón «A» de una fila, a la derecha de su píldora.
+    fn rect_boton(&self, fila: Fila) -> Option<iced_core::Rectangle> {
+        if !self.sensor {
+            return None;
+        }
+        let p = match fila {
+            Fila::Pantalla => self.rect_pildora(),
+            Fila::Teclado => self.rect_teclado()?,
+        };
+        Some(iced_core::Rectangle {
+            x: p.x + p.width + HUECO,
+            y: p.y - (FILA_PILDORA - PILDORA) / 2.0,
+            width: BOTON,
+            height: BOTON,
+        })
+    }
+
+    pub fn animando(&self) -> bool {
+        self.boton.animando() || self.transicion.is_some_and(|(_, t)| t.elapsed() < D_BARRA)
     }
 
     /// El rectángulo de la píldora del teclado, relativo a la emergente.
     fn rect_teclado(&self) -> Option<iced_core::Rectangle> {
         self.teclado.as_ref()?;
         let mut r = self.rect_pildora();
-        r.y += SEPARACION_FILAS + 18.0 + 8.0 + BOTON;
+        r.y += SECCION + SEPARACION_FILAS + Self::alto_ayuda(&self.ayuda_pantalla());
         Some(r)
+    }
+
+    /// El chip «Config» de la cabecera, pegado a la derecha.
+    fn rect_config(&self) -> iced_core::Rectangle {
+        let ancho = control::ancho_chip("Config");
+        iced_core::Rectangle {
+            x: ANCHO - MARGEN - SANGRIA - ancho,
+            y: MARGEN + (CABECERA - control::CHIP) / 2.0,
+            width: ancho,
+            height: control::CHIP,
+        }
     }
 
     pub fn agarrado(&self) -> bool {
@@ -174,11 +335,15 @@ impl Brillo {
 
     /// Escribe el nivel y lo manda a logind. `true` si cambió.
     fn poner(&mut self, nivel: u8) -> bool {
-        if self.dispositivo.is_none() || self.maximo == 0 { return false; }
+        if self.dispositivo.is_none() || self.maximo == 0 {
+            return false;
+        }
         let nivel = nivel.clamp(MINIMO, 100);
         if nivel == self.nivel {
             return false;
         }
+        // Lo mueve la mano: la píldora va con el dedo, sin perseguirlo.
+        self.transicion = None;
         self.nivel = nivel;
         let (Some(dispositivo), true) = (self.dispositivo.as_deref(), self.maximo > 0) else {
             return true;
@@ -192,10 +357,20 @@ impl Brillo {
     }
 
     pub fn puntero(&mut self, punto: Option<(f32, f32)>) -> bool {
+        if self.agarrada == Agarre::Nada {
+            let sobre = punto.and_then(|(x, y)| {
+                let p = iced_core::Point::new(x, y);
+                [Fila::Pantalla, Fila::Teclado]
+                    .into_iter()
+                    .position(|f| self.rect_boton(f).is_some_and(|r| r.contains(p)))
+            });
+            return self.boton.señalar(sobre);
+        }
         let Some((x, _)) = punto else {
             return false;
         };
-        let nivel = control::nivel_en(x, MARGEN, BARRA);
+        let r = self.rect_pildora();
+        let nivel = control::nivel_en(x, r.x, r.width);
         match self.agarrada {
             Agarre::Nada => false,
             Agarre::Pantalla => self.poner(nivel),
@@ -210,8 +385,21 @@ impl Brillo {
             zona.height += MARGEN_AGARRE * 2.0;
             zona
         };
-        let nivel = control::nivel_en(x, MARGEN, BARRA);
-        if holgada(self.rect_pildora()).contains(punto) {
+        if self.rect_config().contains(punto) {
+            return Some(Accion::Lanzar("bookos-settings --page pantalla".into()));
+        }
+        for fila in [Fila::Pantalla, Fila::Teclado] {
+            if self.rect_boton(fila).is_some_and(|r| r.contains(punto)) {
+                match fila {
+                    Fila::Pantalla => self.automatico.pantalla ^= true,
+                    Fila::Teclado => self.automatico.teclado ^= true,
+                }
+                return Some(Accion::BrilloAutomatico(self.automatico));
+            }
+        }
+        let r = self.rect_pildora();
+        let nivel = control::nivel_en(x, r.x, r.width);
+        if holgada(r).contains(punto) {
             self.agarrada = Agarre::Pantalla;
             self.poner(nivel);
         } else if self
@@ -254,89 +442,214 @@ impl Brillo {
     }
 
     pub fn view(&self) -> PanelElement<'_> {
-        let cabecera = row![
-            text("Pantalla").size(tema::T_PEQUENO).color(tema::TEXTO2),
-            Space::new().width(crate::FILL),
-            text(if self.dispositivo.is_some() { format!("{}%", self.nivel) } else { "No disponible".into() })
-                .size(tema::T_CUERPO)
-                .color(tema::texto()),
-        ];
-        let controles = row![
-            control::pildora(BARRA, self.nivel, self.dispositivo.is_none()),
-            Space::new().width(Length::Fixed(HUECO)),
-            // Sin realce de puntero: este botón no se pulsa —el brillo se
-            // cambia con la píldora— y encenderlo al pasar por encima
-            // prometería una acción que no existe.
-            control::boton(self.icono.as_ref(), self.dispositivo.is_none(), 0.0),
-        ]
-        .align_y(Vertical::Center);
-        let mut contenido = column![
+        let ancho_pildora = control::ancho_pildora(BLOQUE, self.sensor);
+        let boton = |encendido: bool, fila: usize| {
+            self.sensor.then(|| {
+                control::boton(
+                    self.icono_auto.as_ref(),
+                    encendido,
+                    tema::superficie(),
+                    self.boton.intensidad(fila),
+                )
+            })
+        };
+        let cabecera = container(
             row![
-                text("Brillo").size(tema::T_TITULO).color(tema::texto()),
-                Space::new().width(crate::FILL),
-            ]
-            .align_y(Vertical::Center),
-            Space::new().height(Length::Fixed(14.0)),
-            cabecera,
-            Space::new().height(Length::Fixed(8.0)),
-            controles,
-        ];
-        if self.teclado.is_some() {
-            let porciento = self.porciento_teclado();
-            contenido = contenido
-                .push(Space::new().height(Length::Fixed(SEPARACION_FILAS)))
-                .push(row![
-                    text("Teclado").size(tema::T_PEQUENO).color(tema::TEXTO2),
-                    Space::new().width(crate::FILL),
-                    text(format!("{porciento}%"))
-                        .size(tema::T_CUERPO)
-                        .color(tema::texto()),
-                ])
-                .push(Space::new().height(Length::Fixed(8.0)))
-                .push(
-                    row![
-                        control::pildora(BARRA, porciento, false),
-                        Space::new().width(Length::Fixed(HUECO)),
-                        control::boton(self.icono_teclado.as_ref(), porciento == 0, 0.0),
-                    ]
-                    .align_y(Vertical::Center),
-                );
-        }
-        // Estado informativo hasta que haya un control de luz nocturna.
-        let nocturna = container(
-            row![
-                column![
-                    text("Luz nocturna").size(14.0).color(tema::texto()),
-                    text("No disponible").size(tema::T_PEQUENO).color(tema::TEXTO2),
-                ],
-                Space::new().width(crate::FILL),
+                control::titulo("Brillo"),
+                Space::new().width(Length::Fill),
+                control::chip("Config", tema::superficie(), tema::texto()),
             ]
             .align_y(Vertical::Center),
         )
         .width(Length::Fixed(ANCHO - MARGEN * 2.0))
-        .height(Length::Fixed(NOCTURNA))
-        .padding([0, 10])
-        .center_y(Length::Fixed(NOCTURNA))
-        .style(|_theme: &iced_widget::Theme| container::Style {
-            background: Some(
-                Color {
-                    a: 0.05,
-                    ..tema::tinta()
-                }
-                .into(),
+        .height(Length::Fixed(CABECERA))
+        .padding([0, SANGRIA as u16])
+        .center_y(Length::Fixed(CABECERA));
+
+        let valor = if self.dispositivo.is_some() {
+            format!("{} %", self.nivel)
+        } else {
+            "No disponible".into()
+        };
+        let pildora_pantalla = control::pildora(
+            ancho_pildora,
+            PILDORA,
+            self.nivel_visible(),
+            self.dispositivo.is_none(),
+            tema::superficie(),
+        );
+        // La marca de lo que pondría el sensor, solo cuando la mano se ha
+        // apartado de ello: sin ajuste coincidiría con el final del relleno.
+        let pildora_pantalla: PanelElement<'_> = match self.ajuste() {
+            Some((objetivo, _)) => {
+                let x = (ancho_pildora * f32::from(objetivo) / 100.0 - MARCA / 2.0)
+                    .clamp(PILDORA / 2.0, ancho_pildora - PILDORA / 2.0);
+                let marca = container(Space::new())
+                    .width(Length::Fixed(MARCA))
+                    .height(Length::Fixed(PILDORA - 10.0))
+                    .style(|_| container::Style {
+                        background: Some(tema::alfa(tema::texto(), 0.55).into()),
+                        border: Border {
+                            radius: (MARCA / 2.0).into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    });
+                stack![
+                    pildora_pantalla,
+                    container(marca).padding(iced_core::Padding::ZERO.left(x).top(5.0)),
+                ]
+                .into()
+            }
+            None => pildora_pantalla,
+        };
+        let mut bloque = column![
+            etiqueta("Pantalla", valor, self.pantalla_automatica()),
+            Space::new().height(Length::Fixed(BAJO_ETIQUETA)),
+            control::fila_pildora(
+                self.icono.as_ref(),
+                pildora_pantalla,
+                boton(self.automatico.pantalla, 0),
             ),
+        ];
+        if let Some(ayuda) = self.ayuda_pantalla() {
+            bloque = bloque.push(linea_ayuda(ayuda));
+        }
+        if self.teclado.is_some() {
+            let porciento = self.porciento_teclado();
+            let valor = if porciento == 0 {
+                "Apagado".to_string()
+            } else {
+                format!("{porciento} %")
+            };
+            bloque = bloque
+                .push(Space::new().height(Length::Fixed(SEPARACION_FILAS)))
+                .push(etiqueta(
+                    "Teclado",
+                    valor,
+                    self.sensor && self.automatico.teclado,
+                ))
+                .push(Space::new().height(Length::Fixed(BAJO_ETIQUETA)))
+                .push(control::fila_pildora(
+                    self.icono_teclado.as_ref(),
+                    control::pildora(ancho_pildora, PILDORA, porciento, false, tema::superficie()),
+                    boton(self.automatico.teclado, 1),
+                ));
+            if let Some(ayuda) = self.ayuda_teclado() {
+                bloque = bloque.push(linea_ayuda(ayuda.to_string()));
+            }
+        }
+
+        // Estado informativo hasta que haya un control de luz nocturna: sin
+        // interruptor, porque uno que no hace nada promete lo que no hay.
+        let luna = container(match crate::icono::propio("noche") {
+            Some(ic) => crate::icono::ver_teñido_propio(&ic, 16.0, tema::TEXTO2),
+            None => Space::new().width(Length::Fixed(16.0)).into(),
+        })
+        .width(Length::Fixed(control::BOTON))
+        .height(Length::Fixed(control::BOTON))
+        .center_x(Length::Fixed(control::BOTON))
+        .center_y(Length::Fixed(control::BOTON))
+        .style(|_theme: &iced_widget::Theme| container::Style {
+            background: Some(tema::superficie().into()),
             border: Border {
-                radius: tema::R_CONTROL.into(),
+                radius: (control::BOTON / 2.0).into(),
                 ..Default::default()
             },
             ..Default::default()
         });
-        contenido = contenido
-            .push(Space::new().height(Length::Fixed(SEPARACION_FILAS)))
-            .push(nocturna);
+        let nocturna = container(
+            row![
+                luna,
+                Space::new().width(Length::Fixed(12.0)),
+                column![
+                    text("Luz nocturna")
+                        .size(14.0)
+                        .font(control::peso(Weight::Medium))
+                        .color(tema::texto()),
+                    text("No disponible").size(11.0).color(tema::TEXTO2),
+                ],
+            ]
+            .align_y(Vertical::Center),
+        )
+        .width(Length::Fill)
+        .height(Length::Fixed(FILA))
+        .center_y(Length::Fixed(FILA))
+        .padding([0, 12])
+        .style(|_theme: &iced_widget::Theme| container::Style {
+            background: Some(control::baldosa(0.0).into()),
+            border: Border {
+                radius: tema::R_BOTON_PEQUENO.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
 
+        let contenido = column![
+            cabecera,
+            Space::new().height(Length::Fixed(BAJO_CABECERA)),
+            container(bloque).padding([0, SANGRIA as u16]),
+            Space::new().height(Length::Fixed(BAJO_CABECERA)),
+            control::grupo(nocturna.into(), ANCHO - MARGEN * 2.0, GRUPO),
+        ];
         control::tarjeta(contenido.into(), ANCHO, MARGEN)
     }
+}
+
+/// Ancho de la marca del sensor sobre la píldora.
+const MARCA: f32 = 2.0;
+
+/// La etiqueta de encima de una píldora, con la chapa «AUTO» cuando esa fila
+/// va sola. Antes el automático se decía con «Auto · 62 %» en gris, que se
+/// leía como parte del número y se perdía.
+fn etiqueta<'a>(nombre: &'a str, valor: String, automatico: bool) -> PanelElement<'a> {
+    let mut fila = row![
+        text(nombre)
+            .size(13.0)
+            .font(control::peso(Weight::Semibold))
+            .color(tema::texto()),
+        Space::new().width(Length::Fill),
+    ]
+    .align_y(Vertical::Center);
+    if automatico {
+        fila = fila
+            .push(
+                container(
+                    text("AUTO")
+                        .size(10.0)
+                        .font(control::peso(Weight::Bold))
+                        .color(tema::acento()),
+                )
+                .padding([0, 6])
+                .center_y(Length::Fixed(ETIQUETA))
+                .style(|_| container::Style {
+                    background: Some(tema::alfa(tema::acento(), 0.14).into()),
+                    border: Border {
+                        radius: tema::R_CHIP.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+            )
+            .push(Space::new().width(Length::Fixed(6.0)));
+    }
+    container(fila.push(text(valor).size(12.0).color(tema::TEXTO2)))
+        .width(Length::Fixed(BLOQUE))
+        .height(Length::Fixed(ETIQUETA))
+        .center_y(Length::Fixed(ETIQUETA))
+        .into()
+}
+
+/// La línea gris bajo una fila en automático, alineada con la píldora.
+fn linea_ayuda<'a>(ayuda: String) -> PanelElement<'a> {
+    container(text(ayuda).size(11.0).color(tema::TEXTO2))
+        .padding(
+            iced_core::Padding::ZERO
+                .left(ICONO + HUECO)
+                .top(AYUDA - 15.0),
+        )
+        .height(Length::Fixed(AYUDA))
+        .into()
 }
 
 #[cfg(test)]
@@ -360,6 +673,56 @@ mod tests {
         b.nivel = 50;
         b.poner(200);
         assert_eq!(b.nivel, 100);
+    }
+
+    fn automatica(nivel: u8, objetivo: Option<u8>) -> Brillo {
+        let mut b = Brillo::new();
+        b.sensor = true;
+        b.dispositivo = Some("prueba".into());
+        b.automatico.pantalla = true;
+        b.nivel = nivel;
+        b.objetivo = objetivo;
+        b
+    }
+
+    /// La marca y el «Ajustado» solo salen cuando la mano se ha apartado de lo
+    /// que pide la luz más de lo que el automático ignora.
+    #[test]
+    fn el_ajuste_a_mano_se_enseña_desde_el_umbral() {
+        assert_eq!(automatica(52, Some(52)).ajuste(), None);
+        assert_eq!(
+            automatica(55, Some(52)).ajuste(),
+            None,
+            "3 puntos no cuentan"
+        );
+        assert_eq!(automatica(68, Some(52)).ajuste(), Some((52, 16)));
+        assert_eq!(
+            automatica(40, Some(52)).ayuda_pantalla().as_deref(),
+            Some("Ajustado −12 % sobre la luz")
+        );
+        assert_eq!(
+            automatica(68, None).ayuda_pantalla().as_deref(),
+            Some("Sigue la luz ambiente"),
+            "sin lectura del sensor no hay con qué comparar"
+        );
+        let mut sin_sensor = automatica(68, Some(52));
+        sin_sensor.sensor = false;
+        assert_eq!(sin_sensor.ayuda_pantalla(), None);
+    }
+
+    /// La ayuda tiene que caber en una línea: `AYUDA` reserva el alto de una
+    /// sola, y una segunda se saldría por encima de la fila del teclado.
+    #[test]
+    fn la_ayuda_cabe_en_una_linea() {
+        let ancho = BLOQUE - ICONO - HUECO;
+        for texto in [
+            "Sigue la luz ambiente",
+            "Ajustado −60 % sobre la luz",
+            "Se enciende con poca luz",
+        ] {
+            let medido = crate::widget::ancho_de(texto, 11.0);
+            assert!(medido < ancho, "«{texto}» mide {medido} y caben {ancho}");
+        }
     }
 
     #[test]

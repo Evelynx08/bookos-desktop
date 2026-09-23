@@ -65,7 +65,7 @@ impl Sonando {
                 .unwrap_or(&bus)
                 .replace("instance", "")
                 .to_string(),
-            artista: campo(&metadatos, "xesam:artist").unwrap_or_default(),
+            artista: campo(metadatos, "xesam:artist").unwrap_or_default(),
             reproduciendo: estado.contains("Playing"),
             posicion: propiedad(&bus, "Position")
                 .and_then(|s| numero(&s))

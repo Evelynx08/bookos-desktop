@@ -10,10 +10,14 @@ use std::{
 use tokio::sync::{Mutex, oneshot};
 use zbus::{Connection, zvariant::OwnedObjectPath};
 
+/// Petición de emparejamiento en curso: número de secuencia, lo que se enseña
+/// al usuario y por dónde vuelve su respuesta.
+type Pendiente = (u64, Value, oneshot::Sender<Option<String>>);
+
 #[derive(Default)]
 pub struct Broker {
     sequence: AtomicU64,
-    pending: Mutex<Option<(u64, Value, oneshot::Sender<Option<String>>)>>,
+    pending: Mutex<Option<Pendiente>>,
 }
 impl Broker {
     pub async fn current(&self) -> String {

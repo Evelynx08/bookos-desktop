@@ -99,10 +99,12 @@ struct Nodo {
 }
 
 type Nodos = Rc<RefCell<HashMap<u32, Nodo>>>;
+/// Los `Vec` de vuelta, con el nodo al que pertenecían, para reutilizarlos.
+pub type Reciclado = mpsc::Receiver<(u32, Vec<u8>)>;
 
 /// Arranca el hilo. Devuelve por dónde hablarle y por dónde recoger los `Vec`
 /// reciclados.
-pub fn arrancar() -> Option<(Emisor, mpsc::Receiver<(u32, Vec<u8>)>)> {
+pub fn arrancar() -> Option<(Emisor, Reciclado)> {
     let (canal, receptor) = pw::channel::channel::<Orden>();
     let (devolver, reciclado) = mpsc::channel::<(u32, Vec<u8>)>();
 
@@ -256,10 +258,10 @@ fn abrir(
                 // al otro lado, así que se manda en cuanto aparece; el `Sender`
                 // se cierra solo cuando el receptor se va.
                 let id = stream.node_id();
-                if id != pw::constants::ID_ANY {
-                    if let Some(respuesta) = respuesta.take() {
-                        respuesta.entregar(id);
-                    }
+                if id != pw::constants::ID_ANY
+                    && let Some(respuesta) = respuesta.take()
+                {
+                    respuesta.entregar(id);
                 }
                 if matches!(nueva, pw::stream::StreamState::Error(_)) {
                     nodos_estado.borrow_mut().remove(&sesion);
@@ -451,7 +453,7 @@ fn pod_buffers(stride: u32, bytes: u32) -> Vec<u8> {
                 pod::Value::Choice(pod::ChoiceValue::Int(Choice(
                     ChoiceFlags::empty(),
                     ChoiceEnum::Flags {
-                        default: tipos as i32,
+                        default: tipos,
                         flags: Vec::new(),
                     },
                 ))),

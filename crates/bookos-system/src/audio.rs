@@ -119,7 +119,7 @@ fn target(t: &str) -> Result<(&str, &str), String> {
 }
 pub async fn perform(op: &Operation) -> Result<(), String> {
     match op {
-        Operation::Volume { target: t, value } => {
+        Operation::Volume { target: t, value } | Operation::VolumePreview { target: t, value } => {
             if *value > 150 {
                 return Err("Volumen fuera de rango".into());
             }
@@ -149,7 +149,7 @@ pub async fn perform(op: &Operation) -> Result<(), String> {
                 run("pactl", &["set-sink-mute", "@DEFAULT_SINK@", "0"]).await?;
             }
         }
-        Operation::Mute { target: t, muted } => {
+        Operation::Mute { target: t, muted } | Operation::MutePreview { target: t, muted } => {
             let (kind, id) = target(t)?;
             run(
                 "pactl",

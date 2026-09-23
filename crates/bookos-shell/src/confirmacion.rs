@@ -24,7 +24,10 @@ impl Energia {
     }
     pub fn de_accion(accion: &crate::Accion) -> Option<Self> {
         match accion {
-            crate::Accion::Bloquear => Some(Self::Bloquear),
+            // Bloquear no se confirma: no se pierde nada y se deshace con la
+            // contraseña. Preguntarlo convertía Meta+L —que en cualquier
+            // sistema bloquea al momento— en un diálogo, y encima con Intro
+            // en «Cancelar».
             crate::Accion::CerrarSesion => Some(Self::CerrarSesion),
             crate::Accion::Lanzar(cmd) => match cmd.as_str() {
                 "systemctl suspend" => Some(Self::Suspender),

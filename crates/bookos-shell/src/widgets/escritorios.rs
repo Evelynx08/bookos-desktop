@@ -14,8 +14,10 @@
 //! leerlo y un punto relleno entre cuatro se ve sin mirar. Los puntos son
 //! pulsables: el que tocas es al que vas.
 
+use std::time::Instant;
+
 use iced_core::{Border, Color, Length};
-use iced_widget::{Space, container, row};
+use iced_widget::{Space, container, row, stack};
 
 use crate::tema;
 use crate::view::PanelElement;
@@ -32,6 +34,8 @@ pub struct Escritorios {
     /// mientras tanto sería peor que nada.
     cuantos: usize,
     activo: usize,
+    /// De qué escritorio viene el punto de acento y desde cuándo se mueve.
+    viaje: Option<(usize, Instant)>,
 }
 
 impl Escritorios {
@@ -42,6 +46,7 @@ impl Escritorios {
             // llega la primera actualización del compositor.
             cuantos: 2,
             activo: 0,
+            viaje: None,
         }
     }
 
@@ -83,9 +88,18 @@ impl Widget for Escritorios {
         if (activo, cuantos) == (self.activo, self.cuantos) {
             return false;
         }
+        // Solo se desliza al cambiar de escritorio con los mismos que había;
+        // si aparece o desaparece uno, el punto va directo a su sitio.
+        self.viaje =
+            (cuantos == self.cuantos && activo != self.activo && !tema::efectos_reducidos())
+                .then(|| (self.activo, Instant::now()));
         self.activo = activo;
         self.cuantos = cuantos;
         true
+    }
+
+    fn animando(&self) -> bool {
+        self.viaje.is_some_and(|(_, t)| t.elapsed() < tema::D_MODAL)
     }
 
     fn ancho(&self) -> f32 {
@@ -99,37 +113,50 @@ impl Widget for Escritorios {
         if self.cuantos == 0 {
             return crate::widget::vacio();
         }
+        let punto = |color: Color| {
+            container(Space::new())
+                .width(Length::Fixed(PUNTO))
+                .height(Length::Fixed(PUNTO))
+                .style(move |_theme: &iced_widget::Theme| container::Style {
+                    background: Some(color.into()),
+                    border: Border {
+                        radius: (PUNTO / 2.0).into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+        };
+        // Todos los puntos en blanco al 35 % y el acento encima, en su propia
+        // capa: así puede ir de un escritorio a otro deslizándose en vez de
+        // apagarse uno y encenderse otro. Es el mismo tratamiento que los
+        // puntos de página del launchpad, para que un punto signifique lo
+        // mismo en los dos sitios.
         let mut fila = row![];
         for i in 0..self.cuantos {
             if i > 0 {
                 fila = fila.push(Space::new().width(Length::Fixed(HUECO)));
             }
-            // El activo va relleno en el acento y los demás en blanco al 35 %:
-            // el mismo tratamiento que los puntos de página del launchpad, para
-            // que un punto signifique lo mismo en los dos sitios.
-            let color = if i == self.activo {
-                tema::acento()
-            } else {
-                Color {
-                    a: 0.35,
-                    ..tema::tinta()
-                }
-            };
-            fila = fila.push(
-                container(Space::new())
-                    .width(Length::Fixed(PUNTO))
-                    .height(Length::Fixed(PUNTO))
-                    .style(move |_theme: &iced_widget::Theme| container::Style {
-                        background: Some(color.into()),
-                        border: Border {
-                            radius: (PUNTO / 2.0).into(),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }),
-            );
+            fila = fila.push(punto(Color {
+                a: 0.35,
+                ..tema::tinta()
+            }));
         }
-        container(fila).center_y(Length::Fill).into()
+        let paso = PUNTO + HUECO;
+        let destino = self.activo as f32 * paso;
+        let x = match self.viaje {
+            Some((origen, desde)) if desde.elapsed() < tema::D_MODAL => {
+                let t = tema::C_MUELLE.eval(tema::fraccion(desde.elapsed(), tema::D_MODAL));
+                let origen = origen as f32 * paso;
+                // El muelle se pasa un poco del destino; se acota para que el
+                // punto no se salga por los extremos de la fila.
+                (origen + (destino - origen) * t).clamp(0.0, self.ancho() - PUNTO)
+            }
+            _ => destino,
+        };
+        let acento = container(punto(tema::acento())).padding(iced_core::Padding::ZERO.left(x));
+        container(stack![fila, acento])
+            .center_y(Length::Fill)
+            .into()
     }
 }
 

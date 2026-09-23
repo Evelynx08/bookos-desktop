@@ -13,7 +13,7 @@ fn volcar(nombre: &str, buf: &[u8], w: u32, h: u32) {
     use image::ImageEncoder;
     // El buffer sale en B,G,R,A y el PNG se escribe en R,G,B,A.
     let mut rgba = buf.to_vec();
-    for p in rgba.chunks_exact_mut(4) {
+    for p in rgba.as_chunks_mut::<4>().0 {
         p.swap(0, 2);
     }
     let ruta = format!("/tmp/energia/{nombre}.png");

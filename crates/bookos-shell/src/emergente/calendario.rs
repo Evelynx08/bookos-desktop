@@ -1,9 +1,9 @@
 //! El calendario que cuelga del reloj.
 //!
-//! Es la mitad derecha del plasmoide `bookos-clock`: la tarjeta de 340 px con
-//! la rejilla del mes, con sus mismas medidas y sus mismos colores — celda
-//! redondeada de radio 10, hoy con el acento al 14 %, el día elegido con el
-//! acento sólido, y la **semana empezando en lunes**.
+//! Es la mitad del mes de la referencia de Figma, con las medidas de las demás
+//! tarjetas del panel: 336 de ancho, cabecera con el mes y los botones ‹ Hoy ›,
+//! celdas redondeadas de radio 10, hoy con el acento al 14 %, el día elegido
+//! con el acento sólido, y la **semana empezando en lunes**.
 //!
 //! **Los eventos no están.** El plasmoide junta dos fuentes: un JSON en su
 //! propia configuración y lo que le da Akonadi por `PlasmaCalendar`. Lo primero
@@ -13,26 +13,43 @@
 //! Meterlos es una decisión aparte, no un rato de trabajo.
 
 use iced_core::alignment::{Horizontal, Vertical};
+use iced_core::font::Weight;
 use iced_core::{Border, Color, Length};
-use iced_widget::{column, container, row, text};
+use iced_widget::{Space, column, container, row, text};
 
 use crate::Accion;
+use crate::icono;
 use crate::state::Fecha;
 use crate::tema;
 use crate::view::PanelElement;
 
+use super::control;
+use super::lista::{ANCHO, CABECERA, MARGEN};
 use super::{Ancla, Tecla};
 
-const ANCHO: f32 = 340.0;
 /// 7 columnas por 6 filas: seis semanas es lo máximo que puede abarcar un mes,
 /// y con un número fijo la rejilla no cambia de alto al pasar de mes.
 const FILAS: u32 = 6;
+/// Alto de una fila de la rejilla: celda de 38 y 2 de aire.
 const CELDA: f32 = 40.0;
-const MARGEN: f32 = 14.0;
-/// Alto de la barra superior con el título y los botones.
-const CABECERA: f32 = 34.0;
+/// Aire entre la cabecera y los nombres de los días.
+const BAJO_CABECERA: f32 = 10.0;
 /// Alto de la fila de Lun/Mar/Mié…
 const DIAS_SEMANA: f32 = 20.0;
+/// Lado de los botones de mes anterior y siguiente.
+const FLECHA: f32 = 32.0;
+/// Aire entre los tres botones de la cabecera.
+const ENTRE_BOTONES: f32 = 2.0;
+/// Relleno lateral de la cabecera: deja el título a 20 del borde.
+const SANGRIA: f32 = 4.0;
+
+/// Qué botón de la cabecera se ha pulsado.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Boton {
+    Anterior,
+    Hoy,
+    Siguiente,
+}
 
 const NOMBRES_DIA: [&str; 7] = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"];
 const NOMBRES_MES: [&str; 12] = [
@@ -76,7 +93,7 @@ impl Calendario {
     pub fn size(&self) -> (f32, f32) {
         (
             ANCHO,
-            CABECERA + DIAS_SEMANA + CELDA * FILAS as f32 + MARGEN * 2.0 + 12.0,
+            MARGEN * 2.0 + CABECERA + BAJO_CABECERA + DIAS_SEMANA + CELDA * FILAS as f32,
         )
     }
 
@@ -138,7 +155,7 @@ impl Calendario {
     /// Qué celda cae en un punto lógico relativo a la esquina del calendario.
     fn celda_en(&self, x: f32, y: f32) -> Option<usize> {
         let x0 = MARGEN;
-        let y0 = MARGEN + CABECERA + DIAS_SEMANA;
+        let y0 = MARGEN + CABECERA + BAJO_CABECERA + DIAS_SEMANA;
         let ancho_celda = (ANCHO - MARGEN * 2.0) / 7.0;
         if x < x0 || y < y0 {
             return None;
@@ -149,6 +166,36 @@ impl Calendario {
             return None;
         }
         Some(fila * 7 + col)
+    }
+
+    /// Qué botón de la cabecera cae en un punto. Se miden desde el borde
+    /// derecho, que es donde están anclados.
+    fn boton_en(&self, x: f32, y: f32) -> Option<Boton> {
+        if y < MARGEN || y > MARGEN + CABECERA {
+            return None;
+        }
+        let siguiente = ANCHO - MARGEN - SANGRIA - FLECHA;
+        let hoy = siguiente - ENTRE_BOTONES - control::ancho_chip("Hoy");
+        let anterior = hoy - ENTRE_BOTONES - FLECHA;
+        match x {
+            x if x >= siguiente && x <= siguiente + FLECHA => Some(Boton::Siguiente),
+            x if x >= hoy && x < siguiente - ENTRE_BOTONES => Some(Boton::Hoy),
+            x if x >= anterior && x < hoy - ENTRE_BOTONES => Some(Boton::Anterior),
+            _ => None,
+        }
+    }
+
+    fn ir(&mut self, boton: Boton) {
+        let (anio, mes) = match boton {
+            Boton::Anterior => mes_anterior(self.vista_anio, self.vista_mes),
+            Boton::Siguiente => mes_siguiente(self.vista_anio, self.vista_mes),
+            Boton::Hoy => {
+                self.elegido = self.hoy;
+                (self.hoy.anio, self.hoy.mes)
+            }
+        };
+        self.vista_anio = anio;
+        self.vista_mes = mes;
     }
 
     pub fn puntero(&mut self, punto: Option<(f32, f32)>) -> bool {
@@ -162,6 +209,10 @@ impl Calendario {
     }
 
     pub fn pulsar(&mut self, x: f32, y: f32) -> Option<Accion> {
+        if let Some(boton) = self.boton_en(x, y) {
+            self.ir(boton);
+            return None;
+        }
         if let Some(i) = self.celda_en(x, y) {
             let (fecha, _del_mes) = self.celda(i);
             // Pulsar un día de los bordes también salta a su mes, como el
@@ -179,22 +230,16 @@ impl Calendario {
         match tecla {
             T::Escape => Tecla::Cerrar,
             T::Izquierda => {
-                let (a, m) = mes_anterior(self.vista_anio, self.vista_mes);
-                self.vista_anio = a;
-                self.vista_mes = m;
+                self.ir(Boton::Anterior);
                 Tecla::Consumida
             }
             T::Derecha => {
-                let (a, m) = mes_siguiente(self.vista_anio, self.vista_mes);
-                self.vista_anio = a;
-                self.vista_mes = m;
+                self.ir(Boton::Siguiente);
                 Tecla::Consumida
             }
-            // Volver a hoy: es lo que hace el botón "Hoy" del plasmoide.
+            // Volver a hoy: lo mismo que el botón «Hoy».
             T::Intro => {
-                self.vista_anio = self.hoy.anio;
-                self.vista_mes = self.hoy.mes;
-                self.elegido = self.hoy;
+                self.ir(Boton::Hoy);
                 Tecla::Consumida
             }
             _ => Tecla::Ignorada,
@@ -202,30 +247,58 @@ impl Calendario {
     }
 
     pub fn view(&self) -> PanelElement<'_> {
+        let mes = NOMBRES_MES[(self.vista_mes - 1) as usize];
+        // El mes con mayúscula: en la cabecera es un título, no media frase.
         let titulo = format!(
-            "{} {}",
-            NOMBRES_MES[(self.vista_mes - 1) as usize],
+            "{}{} {}",
+            mes[..1].to_uppercase(),
+            &mes[1..],
             self.vista_anio
         );
-
-        let cabecera = container(text(titulo).size(20).color(tema::texto()).font(
-            iced_core::Font {
-                weight: iced_core::font::Weight::Bold,
-                ..iced_core::Font::DEFAULT
-            },
-        ))
+        let flecha = |nombre: &str| -> PanelElement<'static> {
+            container(match icono::propio(nombre) {
+                Some(ic) => icono::ver_teñido_propio(&ic, 16.0, tema::TEXTO2),
+                None => Space::new().width(Length::Fixed(16.0)).into(),
+            })
+            .width(Length::Fixed(FLECHA))
+            .height(Length::Fixed(FLECHA))
+            .center_x(Length::Fixed(FLECHA))
+            .center_y(Length::Fixed(FLECHA))
+            .into()
+        };
+        let cabecera = container(
+            row![
+                control::titulo(titulo),
+                Space::new().width(Length::Fill),
+                flecha("chevron-izquierda"),
+                Space::new().width(Length::Fixed(ENTRE_BOTONES)),
+                control::chip("Hoy", tema::superficie(), tema::texto()),
+                Space::new().width(Length::Fixed(ENTRE_BOTONES)),
+                flecha("chevron-derecha"),
+            ]
+            .align_y(Vertical::Center),
+        )
+        .width(Length::Fixed(ANCHO - MARGEN * 2.0))
         .height(Length::Fixed(CABECERA))
-        .align_y(Vertical::Center);
+        .padding([0, SANGRIA as u16])
+        .center_y(Length::Fixed(CABECERA));
 
         let mut semana = row![];
         for nombre in NOMBRES_DIA {
             semana = semana.push(
-                container(text(nombre).size(11).color(tema::TEXTO2))
-                    .width(Length::FillPortion(1))
-                    .align_x(Horizontal::Center),
+                container(
+                    text(nombre)
+                        .size(12)
+                        .font(control::peso(Weight::Medium))
+                        .color(tema::TEXTO2),
+                )
+                .width(Length::FillPortion(1))
+                .align_x(Horizontal::Center),
             );
         }
-        let semana = container(semana).height(Length::Fixed(DIAS_SEMANA));
+        let semana = container(semana)
+            .height(Length::Fixed(DIAS_SEMANA))
+            .align_y(Vertical::Center);
 
         let mut rejilla = column![];
         for fila in 0..FILAS as usize {
@@ -233,22 +306,24 @@ impl Calendario {
             for col in 0..7 {
                 linea = linea.push(self.celda_view(fila * 7 + col));
             }
-            rejilla = rejilla.push(container(linea).height(Length::Fixed(CELDA)));
+            rejilla = rejilla.push(
+                container(linea)
+                    .height(Length::Fixed(CELDA))
+                    .center_y(Length::Fixed(CELDA)),
+            );
         }
 
-        container(column![cabecera, semana, rejilla])
-            .width(Length::Fixed(ANCHO))
-            .padding(MARGEN)
-            .style(|_theme| container::Style {
-                background: Some(tema::card().into()),
-                border: Border {
-                    radius: tema::R_POPOVER.into(),
-                    width: 1.0,
-                    color: tema::borde(),
-                },
-                ..Default::default()
-            })
-            .into()
+        control::tarjeta(
+            column![
+                cabecera,
+                Space::new().height(Length::Fixed(BAJO_CABECERA)),
+                semana,
+                rejilla,
+            ]
+            .into(),
+            ANCHO,
+            MARGEN,
+        )
     }
 
     fn celda_view(&self, i: usize) -> PanelElement<'_> {
@@ -261,14 +336,19 @@ impl Calendario {
         // es hoy **y** está elegido se dibuja como elegido, que es lo que dice
         // dónde está el cursor del usuario. El hover es lo único que se anima:
         // elegir un día es un salto de estado, no un recorrido.
-        let (fondo, color) = if elegido {
-            (tema::acento(), tema::sobre_acento())
+        let (fondo, color, peso) = if elegido {
+            (tema::acento(), tema::sobre_acento(), Weight::Semibold)
         } else if es_hoy {
-            (tema::alfa(tema::acento(), 0.14), tema::acento())
+            (
+                tema::alfa(tema::acento(), 0.14),
+                tema::acento(),
+                Weight::Semibold,
+            )
         } else {
             (
                 tema::mezclar(Color::TRANSPARENT, tema::hover(), señalada),
                 tema::texto(),
+                Weight::Normal,
             )
         };
         // Los días de los meses vecinos se ven, pero apagados: dan contexto sin
@@ -280,19 +360,24 @@ impl Calendario {
         };
 
         container(
-            container(text(fecha.dia.to_string()).size(13).color(color))
-                .width(Length::Fixed(CELDA - 4.0))
-                .height(Length::Fixed(CELDA - 4.0))
-                .center_x(Length::Fixed(CELDA - 4.0))
-                .center_y(Length::Fixed(CELDA - 4.0))
-                .style(move |_theme| container::Style {
-                    background: Some(fondo.into()),
-                    border: Border {
-                        radius: tema::R_BOTON_PEQUENO.into(),
-                        ..Default::default()
-                    },
+            container(
+                text(fecha.dia.to_string())
+                    .size(13)
+                    .font(control::peso(peso))
+                    .color(color),
+            )
+            .width(Length::Fixed(CELDA - 2.0))
+            .height(Length::Fixed(CELDA - 2.0))
+            .center_x(Length::Fixed(CELDA - 2.0))
+            .center_y(Length::Fixed(CELDA - 2.0))
+            .style(move |_theme| container::Style {
+                background: Some(fondo.into()),
+                border: Border {
+                    radius: tema::R_BOTON_PEQUENO.into(),
                     ..Default::default()
-                }),
+                },
+                ..Default::default()
+            }),
         )
         .width(Length::FillPortion(1))
         .align_x(Horizontal::Center)
@@ -319,6 +404,33 @@ fn mes_siguiente(anio: i32, mes: u32) -> (i32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Los tres botones de la cabecera mueven el mes o vuelven a hoy, cada uno
+    /// desde su sitio, y el hueco de la izquierda no es de ninguno.
+    #[test]
+    fn los_botones_de_la_cabecera_mueven_el_mes() {
+        let mut c = Calendario::new();
+        c.vista_anio = 2026;
+        c.vista_mes = 1;
+        let y = MARGEN + CABECERA / 2.0;
+        let siguiente = ANCHO - MARGEN - SANGRIA - FLECHA / 2.0;
+        c.pulsar(siguiente, y);
+        assert_eq!((c.vista_anio, c.vista_mes), (2026, 2));
+        let hoy =
+            ANCHO - MARGEN - SANGRIA - FLECHA - ENTRE_BOTONES - control::ancho_chip("Hoy") / 2.0;
+        assert_eq!(c.boton_en(hoy, y), Some(Boton::Hoy));
+        let anterior = hoy - control::ancho_chip("Hoy") / 2.0 - ENTRE_BOTONES - FLECHA / 2.0;
+        c.pulsar(anterior, y);
+        c.pulsar(anterior, y);
+        assert_eq!((c.vista_anio, c.vista_mes), (2025, 12));
+        c.pulsar(hoy, y);
+        assert_eq!((c.vista_anio, c.vista_mes), (c.hoy.anio, c.hoy.mes));
+        assert_eq!(
+            c.boton_en(MARGEN + 10.0, y),
+            None,
+            "el título no es un botón"
+        );
+    }
 
     /// La rejilla tiene que empezar en el lunes de la semana del día 1. Es
     /// donde se equivoca cualquier calendario escrito a mano.

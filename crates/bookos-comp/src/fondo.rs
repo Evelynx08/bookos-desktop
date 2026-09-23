@@ -6,13 +6,17 @@
 //! fondo**, no las ventanas, que es lo que hace que se lea igual de bien tenga
 //! lo que tenga debajo.
 //!
-//! ## Se sube una vez y no se vuelve a tocar
+//! ## Una subida por imagen visible
 //!
-//! La imagen es de 2880×1800: decodificarla cuesta y subirla a la GPU también.
-//! Se hace al arrancar y el elemento de cada frame reutiliza el mismo buffer,
-//! que Smithay ya sabe que no ha cambiado y no vuelve a subir.
+//! Los fondos estáticos conservan el mismo buffer durante toda la sesión. En
+//! un WebP animado solo se conserva y sube el fotograma visible; el temporizador
+//! despierta al llegar su duración para no mantener la animación entera en RAM.
 
-use std::path::PathBuf;
+use std::io::BufReader;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use image::AnimationDecoder as _;
 
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
@@ -109,6 +113,71 @@ pub struct Fondo {
     /// Se crea la primera vez que se cambia de escritorio y se queda: son otros
     /// 20 MB, y quien no use escritorios virtuales no los paga.
     gemelo: std::cell::RefCell<Option<MemoryRenderBuffer>>,
+    /// Decodificador incremental. Solo conserva el fotograma actual y el
+    /// estado comprimido: guardar todos los RGBA de un fondo largo ocuparía
+    /// cientos de megas sin mejorar el dibujo.
+    animacion: Option<Animacion>,
+}
+
+struct Animacion {
+    ruta: PathBuf,
+    frames: image::Frames<'static>,
+    siguiente: Instant,
+}
+
+impl Animacion {
+    fn abrir(ruta: &Path) -> Option<(Self, Vec<u8>, u32, u32)> {
+        let mut frames = frames_webp(ruta)?;
+        let frame = frames.next()?.ok()?;
+        let retraso = retraso(frame.delay());
+        let rgba = frame.into_buffer();
+        let (w, h) = rgba.dimensions();
+        Some((
+            Self {
+                ruta: ruta.to_path_buf(),
+                frames,
+                siguiente: Instant::now() + retraso,
+            },
+            rgba.into_raw(),
+            w,
+            h,
+        ))
+    }
+
+    fn avanzar(&mut self) -> Option<(Vec<u8>, u32, u32)> {
+        let frame = match self.frames.next() {
+            Some(Ok(frame)) => frame,
+            Some(Err(err)) => {
+                tracing::warn!(ruta = ?self.ruta, %err, "fotograma WebP inválido");
+                return None;
+            }
+            None => {
+                self.frames = frames_webp(&self.ruta)?;
+                self.frames.next()?.ok()?
+            }
+        };
+        self.siguiente = Instant::now() + retraso(frame.delay());
+        let rgba = frame.into_buffer();
+        let (w, h) = rgba.dimensions();
+        Some((rgba.into_raw(), w, h))
+    }
+}
+
+fn retraso(delay: image::Delay) -> Duration {
+    let (numerador, denominador) = delay.numer_denom_ms();
+    let ms = numerador as f64 / denominador.max(1) as f64;
+    // Cero produciría un bucle ocupado con ficheros mal formados. 16 ms es
+    // el fotograma más corto que tiene sentido dibujar en una pantalla normal.
+    Duration::from_secs_f64((ms / 1000.0).max(0.016))
+}
+
+fn frames_webp(ruta: &Path) -> Option<image::Frames<'static>> {
+    if ruta.extension().and_then(|e| e.to_str()) != Some("webp") {
+        return None;
+    }
+    let fichero = std::fs::File::open(ruta).ok()?;
+    let decoder = image::codecs::webp::WebPDecoder::new(BufReader::new(fichero)).ok()?;
+    decoder.has_animation().then(|| decoder.into_frames())
 }
 
 impl Fondo {
@@ -119,8 +188,20 @@ impl Fondo {
             Some(r) => PathBuf::from(r),
             None => buscar()?,
         };
-        let (pixeles, w, h) = bookos_shell::decodificar_rgba(&ruta)?;
-        tracing::info!(?ruta, w, h, "fondo del escritorio");
+        let (animacion, pixeles, w, h) = match Animacion::abrir(&ruta) {
+            Some((animacion, pixeles, w, h)) => (Some(animacion), pixeles, w, h),
+            None => {
+                let (pixeles, w, h) = decodificar_estatico(&ruta)?;
+                (None, pixeles, w, h)
+            }
+        };
+        tracing::info!(
+            ?ruta,
+            w,
+            h,
+            animado = animacion.is_some(),
+            "fondo del escritorio"
+        );
         // Abgr8888: en little-endian son los bytes R,G,B,A, que es justo lo que
         // devuelve el decodificador. Con Argb8888 —el del shell— saldría con el
         // rojo y el azul cambiados; ya pasó una vez con el panel.
@@ -142,7 +223,51 @@ impl Fondo {
             mini_pixeles,
             mini: std::cell::RefCell::new(Vec::new()),
             gemelo: std::cell::RefCell::new(None),
+            animacion,
         })
+    }
+
+    /// Tiempo hasta el siguiente fotograma. `None` también cubre movimiento
+    /// reducido: congelar el primero evita despertar para no cambiar nada.
+    pub fn hasta_siguiente(&self) -> Option<Duration> {
+        if bookos_shell::tema::efectos_reducidos() {
+            return None;
+        }
+        Some(
+            self.animacion
+                .as_ref()?
+                .siguiente
+                .saturating_duration_since(Instant::now()),
+        )
+    }
+
+    /// Cambia de fotograma solo cuando vence su retraso.
+    pub fn avanzar(&mut self) -> bool {
+        if self
+            .hasta_siguiente()
+            .is_none_or(|espera| !espera.is_zero())
+        {
+            return false;
+        }
+        let siguiente = self.animacion.as_mut().and_then(Animacion::avanzar);
+        let Some((rgba, w, h)) = siguiente else {
+            self.animacion = None;
+            return false;
+        };
+        self.buffer = MemoryRenderBuffer::from_slice(
+            &rgba,
+            Fourcc::Abgr8888,
+            (w as i32, h as i32),
+            1,
+            Transform::Normal,
+            None,
+        );
+        self.pixeles = (w as i32, h as i32);
+        self.rgba = rgba;
+        (self.mini_rgba, self.mini_pixeles) = reducir(&self.rgba, self.pixeles, MINIATURA_ANCHO);
+        self.mini.get_mut().clear();
+        *self.gemelo.get_mut() = None;
+        true
     }
 
     /// De qué fichero salió.
@@ -252,8 +377,21 @@ impl Fondo {
         use smithay::utils::Rectangle;
         let mut copias = self.mini.borrow_mut();
         while copias.len() <= indice {
+            // Con las esquinas recortadas al radio del marco: compuesta en
+            // rectángulo, la miniatura asomaba en pico por las cuatro esquinas
+            // del borde redondeado de la vista de escritorios. El radio va en
+            // píxeles de la imagen, que no es del tamaño del hueco.
+            let mut rgba = self.mini_rgba.clone();
+            let por_pixel = self.mini_pixeles.0 as f32 / logico.0.max(1) as f32;
+            bookos_shell::redondear_esquinas(
+                &mut rgba,
+                self.mini_pixeles.0 as u32,
+                self.mini_pixeles.1 as u32,
+                bookos_shell::RADIO_MINIATURA_ESCRITORIO * por_pixel,
+                bookos_shell::Alfa::Premultiplicado,
+            );
             copias.push(MemoryRenderBuffer::from_slice(
-                &self.mini_rgba,
+                &rgba,
                 Fourcc::Abgr8888,
                 (self.mini_pixeles.0, self.mini_pixeles.1),
                 1,
@@ -275,6 +413,30 @@ impl Fondo {
         .inspect_err(|err| tracing::warn!("no se pudo subir la miniatura del fondo: {err}"))
         .ok()
     }
+}
+
+fn decodificar_estatico(ruta: &Path) -> Option<(Vec<u8>, u32, u32)> {
+    if ruta.extension().and_then(|e| e.to_str()) != Some("svg") {
+        return bookos_shell::decodificar_rgba(ruta);
+    }
+    let mut opciones = resvg::usvg::Options {
+        resources_dir: ruta.parent().map(Path::to_path_buf),
+        ..Default::default()
+    };
+    opciones.fontdb_mut().load_system_fonts();
+    let datos = std::fs::read(ruta).ok()?;
+    let arbol = resvg::usvg::Tree::from_data(&datos, &opciones).ok()?;
+    let tamano = arbol.size().to_int_size();
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(tamano.width(), tamano.height())?;
+    // Un fondo es opaco por definición. Esto evita que un SVG con zonas
+    // transparentes deje ver el color de seguridad distinto en cada backend.
+    pixmap.fill(resvg::tiny_skia::Color::BLACK);
+    resvg::render(
+        &arbol,
+        resvg::tiny_skia::Transform::identity(),
+        &mut pixmap.as_mut(),
+    );
+    Some((pixmap.take(), tamano.width(), tamano.height()))
 }
 
 /// Reduce una imagen RGBA a `ancho` píxeles de ancho, promediando cada bloque.
@@ -373,6 +535,54 @@ fn buscar() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temporal(extension: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "bookos-fondo-{}-{}.{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("prueba"),
+            extension
+        ))
+    }
+
+    #[test]
+    fn un_svg_se_rasteriza_con_su_tamano() {
+        let ruta = temporal("svg");
+        std::fs::write(
+            &ruta,
+            br##"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="4">
+                 <rect width="8" height="4" fill="#ff0000"/>
+               </svg>"##,
+        )
+        .expect("se puede crear el SVG temporal");
+        let (rgba, w, h) = decodificar_estatico(&ruta).expect("SVG válido");
+        std::fs::remove_file(&ruta).expect("se puede retirar el SVG temporal");
+        assert_eq!((w, h), (8, 4));
+        assert_eq!(&rgba[..4], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn un_webp_animado_avanza_y_vuelve_al_principio() {
+        use base64::Engine as _;
+
+        // Dos cuadrados 2×2, rojo y azul, a 100 y 50 ms. Tener el fichero
+        // incrustado hace que la prueba no dependa de ImageMagick ni de red.
+        const WEBP: &str = "UklGRsAAAABXRUJQVlA4WAoAAAACAAAAAQAAAQAAQU5JTQYAAAD/////AABBTk1GSAAAAAAAAAAAAAEAAAEAAGQAAAJWUDggMAAAANABAJ0BKgIAAgACADQloAJ0ugH4AAOwAP7wxAv/ILlhdcjX/yA/5Af8gP/48gAAAEFOTUZEAAAAAAAAAAAAAQAAAQAAMgAAAFZQOCAsAAAAlAEAnQEqAgACAAAANCWgAnS6AAOYAP75k2//kB//kB//kB//ID/iF3sgMAA=";
+        let ruta = temporal("webp");
+        let datos = base64::engine::general_purpose::STANDARD
+            .decode(WEBP)
+            .expect("fixture WebP en base64");
+        std::fs::write(&ruta, datos).expect("se puede crear el WebP temporal");
+
+        let (mut animacion, primero, w, h) = Animacion::abrir(&ruta).expect("WebP animado");
+        assert_eq!((w, h), (2, 2));
+        let segundo = animacion.avanzar().expect("segundo fotograma").0;
+        let vuelta = animacion.avanzar().expect("vuelta al primero").0;
+        std::fs::remove_file(&ruta).expect("se puede retirar el WebP temporal");
+        assert_ne!(primero, segundo);
+        assert_eq!(primero, vuelta);
+    }
+
     /// La pareja manda sobre el fondo común, y cambiar de tema cambia la
     /// imagen. Es lo que hacía falta para que pasar a claro no dejara el
     /// escritorio con la foto oscura detrás.

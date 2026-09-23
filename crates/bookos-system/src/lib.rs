@@ -45,8 +45,10 @@ pub enum Operation {
     BluetoothForget { address: String },
     Airplane { enabled: bool },
     Volume { target: String, value: u32 },
+    VolumePreview { target: String, value: u32 },
     VolumeStep { step: i32 },
     Mute { target: String, muted: Option<bool> },
+    MutePreview { target: String, muted: Option<bool> },
     AudioDefault { target: String, input: bool },
     AppVolume { index: u32, value: u32 },
     AppMute { index: u32, muted: bool },
@@ -92,12 +94,11 @@ impl Lane {
     fn push(&self, op: Operation) -> bool {
         let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         // Only replace adjacent absolute volume writes: never reorder toggles or steps.
-        if let (Some(Operation::Volume { target: old, .. }), Operation::Volume { target, .. }) =
-            (queue.back(), &op)
+        if let (Some(old), Some(target)) =
+            (queue.back().and_then(volume_target), volume_target(&op))
+            && old == target
         {
-            if old == target {
-                queue.pop_back();
-            }
+            queue.pop_back();
         }
         if queue.len() >= 64 {
             return false;
@@ -119,6 +120,13 @@ impl Lane {
             }
             self.ready.notified().await;
         }
+    }
+}
+
+fn volume_target(operation: &Operation) -> Option<&str> {
+    match operation {
+        Operation::Volume { target, .. } | Operation::VolumePreview { target, .. } => Some(target),
+        _ => None,
     }
 }
 static SEND: OnceLock<[std::sync::Arc<Lane>; 3]> = OnceLock::new();
@@ -180,15 +188,12 @@ pub fn start(wake: impl Fn() + Send + Sync + 'static) {
                     loop {
                         let op = lane.next().await;
                         let result = call(&op).await;
-                        if result.is_ok() {
-                            if let Ok(c) = zbus::Connection::session().await {
-                                if let Ok(p) = zbus::Proxy::new(&c, NAME, PATH, NAME).await {
-                                    if let Ok(data) = p.call::<_, _, String>("GetState", &()).await
-                                    {
-                                        update(&data, &*wake);
-                                    }
-                                }
-                            }
+                        if result.is_ok()
+                            && let Ok(c) = zbus::Connection::session().await
+                            && let Ok(p) = zbus::Proxy::new(&c, NAME, PATH, NAME).await
+                            && let Ok(data) = p.call::<_, _, String>("GetState", &()).await
+                        {
+                            update(&data, &*wake);
                         }
                         let mut queue = FEEDBACK.lock().unwrap_or_else(|e| e.into_inner());
                         if queue.len() >= 64 {
@@ -258,22 +263,30 @@ pub fn unavailable(domain: &str) -> Option<String> {
         .or_else(|| s.errors.get(domain))
         .cloned()
 }
-pub fn audio_request(args: &[&str]) -> bool {
+pub fn audio_request(args: &[&str], notify: bool) -> bool {
     match args {
         ["set-volume", target, value] => value.parse::<f64>().ok().is_some_and(|v| {
-            request(Operation::Volume {
-                target: (*target).into(),
-                value: (v * 100.).round().clamp(0., 150.) as u32,
+            let target = (*target).into();
+            let value = (v * 100.).round().clamp(0., 150.) as u32;
+            request(if notify {
+                Operation::Volume { target, value }
+            } else {
+                Operation::VolumePreview { target, value }
             })
         }),
-        ["set-mute", target, value] => request(Operation::Mute {
-            target: (*target).into(),
-            muted: match *value {
+        ["set-mute", target, value] => {
+            let target = (*target).into();
+            let muted = match *value {
                 "toggle" => None,
                 "1" => Some(true),
                 _ => Some(false),
-            },
-        }),
+            };
+            request(if notify {
+                Operation::Mute { target, muted }
+            } else {
+                Operation::MutePreview { target, muted }
+            })
+        }
         _ => false,
     }
 }
@@ -296,7 +309,7 @@ mod tests {
     async fn slider_keeps_last_value_and_command_order() {
         let lane = Lane::default();
         for value in 0..=100 {
-            assert!(lane.push(Operation::Volume {
+            assert!(lane.push(Operation::VolumePreview {
                 target: "output".into(),
                 value
             }));
@@ -311,7 +324,7 @@ mod tests {
         }));
         assert!(matches!(
             lane.next().await,
-            Operation::Volume { value: 100, .. }
+            Operation::VolumePreview { value: 100, .. }
         ));
         assert!(matches!(lane.next().await, Operation::Mute { .. }));
         assert!(matches!(

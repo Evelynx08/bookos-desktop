@@ -1,10 +1,9 @@
 //! Volumen almacenado por el cliente del servicio compartido.
 
-
 use crate::icono::{self, Icono};
 use crate::tema;
 use crate::view::{PanelElement, TEXT};
-use crate::widget::Widget;
+use crate::widget::{Cruce, Widget};
 
 pub struct Volumen {
     /// De 0 a 100. `None` mientras no se haya podido leer: sin PipeWire
@@ -14,6 +13,7 @@ pub struct Volumen {
     icono: Option<Icono>,
     /// Con qué nombre se cargó, para no rasterizarlo otra vez sin motivo.
     icono_nombre: &'static str,
+    cruce: Cruce,
 }
 
 impl Volumen {
@@ -23,6 +23,7 @@ impl Volumen {
             silenciado: false,
             icono: None,
             icono_nombre: "",
+            cruce: Cruce::default(),
         };
         v.releer();
         v
@@ -33,29 +34,47 @@ impl Volumen {
         if Some(nivel) == self.nivel && silenciado == self.silenciado {
             return false;
         }
+        let color_previo = self.color();
         self.nivel = Some(nivel);
         self.silenciado = silenciado;
-        self.actualizar_icono();
+        self.actualizar_icono(color_previo);
         true
+    }
+
+    /// Silenciado en gris: es la misma señal que da el plasmoide, y se
+    /// distingue del aspa a distancia de un vistazo.
+    fn color(&self) -> iced_core::Color {
+        if self.nivel.is_none() || self.silenciado {
+            tema::TEXTO2
+        } else {
+            TEXT()
+        }
     }
 
     fn releer(&mut self) -> bool {
         if let Some((nivel, silenciado)) = consultar("@DEFAULT_AUDIO_SINK@") {
             self.aplicar(nivel, silenciado)
         } else {
+            let color_previo = self.color();
             let changed = self.nivel.take().is_some() || self.icono.is_none();
             // El widget permanece visible aunque PipeWire aún no tenga una
             // salida: el icono atenuado explica que no hay dispositivo, en vez
             // de hacer desaparecer un control del panel.
-            self.icono = icono::propio("volumen-silencio");
-            self.icono_nombre = "volumen-silencio";
+            if self.icono_nombre != "volumen-silencio" {
+                let previo = std::mem::replace(&mut self.icono, icono::propio("volumen-silencio"));
+                self.cruce.empezar(previo, color_previo);
+                self.icono_nombre = "volumen-silencio";
+            }
             changed
         }
     }
 
     /// Los cuatro escalones del plasmoide: sin ondas por debajo del 40 %, una
     /// hasta el 75 % y dos por encima. Con el aspa si está silenciado o a cero.
-    fn actualizar_icono(&mut self) {
+    ///
+    /// Cruza solo al cambiar de escalón: mover el volumen punto a punto no
+    /// cambia el dibujo y no tiene por qué animar nada.
+    fn actualizar_icono(&mut self, color_previo: iced_core::Color) {
         let nombre = match (self.silenciado, self.nivel.unwrap_or(0)) {
             (true, _) | (_, 0) => "volumen-silencio",
             (_, n) if n < 40 => "volumen-bajo",
@@ -65,7 +84,8 @@ impl Volumen {
         if nombre == self.icono_nombre {
             return;
         }
-        self.icono = icono::propio(nombre);
+        let previo = std::mem::replace(&mut self.icono, icono::propio(nombre));
+        self.cruce.empezar(previo, color_previo);
         self.icono_nombre = nombre;
     }
 }
@@ -93,15 +113,14 @@ impl Widget for Volumen {
     /// el emergente, y una fila de porcentajes seguidos —brillo, volumen,
     /// batería— se lee peor que un icono que ya dice el nivel por su forma.
     fn ver(&self) -> PanelElement<'_> {
-        let Some(ic) = &self.icono else { return crate::widget::vacio(); };
-        // Silenciado en gris: es la misma señal que da el plasmoide, y se
-        // distingue del aspa a distancia de un vistazo.
-        let color = if self.nivel.is_none() || self.silenciado {
-            tema::TEXTO2
-        } else {
-            TEXT()
+        let Some(ic) = &self.icono else {
+            return crate::widget::vacio();
         };
-        icono::ver_teñido(ic, tema::ICONO_PANEL, Some(color))
+        self.cruce.ver(ic, self.color())
+    }
+
+    fn animando(&self) -> bool {
+        self.cruce.animando()
     }
 }
 

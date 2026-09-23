@@ -28,11 +28,18 @@ const ALTO_ACCIONES: f32 = 112.0;
 const MARGEN: f32 = 14.0;
 /// Lado del icono de la aplicación.
 const ICONO: f32 = 32.0;
-/// Hueco para la sombra dentro del buffer, igual que en el aviso de volumen.
-pub const MARGEN_SOMBRA: f32 = 18.0;
+/// Hueco para que el desenfoque y su desplazamiento quepan dentro del buffer.
+pub const MARGEN_SOMBRA: f32 = 24.0;
 /// Separación desde el borde derecho y desde el panel.
 pub const MARGEN_LATERAL: f32 = 12.0;
 pub const MARGEN_SUPERIOR: f32 = 8.0;
+/// Cuántos avisos caben a la vez. Con más, la pila baja hasta media pantalla y
+/// tapa lo que se está haciendo; los que no caben siguen en la tarjeta de la
+/// campana.
+pub const MAXIMO_A_LA_VISTA: usize = 3;
+/// Entre una tarjeta y la siguiente, el mismo aire que hay entre el panel y la
+/// primera: la pila tiene un solo ritmo.
+pub const HUECO: f32 = MARGEN_SUPERIOR;
 
 /// Lo que se queda a la vista una normal, y una crítica.
 ///
@@ -103,6 +110,27 @@ impl Toast {
             return tema::C_ENTRADA.eval(tema::fraccion(t, ENTRADA));
         }
         1.0 - tema::C_SUAVE.eval(tema::fraccion(t - self.quieto, SALIDA))
+    }
+
+    /// ¿Ha empezado ya a irse?
+    pub fn saliendo(&self) -> bool {
+        self.desde.elapsed() >= self.quieto
+    }
+
+    /// Cuánto sitio ocupa en la pila, de 0 a 1. Crece mientras entra y se
+    /// encoge mientras sale, y así las de debajo se deslizan en vez de saltar
+    /// cuando llega o se va una.
+    pub fn peso(&self) -> f32 {
+        let t = self.desde.elapsed();
+        if t < self.quieto {
+            return tema::C_SUAVE.eval(tema::fraccion(t, ENTRADA));
+        }
+        self.alfa()
+    }
+
+    /// Alto de la tarjeta, sin el margen de la sombra.
+    pub fn alto_tarjeta(&self) -> f32 {
+        self.size().1 - MARGEN_SOMBRA * 2.0
     }
 
     /// Entra creciendo un poco, como los popovers.
@@ -177,13 +205,12 @@ impl Toast {
         ];
         if !n.cuerpo.is_empty() {
             textos = textos.push(
-                text(crate::emergente::recortar_texto(
-                    &n.cuerpo,
-                    ancho_texto,
-                    11.0,
-                ))
-                .size(11.0)
-                .color(tema::TEXTO2),
+                // Dos líneas y no una: en una sola, un aviso normal de
+                // «Descarga completada» se quedaba en el nombre del archivo
+                // cortado a la mitad. Caben en el alto fijo de la tarjeta.
+                text(crate::escritorio::dos_lineas(&n.cuerpo, ancho_texto, 11.0))
+                    .size(11.0)
+                    .color(tema::TEXTO2),
             );
         }
 
@@ -258,19 +285,23 @@ impl Toast {
             .style(|_theme: &iced_widget::Theme| container::Style {
                 background: Some(tema::card().into()),
                 border: Border {
-                    radius: tema::R_POPOVER.into(),
-                    width: 1.0,
-                    color: tema::borde(),
+                    radius: tema::R_CONTROL.into(),
+                    ..Default::default()
                 },
-                // La misma sombra que el aviso de volumen: el toast también flota
-                // sobre lo que haya, y sin ella se pega al fondo de pantalla.
-                shadow: iced_core::Shadow {
-                    color: Color {
-                        a: 0.35,
-                        ..Color::BLACK
-                    },
-                    offset: iced_core::Vector::new(0.0, 8.0),
-                    blur_radius: 24.0,
+                // En oscuro la sombra negra se lee como un borde. El fondo
+                // carbón ya separa el toast; en claro se conserva el nivel de
+                // sombra que prescribe el HIG para superficies temporales.
+                shadow: if tema::es_claro() {
+                    iced_core::Shadow {
+                        color: Color {
+                            a: 0.15,
+                            ..Color::BLACK
+                        },
+                        offset: iced_core::Vector::new(0.0, 4.0),
+                        blur_radius: 20.0,
+                    }
+                } else {
+                    iced_core::Shadow::default()
                 },
                 ..Default::default()
             });

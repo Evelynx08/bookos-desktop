@@ -200,12 +200,12 @@ impl smithay::xwayland::XwmHandler for BookosComp {
         _reorder: Option<Reorder>,
     ) {
         let elemento = self.window_de_x11(&window);
-        if let Some(elemento) = &elemento {
-            if crate::ventanas::encajada(elemento) {
-                let geo = window.geometry();
-                let _ = window.configure(geo);
-                return;
-            }
+        if let Some(elemento) = &elemento
+            && crate::ventanas::encajada(elemento)
+        {
+            let geo = window.geometry();
+            let _ = window.configure(geo);
+            return;
         }
         let anterior = window.geometry();
         let destino = Rectangle::new(
@@ -239,18 +239,18 @@ impl smithay::xwayland::XwmHandler for BookosComp {
     }
 
     fn maximize_request(&mut self, _xwm: XwmId, window: X11Surface) {
-        if let Some(elemento) = self.window_de_x11(&window) {
-            if !crate::ventanas::maximizada(&elemento) {
-                self.alternar_maximizada(&elemento);
-            }
+        if let Some(elemento) = self.window_de_x11(&window)
+            && !crate::ventanas::maximizada(&elemento)
+        {
+            self.alternar_maximizada(&elemento);
         }
     }
 
     fn unmaximize_request(&mut self, _xwm: XwmId, window: X11Surface) {
-        if let Some(elemento) = self.window_de_x11(&window) {
-            if crate::ventanas::maximizada(&elemento) {
-                self.alternar_maximizada(&elemento);
-            }
+        if let Some(elemento) = self.window_de_x11(&window)
+            && crate::ventanas::maximizada(&elemento)
+        {
+            self.alternar_maximizada(&elemento);
         }
     }
 

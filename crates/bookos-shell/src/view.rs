@@ -39,17 +39,22 @@ pub type PanelElement<'a> = Element<'a, (), Theme, Renderer>;
 
 /// Separación entre los estados de la derecha.
 ///
-/// 20 deja respirar cada estado sin que la fila parezca dispersa. Se comparó
-/// pintado a 16, 20 y 24: con 16 los iconos se tocan de más ahora que los
-/// invisibles ya no cuelan su hueco en el dibujo, y con 24 el reloj se despega
-/// del resto y la fila se lee como cosas sueltas. El hit-test reparte la mitad
-/// del hueco a cada vecino, así que esto no crea franjas muertas entre iconos.
-pub const HUECO: f32 = 20.0;
+/// 22 px entre un icono y el siguiente —12 más 10 a petición—. Con 5 los
+/// widgets se pegaban unos a otros y la fila se leía como un bloque sin
+/// separar bluetooth de red, de volumen, etc.; con 20 —el valor original— sí
+/// se distinguían, pero con nueve widgets se comía 160 px de panel en puro
+/// aire, así que bajó a medio camino de los dos. Se volvió a subir porque a
+/// 12 seguía leyéndose apretado.
+///
+/// El hueco no es un espacio suelto entre elementos: va **dentro** de cada
+/// ranura, mitad a cada lado. Así el resalte del puntero cubre el icono con
+/// aire alrededor, y la zona de clic —que ya repartía medio hueco a cada
+/// vecino— coincide exactamente con la píldora que se pinta.
+pub const HUECO: f32 = 22.0;
 /// Margen izquierdo y derecho del panel.
 ///
-/// 16 y no 12: con la separación entre estados en 20, un margen menor dejaba el
-/// reloj más pegado al borde de la pantalla que a su vecino, y se leía como si
-/// estuviera a punto de salirse.
+/// 16 y no 12: un margen menor deja el reloj demasiado pegado al borde de la
+/// pantalla, y se lee como si estuviera a punto de salirse.
 pub const MARGEN_PANEL: f32 = 16.0;
 /// Lado del logo, en lógicos. 20 sobre un panel de 32 deja 6 de aire arriba y
 /// abajo, que es lo que hace que no parezca metido con calzador.
@@ -68,10 +73,7 @@ pub fn panel(widgets: &Panel) -> PanelElement<'_> {
     // todos pueden faltar: sin batería, sin red o sin retroiluminación no se
     // dibuja un hueco vacío, se dibuja una cosa menos.
     let mut derecha = row![].align_y(iced_core::alignment::Vertical::Center);
-    for (i, estado) in widgets.derecha().into_iter().enumerate() {
-        if i > 0 {
-            derecha = derecha.push(Space::new().width(Length::Fixed(HUECO)));
-        }
+    for estado in widgets.derecha() {
         derecha = derecha.push(estado);
     }
 
@@ -80,7 +82,10 @@ pub fn panel(widgets: &Panel) -> PanelElement<'_> {
         crate::marca::ver(LADO_LOGO),
         Space::new().width(crate::FILL),
         derecha,
-        Space::new().width(Length::Fixed(MARGEN_PANEL)),
+        // Cada ranura ya trae medio hueco a su derecha: se descuenta aquí para
+        // que el último icono quede a `MARGEN_PANEL` del borde, que es donde lo
+        // colocan las zonas de clic.
+        Space::new().width(Length::Fixed(MARGEN_PANEL - HUECO / 2.0)),
     ]
     .align_y(iced_core::alignment::Vertical::Center)
     .height(Length::Fill);

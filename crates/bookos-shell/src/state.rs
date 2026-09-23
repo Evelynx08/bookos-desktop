@@ -188,7 +188,6 @@ pub(crate) fn backlight_max(dispositivo: &str) -> Option<u32> {
             .join(dispositivo)
             .join("max_brightness"),
     )
-    .map(|v| v as u32)
 }
 
 /// Recuerda el resultado de buscar un dispositivo en sysfs.
@@ -222,15 +221,30 @@ fn backlight_path() -> Option<PathBuf> {
 // No se conserva una ruta entre refrescos: el controlador puede reaparecer
 // tras suspender o cargarse después del arranque.
 fn elegir_luz(root: &Path, teclado: bool) -> Option<PathBuf> {
-    let mut paths: Vec<_> = fs::read_dir(root).ok()?.filter_map(Result::ok)
+    let mut paths: Vec<_> = fs::read_dir(root)
+        .ok()?
+        .filter_map(Result::ok)
         .map(|e| e.path())
-        .filter(|p| !teclado || p.file_name().is_some_and(|n| n.to_string_lossy().contains("kbd_backlight")))
-        .filter(|p| read_num(p.join("max_brightness")).is_some_and(|n| n > 0)
-            && read_num(p.join("brightness")).is_some())
+        .filter(|p| {
+            !teclado
+                || p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().contains("kbd_backlight"))
+        })
+        .filter(|p| {
+            read_num(p.join("max_brightness")).is_some_and(|n| n > 0)
+                && read_num(p.join("brightness")).is_some()
+        })
         .collect();
     paths.sort_by_key(|p| {
         let kind = fs::read_to_string(p.join("type")).unwrap_or_default();
-        (match kind.trim() { "raw" => 0, "platform" => 1, _ => 2 }, p.clone())
+        (
+            match kind.trim() {
+                "raw" => 0,
+                "platform" => 1,
+                _ => 2,
+            },
+            p.clone(),
+        )
     });
     paths.into_iter().next()
 }
@@ -238,7 +252,11 @@ fn elegir_luz(root: &Path, teclado: bool) -> Option<PathBuf> {
 pub(crate) fn teclado_actual() -> Option<(String, u32, u32)> {
     let path = elegir_luz(Path::new("/sys/class/leds"), true)?;
     let max = read_num(path.join("max_brightness"))?;
-    Some((path.file_name()?.to_str()?.into(), read_num(path.join("brightness"))?.min(max), max))
+    Some((
+        path.file_name()?.to_str()?.into(),
+        read_num(path.join("brightness"))?.min(max),
+        max,
+    ))
 }
 
 pub(crate) fn read_brightness() -> Option<u8> {

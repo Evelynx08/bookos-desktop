@@ -10,19 +10,20 @@
 use std::time::{Duration, Instant};
 
 use iced_core::alignment::Vertical;
-use iced_core::{Border, Color, Length};
+use iced_core::font::Weight;
+use iced_core::{Border, Length};
 use iced_widget::{Space, column, container, row, text};
 
 use crate::Accion;
 use crate::tema;
 use crate::view::PanelElement;
 
-use super::control;
+use super::control::{self, GRUPO};
 use super::lista::{self, interruptor};
 use super::{Ancla, Tecla};
 
 /// Alto de la fila de «No molestar», con su explicación y su interruptor.
-const BLOQUE: f32 = 56.0;
+const BLOQUE: f32 = 52.0;
 /// Alto de una notificación de la lista: dos renglones y su icono.
 const FILA_NOTIF: f32 = 52.0;
 /// Cuántas caben antes de que la tarjeta sea más alta que la pantalla. Las
@@ -32,8 +33,10 @@ const VISIBLES: usize = 4;
 const CIERRE: f32 = 30.0;
 /// Alto de cada botón de duración.
 const DURACION: f32 = 34.0;
-/// Lado de la pastilla del icono, la misma que en la tarjeta de energía.
-const PASTILLA: f32 = 32.0;
+/// Hueco entre las piezas del grupo: filas, botones y bloques.
+const HUECO: f32 = 6.0;
+/// Hueco entre los dos chips de la cabecera.
+const ENTRE_CHIPS: f32 = 8.0;
 
 /// Cuánto dura el silencio, en la rejilla de dos por dos del diseño.
 const DURACIONES: &[(&str, Option<Duration>)] = &[
@@ -53,8 +56,6 @@ pub struct Notificaciones {
     sobre_interruptor: bool,
     /// El recorrido de la bolita, siguiendo al silencio.
     interruptor: tema::Transicion,
-    /// La luna de «No molestar».
-    icono: Option<crate::icono::Icono>,
     /// Lo que hay que enseñar, copiado de la cola del shell. Copia y no
     /// préstamo porque la tarjeta se dibuja desde `view(&self)` y el `Shell`
     /// que tiene la cola es quien la llama: prestársela sería prestarse a sí
@@ -95,7 +96,6 @@ impl Notificaciones {
             señalada: tema::Realce::nuevo(),
             sobre_interruptor: false,
             interruptor: tema::Transicion::nueva(0.0, tema::D_MODAL, tema::C_MUELLE),
-            icono: crate::icono::propio("noche"),
             lista: Vec::new(),
             fila: tema::Realce::nuevo(),
             seleccionada: None,
@@ -105,16 +105,14 @@ impl Notificaciones {
     pub fn size(&self) -> (f32, f32) {
         // Las duraciones solo ocupan sitio cuando el silencio está puesto: es
         // lo que dice el diseño y evita cuatro botones que no hacen nada.
-        // El aire tras la fila del silencio, la primera fila con su canal y la
-        // segunda sin él: el canal de 8 px va contado dentro de `DURACION`.
         let duraciones = if self.silenciado() {
-            8.0 + DURACION + (DURACION - 8.0)
+            (HUECO + DURACION) * 2.0
         } else {
             0.0
         };
         (
             lista::ANCHO,
-            lista::MARGEN * 2.0 + lista::CABECERA + self.alto_lista() + 12.0 + BLOQUE + duraciones,
+            self.y_bloque() + BLOQUE + duraciones + GRUPO + lista::MARGEN,
         )
     }
 
@@ -123,12 +121,12 @@ impl Notificaciones {
     /// llegar la primera.
     fn alto_lista(&self) -> f32 {
         let n = self.lista.len().clamp(1, VISIBLES) as f32;
-        n * FILA_NOTIF + (n - 1.0) * 6.0
+        n * FILA_NOTIF + (n - 1.0) * HUECO
     }
 
-    /// La `y` donde empieza la lista.
+    /// La `y` donde empieza la lista: bajo la cabecera y dentro del grupo.
     fn y_lista(&self) -> f32 {
-        lista::MARGEN + lista::CABECERA
+        lista::MARGEN + lista::CABECERA + lista::BAJO_CABECERA + GRUPO
     }
 
     /// Cambia lo que se enseña. Lo llama el shell cuando la cola cambia.
@@ -144,15 +142,15 @@ impl Notificaciones {
 
     /// Qué fila de la lista cae en un punto.
     fn fila_en(&self, x: f32, y: f32) -> Option<usize> {
-        if x < lista::MARGEN || x > lista::ANCHO - lista::MARGEN {
+        if x < lista::MARGEN + GRUPO || x > lista::ANCHO - lista::MARGEN - GRUPO {
             return None;
         }
         let rel = y - self.y_lista();
         if rel < 0.0 {
             return None;
         }
-        let i = (rel / (FILA_NOTIF + 6.0)) as usize;
-        if rel - i as f32 * (FILA_NOTIF + 6.0) > FILA_NOTIF {
+        let i = (rel / (FILA_NOTIF + HUECO)) as usize;
+        if rel - i as f32 * (FILA_NOTIF + HUECO) > FILA_NOTIF {
             return None;
         }
         (i < self.lista.len().min(VISIBLES)).then_some(i)
@@ -161,12 +159,23 @@ impl Notificaciones {
     /// El «Borrar todo» de la cabecera. Se mide desde el borde derecho porque
     /// es donde está anclado, igual que se dibuja.
     fn rect_borrar(&self) -> iced_core::Rectangle {
-        let ancho = crate::widget::ancho_de("Borrar todo", 12.0) + 12.0;
+        let ancho = control::ancho_chip("Borrar todo");
         iced_core::Rectangle {
-            x: lista::ANCHO - lista::MARGEN - ancho,
-            y: lista::MARGEN,
+            x: lista::ANCHO - lista::MARGEN - 4.0 - ancho,
+            y: lista::MARGEN + (lista::CABECERA - control::CHIP) / 2.0,
             width: ancho,
-            height: lista::CABECERA,
+            height: control::CHIP,
+        }
+    }
+
+    /// El «Config» de la cabecera, a la izquierda del «Borrar todo».
+    fn rect_config(&self) -> iced_core::Rectangle {
+        let borrar = self.rect_borrar();
+        let ancho = control::ancho_chip("Config");
+        iced_core::Rectangle {
+            x: borrar.x - ENTRE_CHIPS - ancho,
+            width: ancho,
+            ..borrar
         }
     }
 
@@ -194,21 +203,23 @@ impl Notificaciones {
     /// todo»— cuando lo que hace es silenciarlas.
     fn rect_interruptor(&self) -> iced_core::Rectangle {
         iced_core::Rectangle {
-            x: lista::ANCHO - lista::MARGEN - 10.0 - lista::INTERRUPTOR_ANCHO,
+            x: lista::ANCHO - lista::MARGEN - GRUPO - 8.0 - lista::INTERRUPTOR_ANCHO,
             y: self.y_bloque() + (BLOQUE - lista::INTERRUPTOR_ALTO) / 2.0,
             width: lista::INTERRUPTOR_ANCHO,
             height: lista::INTERRUPTOR_ALTO,
         }
     }
 
-    /// La `y` donde empieza la fila de «No molestar».
+    /// La `y` donde empieza la fila de «No molestar»: tras la lista entera y
+    /// el divisor. Contaba una sola fila, y con dos notificaciones o más el
+    /// interruptor se dibujaba más abajo de donde se pulsaba.
     fn y_bloque(&self) -> f32 {
-        lista::MARGEN + lista::CABECERA + lista::FILA + 12.0
+        self.y_lista() + self.alto_lista() + lista::PIE_AIRE
     }
 
     /// La `y` donde empieza la rejilla de duraciones.
     fn y_duraciones(&self) -> f32 {
-        self.y_bloque() + BLOQUE + 8.0
+        self.y_bloque() + BLOQUE + HUECO
     }
 
     /// Qué botón de duración cae en un punto.
@@ -217,11 +228,12 @@ impl Notificaciones {
             return None;
         }
         let y0 = self.y_duraciones();
-        if x < lista::MARGEN || x > lista::ANCHO - lista::MARGEN || y < y0 {
+        if x < lista::MARGEN + GRUPO || x > lista::ANCHO - lista::MARGEN - GRUPO || y < y0 {
             return None;
         }
-        let fila = ((y - y0) / DURACION) as usize;
-        if fila > 1 {
+        let rel = y - y0;
+        let fila = (rel / (DURACION + HUECO)) as usize;
+        if fila > 1 || rel - fila as f32 * (DURACION + HUECO) > DURACION {
             return None;
         }
         let columna = usize::from(x > lista::ANCHO / 2.0);
@@ -275,6 +287,11 @@ impl Notificaciones {
         if self.rect_borrar().contains(punto) {
             return Some(Accion::BorrarNotificaciones);
         }
+        if self.rect_config().contains(punto) {
+            return Some(Accion::Lanzar(
+                "bookos-settings --page notificaciones".into(),
+            ));
+        }
         if self.rect_interruptor().contains(punto) {
             self.silencio = if self.silenciado() {
                 None
@@ -303,7 +320,11 @@ impl Notificaciones {
                     return Tecla::Ignorada;
                 }
                 let actual = self.seleccionada.unwrap_or_else(|| {
-                    if matches!(tecla, crate::TeclaPulsada::Arriba) { n - 1 } else { 0 }
+                    if matches!(tecla, crate::TeclaPulsada::Arriba) {
+                        n - 1
+                    } else {
+                        0
+                    }
                 });
                 let siguiente = if matches!(tecla, crate::TeclaPulsada::Arriba) {
                     actual.saturating_sub(1)
@@ -315,7 +336,9 @@ impl Notificaciones {
                 Tecla::Consumida
             }
             crate::TeclaPulsada::Inicio => {
-                if self.lista.is_empty() { Tecla::Ignorada } else {
+                if self.lista.is_empty() {
+                    Tecla::Ignorada
+                } else {
                     self.seleccionada = Some(0);
                     self.fila.señalar(Some(0));
                     Tecla::Consumida
@@ -323,15 +346,21 @@ impl Notificaciones {
             }
             crate::TeclaPulsada::Fin => {
                 let n = self.lista.len().min(VISIBLES);
-                if n == 0 { Tecla::Ignorada } else {
+                if n == 0 {
+                    Tecla::Ignorada
+                } else {
                     self.seleccionada = Some(n - 1);
                     self.fila.señalar(Some(n - 1));
                     Tecla::Consumida
                 }
             }
             crate::TeclaPulsada::Intro => {
-                let Some(i) = self.seleccionada else { return Tecla::Ignorada; };
-                let Some(notif) = self.lista.get(i) else { return Tecla::Ignorada; };
+                let Some(i) = self.seleccionada else {
+                    return Tecla::Ignorada;
+                };
+                let Some(notif) = self.lista.get(i) else {
+                    return Tecla::Ignorada;
+                };
                 if let Some(accion) = notif.acciones.first() {
                     Tecla::Hacer(Accion::NotificacionAccion {
                         id: notif.id,
@@ -354,18 +383,14 @@ impl Notificaciones {
         notif: &'a crate::notificaciones::Notificacion,
         señalada: f32,
     ) -> PanelElement<'a> {
-        let ancho = lista::ANCHO - lista::MARGEN * 2.0;
+        let ancho = lista::BALDOSA;
         let dibujo: PanelElement<'a> = match &notif.icono {
             Some(ic) => crate::icono::ver(ic, 26.0, 26.0),
             None => Space::new().width(Length::Fixed(26.0)).into(),
         };
         // La crítica lleva el nombre en rojo: es lo que la separa de las demás
         // sin meter un fondo de color que taparía su propio icono.
-        let repeticiones = self
-            .lista
-            .iter()
-            .filter(|n| n.app == notif.app)
-            .count();
+        let repeticiones = self.lista.iter().filter(|n| n.app == notif.app).count();
         let app = if repeticiones > 1 {
             format!("{} · {}", notif.app, repeticiones)
         } else {
@@ -376,13 +401,17 @@ impl Notificaciones {
         } else {
             tema::TEXTO2
         };
-        let indicador = match (notif.acciones.len(), notif.progreso, notif.progreso_indeterminado) {
+        let indicador = match (
+            notif.acciones.len(),
+            notif.progreso,
+            notif.progreso_indeterminado,
+        ) {
             (acciones, Some(porcentaje), _) if acciones > 0 => {
                 format!("{} · {}%", acciones, porcentaje)
             }
             (acciones, _, true) if acciones > 0 => format!("{} · …", acciones),
-            (acciones, Some(porcentaje), _) if acciones == 0 => format!("{}%", porcentaje),
-            (acciones, _, true) if acciones == 0 => "…".to_string(),
+            (0, Some(porcentaje), _) => format!("{}%", porcentaje),
+            (0, _, true) => "…".to_string(),
             (acciones, _, _) if acciones > 0 => format!("{} acciones", acciones),
             _ => String::new(),
         };
@@ -398,11 +427,12 @@ impl Notificaciones {
         ]
         .align_y(Vertical::Center);
 
-        let ancho_texto = ancho - 26.0 - 12.0 - CIERRE;
+        let ancho_texto = ancho - 24.0 - 26.0 - 12.0 - CIERRE;
         let mut textos = column![
             cabecera,
             text(lista::recortar(&notif.resumen, ancho_texto, 13.0))
                 .size(13.0)
+                .font(control::peso(Weight::Medium))
                 .color(tema::texto()),
         ];
         if !notif.cuerpo.is_empty() {
@@ -424,7 +454,7 @@ impl Notificaciones {
             Space::new().into()
         };
 
-        let fondo = tema::mezclar(tema::alfa(tema::tinta(), 0.04), tema::hover(), señalada);
+        let fondo = control::baldosa(señalada);
         // Los textos van en una caja de ancho fijo: sin ella, iced los deja
         // crecer hasta el hueco libre y **parte el resumen en dos líneas**, que
         // desborda una fila de 52 px. Recortar no basta, porque lo recortado se
@@ -443,11 +473,11 @@ impl Notificaciones {
         .width(Length::Fixed(ancho))
         .height(Length::Fixed(FILA_NOTIF))
         .center_y(Length::Fixed(FILA_NOTIF))
-        .padding([0, 10])
+        .padding([0, 12])
         .style(move |_theme: &iced_widget::Theme| container::Style {
             background: Some(fondo.into()),
             border: Border {
-                radius: tema::R_CONTROL.into(),
+                radius: tema::R_BOTON_PEQUENO.into(),
                 ..Default::default()
             },
             ..Default::default()
@@ -458,118 +488,102 @@ impl Notificaciones {
     fn boton_duracion(&self, i: usize) -> PanelElement<'_> {
         let (etiqueta, _) = DURACIONES[i];
         let elegido = self.duracion == i && self.silenciado();
-        // Chips de verdad, con relleno: sin fondo no se veía que fueran cuatro
-        // botones, solo cuatro renglones de texto gris debajo del interruptor.
-        // El elegido va en acento sólido; el resto sube del reposo al hover
-        // con la curva, en vez de encenderse de golpe.
         let señalado = self.señalada.intensidad(i);
-        let (fondo, color) = if elegido {
-            (tema::acento(), tema::sobre_acento())
-        } else {
+        // La elegida como lo seleccionado de cualquier lista: acento al 10 % y
+        // texto en acento. En sólido pesaba más que el interruptor de encima,
+        // que es la decisión de verdad.
+        let (fondo, color, peso) = if elegido {
             (
-                tema::mezclar(tema::alfa(tema::tinta(), 0.04), tema::hover(), señalado),
-                tema::mezclar(tema::TEXTO2, tema::texto(), señalado),
+                control::seleccionada(señalado),
+                tema::acento(),
+                Weight::Semibold,
             )
+        } else {
+            (control::baldosa(señalado), tema::texto(), Weight::Medium)
         };
-        // Cuatro celdas de dos en dos, con 8 px de canal en medio.
-        let ancho = (lista::ANCHO - lista::MARGEN * 2.0 - 8.0) / 2.0;
-        container(text(etiqueta).size(12.0).color(color))
-            .width(Length::Fixed(ancho))
-            .height(Length::Fixed(DURACION - 8.0))
-            .center_x(Length::Fixed(ancho))
-            .center_y(Length::Fixed(DURACION - 8.0))
-            .style(move |_theme: &iced_widget::Theme| container::Style {
-                background: Some(fondo.into()),
-                border: Border {
-                    radius: tema::R_BOTON_PEQUENO.into(),
-                    ..Default::default()
-                },
+        let ancho = (lista::BALDOSA - HUECO) / 2.0;
+        container(
+            text(etiqueta)
+                .size(13.0)
+                .font(control::peso(peso))
+                .color(color),
+        )
+        .width(Length::Fixed(ancho))
+        .height(Length::Fixed(DURACION))
+        .center_x(Length::Fixed(ancho))
+        .center_y(Length::Fixed(DURACION))
+        .style(move |_theme: &iced_widget::Theme| container::Style {
+            background: Some(fondo.into()),
+            border: Border {
+                radius: tema::R_BOTON_PEQUENO.into(),
                 ..Default::default()
-            })
-            .into()
+            },
+            ..Default::default()
+        })
+        .into()
     }
 
-    /// Una fila de chips con su canal en medio.
+    /// Una fila de dos botones de duración con su hueco en medio.
     fn fila_duraciones(&self, i: usize) -> PanelElement<'_> {
         row![
             self.boton_duracion(i),
-            Space::new().width(Length::Fixed(8.0)),
+            Space::new().width(Length::Fixed(HUECO)),
             self.boton_duracion(i + 1),
         ]
         .into()
     }
 
     pub fn view(&self) -> PanelElement<'_> {
-        // «Config» y «Borrar todo» van en texto plano y no en píldoras: con
-        // relleno pesaban más que el propio título —una de ellas roja— y la
-        // cabecera se leía como una barra de tres botones.
-        let boton = |etiqueta: &'static str, rojo: bool| -> PanelElement<'static> {
-            container(text(etiqueta).size(12.0).color(if rojo {
-                tema::rojo()
-            } else {
-                tema::TEXTO2
-            }))
-            .height(Length::Fixed(24.0))
-            .center_y(Length::Fixed(24.0))
-            .padding([0, 6])
-            .into()
-        };
         let cabecera = container(
             row![
-                text("Notificaciones")
-                    .size(tema::T_TITULO)
-                    .color(tema::texto()),
+                control::titulo("Notificaciones"),
                 Space::new().width(Length::Fill),
-                boton("Config", false),
-                boton("Borrar todo", true),
+                control::chip("Config", tema::superficie(), tema::texto()),
+                Space::new().width(Length::Fixed(ENTRE_CHIPS)),
+                // Con la lista vacía se apaga en vez de desaparecer: «Config»
+                // se ancla a él, y el rojo de destruir sin nada que destruir
+                // se lee como un aviso.
+                if self.lista.is_empty() {
+                    control::chip(
+                        "Borrar todo",
+                        tema::superficie(),
+                        tema::alfa(tema::TEXTO2, 0.6),
+                    )
+                } else {
+                    control::chip("Borrar todo", tema::alfa(tema::rojo(), 0.14), tema::rojo())
+                },
             ]
             .align_y(Vertical::Center),
         )
         .width(Length::Fixed(lista::ANCHO - lista::MARGEN * 2.0))
         .height(Length::Fixed(lista::CABECERA))
+        .padding([0, 4])
         .center_y(Length::Fixed(lista::CABECERA));
 
-        // «No molestar» es una fila-control con su interruptor dentro, con la
-        // misma pastilla de icono que los perfiles de energía: es lo que hace
-        // que las dos tarjetas se lean como del mismo sistema.
-        let pastilla_fondo = if self.silenciado() {
-            Color {
-                a: 0.20,
-                ..tema::acento()
-            }
-        } else {
-            Color {
-                a: 0.06,
-                ..tema::tinta()
-            }
-        };
-        let tinta = if self.silenciado() {
-            tema::acento()
-        } else {
-            tema::TEXTO2
-        };
-        let pastilla = container(match &self.icono {
-            Some(ic) => crate::icono::ver_teñido(ic, 18.0, Some(tinta)),
-            None => Space::new().width(Length::Fixed(18.0)).into(),
-        })
-        .width(Length::Fixed(PASTILLA))
-        .height(Length::Fixed(PASTILLA))
-        .center_x(Length::Fixed(PASTILLA))
-        .center_y(Length::Fixed(PASTILLA))
-        .style(move |_theme: &iced_widget::Theme| container::Style {
-            background: Some(pastilla_fondo.into()),
-            border: Border {
-                radius: (PASTILLA / 2.0).into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        });
+        let mut cola = column![].spacing(HUECO);
+        if self.lista.is_empty() {
+            cola = cola.push(
+                container(lista::vacia("No hay notificaciones"))
+                    .height(Length::Fixed(FILA_NOTIF))
+                    .center_y(Length::Fixed(FILA_NOTIF)),
+            );
+        }
+        for (i, notif) in self.lista.iter().take(VISIBLES).enumerate() {
+            let resaltado = self.seleccionada.is_some_and(|seleccion| seleccion == i);
+            let intensidad = self
+                .fila
+                .intensidad(i)
+                .max(if resaltado { 0.65 } else { 0.0 });
+            cola = cola.push(self.fila_notificacion(notif, intensidad));
+        }
+
         let no_molestar = container(
             row![
-                pastilla,
-                Space::new().width(Length::Fixed(12.0)),
                 column![
-                    text("No molestar").size(14.0).color(tema::texto()),
+                    text("No molestar")
+                        .size(14.0)
+                        .font(control::peso(Weight::Medium))
+                        .color(tema::texto()),
                     text("Las notificaciones solo se guardan aquí")
                         .size(11.0)
                         .color(tema::TEXTO2),
@@ -579,50 +593,30 @@ impl Notificaciones {
             ]
             .align_y(Vertical::Center),
         )
-        .width(Length::Fixed(lista::ANCHO - lista::MARGEN * 2.0))
+        .width(Length::Fixed(lista::BALDOSA))
         .height(Length::Fixed(BLOQUE))
         .center_y(Length::Fixed(BLOQUE))
-        .padding([0, 10])
-        .style(|_theme: &iced_widget::Theme| container::Style {
-            background: Some(
-                Color {
-                    a: 0.04,
-                    ..tema::tinta()
-                }
-                .into(),
-            ),
-            border: Border {
-                radius: tema::R_CONTROL.into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        });
+        .padding([0, 8]);
 
-        let mut cola = column![].spacing(6.0);
-        if self.lista.is_empty() {
-            cola = cola.push(lista::vacia("No hay notificaciones"));
-        }
-        for (i, notif) in self.lista.iter().take(VISIBLES).enumerate() {
-            let resaltado = self
-                .seleccionada
-                .is_some_and(|seleccion| seleccion == i);
-            let intensidad = self.fila.intensidad(i).max(if resaltado { 0.65 } else { 0.0 });
-            cola = cola.push(self.fila_notificacion(notif, intensidad));
-        }
-
-        let mut contenido = column![
-            cabecera,
+        let mut grupo = column![
             cola,
-            Space::new().height(Length::Fixed(12.0)),
+            Space::new().height(Length::Fixed(HUECO + 2.0)),
+            container(control::divisor(lista::BALDOSA - 12.0)).padding([0, 6]),
+            Space::new().height(Length::Fixed(2.0 + HUECO)),
             no_molestar,
         ];
         if self.silenciado() {
-            contenido = contenido
-                .push(Space::new().height(Length::Fixed(8.0)))
+            grupo = grupo
+                .push(Space::new().height(Length::Fixed(HUECO)))
                 .push(self.fila_duraciones(0))
-                .push(Space::new().height(Length::Fixed(8.0)))
+                .push(Space::new().height(Length::Fixed(HUECO)))
                 .push(self.fila_duraciones(2));
         }
+        let contenido = column![
+            cabecera,
+            Space::new().height(Length::Fixed(lista::BAJO_CABECERA)),
+            lista::grupo(grupo.into()),
+        ];
         control::tarjeta(contenido.into(), lista::ANCHO, lista::MARGEN)
     }
 }
@@ -686,7 +680,10 @@ mod tests {
             None,
             false,
         )]);
-        assert!(matches!(n.tecla(crate::TeclaPulsada::Abajo), Tecla::Consumida));
+        assert!(matches!(
+            n.tecla(crate::TeclaPulsada::Abajo),
+            Tecla::Consumida
+        ));
         assert!(matches!(
             n.tecla(crate::TeclaPulsada::Intro),
             Tecla::Hacer(Accion::NotificacionAccion { id: 7, .. })

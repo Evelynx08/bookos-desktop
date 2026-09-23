@@ -1058,14 +1058,7 @@ fn tarjeta_v<'a>(
                 width: 1.0,
                 color: borde,
             },
-            shadow: Shadow {
-                color: Color {
-                    a: if tema::es_claro() { 0.20 } else { 0.5 },
-                    ..Color::BLACK
-                },
-                offset: Vector::new(0.0, 10.0),
-                blur_radius: 30.0,
-            },
+            shadow: tema::sombra_popover(),
             ..Default::default()
         })
         .into()
@@ -1403,41 +1396,11 @@ fn preparar_portada(portada: Option<&Portada>) -> (Option<Portada>, Option<Color
 }
 
 fn redondear(p: &Portada) -> Portada {
-    let (w, h) = (p.width as i32, p.height as i32);
     // El mismo 22 % de radio que usa la carátula sin portada, para que las dos
     // tengan la misma curva a cualquier tamaño.
-    let r = (w.min(h) as f32 * 0.22).round() as i32;
+    let radio = p.width.min(p.height) as f32 * 0.22;
     let mut rgba = p.rgba.clone();
-    for y in 0..h {
-        for x in 0..w {
-            // Distancia al centro de la esquina más cercana; fuera del cuarto
-            // de círculo, transparente. Un píxel de antialias en el borde
-            // evita el escalón.
-            let dx = if x < r {
-                r - x
-            } else if x >= w - r {
-                x - (w - r - 1)
-            } else {
-                0
-            };
-            let dy = if y < r {
-                r - y
-            } else if y >= h - r {
-                y - (h - r - 1)
-            } else {
-                0
-            };
-            if dx == 0 || dy == 0 {
-                continue;
-            }
-            let d = ((dx * dx + dy * dy) as f32).sqrt();
-            let alfa = ((r as f32 + 0.5 - d).clamp(0.0, 1.0) * 255.0) as u8;
-            if alfa < 255 {
-                let i = ((y * w + x) * 4 + 3) as usize;
-                rgba[i] = (rgba[i] as u16 * alfa as u16 / 255) as u8;
-            }
-        }
-    }
+    crate::redondear_esquinas(&mut rgba, p.width, p.height, radio, crate::Alfa::Recto);
     Portada {
         rgba,
         width: p.width,
@@ -1767,8 +1730,7 @@ mod tests {
     fn el_color_de_la_portada_es_utilizable() {
         for (r, g, b) in [(10u8, 10u8, 12u8), (250, 250, 250), (120, 30, 200)] {
             let p = Portada {
-                rgba: std::iter::repeat([r, g, b, 255])
-                    .take(64 * 64)
+                rgba: std::iter::repeat_n([r, g, b, 255], 64 * 64)
                     .flatten()
                     .collect(),
                 width: 64,
@@ -1784,8 +1746,7 @@ mod tests {
     #[test]
     fn el_recorte_solo_se_come_las_esquinas() {
         let p = Portada {
-            rgba: std::iter::repeat([200u8, 100, 50, 255])
-                .take(100 * 100)
+            rgba: std::iter::repeat_n([200u8, 100, 50, 255], 100 * 100)
                 .flatten()
                 .collect(),
             width: 100,

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Captura
+Comment=Captura de pantalla de BookOS
+Exec=bookos-captura
+TryExec=bookos-captura
+Icon=applets-screenshooter
+Type=Application
+Categories=Graphics;Utility;
+Keywords=captura;pantalla;screenshot;

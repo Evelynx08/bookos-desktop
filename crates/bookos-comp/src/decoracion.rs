@@ -95,25 +95,37 @@ pub fn barra_rect(state: &BookosComp, window: &Window) -> Option<Rectangle<i32, 
 
 /// La ventana cuya barra está bajo el punto, y qué botón, si alguno.
 ///
-/// Se recorre de delante hacia atrás —`elements()` va de atrás a adelante— para
-/// que la barra de una ventana tapada no se lleve el clic de la que está
-/// encima.
+/// Se recorre de delante hacia atrás —`elements()` va de atrás a adelante— y se
+/// **para en la primera ventana que cubra el punto**, sea con su barra o con su
+/// cuerpo. Mirar solo las barras no bastaba: si el cuerpo de la de delante tapa
+/// la barra de una de atrás, el clic caía en una barra que no se ve, y pulsar
+/// dentro de la ventana con la que estás trabajando cerraba otra. Con el cuerpo
+/// cortando el recorrido, lo que está tapado deja de ser alcanzable.
 pub fn barra_en(state: &BookosComp, punto: Point<f64, Logical>) -> Option<(Window, Option<Boton>)> {
-    state.space.elements().rev().find_map(|window| {
-        let rect = barra_rect(state, window)?;
-        let dentro = punto.x >= rect.loc.x as f64
-            && punto.x < (rect.loc.x + rect.size.w) as f64
-            && punto.y >= rect.loc.y as f64
-            && punto.y < (rect.loc.y + rect.size.h) as f64;
-        dentro.then(|| {
+    let dentro = |r: Rectangle<i32, Logical>| {
+        punto.x >= r.loc.x as f64
+            && punto.x < (r.loc.x + r.size.w) as f64
+            && punto.y >= r.loc.y as f64
+            && punto.y < (r.loc.y + r.size.h) as f64
+    };
+    for window in state.space.elements().rev() {
+        if let Some(rect) = barra_rect(state, window)
+            && dentro(rect)
+        {
             let boton = bookos_shell::decoracion::boton_en(
                 rect.size.w as f32,
                 (punto.x - rect.loc.x as f64) as f32,
                 (punto.y - rect.loc.y as f64) as f32,
             );
-            (window.clone(), boton)
-        })
-    })
+            return Some((window.clone(), boton));
+        }
+        // El cuerpo no devuelve barra, pero sí tapa: quien esté por detrás no
+        // puede recibir este clic.
+        if state.space.element_geometry(window).is_some_and(&dentro) {
+            return None;
+        }
+    }
+    None
 }
 
 /// El área donde cabe una ventana **con** su barra: la útil, sin la franja de
@@ -210,5 +222,14 @@ pub fn vivas(state: &BookosComp) -> Vec<u64> {
         .elements()
         .chain(state.minimizadas.iter().map(|(w, _)| w))
         .filter_map(id)
+        // La barra de una ventana que se está cerrando se sigue pintando
+        // mientras dura la animación: sin esto desaparecía de golpe y el
+        // cuerpo se desvanecía solo.
+        .chain(
+            state
+                .cierres
+                .iter()
+                .filter_map(|c| c.barra.as_ref().map(|b| b.id)),
+        )
         .collect()
 }

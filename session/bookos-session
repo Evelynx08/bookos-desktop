@@ -9,7 +9,13 @@
 # Se instala con `session/instalar.sh`, que necesita root para escribir en
 # /usr/share/wayland-sessions.
 set -u
-umask 077
+# 022 y no 077. El 077 lo heredaban **todas** las aplicaciones de la sesión, y
+# lo que escribieran nacía sin permiso de lectura para nadie más: los `.desktop`
+# que se instalan desde dentro del escritorio quedaban en 600, así que el
+# launchpad no los veía y en el registro salía «Error loading .desktop file …:
+# permiso denegado». Lo que sí es privado —el registro y el directorio de la
+# sesión— se protege abajo por su cuenta, que es donde toca.
+umask 022
 
 # Lo que anuncia la sesión al resto del sistema. `XDG_CURRENT_DESKTOP` es lo
 # que miran los portales y las bibliotecas de toolkit para decidir cómo
@@ -87,6 +93,11 @@ systemctl --user start bookos-system.service >/dev/null 2>&1 || true
 # El registro va a un fichero y no a la salida estándar porque SDDM se la come:
 # cuando la sesión no arranca, esto es lo único que queda para saber por qué.
 registro="${XDG_RUNTIME_DIR:-/tmp}/bookos-session.log"
+# El registro lleva la salida de todo lo que corre en la sesión y puede acabar
+# con cualquier cosa dentro, así que es del usuario y de nadie más. Se crea
+# vacío y se le quitan los permisos **antes** de escribir nada, que si no hay
+# una ventana en la que existe abierto de par en par.
+: >"$registro" && chmod 600 "$registro"
 # Qué binario y de cuándo, lo primero de todo: es la línea que contesta a "¿por
 # qué no veo el cambio que acabo de hacer?".
 {
@@ -142,13 +153,18 @@ sesion_tmp=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/bookos-session.XXXXXXXX") || ex
 export BOOKOS_SESSION_SOCKET_FILE="$sesion_tmp/socket"
 export BOOKOS_SESSION_LOCK_FILE="$sesion_tmp/unlocked"
 comp=""
+sonido_login=false
 finalizar() {
     trap - TERM INT HUP
     if [ -n "$comp" ]; then kill "$comp" 2>/dev/null || true; wait "$comp" 2>/dev/null || true; fi
     exit 0
 }
 trap finalizar TERM INT HUP
-trap 'rm -f "$BOOKOS_SESSION_SOCKET_FILE" "$BOOKOS_SESSION_LOCK_FILE"; rmdir "$sesion_tmp" 2>/dev/null || true' EXIT
+# Parar el target al salir se lleva por delante el portal y bookos-system, que
+# cuelgan de `graphical-session.target`. Sin esto quedarían corriendo contra un
+# compositor que ya no está, y la siguiente sesión encontraría un portal con el
+# entorno de la anterior.
+trap 'systemctl --user stop bookos-session.target >/dev/null 2>&1 || true; rm -f "$BOOKOS_SESSION_SOCKET_FILE" "$BOOKOS_SESSION_LOCK_FILE"; rmdir "$sesion_tmp" 2>/dev/null || true' EXIT
 while true; do
     # Un reinicio desde la recuperación ha sido solicitado explícitamente.
     printf unlocked >"$BOOKOS_SESSION_LOCK_FILE"
@@ -168,7 +184,45 @@ while true; do
     done
     if [ -n "$socket" ] && kill -0 "$comp" 2>/dev/null; then
         export WAYLAND_DISPLAY="$socket"
+
+        # Los servicios D-Bus de usuario nacieron antes que el compositor y no
+        # heredan las variables que acabamos de fijar en este proceso. En
+        # particular xdg-desktop-portal necesita saber que está en BookOS para
+        # elegir BookOS-portals.conf; con el entorno viejo escogía el backend
+        # genérico y las aplicaciones recibían el esquema claro aunque el
+        # escritorio estuviera oscuro.
+        if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+            dbus-update-activation-environment --systemd \
+                WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP \
+                XDG_SESSION_TYPE QT_QPA_PLATFORM GDK_BACKEND MOZ_ENABLE_WAYLAND \
+                XCURSOR_THEME XCURSOR_SIZE >/dev/null 2>&1 || true
+        else
+            systemctl --user import-environment \
+                WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP \
+                XDG_SESSION_TYPE QT_QPA_PLATFORM GDK_BACKEND MOZ_ENABLE_WAYLAND \
+                XCURSOR_THEME XCURSOR_SIZE >/dev/null 2>&1 || true
+        fi
+        # Y ahora sí se declara la sesión gráfica, **después** de meter el
+        # entorno en el bus: lo que arranque a partir de aquí ya nace sabiendo
+        # que está en BookOS y con qué socket de Wayland hablar.
+        #
+        # Esta línea es la que hace que haya portal. `xdg-desktop-portal.service`
+        # lleva `Requisite=graphical-session.target` y sin el target activo su
+        # trabajo falla nada más pedirlo, así que hasta ahora ninguna aplicación
+        # recibía el `color-scheme` oscuro, no había diálogo de abrir fichero y
+        # compartir pantalla no funcionaba. Ver `bookos-session.target`.
+        systemctl --user start bookos-session.target >/dev/null 2>&1 || true
+        # Si el portal venía vivo de otra sesión, que relea el escritorio y
+        # la selección de backend. `try-restart` no arranca nada si aún no se
+        # había usado; el arranque de verdad lo hace el target de arriba.
+        systemctl --user try-restart xdg-desktop-portal.service >/dev/null 2>&1 || true
         lanzar_autostart
+        # La recuperación puede relanzar el compositor dentro de esta misma
+        # sesión. El sonido marca el login, no cada reinicio tras un fallo.
+        if [ "$sonido_login" = false ] && command -v canberra-gtk-play >/dev/null 2>&1; then
+            canberra-gtk-play -i desktop-login >/dev/null 2>&1 &
+            sonido_login=true
+        fi
     fi
     wait "$comp"
     codigo=$?

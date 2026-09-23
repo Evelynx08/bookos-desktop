@@ -76,12 +76,57 @@ pub fn leer() -> Vec<App> {
 /// el `.desktop` no se llama como la aplicación dice llamarse.
 pub fn por_app_id(app_id: &str) -> Option<App> {
     let cola = app_id.rsplit('.').next().unwrap_or(app_id);
-    for dir in directorios() {
-        for nombre in [app_id, cola] {
+    // En minúsculas también: VirtualBox en Wayland se anuncia como
+    // `VirtualBox` y su fichero es `virtualbox.desktop`. Su `StartupWMClass`
+    // —«VirtualBox Manager», abajo— es el nombre X11 y tampoco casa.
+    let minusculas = cola.to_lowercase();
+    let dirs = directorios();
+    for dir in &dirs {
+        for nombre in [app_id, cola, &minusculas] {
             let ruta = dir.join(format!("{nombre}.desktop"));
             if let Some(app) = leer_una(&ruta) {
                 return Some(app);
             }
+        }
+    }
+
+    // Las aplicaciones X11 se identifican por WM_CLASS, que no tiene por qué
+    // parecerse al nombre del fichero. VirtualBox es el caso importante:
+    // `virtualbox.desktop` declara `StartupWMClass=VirtualBox Manager`. Sin
+    // mirar esa clave el dock conoce la ventana, pero no encuentra su icono y
+    // cae a la baldosa con una inicial.
+    for dir in dirs {
+        let Ok(entradas) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for ruta in entradas
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "desktop"))
+        {
+            let Ok(texto) = std::fs::read_to_string(&ruta) else {
+                continue;
+            };
+            if startup_wm_class(&texto).is_some_and(|c| c.eq_ignore_ascii_case(app_id))
+                && let Some(app) = leer_una(&ruta)
+            {
+                return Some(app);
+            }
+        }
+    }
+    None
+}
+
+/// `StartupWMClass` del grupo principal de una entrada de escritorio.
+fn startup_wm_class(texto: &str) -> Option<&str> {
+    let mut en_entrada = false;
+    for linea in texto.lines().map(str::trim) {
+        if linea.starts_with('[') {
+            en_entrada = linea == "[Desktop Entry]";
+            continue;
+        }
+        if en_entrada && let Some(valor) = linea.strip_prefix("StartupWMClass=") {
+            return Some(valor.trim());
         }
     }
     None
@@ -279,5 +324,12 @@ mod tests {
         let camara = app("Cámara");
         assert_eq!(puntuar(&camara, "camara"), Some(0));
         assert_eq!(puntuar(&camara, "cam"), Some(1));
+    }
+
+    #[test]
+    fn wm_class_se_lee_solo_de_la_entrada_principal() {
+        let texto = "[Desktop Entry]\nName=VirtualBox\nStartupWMClass=VirtualBox Manager\n\
+                     [Desktop Action Otra]\nStartupWMClass=Incorrecta\n";
+        assert_eq!(startup_wm_class(texto), Some("VirtualBox Manager"));
     }
 }

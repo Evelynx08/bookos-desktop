@@ -129,10 +129,11 @@ fn el_sonido_se_abre_y_su_deslizador_arrastra() {
     assert!(tinta(&buf, w, h, 0, w) > 0, "el emergente sale en blanco");
 
     // Agarrar la píldora por la izquierda y arrastrarla hasta pasarse del
-    // borde derecho: el nivel tiene que acabar al máximo, no a medias.
-    shell.emergente_pulsar(20.0, 90.0);
+    // borde derecho: el nivel tiene que acabar al máximo, no a medias. La de
+    // los altavoces empieza en x = 16 + 4 + 18 + 10 y ocupa de y = 90 a 114.
+    shell.emergente_pulsar(60.0, 100.0);
     assert!(shell.emergente_agarrada(), "la píldora no quedó agarrada");
-    shell.emergente_puntero(Some((10_000.0, 90.0)));
+    shell.emergente_puntero(Some((10_000.0, 100.0)));
     assert!(
         shell.soltar().0,
         "soltar no devolvió que había algo agarrado"
@@ -657,7 +658,7 @@ fn el_calendario_se_abre_desde_el_reloj() {
     assert!(shell.hay_emergente(), "pulsar el reloj abre el calendario");
 
     let ((w, _h), _, _) = shell.emergente_geometria().unwrap();
-    assert_eq!(w, 340, "el ancho es el de la tarjeta del plasmoide");
+    assert_eq!(w, 336, "el ancho es el de las demás tarjetas del panel");
 
     let (bw, bh) = shell.emergente_buffer_size().unwrap();
     let mut buf = vec![0u8; (bw * bh * 4) as usize];
@@ -725,7 +726,7 @@ fn el_launchpad_se_abre_y_se_pinta() {
     shell.emergente_puntero(Some((100.0, 200.0)));
     let realce = shell.emergente_realce();
     let mut compuesto = vec![0u8; (bw * bh * 4) as usize];
-    for p in compuesto.chunks_exact_mut(4) {
+    for p in compuesto.as_chunks_mut::<4>().0 {
         // El velo va sobre negro, que es el escritorio vacío.
         p[0] = (velo[2] * velo[3] * 255.0) as u8;
         p[1] = (velo[1] * velo[3] * 255.0) as u8;
@@ -772,6 +773,10 @@ fn el_launchpad_se_abre_y_se_pinta() {
 #[test]
 fn el_icono_señalado_se_ve_distinto() {
     let mut shell = shell(1.0);
+    // Con una ventana abierta, para ver también el indicador en el volcado. Va
+    // **antes** de medir: abrir una aplicación que no está fijada ensancha el
+    // dock, y un búfer del tamaño viejo se rechaza sin pintar nada.
+    shell.dock_ventanas(&["org.kde.dolphin".to_string()]);
     let (w, h) = shell.dock_buffer_size();
 
     let mut apagado = vec![0u8; (w * h * 4) as usize];
@@ -782,14 +787,16 @@ fn el_icono_señalado_se_ve_distinto() {
         shell.dock_hover(Some((centro, centro))),
         "señalar un icono nuevo tiene que pedir repintado"
     );
-    // Y con una ventana abierta, para ver también el indicador en el volcado.
-    shell.dock_ventanas(&["org.kde.dolphin".to_string()]);
     // La placa entra en 120 ms: sin esperarlos, lo que se pinta es el primer
     // fotograma de la animación, casi idéntico al icono apagado.
     std::thread::sleep(bookos_shell::tema::D_HOVER);
     let mut señalado = vec![0u8; (w * h * 4) as usize];
     shell.draw_dock(&mut señalado);
     volcar("BOOKOS_DOCK_PNG", &señalado, w, h);
+    assert!(
+        señalado.as_chunks::<4>().0.iter().any(|p| p[3] != 0),
+        "el dock señalado sale transparente"
+    );
 
     assert_ne!(
         apagado, señalado,
@@ -956,8 +963,14 @@ fn el_no_molestar_enseña_sus_duraciones() {
     let mut shell = shell(1.0);
     shell.abrir(bookos_shell::Emergente::notificaciones());
     let (_, alto_antes) = shell.emergente_buffer_size().expect("tiene superficie");
-    // El interruptor vive en la fila de «No molestar», a la derecha.
-    shell.emergente_pulsar(335.0 - 21.0 - 10.0 - 20.0, 21.0 + 40.0 + 43.0 + 12.0 + 28.0);
+    // El interruptor vive en la fila de «No molestar», a la derecha: tarjeta,
+    // margen, relleno del grupo y aire hasta la mitad del interruptor; y en
+    // alto, cabecera, grupo, la fila vacía de la lista, el divisor y media
+    // fila del bloque.
+    shell.emergente_pulsar(
+        336.0 - 16.0 - 6.0 - 8.0 - 23.0,
+        16.0 + 32.0 + 12.0 + 6.0 + 52.0 + 16.5 + 26.0,
+    );
     let (w, h) = shell.emergente_buffer_size().expect("tiene superficie");
     assert!(h > alto_antes, "con el silencio puesto la tarjeta crece");
     let mut buf = vec![0u8; (w * h * 4) as usize];
@@ -1220,7 +1233,10 @@ fn el_menu_del_bloqueo_se_despliega() {
     let inicial = alto_menu(&mut shell);
     std::thread::sleep(std::time::Duration::from_millis(250));
     let final_ = alto_menu(&mut shell);
-    assert!(inicial < final_, "el menú no se desplegó: {inicial} → {final_}");
+    assert!(
+        inicial < final_,
+        "el menú no se desplegó: {inicial} → {final_}"
+    );
     assert!(
         final_ > 100,
         "el menú no acabó de desplegarse: {final_} px de alto"
@@ -1350,23 +1366,92 @@ fn el_aviso_de_notificacion_se_pinta_y_se_descarta() {
         ),
         -1,
     );
-    let (w, h) = shell.toast_buffer_size().expect("tiene superficie");
+    let (w, h) = shell.toast_buffer_size(1).expect("tiene superficie");
     let mut buf = vec![0u8; (w * h * 4) as usize];
-    shell.draw_toast(&mut buf);
+    shell.draw_toast(1, &mut buf);
     volcar("BOOKOS_TOAST_PNG", &buf, w, h);
     assert!(tinta(&buf, w, h, 0, w) > 0, "el aviso sale en blanco");
-    assert!(shell.toast_vivo());
+    assert!(shell.toasts_vivos());
 
     // Pulsarlo lo manda a irse, pero la notificación se queda en la lista:
     // despedir el aviso no es haberla atendido.
-    assert!(shell.descartar_toast());
+    assert!(shell.descartar_toast(1));
     assert!(
         shell
-            .toast_queda()
-            .is_some_and(|q| q <= bookos_shell::toast::SALIDA),
+            .toasts_quedan()
+            .first()
+            .is_some_and(|q| *q <= bookos_shell::toast::SALIDA),
         "descartar tiene que dejarle solo la salida"
     );
     assert_eq!(shell.notificaciones().len(), 1);
+}
+
+/// Los avisos se apilan, el más nuevo arriba; si llega uno de más, el más
+/// antiguo se va, y uno que se actualiza se queda en su sitio.
+#[test]
+fn los_avisos_se_apilan_y_el_que_sobra_se_va() {
+    use bookos_shell::notificaciones::Notificacion;
+    use bookos_shell::toast::MAXIMO_A_LA_VISTA;
+
+    let mut shell = shell(1.0);
+    let n = |id: u32| {
+        Notificacion::nueva(
+            id,
+            "App".into(),
+            format!("Aviso {id}"),
+            String::new(),
+            "",
+            false,
+        )
+    };
+    for id in 1..=MAXIMO_A_LA_VISTA as u32 {
+        shell.notificar(n(id), -1);
+    }
+    assert_eq!(shell.toasts_ids(), vec![3, 2, 1], "el más nuevo va arriba");
+
+    shell.notificar(n(4), -1);
+    assert_eq!(shell.toasts_ids(), vec![4, 3, 2, 1]);
+    assert!(
+        shell
+            .toasts_quedan()
+            .last()
+            .is_some_and(|q| *q <= bookos_shell::toast::SALIDA),
+        "el que sobra tiene que estar saliendo, no quitarse de golpe"
+    );
+
+    // `replaces_id`: no vuelve arriba.
+    shell.notificar(n(2), -1);
+    assert_eq!(shell.toasts_ids(), vec![4, 3, 2, 1]);
+}
+
+/// Abrir una tarjeta despide los avisos, y con ella abierta no salen nuevos:
+/// caían encima de la de notificaciones y tapaban «No molestar».
+#[test]
+fn una_tarjeta_abierta_aparta_los_avisos() {
+    use bookos_shell::notificaciones::Notificacion;
+
+    let mut shell = shell(1.0);
+    let n = |id: u32, critica: bool| {
+        Notificacion::nueva(id, "App".into(), "Aviso".into(), String::new(), "", critica)
+    };
+    shell.notificar(n(1, false), -1);
+    shell.abrir_de_widget("notificaciones");
+    assert!(
+        shell
+            .toasts_quedan()
+            .iter()
+            .all(|q| *q <= bookos_shell::toast::SALIDA),
+        "abrir la tarjeta tiene que mandar a irse los avisos"
+    );
+
+    shell.notificar(n(2, false), -1);
+    assert!(
+        !shell.toasts_ids().contains(&2),
+        "no debe salir encima de la tarjeta"
+    );
+    assert_eq!(shell.notificaciones().len(), 2, "pero sí se guarda");
+    shell.notificar(n(3, true), -1);
+    assert!(shell.toasts_ids().contains(&3), "una crítica sale igual");
 }
 
 /// «No molestar» sobrevive a cerrar la tarjeta, y mientras está puesto una
@@ -1379,7 +1464,7 @@ fn el_silencio_sobrevive_y_deja_pasar_lo_critico() {
     shell.abrir_de_widget("notificaciones");
     // El interruptor de «No molestar», en la fila de su bloque.
     let (w, _) = shell.emergente_geometria().unwrap().0;
-    shell.emergente_pulsar(w as f32 - 40.0, 145.0);
+    shell.emergente_pulsar(w as f32 - 40.0, 160.0);
     assert!(
         shell.notificaciones_silenciadas(),
         "pulsar el interruptor tiene que silenciar"
@@ -1405,7 +1490,7 @@ fn el_silencio_sobrevive_y_deja_pasar_lo_critico() {
         ),
         -1,
     );
-    assert!(!shell.toast_vivo(), "con silencio no debe salir el aviso");
+    assert!(!shell.toasts_vivos(), "con silencio no debe salir el aviso");
     assert_eq!(shell.notificaciones().len(), 1, "pero sí se guarda");
 
     // …y una crítica sale igual: para eso es crítica.
@@ -1421,7 +1506,7 @@ fn el_silencio_sobrevive_y_deja_pasar_lo_critico() {
         -1,
     );
     assert!(
-        shell.toast_vivo(),
+        shell.toasts_vivos(),
         "una crítica tiene que salir aunque haya silencio"
     );
 }
@@ -1605,8 +1690,8 @@ fn el_buscador_busca_y_lanza() {
     assert!(shell.hay_emergente());
     assert_eq!(shell.emergente_nombre(), Some("buscador"));
     assert!(
-        shell.emergente_usa_cristal(),
-        "el buscador va sobre cristal"
+        !shell.emergente_usa_cristal(),
+        "una tarjeta opaca no debe dejar un halo del fondo en las esquinas"
     );
 
     // Vacío es solo el campo: sin lista, la tarjeta no puede tener el alto de
@@ -1629,13 +1714,13 @@ fn el_buscador_busca_y_lanza() {
     assert!(tinta(&buf, bw, bh, 0, bw) > 0, "el buscador sale vacío");
 
     // El alto con el que el compositor lo **coloca** no cambia con lo escrito:
-    // es lo que impide que el campo de texto salte media fila con cada tecla.
-    // Ver `Emergente::alto_estable`.
+    // es el del campo, que queda centrado mientras los resultados crecen hacia
+    // abajo. Ver `Emergente::alto_estable`.
     let estable = shell.emergente_geometria().unwrap().2;
     assert_eq!(
         estable,
-        Some(60 + 1 + 6 * 52 + 10),
-        "el buscador tiene que colocarse por su alto máximo, no por el de ahora"
+        Some(60),
+        "Spotlight tiene que colocarse por el campo centrado, no por la lista"
     );
 
     // Intro lanza lo elegido y cierra.
@@ -1663,48 +1748,163 @@ fn el_escape_del_buscador_borra_antes_de_cerrar() {
     assert!(!shell.hay_emergente(), "el segundo Esc cierra");
 }
 
-/// La capa de captura se pinta: el velo, el recuadro con sus medidas y la barra
-/// de modos abajo.
+/// La capa de captura se pinta: la barra de modos y la pastilla con las
+/// medidas, cada una en su superficie. El velo con su agujero no sale aquí: lo
+/// compone el compositor, y se comprueba allí.
 ///
-/// Con `BOOKOS_CAPTURA_PNG=/ruta.png` guarda lo que sale, para mirarlo contra
-/// el resto del escritorio.
+/// Con `BOOKOS_CAPTURA_PNG=/ruta.png` guarda la barra, y con
+/// `BOOKOS_CAPTURA_PASTILLA_PNG` la pastilla, para mirarlas contra el resto del
+/// escritorio.
 #[test]
 fn la_capa_de_captura_se_pinta() {
+    use bookos_shell::{PiezaCaptura, TeclaPulsada};
+
     let pantalla = (1280.0, 800.0);
     let mut shell = shell(1.0);
     shell.abrir_captura(pantalla);
     assert!(shell.hay_captura());
+    assert_eq!(
+        shell.captura_origen(PiezaCaptura::Pastilla),
+        None,
+        "sin recuadro la pastilla no va en ningún sitio"
+    );
 
     // Un recuadro marcado a mano, que es lo que enseña de verdad la capa.
     shell.captura_pulsar(240.0, 180.0);
     shell.captura_puntero(880.0, 560.0);
 
-    let (w, h) = shell.captura_buffer_size().expect("tiene superficie");
-    let mut buf = vec![0u8; (w * h * 4) as usize];
-    shell.draw_captura(&mut buf);
-    volcar("BOOKOS_CAPTURA_PNG", &buf, w, h);
-    assert!(tinta(&buf, w, h, 0, w) > 0, "la capa sale en blanco");
+    for (pieza, variable) in [
+        (PiezaCaptura::Barra, "BOOKOS_CAPTURA_PNG"),
+        (PiezaCaptura::Pastilla, "BOOKOS_CAPTURA_PASTILLA_PNG"),
+    ] {
+        assert!(shell.captura_needs_paint(pieza), "{pieza:?} sin pintar");
+        let (w, h) = shell.captura_buffer_size(pieza).expect("tiene superficie");
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        shell.draw_captura(pieza, &mut buf);
+        volcar(variable, &buf, w, h);
+        assert!(tinta(&buf, w, h, 0, w) > 0, "{pieza:?} sale en blanco");
+        assert!(!shell.captura_needs_paint(pieza));
+    }
 
-    // El agujero del recuadro tiene que estar **sin velo**: es lo que hace que
-    // se vea qué va a salir en la foto. Se compara el alfa del centro del
-    // recuadro con el de una esquina, que sí lleva velo.
-    let alfa = |x: u32, y: u32| buf[((y * w + x) * 4 + 3) as usize];
-    assert!(alfa(20, 20) > 80, "el velo de fuera no se pintó");
+    let r = shell.captura_marcado().expect("hay recuadro");
+    assert_eq!((r.x, r.y, r.w, r.h), (240.0, 180.0, 640.0, 380.0));
+    // La pastilla va centrada bajo el recuadro.
+    let (px, py) = shell
+        .captura_origen(PiezaCaptura::Pastilla)
+        .expect("con recuadro la pastilla se coloca");
+    assert!(py > r.y + r.h, "la pastilla tiene que ir debajo");
     assert_eq!(
-        alfa(560, 370),
-        0,
-        "el hueco del recuadro tiene que ser transparente"
+        px + bookos_shell::captura::PASTILLA_ANCHO / 2.0,
+        r.x + r.w / 2.0
     );
 
-    // Y soltar pide la captura de lo marcado, al portapapeles por defecto.
-    assert_eq!(
-        shell.captura_soltar(),
-        Some(bookos_shell::Accion::Capturar {
+    // Mover sin cambiar lo que se ve no repinta nada: es lo que hace que
+    // arrastrar no rasterice en cada evento del ratón.
+    shell.captura_puntero(880.2, 560.3);
+    assert!(!shell.captura_needs_paint(PiezaCaptura::Barra));
+    assert!(!shell.captura_needs_paint(PiezaCaptura::Pastilla));
+    shell.captura_puntero(900.0, 560.3);
+    assert!(!shell.captura_needs_paint(PiezaCaptura::Barra));
+    assert!(shell.captura_needs_paint(PiezaCaptura::Pastilla));
+
+    // Soltar no captura: lo marcado se queda esperando, e Intro lo copia.
+    shell.captura_soltar();
+    assert!(shell.captura_marcado().is_some(), "soltar deja el recuadro");
+    assert!(matches!(
+        shell.captura_tecla(TeclaPulsada::Intro),
+        bookos_shell::Tecla::Hacer(bookos_shell::Accion::Capturar {
             x: 240,
             y: 180,
-            ancho: 640,
+            ancho: 660,
             alto: 380,
             guardar: false
         })
+    ));
+}
+
+/// La entrada del bloqueo se **mueve**: no basta con que exista el código de la
+/// animación, tiene que cambiar lo que se pinta entre un instante y otro.
+///
+/// Se comprueba midiendo tinta en tres momentos. El primer fotograma va a alfa
+/// cero a propósito —por eso el test de la foto de arriba desactiva las
+/// animaciones—, así que arrancar con la pantalla en blanco no es el fallo: el
+/// fallo sería quedarse ahí.
+#[test]
+fn la_entrada_del_bloqueo_se_anima() {
+    use std::time::Duration;
+
+    let pantalla = (1645.0, 1029.0);
+    let mut shell = Shell::new(ANCHO, 1.0);
+    shell.bloquear("12:30".into(), "lunes, 17 de agosto".into(), pantalla);
+    assert!(
+        shell.bloqueo_animando(),
+        "recién echado tiene que haber animación en marcha"
     );
+
+    let (w, h) = shell
+        .bloqueo_buffer_size()
+        .expect("hay superficie de bloqueo");
+    let mut medir = || {
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        shell.draw_bloqueo(&mut buf);
+        comun::tinta(&buf, w, h, 0, w)
+    };
+
+    let principio = medir();
+    std::thread::sleep(Duration::from_millis(400));
+    let medio = medir();
+    std::thread::sleep(Duration::from_millis(500));
+    let final_ = medir();
+
+    assert_ne!(
+        principio, medio,
+        "el bloqueo no cambió en los primeros 400 ms: la entrada está congelada"
+    );
+    assert!(
+        final_ > 0,
+        "al terminar la entrada el bloqueo tiene que estar pintado"
+    );
+    assert!(
+        !shell.bloqueo_animando(),
+        "pasados los 760 ms de ENTRADA_TOTAL la animación tiene que haber acabado"
+    );
+}
+
+/// Comprobación visual del solape del bloqueo con la tarjeta de medios, a la
+/// resolución lógica real del portátil: 1280×800 (2240×1400 físicos a escala
+/// 1,75). Con `BOOKOS_BLOQUEO_1280_PNG=/ruta.png` se puede mirar el PNG.
+#[test]
+fn el_bloqueo_no_se_solapa_a_1280x800() {
+    use bookos_shell::bloqueo::{Estado, Medio};
+
+    let pantalla = (1280.0, 800.0);
+    let mut config = Config::default();
+    config.bloqueo.animaciones = false;
+    let mut shell = Shell::con_config(ANCHO, 1.0, config);
+    shell.bloquear("23:50".into(), "jueves, 17 de septiembre".into(), pantalla);
+    if let Some(b) = shell.bloqueo_mut() {
+        b.medios.push(Medio {
+            bus: "org.mpris.MediaPlayer2.prueba".into(),
+            titulo: "Surface of a Glass Lake".into(),
+            detalle: "_1_975".into(),
+            color: iced_core::Color::from_rgb(0.35, 0.4, 0.9),
+            progreso: Some(0.25),
+            posicion: Some(13),
+            duracion: Some(52),
+            reproduciendo: false,
+        });
+    }
+    assert_eq!(
+        shell.bloqueo_mut().map(|b| {
+            b.estado = Estado::Escribiendo;
+        }),
+        Some(())
+    );
+
+    let (w, h) = shell
+        .bloqueo_buffer_size()
+        .expect("hay superficie de bloqueo");
+    let mut buf = vec![0u8; (w * h * 4) as usize];
+    shell.draw_bloqueo(&mut buf);
+    volcar("BOOKOS_BLOQUEO_1280_PNG", &buf, w, h);
 }

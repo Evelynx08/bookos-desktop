@@ -59,6 +59,10 @@ pub enum Ancla {
     SobreElDock { x: f32 },
     /// En el centro de la pantalla. El launchpad.
     Centrada,
+    /// Con la esquina superior izquierda en ese punto lógico, sin salirse de
+    /// la pantalla. Es el menú del clic derecho sobre el escritorio: tiene
+    /// que salir junto al cursor, no en el centro.
+    Punto { x: f32, y: f32 },
     /// Franja de gestión pegada al borde superior de la pantalla.
     Arriba,
 }
@@ -77,6 +81,7 @@ pub enum Tecla {
 }
 
 pub use compartir::Pantalla as PantallaCompartible;
+pub use escritorios::RADIO_MINIATURA as RADIO_MINIATURA_ESCRITORIO;
 pub use menu_dock::Objetivo;
 pub use proyeccion::Modo as ModoProyeccion;
 
@@ -118,6 +123,12 @@ pub enum Emergente {
 impl Emergente {
     pub fn menu_ventana(opciones: Vec<(String, Accion)>) -> Self {
         Self::MenuDock(menu_dock::MenuDock::ventana(opciones))
+    }
+
+    /// El mismo menú, pero anclado a un punto de la pantalla en vez de
+    /// centrado: lo que quiere el clic derecho sobre el escritorio.
+    pub fn menu_ventana_en(opciones: Vec<(String, Accion)>, punto: (f32, f32)) -> Self {
+        Self::MenuDock(menu_dock::MenuDock::ventana_en(opciones, punto))
     }
     pub fn menu() -> Self {
         Self::Menu(menu::Menu::new())
@@ -218,7 +229,13 @@ impl Emergente {
             Self::Sonido(_) => "sonido",
             Self::Brillo(_) => "brillo",
             Self::Energia(_) => "energia",
-            Self::MenuDock(m) => if m.es_ventana() { "menu-ventana" } else { "menu-dock" },
+            Self::MenuDock(m) => {
+                if m.es_ventana() {
+                    "menu-ventana"
+                } else {
+                    "menu-dock"
+                }
+            }
             Self::Acerca(_) => "acerca",
             Self::Centro(_) => "centro",
             Self::Notificaciones(_) => "notificaciones",
@@ -261,13 +278,12 @@ impl Emergente {
     ///
     /// Solo el buscador lo tiene: su alto cambia con cada tecla —cada resultado
     /// que entra o sale es media fila— y centrarlo por el alto de ahora lo hace
-    /// saltar mientras escribes, con el rectángulo de cristal detrás saltando
-    /// con él. Colocándolo por el máximo, el campo de texto se queda clavado y
-    /// la lista crece hacia abajo. Las demás devuelven `None` y se colocan por
-    /// lo que miden, que es lo que siempre han hecho.
+    /// saltar mientras escribes. Se coloca por el alto estable de su campo: el
+    /// campo queda centrado y la lista crece hacia abajo. Las demás devuelven
+    /// `None` y se colocan por lo que miden, que es lo que siempre han hecho.
     pub fn alto_estable(&self) -> Option<f32> {
         match self {
-            Self::Buscador(_) => Some(buscador::Buscador::alto_maximo()),
+            Self::Buscador(_) => Some(buscador::Buscador::alto_colocacion()),
             _ => None,
         }
     }
@@ -335,9 +351,7 @@ impl Emergente {
             Self::Escritorios(e) => e.animando(),
             Self::Proyeccion(p) => p.animando(),
             Self::Compartir(c) => c.animando(),
-            // El brillo no tiene nada que animar dentro: sus dos píldoras
-            // siguen al dedo y sus botones no se pulsan.
-            Self::Brillo(_) => false,
+            Self::Brillo(b) => b.animando(),
         }
     }
 
@@ -348,6 +362,16 @@ impl Emergente {
     /// solo la zona con contenido.
     pub fn tapa_la_pantalla(&self) -> bool {
         matches!(self, Self::Launchpad(_) | Self::Escritorios(_))
+    }
+
+    /// El color con que se limpia el buffer antes de dibujar la vista, para
+    /// la emergente que va entera sobre un fondo liso. Ver
+    /// `Shell::paint_con_fondo`.
+    pub fn fondo(&self) -> Option<iced_core::Color> {
+        match self {
+            Self::Escritorios(e) => Some(e.fondo()),
+            _ => None,
+        }
     }
 
     /// El velo a pantalla completa que va detrás, si la emergente lo quiere.
@@ -370,15 +394,13 @@ impl Emergente {
         }
     }
 
-    /// ¿Lleva cristal esmerilado debajo?
+    /// ¿Lleva cristal esmerilado debajo de su propia superficie?
     ///
-    /// Solo el buscador. Las tarjetas que cuelgan del panel no lo llevan por lo
-    /// mismo que el panel: salen sobre el fondo del escritorio, que ya es liso,
-    /// y el desenfoque solo se notaría emborronando el borde del fondo. El
-    /// buscador sí flota en mitad de la pantalla, y ahí lo de debajo es
-    /// cualquier cosa.
+    /// Ninguna tarjeta opaca lo necesita. Ponerlo bajo el buscador dejaba
+    /// asomar el color del fondo en el píxel antialiasado de sus esquinas, como
+    /// un segundo borde que cambiaba con el wallpaper.
     pub fn usa_cristal(&self) -> bool {
-        matches!(self, Self::Buscador(_))
+        false
     }
 
     /// El realce de lo señalado: rectángulo **relativo a la emergente** y si

@@ -205,6 +205,14 @@ pub fn encogido_ahora(e: Encogido) -> (Point<f64, Logical>, f64, f32) {
 /// [`animar_minimizados`]: si se sacara ya del `Space` no habría nada que
 /// dibujar y el encogido no se vería.
 pub fn minimizar(state: &mut BookosComp, window: Window) {
+    // El botón puede recibir otro clic mientras la lámpara sigue en marcha.
+    // No debemos arrancar una segunda animación ni guardar la misma ventana
+    // dos veces: al terminar, eso dejaría una entrada fantasma en el dock.
+    if state.minimizando.iter().any(|(w, _)| *w == window)
+        || state.minimizadas.iter().any(|(w, _)| *w == window)
+    {
+        return;
+    }
     let Some(origen) = state.space.element_geometry(&window) else {
         return;
     };
@@ -228,6 +236,7 @@ pub fn minimizar(state: &mut BookosComp, window: Window) {
             }
         }
     }
+    state.actualizar_dock();
     state.needs_redraw = true;
 }
 
@@ -323,6 +332,9 @@ pub fn animar_minimizados(state: &mut BookosComp) -> bool {
         state.capturas.retain(|(w, _)| *w != window);
         state.minimizadas.push((window, posicion));
     }
+    // La ventana sigue abierta aunque ya no esté mapeada: el dock debe
+    // enterarse de inmediato para conservar su indicador y permitir restaurarla.
+    state.actualizar_dock();
     state.needs_redraw = true;
     sigue
 }
@@ -937,7 +949,7 @@ pub fn hueco(
     // abrir veinte terminales: pasado ese punto se vuelve al centro y se aceptan
     // las dos superpuestas, que es menos malo que una ventana inalcanzable.
     for _ in 0..8 {
-        if !ocupadas.iter().any(|p| *p == sitio) {
+        if !ocupadas.contains(&sitio) {
             return sitio;
         }
         sitio.x += CASCADA;
@@ -968,24 +980,43 @@ impl BookosComp {
     /// Traslada coordenadas lógicas y conserva maximizado/fullscreen y el
     /// rectángulo flotante al que volver. El destino puede tener otra escala.
     pub fn mover_a_monitor(&mut self, window: &Window, nombre: &str) {
-        if self.minimizando.iter().any(|(w, _)| w == window) { return; }
+        if self.minimizando.iter().any(|(w, _)| w == window) {
+            return;
+        }
         crate::escritorios::terminar_todos(self);
-        let Some(destino) = self.space.outputs().find(|o| o.name() == nombre)
-            .and_then(|o| self.space.output_geometry(o)) else { return; };
-        let Some(loc) = self.space.element_location(window) else { return; };
+        let Some(destino) = self
+            .space
+            .outputs()
+            .find(|o| o.name() == nombre)
+            .and_then(|o| self.space.output_geometry(o))
+        else {
+            return;
+        };
+        let Some(loc) = self.space.element_location(window) else {
+            return;
+        };
         let origen = crate::escritorios::salida_de(self, window)
             .and_then(|n| self.space.outputs().find(|o| o.name() == n))
-            .and_then(|o| self.space.output_geometry(o)).unwrap_or(destino);
-        if origen == destino { return; }
+            .and_then(|o| self.space.output_geometry(o))
+            .unwrap_or(destino);
+        if origen == destino {
+            return;
+        }
         let puntero = self.pointer_location;
         // Los helpers de área útil usan la salida bajo el puntero. Se cambia
         // solo durante la operación, sin emitir movimiento al cliente.
         self.pointer_location = (destino.loc.x as f64 + 1.0, destino.loc.y as f64 + 1.0).into();
         let area = crate::decoracion::area_util(self, window);
-        let posicion = confinar(loc + (destino.loc - origen.loc), window.geometry().size, area);
+        let posicion = confinar(
+            loc + (destino.loc - origen.loc),
+            window.geometry().size,
+            area,
+        );
         if let Some(previa) = estado(window).restaurar.get() {
             estado(window).restaurar.set(Some(Rectangle::new(
-                confinar(previa.loc + (destino.loc - origen.loc), previa.size, area), previa.size)));
+                confinar(previa.loc + (destino.loc - origen.loc), previa.size, area),
+                previa.size,
+            )));
         }
         self.space.map_element(window.clone(), posicion, false);
         if completa(window) {
@@ -1027,8 +1058,8 @@ impl BookosComp {
         // y una ventana maximizada llegaba hasta el borde de abajo con el dock
         // encima tapándole sus últimos píxeles: medido a 1280×800, el área
         // acababa en y=800 y el dock empezaba en y=712.
-        let (arriba, abajo) = (pantalla.loc == (0, 0).into())
-            .then(|| {
+        let (arriba, abajo) = if pantalla.loc == (0, 0).into() {
+            {
                 self.shell
                     .as_ref()
                     .map(|s| {
@@ -1038,8 +1069,10 @@ impl BookosComp {
                         )
                     })
                     .unwrap_or((0, 0))
-            })
-            .unwrap_or((0, 0));
+            }
+        } else {
+            (0, 0)
+        };
         Rectangle::new(
             (pantalla.loc.x, pantalla.loc.y + arriba).into(),
             (
@@ -1122,10 +1155,10 @@ impl BookosComp {
             // `set_activated` devuelve si el estado cambió de verdad; solo
             // entonces hay que mandar configure. Mandarlo siempre es un ida y
             // vuelta con cada cliente en cada clic.
-            if otra.set_activated(otra == window) {
-                if let Some(toplevel) = otra.toplevel() {
-                    toplevel.send_pending_configure();
-                }
+            if otra.set_activated(otra == window)
+                && let Some(toplevel) = otra.toplevel()
+            {
+                toplevel.send_pending_configure();
             }
         }
 
@@ -1483,10 +1516,10 @@ impl BookosComp {
             // A dónde volver: solo se guarda si no había nada guardado ya, para
             // no perder el tamaño flotante de una ventana que estaba encajada
             // cuando el cliente pidió pantalla completa.
-            if let Some(actual) = actual {
-                if estado(window).restaurar.get().is_none() {
-                    guardar_restaurar(window, actual);
-                }
+            if let Some(actual) = actual
+                && estado(window).restaurar.get().is_none()
+            {
+                guardar_restaurar(window, actual);
             }
             pantalla
         } else {

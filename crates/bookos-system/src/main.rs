@@ -312,15 +312,15 @@ async fn watch_owner(
     // lento, reanudación o reinicio). El watcher anterior solo intentaba crear
     // el proxy una vez y se quedaba muerto para el resto de la sesión.
     loop {
-        if let Ok(p) = zbus::Proxy::new(&c, name, "/", name).await {
-            if let Ok(mut owners) = p.receive_owner_changed().await {
-                // Al encontrar el servicio por primera vez, fuerza una lectura
-                // inmediata; después solo despierta al shell cuando cambia el
-                // propietario. Si aún no existe, no generamos ticks inútiles.
+        if let Ok(p) = zbus::Proxy::new(&c, name, "/", name).await
+            && let Ok(mut owners) = p.receive_owner_changed().await
+        {
+            // Al encontrar el servicio por primera vez, fuerza una lectura
+            // inmediata; después solo despierta al shell cuando cambia el
+            // propietario. Si aún no existe, no generamos ticks inútiles.
+            let _ = tx.send(domain.into()).await;
+            while owners.next().await.is_some() {
                 let _ = tx.send(domain.into()).await;
-                while owners.next().await.is_some() {
-                    let _ = tx.send(domain.into()).await;
-                }
             }
         }
         tokio::time::sleep(Duration::from_secs(3)).await;

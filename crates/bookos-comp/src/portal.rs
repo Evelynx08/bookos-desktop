@@ -278,10 +278,12 @@ impl ScreenCast {
         let ruta_solicitud: OwnedObjectPath = handle.to_owned().into();
         let cancelada = Arc::new(AtomicBool::new(false));
         let solicitud = Solicitud {
-            estado: self.estado.clone(),
             ruta: ruta_solicitud.clone(),
-            sesion,
             cancelada: cancelada.clone(),
+            al_cerrar: AlCerrar::Captura {
+                estado: self.estado.clone(),
+                sesion,
+            },
         };
         if let Err(err) = servidor.at(ruta_solicitud.as_str(), solicitud).await {
             tracing::warn!(%ruta_solicitud, "no se pudo publicar Request: {err}");
@@ -382,22 +384,41 @@ fn respuesta_start(
     (CORRECTO, resultados)
 }
 
-/// Objeto efímero que permite a xdg-desktop-portal cancelar el diálogo de
-/// `Start` mientras su llamada asíncrona sigue esperando.
+/// Objeto efímero que permite a xdg-desktop-portal cancelar una interacción
+/// —el diálogo de `Start` o el selector de archivos— mientras su llamada
+/// asíncrona sigue esperando.
 struct Solicitud {
-    estado: Arc<Estado>,
     ruta: OwnedObjectPath,
-    sesion: u32,
     cancelada: Arc<AtomicBool>,
+    al_cerrar: AlCerrar,
+}
+
+/// Qué hay que deshacer cuando el portal cancela.
+enum AlCerrar {
+    /// Retirar el diálogo de permiso y el nodo en preparación.
+    Captura { estado: Arc<Estado>, sesion: u32 },
+    /// Cerrar la ventana del selector, que es un proceso aparte.
+    Selector { pid: u32 },
 }
 
 #[zbus::interface(name = "org.freedesktop.impl.portal.Request")]
 impl Solicitud {
     async fn close(&self, #[zbus(object_server)] servidor: &zbus::ObjectServer) {
         self.cancelada.store(true, Ordering::Release);
-        self.estado.avisar(Aviso::Cancelar {
-            sesion: self.sesion,
-        });
+        match &self.al_cerrar {
+            AlCerrar::Captura { estado, sesion } => {
+                estado.avisar(Aviso::Cancelar { sesion: *sesion });
+            }
+            // Hay una ventana entre que el hilo recoge al hijo y se retira esta
+            // `Solicitud` en la que el pid ya no es nuestro. Es de
+            // microsegundos y el kernel no recicla un pid tan deprisa; cerrarla
+            // del todo pediría `pidfd`, y no compensa para un `SIGTERM`.
+            AlCerrar::Selector { pid } => {
+                // SAFETY: `kill` no toca memoria; el peor caso es ESRCH si el
+                // hijo acaba de salir por su cuenta.
+                unsafe { libc::kill(*pid as libc::pid_t, libc::SIGTERM) };
+            }
+        }
         if let Err(err) = servidor.remove::<Solicitud, _>(self.ruta.as_str()).await {
             tracing::debug!(ruta = %self.ruta, "Request ya retirado: {err}");
         }
@@ -630,6 +651,330 @@ impl Screenshot {
     }
 }
 
+/// El diálogo de abrir y guardar archivos, con la cara de BookOS.
+///
+/// No lo dibuja el shell: es `bookos-explorer` en modo selector, que ya tiene
+/// la navegación, las miniaturas, la barra lateral y el tema. Rehacer todo eso
+/// en iced para un diálogo sería mantener dos exploradores. Como proceso
+/// aparte, además, un explorador que se cuelga no se lleva al compositor.
+///
+/// El explorador escribe las rutas elegidas, una por línea, en un fichero que
+/// se le pasa; si se cierra sin escribir nada, es que el usuario canceló.
+struct Selector {
+    /// El socket Wayland de **este** compositor. El proceso hereda el entorno
+    /// del compositor y, en anidado, su `WAYLAND_DISPLAY` es el del anfitrión:
+    /// sin fijarlo, el diálogo se abriría en la otra sesión.
+    socket: std::ffi::OsString,
+    siguiente: AtomicU32,
+}
+
+/// Lo que se le pide al explorador.
+enum Modo {
+    Abrir {
+        multiple: bool,
+    },
+    Guardar,
+    /// `directory` en `OpenFile`, y también `SaveFiles`, que solo necesita
+    /// saber la carpeta: los nombres los trae la aplicación.
+    Carpeta,
+}
+
+/// Un filtro del portal, `(sa(us))`: nombre y lista de `(tipo, patrón)`, donde
+/// el tipo 0 es un glob y el 1 un tipo MIME.
+type Filtro = (String, Vec<(u32, String)>);
+
+impl Selector {
+    async fn elegir(
+        &self,
+        handle: ObjectPath<'_>,
+        titulo: &str,
+        modo: Modo,
+        mut opciones: HashMap<String, OwnedValue>,
+        servidor: &zbus::ObjectServer,
+    ) -> Result<Vec<PathBuf>, u32> {
+        let mut args: Vec<std::ffi::OsString> = Vec::new();
+        let mut par = |clave: &str, valor: std::ffi::OsString| {
+            args.push(clave.into());
+            args.push(valor);
+        };
+        par(
+            "--pick-mode",
+            match modo {
+                Modo::Abrir { .. } => "open",
+                Modo::Guardar => "save",
+                Modo::Carpeta => "folder",
+            }
+            .into(),
+        );
+        if !titulo.is_empty() {
+            par("--pick-title", titulo.into());
+        }
+        if let Some(etiqueta) = cadena(&mut opciones, "accept_label") {
+            // El guion bajo es el mnemónico de GTK («_Abrir»); en un botón
+            // HTML se vería tal cual.
+            par("--pick-accept", etiqueta.replacen('_', "", 1).into());
+        }
+        if let Some(nombre) = cadena(&mut opciones, "current_name") {
+            par("--pick-name", nombre.into());
+        }
+        // `current_file` es un archivo que ya existe y se está volviendo a
+        // guardar: manda sobre `current_folder` y `current_name` porque dice
+        // las dos cosas a la vez.
+        let actual = bytes_ruta(&mut opciones, "current_file");
+        let carpeta = actual
+            .as_deref()
+            .and_then(std::path::Path::parent)
+            .map(PathBuf::from)
+            .or_else(|| bytes_ruta(&mut opciones, "current_folder"));
+        if let Some(carpeta) = carpeta {
+            par("--pick-start", carpeta.into_os_string());
+        }
+        if let Some(nombre) = actual.as_deref().and_then(std::path::Path::file_name) {
+            par("--pick-name", nombre.to_owned());
+        }
+        let filtro = filtro_inicial(&mut opciones);
+        if let Some((nombre, patrones)) = &filtro {
+            // El nombre también: «Imágenes» se entiende; `*.png *.jpg`, menos.
+            par("--pick-filter-name", nombre.into());
+            // Solo los globs. Un filtro MIME pediría la base de datos de
+            // shared-mime-info para decidir; sin ella, no filtrar es mejor que
+            // esconder archivos que la aplicación sí acepta.
+            for (_, glob) in patrones.iter().filter(|(tipo, _)| *tipo == 0) {
+                par("--pick-pattern", glob.into());
+            }
+        }
+        if let Modo::Abrir { multiple: true } = modo {
+            args.push("--pick-multiple".into());
+        }
+
+        let dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let salida = dir.join(format!(
+            "bookos-selector-{}-{}",
+            std::process::id(),
+            self.siguiente.fetch_add(1, Ordering::Relaxed)
+        ));
+        let hijo = std::process::Command::new("bookos-explorer")
+            .arg("--bookos-portal")
+            .arg(&salida)
+            .args(&args)
+            .env("WAYLAND_DISPLAY", &self.socket)
+            .spawn();
+        let mut hijo = match hijo {
+            Ok(hijo) => hijo,
+            Err(err) => {
+                tracing::warn!("no se pudo abrir el selector de archivos: {err}");
+                return Err(FALLO);
+            }
+        };
+
+        let ruta_solicitud: OwnedObjectPath = handle.to_owned().into();
+        let cancelada = Arc::new(AtomicBool::new(false));
+        let solicitud = Solicitud {
+            ruta: ruta_solicitud.clone(),
+            cancelada: cancelada.clone(),
+            al_cerrar: AlCerrar::Selector { pid: hijo.id() },
+        };
+        if let Err(err) = servidor.at(ruta_solicitud.as_str(), solicitud).await {
+            // Sin `Request` el portal no podría cancelar, pero el usuario sí
+            // puede cerrar la ventana: se sigue.
+            tracing::debug!(%ruta_solicitud, "no se pudo publicar Request: {err}");
+        }
+
+        // `wait` bloquea y aquí no se puede bloquear (ver la cabecera del
+        // módulo): lo espera un hilo y la conexión sigue atendiendo.
+        let (emisario, espera) = promesa();
+        std::thread::spawn(move || {
+            if let Err(err) = hijo.wait() {
+                tracing::warn!("no se pudo esperar al selector de archivos: {err}");
+                return;
+            }
+            // Sin fichero, el emisario se suelta sin contestar: cancelado.
+            if let Ok(texto) = std::fs::read_to_string(&salida) {
+                let _ = std::fs::remove_file(&salida);
+                emisario.entregar(texto);
+            }
+        });
+        let texto = espera.await;
+        if let Err(err) = servidor
+            .remove::<Solicitud, _>(ruta_solicitud.as_str())
+            .await
+        {
+            tracing::debug!(%ruta_solicitud, "Request ya retirado: {err}");
+        }
+
+        let rutas: Vec<PathBuf> = texto
+            .iter()
+            .flat_map(|t| t.lines())
+            .filter(|l| !l.is_empty())
+            .map(PathBuf::from)
+            .collect();
+        if cancelada.load(Ordering::Acquire) || rutas.is_empty() {
+            return Err(CANCELADO);
+        }
+        Ok(rutas)
+    }
+}
+
+#[zbus::interface(name = "org.freedesktop.impl.portal.FileChooser")]
+impl Selector {
+    async fn open_file(
+        &self,
+        handle: ObjectPath<'_>,
+        _app_id: &str,
+        _parent_window: &str,
+        title: &str,
+        mut options: HashMap<String, OwnedValue>,
+        #[zbus(object_server)] servidor: &zbus::ObjectServer,
+    ) -> (u32, HashMap<String, OwnedValue>) {
+        let modo = if booleano(&mut options, "directory") {
+            Modo::Carpeta
+        } else {
+            Modo::Abrir {
+                multiple: booleano(&mut options, "multiple"),
+            }
+        };
+        match self.elegir(handle, title, modo, options, servidor).await {
+            Ok(rutas) => respuesta_uris(&rutas),
+            Err(codigo) => (codigo, HashMap::new()),
+        }
+    }
+
+    async fn save_file(
+        &self,
+        handle: ObjectPath<'_>,
+        _app_id: &str,
+        _parent_window: &str,
+        title: &str,
+        options: HashMap<String, OwnedValue>,
+        #[zbus(object_server)] servidor: &zbus::ObjectServer,
+    ) -> (u32, HashMap<String, OwnedValue>) {
+        match self
+            .elegir(handle, title, Modo::Guardar, options, servidor)
+            .await
+        {
+            Ok(rutas) => respuesta_uris(&rutas[..1]),
+            Err(codigo) => (codigo, HashMap::new()),
+        }
+    }
+
+    /// Se elige una carpeta y cada nombre de `files` se cuelga de ella, en el
+    /// mismo orden, que es lo que pide la especificación.
+    async fn save_files(
+        &self,
+        handle: ObjectPath<'_>,
+        _app_id: &str,
+        _parent_window: &str,
+        title: &str,
+        mut options: HashMap<String, OwnedValue>,
+        #[zbus(object_server)] servidor: &zbus::ObjectServer,
+    ) -> (u32, HashMap<String, OwnedValue>) {
+        let nombres: Vec<Vec<u8>> = options
+            .remove("files")
+            .and_then(|v| Vec::try_from(v).ok())
+            .unwrap_or_default();
+        // Se rechaza antes de enseñar el diálogo: `join` con "/tmp/x" o "../x"
+        // devolvería permiso sobre una ruta que el usuario nunca eligió.
+        let Some(nombres) = nombres
+            .iter()
+            .map(|n| nombre_base(n))
+            .collect::<Option<Vec<PathBuf>>>()
+        else {
+            return (FALLO, HashMap::new());
+        };
+        match self
+            .elegir(handle, title, Modo::Carpeta, options, servidor)
+            .await
+        {
+            Ok(rutas) => {
+                let rutas: Vec<PathBuf> = nombres.iter().map(|n| rutas[0].join(n)).collect();
+                respuesta_uris(&rutas)
+            }
+            Err(codigo) => (codigo, HashMap::new()),
+        }
+    }
+}
+
+fn cadena(opciones: &mut HashMap<String, OwnedValue>, clave: &str) -> Option<String> {
+    opciones
+        .remove(clave)
+        .and_then(|v| String::try_from(v).ok())
+        .filter(|s| !s.is_empty())
+}
+
+fn booleano(opciones: &mut HashMap<String, OwnedValue>, clave: &str) -> bool {
+    opciones
+        .remove(clave)
+        .and_then(|v| bool::try_from(v).ok())
+        .unwrap_or(false)
+}
+
+/// Las rutas del portal viajan como `ay` terminado en NUL: no tienen por qué
+/// ser UTF-8.
+fn bytes_ruta(opciones: &mut HashMap<String, OwnedValue>, clave: &str) -> Option<PathBuf> {
+    let bytes: Vec<u8> = opciones.remove(clave).and_then(|v| Vec::try_from(v).ok())?;
+    let ruta = ruta_de_bytes(&bytes);
+    (!ruta.as_os_str().is_empty()).then_some(ruta)
+}
+
+fn ruta_de_bytes(bytes: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    let hasta = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    PathBuf::from(std::ffi::OsStr::from_bytes(&bytes[..hasta]))
+}
+
+/// Un nombre de archivo sin más: un único componente normal, ni absoluto, ni
+/// `..`, ni con barras.
+fn nombre_base(bytes: &[u8]) -> Option<PathBuf> {
+    let ruta = ruta_de_bytes(bytes);
+    let mut componentes = ruta.components();
+    match (componentes.next(), componentes.next()) {
+        (Some(std::path::Component::Normal(_)), None) => Some(ruta),
+        _ => None,
+    }
+}
+
+/// El que pide la aplicación con `current_filter` y, si no dice nada, el
+/// primero de la lista, que es el que enseñaría cualquier diálogo.
+fn filtro_inicial(opciones: &mut HashMap<String, OwnedValue>) -> Option<Filtro> {
+    let actual = opciones
+        .remove("current_filter")
+        .and_then(|v| Filtro::try_from(v).ok());
+    actual.or_else(|| {
+        opciones
+            .remove("filters")
+            .and_then(|v| Vec::<Filtro>::try_from(v).ok())
+            .and_then(|filtros| filtros.into_iter().next())
+    })
+}
+
+fn respuesta_uris(rutas: &[PathBuf]) -> (u32, HashMap<String, OwnedValue>) {
+    let uris: Vec<String> = rutas.iter().map(|r| uri_de_archivo(r)).collect();
+    match OwnedValue::try_from(Value::from(uris)) {
+        Ok(v) => (CORRECTO, HashMap::from([("uris".to_string(), v)])),
+        Err(err) => {
+            tracing::warn!("no se pudieron empaquetar las rutas elegidas: {err}");
+            (FALLO, HashMap::new())
+        }
+    }
+}
+
+/// `file://` con los bytes escapados. Una ruta con espacios o acentos metida
+/// tal cual no es una URI: GLib la rechaza y la aplicación no abre nada.
+fn uri_de_archivo(ruta: &std::path::Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let mut uri = String::from("file://");
+    for &b in ruta.as_os_str().as_bytes() {
+        if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
+            uri.push(b as char);
+        } else {
+            uri.push_str(&format!("%{b:02X}"));
+        }
+    }
+    uri
+}
+
 /// El nombre que se le enseña al usuario en el diálogo.
 ///
 /// El `app_id` que llega es el del `.desktop` —`org.mozilla.firefox`— o la
@@ -650,7 +995,10 @@ fn nombre_legible(app_id: &str) -> String {
 
 /// Devuelve la conexión, que hay que **guardar**: al soltarla se cierra el bus
 /// y el nombre se pierde.
-pub fn arrancar(canal: Sender<Aviso>) -> Option<zbus::blocking::Connection> {
+pub fn arrancar(
+    canal: Sender<Aviso>,
+    socket: &std::ffi::OsStr,
+) -> Option<zbus::blocking::Connection> {
     let estado = Arc::new(Estado {
         canal,
         sesiones: Mutex::new(HashMap::new()),
@@ -674,7 +1022,16 @@ pub fn arrancar(canal: Sender<Aviso>) -> Option<zbus::blocking::Connection> {
             )
         })
         .and_then(|b| b.serve_at(RUTA, Ajustes))
-        // El nombre se pide **al final**: hasta que las dos interfaces están
+        .and_then(|b| {
+            b.serve_at(
+                RUTA,
+                Selector {
+                    socket: socket.to_owned(),
+                    siguiente: AtomicU32::new(1),
+                },
+            )
+        })
+        // El nombre se pide **al final**: hasta que todas las interfaces están
         // publicadas, un `xdg-desktop-portal` que ya estuviera esperando podría
         // preguntar por una que todavía no existe.
         .and_then(|b| b.name(NOMBRE))
@@ -757,7 +1114,10 @@ fn consentir(
         .map(|output| {
             let tamano = crate::captura::tamano_de(output);
             bookos_shell::PantallaCompartible {
-                nombre: output.name(),
+                nombre: crate::pantallas::nombre_visible(
+                    &output.name(),
+                    &output.physical_properties().model,
+                ),
                 ancho: tamano.w.max(0) as u32,
                 alto: tamano.h.max(0) as u32,
             }
@@ -902,6 +1262,22 @@ fn capturar(state: &mut crate::state::BookosComp, respuesta: Emisario<PathBuf>) 
 mod pruebas {
     use super::*;
 
+    #[test]
+    fn save_files_solo_acepta_nombres_base() {
+        assert_eq!(
+            nombre_base(b"informe.pdf\0"),
+            Some(PathBuf::from("informe.pdf"))
+        );
+        for malo in [&b"/tmp/x"[..], b"../x", b"a/b", b"..", b".", b"", b"\0"] {
+            assert_eq!(
+                nombre_base(malo),
+                None,
+                "{:?}",
+                String::from_utf8_lossy(malo)
+            );
+        }
+    }
+
     /// Lo que se le sirve a GTK es lo que el escritorio está pintando.
     ///
     /// Los números son los del propio tema, no una copia: si alguien cambia el
@@ -957,5 +1333,51 @@ mod pruebas {
         assert_eq!(nombre_legible("org.mozilla.firefox"), "Firefox");
         assert_eq!(nombre_legible("chromium"), "Chromium");
         assert_eq!(nombre_legible(""), "Una aplicación");
+    }
+
+    #[test]
+    fn la_ruta_elegida_sale_como_uri_escapada() {
+        assert_eq!(
+            uri_de_archivo(std::path::Path::new("/home/eve/Mis fotos/año.png")),
+            "file:///home/eve/Mis%20fotos/a%C3%B1o.png"
+        );
+    }
+
+    #[test]
+    fn la_ruta_del_portal_se_corta_en_el_nul() {
+        assert_eq!(ruta_de_bytes(b"/tmp/x\0basura"), PathBuf::from("/tmp/x"));
+        assert_eq!(ruta_de_bytes(b"/tmp/y"), PathBuf::from("/tmp/y"));
+    }
+
+    /// `current_filter` manda; sin él, el primero de `filters`. Los valores se
+    /// construyen con la misma firma que manda xdg-desktop-portal.
+    #[test]
+    fn el_filtro_inicial_es_el_que_pide_la_aplicacion() {
+        let imagenes: Filtro = (
+            "Imágenes".into(),
+            vec![(0, "*.png".into()), (1, "image/*".into())],
+        );
+        let texto: Filtro = ("Texto".into(), vec![(0, "*.txt".into())]);
+        let empaqueta = |v: Value<'_>| OwnedValue::try_from(v).expect("valor sin descriptores");
+
+        let mut opciones = HashMap::from([(
+            "filters".to_string(),
+            empaqueta(Value::from(vec![imagenes.clone(), texto.clone()])),
+        )]);
+        assert_eq!(filtro_inicial(&mut opciones), Some(imagenes.clone()));
+
+        let mut opciones = HashMap::from([
+            (
+                "filters".to_string(),
+                empaqueta(Value::from(vec![imagenes, texto.clone()])),
+            ),
+            (
+                "current_filter".to_string(),
+                empaqueta(Value::from(texto.clone())),
+            ),
+        ]);
+        assert_eq!(filtro_inicial(&mut opciones), Some(texto));
+
+        assert_eq!(filtro_inicial(&mut HashMap::new()), None);
     }
 }

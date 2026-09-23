@@ -13,6 +13,28 @@ const PAM_PROMPT_ECHO_ON: c_int = 2;
 const PAM_ERROR_MSG: c_int = 3;
 const PAM_TEXT_INFO: c_int = 4;
 const PAM_CONV_ERR: c_int = 19;
+/// «No puedo recoger la información de autenticación». Es lo que contesta
+/// `pam_fprintd` en una máquina **sin lector de huellas**, y no es lo mismo que
+/// un rechazo: no hay nada que rechazar. Distinguirlo importa porque tratarlo
+/// como fallo hacía que el bloqueo se abriera anunciando «no se pudo verificar
+/// la huella» en un portátil que nunca ha tenido sensor.
+const PAM_AUTHINFO_UNAVAIL: c_int = 9;
+
+/// Qué contestó PAM, con el único matiz que cambia lo que hay que enseñar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Veredicto {
+    Correcto,
+    /// La identidad no cuela: contraseña incorrecta, o huella que no casa.
+    Rechazado,
+    /// No se pudo ni preguntar: no hay lector, o el servicio no está.
+    NoDisponible,
+}
+
+impl Veredicto {
+    pub fn correcto(self) -> bool {
+        self == Self::Correcto
+    }
+}
 
 #[repr(C)]
 struct PamMessage {
@@ -42,32 +64,68 @@ struct PamConv {
 struct Secretos {
     usuario: CString,
     contrasena: CString,
+    /// Por donde sale cada `PAM_ERROR_MSG` de la conversación. Solo la huella
+    /// lo escucha: con `max-tries`, `pam_fprintd` avisa así de cada dedo que no
+    /// casa mientras sigue esperando el siguiente.
+    avisos: Option<mpsc::Sender<()>>,
+}
+
+/// Sobrescribe a ceros y se asegura de que el compilador no lo tire.
+///
+/// La contraseña pasa por varias copias antes de llegar a PAM, y el compositor
+/// es un proceso que vive toda la sesión y puede acabar en un volcado: lo que no
+/// se borre queda ahí legible. `write_volatile` es lo que impide que se optimice
+/// el bucle, porque escribir algo que nadie vuelve a leer es justo lo que un
+/// optimizador está deseando quitar.
+fn borrar(bytes: &mut [u8]) {
+    for b in bytes {
+        // SAFETY: el puntero sale de una referencia mutable viva y válida.
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
 }
 
 pub struct Comprobacion {
-    resultado: Receiver<bool>,
+    resultado: Receiver<Veredicto>,
+    avisos: Option<Receiver<()>>,
 }
 
 impl Comprobacion {
     pub fn lanzar(usuario: &str, contrasena: &str) -> Option<Self> {
         let usuario = usuario.to_string();
-        let contrasena = contrasena.to_string();
+        // En `Vec<u8>` y no en `String` porque hay que poder ponerlo a ceros al
+        // terminar, y borrar un `String` por dentro obligaría a tocar sus bytes
+        // saltándose la garantía de UTF-8.
+        let mut contrasena = contrasena.as_bytes().to_vec();
         let (envio, resultado) = mpsc::sync_channel(1);
-        std::thread::Builder::new()
+        let hilo = std::thread::Builder::new()
             .name("bookos-pam".into())
             .spawn(move || {
                 let vale = autenticar(&usuario, &contrasena);
+                borrar(&mut contrasena);
                 let _ = envio.send(vale);
-            })
-            .ok()?;
-        Some(Self { resultado })
+            });
+        if hilo.is_err() {
+            return None;
+        }
+        Some(Self {
+            resultado,
+            avisos: None,
+        })
     }
 
-    pub fn resultado(&mut self) -> Option<bool> {
+    /// ¿Ha avisado PAM de un intento fallido desde la última vez que se
+    /// preguntó? Solo en la huella; en la contraseña siempre `false`.
+    pub fn dedo_no_casa(&mut self) -> bool {
+        self.avisos
+            .as_ref()
+            .is_some_and(|r| r.try_iter().count() > 0)
+    }
+
+    pub fn resultado(&mut self) -> Option<Veredicto> {
         match self.resultado.try_recv() {
             Ok(vale) => Some(vale),
             Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => Some(false),
+            Err(TryRecvError::Disconnected) => Some(Veredicto::Rechazado),
         }
     }
 
@@ -94,14 +152,23 @@ impl Comprobacion {
         let liberar = Liberar;
         let usuario = usuario.to_string();
         let (envio, resultado) = mpsc::sync_channel(1);
+        let (aviso, avisos) = mpsc::channel();
         std::thread::Builder::new()
             .name("bookos-fingerprint".into())
             .spawn(move || {
                 let _liberar = liberar;
-                let _ = envio.send(autenticar_servicio("bookos-fingerprint", &usuario, ""));
+                let _ = envio.send(autenticar_servicio(
+                    "bookos-fingerprint",
+                    &usuario,
+                    b"",
+                    Some(aviso),
+                ));
             })
             .ok()?;
-        Some(Self { resultado })
+        Some(Self {
+            resultado,
+            avisos: Some(avisos),
+        })
     }
 }
 
@@ -130,28 +197,40 @@ pub fn usuario() -> String {
 }
 
 fn servicio() -> &'static str {
-    ["bookos", "system-auth", "common-auth", "login"]
-        .into_iter()
-        .find(|nombre| std::path::Path::new("/etc/pam.d").join(nombre).is_file())
-        .unwrap_or("login")
+    if std::path::Path::new("/etc/pam.d/bookos").is_file() {
+        "bookos"
+    } else {
+        // Compatibilidad con instalaciones anteriores. Estas pilas generales
+        // pueden incluir pam_fprintd y demorar el intento; el instalador nuevo
+        // crea el servicio `bookos`, exclusivo para la contraseña.
+        ["system-auth", "common-auth", "login"]
+            .into_iter()
+            .find(|nombre| std::path::Path::new("/etc/pam.d").join(nombre).is_file())
+            .unwrap_or("login")
+    }
 }
 
-fn autenticar(usuario: &str, contrasena: &str) -> bool {
-    autenticar_servicio(servicio(), usuario, contrasena)
+fn autenticar(usuario: &str, contrasena: &[u8]) -> Veredicto {
+    autenticar_servicio(servicio(), usuario, contrasena, None)
 }
 
-fn autenticar_servicio(nombre: &str, usuario: &str, contrasena: &str) -> bool {
+fn autenticar_servicio(
+    nombre: &str,
+    usuario: &str,
+    contrasena: &[u8],
+    avisos: Option<mpsc::Sender<()>>,
+) -> Veredicto {
     if usuario.is_empty() {
-        return false;
+        return Veredicto::Rechazado;
     }
     let Ok(usuario) = CString::new(usuario) else {
-        return false;
+        return Veredicto::Rechazado;
     };
     let Ok(contrasena) = CString::new(contrasena) else {
-        return false;
+        return Veredicto::Rechazado;
     };
     let Ok(servicio) = CString::new(nombre) else {
-        return false;
+        return Veredicto::Rechazado;
     };
 
     // SAFETY: la biblioteca permanece viva hasta después de `pam_end`; las
@@ -159,7 +238,7 @@ fn autenticar_servicio(nombre: &str, usuario: &str, contrasena: &str) -> bool {
     unsafe {
         let Ok(pam) = libloading::Library::new("libpam.so.0") else {
             tracing::error!("no se pudo cargar libpam.so.0");
-            return false;
+            return Veredicto::NoDisponible;
         };
         type Start = unsafe extern "C" fn(
             *const c_char,
@@ -170,22 +249,37 @@ fn autenticar_servicio(nombre: &str, usuario: &str, contrasena: &str) -> bool {
         type Authenticate = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
         type Account = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
         type End = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
+        type StrError = unsafe extern "C" fn(*mut c_void, c_int) -> *const c_char;
         let Ok(start) = pam.get::<Start>(b"pam_start\0") else {
-            return false;
+            return Veredicto::NoDisponible;
         };
         let Ok(authenticate) = pam.get::<Authenticate>(b"pam_authenticate\0") else {
-            return false;
+            return Veredicto::NoDisponible;
         };
         let Ok(account) = pam.get::<Account>(b"pam_acct_mgmt\0") else {
-            return false;
+            return Veredicto::NoDisponible;
         };
         let Ok(end) = pam.get::<End>(b"pam_end\0") else {
-            return false;
+            return Veredicto::NoDisponible;
+        };
+        // Para poder decir **por qué** falló. Sin esto, todos los caminos de
+        // error son el mismo `false` y «el bloqueo no me deja entrar» no se
+        // puede distinguir de «la contraseña estaba mal»: no hay nada en el
+        // registro que separe una cosa de la otra.
+        let porque = pam.get::<StrError>(b"pam_strerror\0").ok();
+        let motivo = |handle: *mut c_void, codigo: c_int| -> String {
+            match &porque {
+                Some(f) => CStr::from_ptr(f(handle, codigo))
+                    .to_string_lossy()
+                    .into_owned(),
+                None => format!("código {codigo}"),
+            }
         };
 
         let mut secretos = Secretos {
             usuario,
             contrasena,
+            avisos,
         };
         let conversacion = PamConv {
             conv: Some(conversar),
@@ -199,7 +293,12 @@ fn autenticar_servicio(nombre: &str, usuario: &str, contrasena: &str) -> bool {
             &mut handle,
         );
         if inicio != PAM_SUCCESS || handle.is_null() {
-            return false;
+            tracing::error!(
+                servicio = nombre,
+                "pam_start falló: {}",
+                motivo(handle, inicio)
+            );
+            return Veredicto::NoDisponible;
         }
         let autenticacion = authenticate(handle, 0);
         let resultado = if autenticacion == PAM_SUCCESS {
@@ -207,8 +306,45 @@ fn autenticar_servicio(nombre: &str, usuario: &str, contrasena: &str) -> bool {
         } else {
             autenticacion
         };
+        // La contraseña no aparece por ningún lado: lo que se registra es el
+        // veredicto de PAM, que es exactamente lo que hace falta para saber si
+        // el fallo es «no era la contraseña» o «esto ni siquiera pudo
+        // preguntar».
+        if resultado == PAM_SUCCESS {
+            tracing::info!(servicio = nombre, "PAM autenticó");
+        } else if autenticacion == PAM_AUTHINFO_UNAVAIL {
+            tracing::info!(
+                servicio = nombre,
+                "PAM no pudo preguntar: {}",
+                motivo(handle, autenticacion)
+            );
+        } else if autenticacion != PAM_SUCCESS {
+            tracing::info!(
+                servicio = nombre,
+                "PAM rechazó: {}",
+                motivo(handle, autenticacion)
+            );
+        } else {
+            tracing::warn!(
+                servicio = nombre,
+                "PAM autenticó pero rechazó la cuenta: {}",
+                motivo(handle, resultado)
+            );
+        }
         let _ = end(handle, resultado);
-        resultado == PAM_SUCCESS
+        // Ya no queda nadie que la mire: ni PAM ni `conversar`. La copia que
+        // `conversar` le entregó a PAM la libera PAM por su cuenta y no está en
+        // nuestra mano; esta sí.
+        let mut bytes = secretos.contrasena.into_bytes_with_nul();
+        borrar(&mut bytes);
+        match resultado {
+            PAM_SUCCESS => Veredicto::Correcto,
+            // El único que no es un «no»: significa que no había con qué
+            // preguntar. Quien llame decide si eso merece un mensaje o si
+            // simplemente se pasa al siguiente método.
+            PAM_AUTHINFO_UNAVAIL => Veredicto::NoDisponible,
+            _ => Veredicto::Rechazado,
+        }
     }
 }
 
@@ -239,7 +375,22 @@ unsafe extern "C" fn conversar(
         let texto = match estilo {
             PAM_PROMPT_ECHO_OFF => Some(secretos.contrasena.as_c_str()),
             PAM_PROMPT_ECHO_ON => Some(secretos.usuario.as_c_str()),
-            PAM_ERROR_MSG | PAM_TEXT_INFO => None,
+            PAM_ERROR_MSG => {
+                // El texto viene traducido según el idioma del sistema, así
+                // que no se compara: se registra para poder leerlo y se avisa.
+                let texto = unsafe { (*mensaje).msg };
+                if !texto.is_null() {
+                    tracing::info!(
+                        "PAM avisa: {}",
+                        unsafe { CStr::from_ptr(texto) }.to_string_lossy()
+                    );
+                }
+                if let Some(avisos) = &secretos.avisos {
+                    let _ = avisos.send(());
+                }
+                None
+            }
+            PAM_TEXT_INFO => None,
             _ => {
                 liberar_respuestas(bloque, i);
                 return PAM_CONV_ERR;
@@ -280,20 +431,21 @@ mod tests {
 
     #[test]
     fn una_identidad_ausente_nunca_autentica() {
-        assert!(!autenticar_servicio("bookos-fingerprint", "", ""));
-        assert!(!autenticar_servicio(
-            "bookos-fingerprint",
-            "usuario\0invalido",
-            ""
-        ));
+        assert!(!autenticar_servicio("bookos-fingerprint", "", b"", None).correcto());
+        assert!(
+            !autenticar_servicio("bookos-fingerprint", "usuario\0invalido", b"", None).correcto()
+        );
     }
 
     #[test]
     fn un_worker_desconectado_falla_cerrado() {
         let (tx, rx) = mpsc::channel();
         drop(tx);
-        let mut comprobacion = Comprobacion { resultado: rx };
-        assert_eq!(comprobacion.resultado(), Some(false));
+        let mut comprobacion = Comprobacion {
+            resultado: rx,
+            avisos: None,
+        };
+        assert_eq!(comprobacion.resultado(), Some(Veredicto::Rechazado));
     }
 
     #[test]
@@ -301,8 +453,11 @@ mod tests {
         let mut c = Comprobacion::lanzar(&usuario(), "no-es-esta-contrasena-12345")
             .expect("se puede crear el worker PAM");
         for _ in 0..100 {
-            if let Some(vale) = c.resultado() {
-                assert!(!vale, "una contraseña inventada ha pasado PAM");
+            if let Some(veredicto) = c.resultado() {
+                assert!(
+                    !veredicto.correcto(),
+                    "una contraseña inventada ha pasado PAM"
+                );
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));

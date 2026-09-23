@@ -47,6 +47,25 @@ const MEDIOS_ARTE: f32 = 78.0;
 const MEDIOS_INFO: f32 = 246.0;
 const MEDIOS_ALTO: f32 = 102.0;
 
+/// Alto de la línea del nombre de usuario: tamaño 20 con el interlineado
+/// habitual de 1,2.
+const ALTO_NOMBRE: f32 = 24.0;
+/// Alto del aviso de la huella: tamaño 13 con el mismo interlineado. Está
+/// vacío la mayor parte del tiempo, pero reserva su hueco igual —la tarjeta de
+/// medios no puede depender de si hoy hay algo que decir sobre la huella.
+const ALTO_HUELLA: f32 = 16.0;
+/// Aire mínimo entre el bloque de acceso y la tarjeta de medios.
+///
+/// Sin este mínimo, la tarjeta se posicionaba a una fracción fija de la
+/// pantalla (`medios_y`) sin saber lo que ocupaba el bloque de encima, que es
+/// de tamaño fijo en píxeles y no escala con la pantalla. En una resolución
+/// lógica baja —1280×800, la de este portátil a escala 1,75— el bloque de
+/// acceso llegaba más abajo que donde empezaba la tarjeta y se comían: el
+/// aviso "Introduce tu contraseña para desbloquear" quedaba tapado a medias
+/// por la carátula. En una pantalla más alta este mínimo no hace nada, porque
+/// `medios_y` ya deja de sobra.
+const MARGEN_MEDIOS: f32 = 24.0;
+
 /// Fondo del campo y del botón: casi negro y translúcido, para que se vea el
 /// fondo por debajo sin perder el contraste de los puntos.
 const FONDO_CAMPO: Color = tema::hexa(0x16191e, 0.82);
@@ -248,6 +267,23 @@ fn nombre_completo(login: &str) -> Option<String> {
     None
 }
 
+/// Lo que dice la huella debajo del campo.
+///
+/// Un estado y no solo un texto: sin él, un dedo que no casaba y uno que sí se
+/// veían igual —el mismo renglón gris— hasta que PAM agotaba los tres intentos
+/// o la pantalla desaparecía de golpe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Huella {
+    /// Nada que decir: sin lector, o con la huella desactivada.
+    Callada,
+    /// Un aviso neutro: «coloca el dedo», «no disponible»…
+    Aviso(&'static str),
+    /// El lector ha leído un dedo que no es. PAM sigue esperando otro.
+    NoCoincide,
+    /// Ha casado; lo que queda es la salida del bloqueo.
+    Reconocida,
+}
+
 pub struct Bloqueo {
     /// La hora, ya formateada. La pone el compositor para no tener dos relojes
     /// distintos en el mismo escritorio.
@@ -257,7 +293,9 @@ pub struct Bloqueo {
     /// Cuántos caracteres lleva la contraseña. El texto no se guarda aquí.
     pub escritos: usize,
     pub estado: Estado,
-    pub huella_mensaje: &'static str,
+    huella: Huella,
+    /// Desde cuándo dice lo que dice, para la sacudida del «no coincide».
+    huella_desde: Instant,
     confirmacion: Option<(Peticion, crate::confirmacion::Confirmacion)>,
     /// Estado de Bloq Mayús. No forma parte de la contraseña, pero explicarlo
     /// evita intentos fallidos que parecen una clave incorrecta.
@@ -294,7 +332,8 @@ impl Bloqueo {
             fecha,
             escritos: 0,
             estado: Estado::Escribiendo,
-            huella_mensaje: "",
+            huella: Huella::Callada,
+            huella_desde: ahora - ESTADO_TOTAL,
             confirmacion: None,
             caps_lock: false,
             menu: false,
@@ -372,9 +411,7 @@ impl Bloqueo {
             self.campo(acceso_avance),
             Space::new().height(Length::Fixed(10.0)),
             self.mensaje(acceso_avance),
-            text(self.huella_mensaje)
-                .size(13)
-                .color(con_alfa(Color::WHITE, acceso_avance * 0.82)),
+            self.aviso_huella(acceso_avance),
         ]
         .align_x(Horizontal::Center);
 
@@ -402,7 +439,7 @@ impl Bloqueo {
                 tarjetas = tarjetas.push(self.tarjeta(medio, medios_avance));
                 tarjetas = tarjetas.push(Space::new().height(Length::Fixed(10.0)));
             }
-            let medios_y = pantalla.1 * self.config.medios_y + (1.0 - medios_avance) * 28.0;
+            let medios_y = self.medios_y_actual(pantalla.1, medios_avance);
             let capa_medios = column![
                 Space::new().height(Length::Fixed(medios_y.max(0.0))),
                 container(tarjetas)
@@ -455,6 +492,50 @@ impl Bloqueo {
         ))
     }
 
+    /// Dónde empieza la tarjeta de medios en reposo, sin el término de la
+    /// animación de entrada.
+    ///
+    /// Nunca por debajo de donde termina el bloque de acceso. `medios_y` es
+    /// una fracción fija de la pantalla y el bloque de acceso mide un número
+    /// fijo de píxeles: en una pantalla lo bastante baja —1280×800 lógicos, la
+    /// de este portátil a escala 1,75— la fracción caía **dentro** del bloque
+    /// de acceso y la tarjeta tapaba el aviso de la contraseña. En una
+    /// pantalla más alta este piso no cambia nada, porque la fracción ya cae
+    /// más abajo que él.
+    ///
+    /// No es la posición donde se dibuja ni donde se prueba el clic: esa es
+    /// [`Self::medios_y_actual`], que le suma el término de la animación de
+    /// entrada. Esta existe aparte para poder fijar el piso sin depender de
+    /// en qué punto de la animación está, que es lo único que hace falta en
+    /// los tests de abajo.
+    fn medios_y_asentada(&self, alto_pantalla: f32) -> f32 {
+        let piso = alto_pantalla * self.config.acceso_y
+            + self.config.avatar_tamano
+            + 12.0
+            + ALTO_NOMBRE
+            + 16.0
+            + ALTO_CAMPO
+            + 10.0
+            + 20.0
+            + ALTO_HUELLA
+            + MARGEN_MEDIOS;
+        (alto_pantalla * self.config.medios_y).max(piso)
+    }
+
+    /// Dónde está la tarjeta de medios **ahora mismo**, con la animación de
+    /// entrada incluida: es lo que pintan `view()` y lo que prueba
+    /// `medio_en()`, y tiene que ser la misma cuenta en los dos sitios.
+    ///
+    /// Antes no lo era: `view()` sumaba `(1.0 - medios_avance) * 28.0` a mano
+    /// y `medio_en()` llamaba a [`Self::medios_y_asentada`] sin ese término,
+    /// así que durante los primeros ~500 ms tras echar el bloqueo la tarjeta
+    /// se dibujaba hasta 28 px más abajo de donde el clic la buscaba: tocar
+    /// play nada más pulsar Meta+L no hacía nada hasta que la entrada
+    /// terminaba de asentarse.
+    fn medios_y_actual(&self, alto_pantalla: f32, medios_avance: f32) -> f32 {
+        self.medios_y_asentada(alto_pantalla) + (1.0 - medios_avance) * 28.0
+    }
+
     fn medio_avance(&self) -> f32 {
         if !self.config.animaciones {
             return 1.0;
@@ -465,11 +546,51 @@ impl Bloqueo {
     }
 
     fn sacudida(&self) -> f32 {
-        if !self.config.animaciones || self.estado != Estado::Fallo {
+        // La misma sacudida para la contraseña mala y para el dedo que no
+        // casa: las dos dicen «no eres tú», y decirlo de dos formas haría
+        // pensar que una es más grave.
+        let desde = if self.estado == Estado::Fallo {
+            self.estado_desde
+        } else if self.huella == Huella::NoCoincide {
+            self.huella_desde
+        } else {
+            return 0.0;
+        };
+        if !self.config.animaciones {
             return 0.0;
         }
-        let t = tema::fraccion(self.estado_desde.elapsed(), ESTADO_TOTAL);
+        let t = tema::fraccion(desde.elapsed(), ESTADO_TOTAL);
         (t * std::f32::consts::TAU * 3.0).sin() * (1.0 - t) * 11.0
+    }
+
+    /// Cambia lo que dice la huella. `true` si hay que repintar.
+    pub fn actualizar_huella(&mut self, huella: Huella) -> bool {
+        // Un segundo «no coincide» seguido también sacude: es otro dedo.
+        if self.huella == huella && huella != Huella::NoCoincide {
+            return false;
+        }
+        self.huella = huella;
+        self.huella_desde = Instant::now();
+        true
+    }
+
+    fn aviso_huella<'a>(&self, alfa: f32) -> PanelElement<'a> {
+        let (texto, color) = match self.huella {
+            Huella::Callada => ("", Color::WHITE),
+            Huella::Aviso(texto) => (texto, con_alfa(Color::WHITE, 0.82)),
+            // En rojo como la contraseña mala, y diciendo que PAM sigue
+            // escuchando: no hace falta hacer nada más que volver a poner el
+            // dedo.
+            Huella::NoCoincide => ("Huella no reconocida. Vuelve a intentarlo.", tema::rojo()),
+            Huella::Reconocida => ("Huella reconocida", Color::WHITE),
+        };
+        text(texto)
+            .size(13)
+            .color(Color {
+                a: color.a * alfa,
+                ..color
+            })
+            .into()
     }
 
     pub fn actualizar_estado(&mut self, escritos: usize, estado: Estado) -> bool {
@@ -621,14 +742,14 @@ impl Bloqueo {
             }
             return (None, true);
         }
-        if let Some(orden) = self.medio_en(x, y, pantalla) {
-            if let Some(medio) = self.medios.first_mut() {
-                let ejecutada = crate::medios::ejecutar_en(&medio.bus, orden);
-                if orden == crate::medios::Orden::Alternar && ejecutada {
-                    medio.reproduciendo = !medio.reproduciendo;
-                }
-                return (None, ejecutada);
+        if let Some(orden) = self.medio_en(x, y, pantalla)
+            && let Some(medio) = self.medios.first_mut()
+        {
+            let ejecutada = crate::medios::ejecutar_en(&medio.bus, orden);
+            if orden == crate::medios::Orden::Alternar && ejecutada {
+                medio.reproduciendo = !medio.reproduciendo;
             }
+            return (None, ejecutada);
         }
         let estaba_abierto = self.menu;
         self.cerrar_menu();
@@ -640,7 +761,7 @@ impl Bloqueo {
             return None;
         }
         let tarjeta_x = (pantalla.0 - MEDIOS_ANCHO) / 2.0;
-        let tarjeta_y = pantalla.1 * self.config.medios_y;
+        let tarjeta_y = self.medios_y_actual(pantalla.1, self.medio_avance());
         if y < tarjeta_y || y > tarjeta_y + MEDIOS_ALTO {
             return None;
         }
@@ -688,12 +809,16 @@ impl Bloqueo {
         let estado = self.config.animaciones
             && matches!(self.estado, Estado::Comprobando | Estado::Fallo)
             && self.estado_desde.elapsed() < ESTADO_TOTAL;
+        let huella = self.config.animaciones
+            && self.huella == Huella::NoCoincide
+            && self.huella_desde.elapsed() < ESTADO_TOTAL;
         let medio = self.config.animaciones
             && self
                 .medio_desde
                 .is_some_and(|t| t.elapsed() < Duration::from_millis(500));
         entrada
             || estado
+            || huella
             || medio
             || self
                 .menu_desde
@@ -1198,13 +1323,10 @@ impl Bloqueo {
                     ..Color::WHITE
                 },
             },
-            shadow: iced_core::Shadow {
-                color: Color {
-                    a: 0.30 * alfa,
-                    ..Color::BLACK
-                },
-                offset: iced_core::Vector::new(0.0, 10.0),
-                blur_radius: 24.0,
+            shadow: {
+                let mut sombra = tema::sombra_popover();
+                sombra.color.a *= alfa;
+                sombra
             },
             ..Default::default()
         })
@@ -1340,8 +1462,10 @@ mod tests {
 
     #[test]
     fn sin_animaciones_el_bloqueo_nace_quieto() {
-        let mut config = crate::config::Bloqueo::default();
-        config.animaciones = false;
+        let config = crate::config::Bloqueo {
+            animaciones: false,
+            ..Default::default()
+        };
         let b = Bloqueo::new("12:30".into(), "lunes".into(), None, config);
         assert_eq!(b.entrada_avance(0, 440), 1.0);
         assert!(!b.animando());
@@ -1349,7 +1473,16 @@ mod tests {
 
     #[test]
     fn los_controles_multimedia_coinciden_con_la_tarjeta() {
-        let config = crate::config::Bloqueo::default();
+        // Sin animaciones: la prueba mete el medio a mano, sin pasar por
+        // `poner_medio`, así que `medio_desde` nunca se pone y la entrada se
+        // quedaría a medias para siempre si las animaciones estuvieran
+        // activas. Lo que se comprueba aquí es que el dibujo y el clic
+        // coinciden en la posición **asentada**, no a mitad de una animación
+        // que este montaje no dispara de verdad.
+        let config = crate::config::Bloqueo {
+            animaciones: false,
+            ..Default::default()
+        };
         let mut b = Bloqueo::new("12:30".into(), "lunes".into(), None, config);
         b.medios.push(Medio {
             bus: "org.mpris.MediaPlayer2.prueba".into(),
@@ -1374,5 +1507,84 @@ mod tests {
             Some(crate::medios::Orden::Alternar)
         );
         assert_eq!(b.medio_en(x0 - 2.0, y, pantalla), None);
+    }
+
+    /// El clic tiene que acertar donde la tarjeta **se ve**, aunque todavía
+    /// esté entrando.
+    ///
+    /// Antes `view()` sumaba el término de la animación a mano y `medio_en`
+    /// llamaba a la posición asentada sin él: durante los primeros ~500 ms
+    /// tras `Meta+L`, la tarjeta se dibujaba hasta 28 px más abajo de donde
+    /// el clic la buscaba, así que tocar play nada más echar el bloqueo no
+    /// hacía nada.
+    #[test]
+    fn el_clic_acierta_aunque_la_tarjeta_siga_entrando() {
+        let config = crate::config::Bloqueo::default();
+        let mut b = Bloqueo::new("12:30".into(), "lunes".into(), None, config);
+        // `poner_medio`, no un `push` a mano: es lo que arranca de verdad la
+        // animación de entrada, con `medio_desde` recién puesto.
+        b.poner_medio(Some(crate::medios::Sonando {
+            bus: "org.mpris.MediaPlayer2.prueba".into(),
+            titulo: "Canción".into(),
+            artista: "Artista".into(),
+            aplicacion: "Prueba".into(),
+            posicion: Some(30),
+            duracion: Some(60),
+            reproduciendo: true,
+        }));
+        assert!(
+            b.medio_avance() < 1.0,
+            "la prueba no prueba nada si ya asentó"
+        );
+
+        let pantalla = (1645.0, 1029.0);
+        let x0 = (pantalla.0 - MEDIOS_ANCHO) / 2.0;
+        let centro = x0 + 12.0 + MEDIOS_ARTE + 14.0 + MEDIOS_INFO / 2.0;
+        // La `y` de verdad: la misma cuenta que hace `view()` para dibujar,
+        // con el término de la animación incluido. Si `medio_en` la ignora,
+        // este punto cae fuera de lo que el hit-test busca y el `assert`
+        // de abajo falla con `None`.
+        let y = b.medios_y_actual(pantalla.1, b.medio_avance()) + 66.0 + 17.0;
+        assert_eq!(
+            b.medio_en(centro, y, pantalla),
+            Some(crate::medios::Orden::Alternar),
+            "el clic no acertó la tarjeta mientras seguía entrando"
+        );
+    }
+
+    /// En una resolución lógica baja, la tarjeta de medios no puede tapar el
+    /// bloque de acceso.
+    ///
+    /// 1280×800 es la de este portátil a escala 1,75 —comprobado en la
+    /// sesión real—: con el cálculo antiguo, `0.68 * 800 = 544` caía dentro
+    /// del bloque de acceso, que a esa altura llega hasta `288 + 274 = 562`.
+    #[test]
+    fn la_tarjeta_de_medios_no_tapa_el_acceso_en_pantallas_bajas() {
+        let config = crate::config::Bloqueo::default();
+        let b = Bloqueo::new("23:50".into(), "jueves".into(), None, config);
+        let alto = 800.0;
+        let fin_acceso = alto * config.acceso_y
+            + config.avatar_tamano
+            + 12.0
+            + ALTO_NOMBRE
+            + 16.0
+            + ALTO_CAMPO
+            + 10.0
+            + 20.0
+            + ALTO_HUELLA;
+        assert!(
+            b.medios_y_asentada(alto) >= fin_acceso + MARGEN_MEDIOS,
+            "la tarjeta de medios se solapa con el bloque de acceso"
+        );
+    }
+
+    /// Y en una pantalla normal, el piso no debe moverla: sigue en la
+    /// fracción de siempre.
+    #[test]
+    fn en_pantallas_normales_la_tarjeta_no_se_mueve() {
+        let config = crate::config::Bloqueo::default();
+        let b = Bloqueo::new("23:50".into(), "jueves".into(), None, config);
+        let alto = 1029.0;
+        assert_eq!(b.medios_y_asentada(alto), alto * config.medios_y);
     }
 }

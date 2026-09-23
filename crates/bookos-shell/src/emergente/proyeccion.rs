@@ -1,7 +1,7 @@
 //! Selector de proyección de Fn+F4.
 
 use iced_core::alignment::Horizontal;
-use iced_core::{Border, Color, Length};
+use iced_core::{Border, Length};
 use iced_widget::{Space, column, container, row, text};
 
 use super::{Ancla, Tecla};
@@ -96,7 +96,7 @@ impl Proyeccion {
         }
         let paso = CELDA_W + HUECO;
         let i = ((x - MARGEN) / paso).floor() as isize;
-        if i < 0 || i >= 5 || (x - MARGEN) % paso > CELDA_W {
+        if !(0..5).contains(&i) || (x - MARGEN) % paso > CELDA_W {
             return false;
         }
         let i = i as usize;
@@ -217,14 +217,9 @@ fn tarjeta(_: &iced_widget::Theme) -> iced_widget::container::Style {
             width: 1.0,
             color: tema::borde(),
         },
-        shadow: iced_core::Shadow {
-            color: Color {
-                a: 0.30,
-                ..Color::BLACK
-            },
-            offset: iced_core::Vector::new(0.0, 10.0),
-            blur_radius: 28.0,
-        },
+        // Popover y no modal aunque sea un diálogo: la de modal pide 56 px
+        // alrededor y el búfer reserva 22.
+        shadow: tema::sombra_popover(),
         ..Default::default()
     }
 }

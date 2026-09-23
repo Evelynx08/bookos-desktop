@@ -683,9 +683,10 @@ impl Launchpad {
         tema::Acento::TODOS
             .into_iter()
             .map(ColorCarpeta::Acento)
-            .chain((0..TONOS_TECLADO).map(|i| {
-                ColorCarpeta::Tono(i as f32 * 360.0 / TONOS_TECLADO as f32)
-            }))
+            .chain(
+                (0..TONOS_TECLADO)
+                    .map(|i| ColorCarpeta::Tono(i as f32 * 360.0 / TONOS_TECLADO as f32)),
+            )
             .collect()
     }
 
@@ -724,7 +725,8 @@ impl Launchpad {
         let Some(color) = Self::colores_del_teclado().get(i).copied() else {
             return;
         };
-        self.carpetas[carpeta].color = (self.carpetas[carpeta].color != Some(color)).then_some(color);
+        self.carpetas[carpeta].color =
+            (self.carpetas[carpeta].color != Some(color)).then_some(color);
         self.cerrar_paleta();
         self.animar(Transicion::Fundido);
         self.guardar();
@@ -1999,14 +2001,7 @@ impl Launchpad {
                 // La sombra de modal de §2.5. Es la única que se dibuja en todo
                 // el launchpad: en oscuro las tarjetas no llevan, pero esto no
                 // es una tarjeta fija, es un diálogo sobre el velo.
-                shadow: iced_core::Shadow {
-                    color: Color {
-                        a: 0.30,
-                        ..Color::BLACK
-                    },
-                    offset: iced_core::Vector::new(0.0, 20.0),
-                    blur_radius: 56.0,
-                },
+                shadow: tema::sombra_modal(),
                 ..Default::default()
             });
 
@@ -2187,14 +2182,7 @@ impl Launchpad {
                     width: 1.0,
                     color: tema::alfa(tema::tinta(), 0.09),
                 },
-                shadow: iced_core::Shadow {
-                    color: Color {
-                        a: 0.18,
-                        ..Color::BLACK
-                    },
-                    offset: iced_core::Vector::new(0.0, 6.0),
-                    blur_radius: 22.0,
-                },
+                shadow: tema::sombra_popover(),
                 ..Default::default()
             })
             .into()

@@ -192,15 +192,14 @@ impl Buscador {
         }
     }
 
-    /// Lo que llega a medir con la lista llena.
+    /// Alto que usa el compositor para colocar el buscador.
     ///
-    /// Es lo que usa el compositor para colocarla: si se centrara con el alto
-    /// **de ahora**, la tarjeta se movería media fila arriba y abajo con cada
-    /// tecla, porque cada resultado que entra o sale la hace crecer o encoger.
-    /// Con el alto máximo el campo de texto se queda clavado y la lista crece
-    /// hacia abajo, que es lo que hacen los dedos.
-    pub fn alto_maximo() -> f32 {
-        Self::alto_para(MAXIMO)
+    /// Es estable para que el campo no salte al aparecer resultados, pero es
+    /// el alto del **campo**, no el máximo de toda la lista: así lo que se
+    /// centra al abrir Spotlight es aquello con lo que se interactúa. Los
+    /// resultados crecen hacia abajo sin desplazarlo.
+    pub fn alto_colocacion() -> f32 {
+        CAMPO
     }
 
     /// El velo de detrás. Más flojo que el del launchpad: esto no ocupa la
@@ -316,16 +315,15 @@ impl Buscador {
                 .into()
         };
         let campo = container(
-            row![
-                Space::new().width(Length::Fixed(18.0)),
-                lupa,
-                Space::new().width(Length::Fixed(12.0)),
-                escrito,
-            ]
-            .align_y(Vertical::Center),
+            row![lupa, Space::new().width(Length::Fixed(12.0)), escrito,].align_y(Vertical::Center),
         )
         .width(Length::Fixed(self.ancho))
-        .height(Length::Fixed(CAMPO));
+        .height(Length::Fixed(CAMPO))
+        // El texto empieza donde empieza el contenido de las filas. Centrar el
+        // conjunto hacía que la lupa y el texto saltasen horizontalmente al
+        // escribir, porque su anchura cambia con cada carácter.
+        .padding([0, 20])
+        .align_y(Vertical::Center);
 
         let mut contenido = column![campo];
         if !self.resultados.is_empty() {
@@ -335,7 +333,7 @@ impl Buscador {
                 container(Space::new().height(Length::Fixed(DIVISOR)))
                     .width(Length::Fixed(self.ancho))
                     .style(|_theme| container::Style {
-                        background: Some(tema::alfa(tema::tinta(), 0.10).into()),
+                        background: Some(tema::divisor().into()),
                         ..Default::default()
                     }),
             );
@@ -361,7 +359,7 @@ impl Buscador {
                 border: Border {
                     radius: tema::R_DIALOGO.into(),
                     width: 1.0,
-                    color: tema::alfa(tema::tinta(), 0.10),
+                    color: tema::borde(),
                 },
                 ..Default::default()
             })
@@ -375,7 +373,7 @@ impl Buscador {
         // encima solo levanta un velo de tinta: si las dos cosas se pintaran
         // igual, pasar el ratón parecería cambiar lo que va a ejecutarse.
         let fondo = match (elegida, señalada) {
-            (true, _) => tema::alfa(tema::acento(), 0.22),
+            (true, _) => tema::alfa(tema::acento(), 0.10),
             (false, true) => tema::hover(),
             (false, false) => iced_core::Color::TRANSPARENT,
         };
@@ -421,7 +419,7 @@ impl Buscador {
         .style(move |_theme| container::Style {
             background: Some(fondo.into()),
             border: Border {
-                radius: tema::R_CONTROL.into(),
+                radius: tema::R_ITEM_POPOVER.into(),
                 ..Default::default()
             },
             ..Default::default()

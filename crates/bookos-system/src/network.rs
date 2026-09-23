@@ -202,8 +202,7 @@ pub async fn perform(c: &Connection, op: &Operation) -> Result<(), String> {
             let a = OwnedObjectPath::try_from(ap["id"].as_str().ok_or("Red inválida")?)
                 .map_err(|e| e.to_string())?;
             let saved = profiles(c, ssid).await?;
-            let active: OwnedObjectPath;
-            if !saved.is_empty() {
+            let active: OwnedObjectPath = if !saved.is_empty() {
                 if !password.is_empty() {
                     let profile = proxy(
                         c,
@@ -229,10 +228,10 @@ pub async fn perform(c: &Connection, op: &Operation) -> Result<(), String> {
                         .await
                         .map_err(|e| e.to_string())?;
                 }
-                active = manager
+                manager
                     .call("ActivateConnection", &(&saved[0], &d, &a))
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| e.to_string())?
             } else {
                 let mut settings: HashMap<&str, HashMap<&str, Value<'_>>> = HashMap::new();
                 settings.insert(
@@ -259,8 +258,8 @@ pub async fn perform(c: &Connection, op: &Operation) -> Result<(), String> {
                     .call("AddAndActivateConnection", &(settings, &d, &a))
                     .await
                     .map_err(|e| e.to_string())?;
-                active = connection;
-            }
+                connection
+            };
             let connection = proxy(
                 c,
                 active.as_str(),

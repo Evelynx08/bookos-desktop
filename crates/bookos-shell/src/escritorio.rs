@@ -22,6 +22,7 @@
 //! temporizador propio. El precio es hasta un minuto de retraso, que es el
 //! trato que este escritorio hace siempre a cambio de no despertar de más.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use iced_core::alignment::Horizontal;
@@ -122,11 +123,12 @@ impl Escritorio {
                 .iter()
                 .find(|(nombre, _)| *nombre == elemento.nombre)
                 .map(|(_, celda)| celda)
+                && celda.0 < self.columnas
+                && celda.1 < self.filas
+                && !ocupadas.contains(&celda)
             {
-                if celda.0 < self.columnas && celda.1 < self.filas && !ocupadas.contains(&celda) {
-                    elemento.celda = celda;
-                    ocupadas.push(celda);
-                }
+                elemento.celda = celda;
+                ocupadas.push(celda);
             }
         }
         for elemento in &mut self.elementos {
@@ -159,6 +161,64 @@ impl Escritorio {
         self.elementos = nuevos;
         self.recolocar(alto_panel, pantalla);
         true
+    }
+
+    /// Crea una carpeta nueva y la deja seleccionada.
+    ///
+    /// Sin escotilla propia: si no hay `~/Escritorio` —ni siquiera se ha usado
+    /// nunca el escritorio en esta cuenta— no hay dónde crear nada, y no es
+    /// este el sitio para decidir que de repente sí la hay.
+    pub fn crear_carpeta(&mut self, alto_panel: f32, pantalla: (f32, f32)) -> bool {
+        let Some(carpeta) = carpeta_escritorio() else {
+            tracing::warn!("sin carpeta de escritorio: no se puede crear nada en ella");
+            return false;
+        };
+        let mut nombre = "Nueva carpeta".to_string();
+        let mut intento = 2;
+        while carpeta.join(&nombre).exists() {
+            nombre = format!("Nueva carpeta ({intento})");
+            intento += 1;
+        }
+        if let Err(err) = std::fs::create_dir(carpeta.join(&nombre)) {
+            tracing::warn!(nombre, "no se pudo crear la carpeta: {err}");
+            return false;
+        }
+        self.releer(alto_panel, pantalla);
+        for elemento in &mut self.elementos {
+            elemento.seleccionado = elemento.nombre == nombre;
+        }
+        true
+    }
+
+    /// Manda lo seleccionado a la papelera. `true` si algo cambió.
+    ///
+    /// A la papelera y no `remove_dir_all`/`remove_file` directos: un
+    /// "eliminar" del menú del escritorio se pulsa más fácilmente sin querer
+    /// que uno que primero pide confirmar, y sin poder deshacerlo eso es
+    /// jugársela con los ficheros de quien sea. `~/.local/share/Trash` es la
+    /// misma que usan Dolphin y Nautilus, así que lo que se borra desde aquí
+    /// se recupera desde cualquiera de los dos.
+    pub fn eliminar_seleccionados(&mut self, alto_panel: f32, pantalla: (f32, f32)) -> bool {
+        let rutas: Vec<PathBuf> = self
+            .elementos
+            .iter()
+            .filter(|e| e.seleccionado)
+            .map(|e| e.ruta.clone())
+            .collect();
+        if rutas.is_empty() {
+            return false;
+        }
+        let mut alguno = false;
+        for ruta in &rutas {
+            match mover_a_papelera(ruta) {
+                Ok(()) => alguno = true,
+                Err(err) => tracing::warn!(?ruta, "no se pudo mandar a la papelera: {err}"),
+            }
+        }
+        if alguno {
+            self.releer(alto_panel, pantalla);
+        }
+        alguno
     }
 
     pub fn cuantos(&self) -> usize {
@@ -388,7 +448,7 @@ impl Escritorio {
 ///
 /// El sobrante se remata con puntos suspensivos. Se hace aquí y no con el
 /// ajuste de línea de iced porque iced no sabe parar a las dos líneas.
-fn dos_lineas(nombre: &str, ancho: f32, tamaño: f32) -> String {
+pub(crate) fn dos_lineas(nombre: &str, ancho: f32, tamaño: f32) -> String {
     let (primera, resto) = cortar(nombre, ancho, tamaño);
     if resto.is_empty() {
         return primera;
@@ -488,17 +548,17 @@ impl Elemento {
         // Un `.desktop` en el escritorio es un lanzador, no un fichero de
         // texto: enseña su `Name` y su icono, y al abrirlo se ejecuta su
         // `Exec`. Es lo único que distingue un escritorio de un listado.
-        if ruta.extension().is_some_and(|e| e == "desktop") {
-            if let Some(app) = crate::apps::leer_una(ruta) {
-                return Some(Self {
-                    nombre: app.nombre,
-                    ruta: ruta.to_path_buf(),
-                    orden: app.exec,
-                    icono: crate::icono::cargar(&app.icono),
-                    celda: (-1, -1),
-                    seleccionado: false,
-                });
-            }
+        if ruta.extension().is_some_and(|e| e == "desktop")
+            && let Some(app) = crate::apps::leer_una(ruta)
+        {
+            return Some(Self {
+                nombre: app.nombre,
+                ruta: ruta.to_path_buf(),
+                orden: app.exec,
+                icono: crate::icono::cargar(&app.icono),
+                celda: (-1, -1),
+                seleccionado: false,
+            });
         }
         Some(Self {
             nombre: nombre_fichero,
@@ -549,6 +609,139 @@ fn entrecomillar(ruta: &Path) -> String {
 /// y los entornos de escritorio; si no está, los dos nombres de siempre. Sin
 /// esto, en una sesión en castellano se leería `~/Desktop` —que no existe— y el
 /// escritorio saldría vacío.
+/// Manda un fichero o carpeta a la papelera de freedesktop
+/// (`~/.local/share/Trash`), la que siguen Dolphin, Nautilus y el resto de
+/// gestores que respetan la especificación.
+fn mover_a_papelera(ruta: &Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    let datos = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .ok_or_else(|| Error::new(ErrorKind::NotFound, "sin HOME ni XDG_DATA_HOME"))?;
+    let papelera = datos.join("Trash");
+    let ficheros = papelera.join("files");
+    let info = papelera.join("info");
+    std::fs::create_dir_all(&ficheros)?;
+    std::fs::create_dir_all(&info)?;
+
+    let nombre = ruta
+        .file_name()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "ruta sin nombre de fichero"))?
+        .to_string_lossy()
+        .into_owned();
+    // Nombre libre dentro de la papelera: puede que ya haya algo con el mismo
+    // nombre —de otra carpeta, o de un borrado anterior— y sobrescribirlo
+    // perdería lo que ya estaba ahí.
+    let (base, extension) = match nombre.rsplit_once('.') {
+        Some((b, e)) if !b.is_empty() => (b.to_string(), format!(".{e}")),
+        _ => (nombre.clone(), String::new()),
+    };
+    let origen_absoluto = if ruta.is_absolute() {
+        ruta.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(ruta)
+    };
+    let contenido = format!(
+        "[Trash Info]\nPath={}\nDeletionDate={}\n",
+        codificar_ruta(&origen_absoluto),
+        fecha_papelera(),
+    );
+
+    // El .trashinfo va primero y con `create_new`, como pide la
+    // especificación: crearlo en exclusiva es lo que reserva el nombre, y si
+    // se escribiera después del `rename` y fallara, el fichero quedaría en
+    // Trash/files sin nada que diga de dónde vino.
+    let mut destino_nombre = nombre.clone();
+    let mut intento = 2;
+    let ficha = loop {
+        let ficha = info.join(format!("{destino_nombre}.trashinfo"));
+        if !ficheros.join(&destino_nombre).exists() {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&ficha)
+            {
+                Ok(mut f) => {
+                    use std::io::Write;
+                    if let Err(e) = f.write_all(contenido.as_bytes()) {
+                        let _ = std::fs::remove_file(&ficha);
+                        return Err(e);
+                    }
+                    break ficha;
+                }
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+        }
+        destino_nombre = format!("{base} {intento}{extension}");
+        intento += 1;
+    };
+    if let Err(e) = std::fs::rename(ruta, ficheros.join(&destino_nombre)) {
+        let _ = std::fs::remove_file(&ficha);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Codifica una ruta como pide la especificación de la papelera: los bytes
+/// fuera del juego "sin reservar" de RFC 3986, en `%XX`.
+///
+/// A mano y no con una dependencia: una ruta de escritorio real lleva letras,
+/// números y como mucho espacios o acentos, y son unos pocos bytes por
+/// fichero borrado.
+fn codificar_ruta(ruta: &Path) -> String {
+    let mut salida = String::new();
+    for byte in ruta.to_string_lossy().bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                salida.push(byte as char);
+            }
+            _ => {
+                let _ = write!(salida, "%{byte:02X}");
+            }
+        }
+    }
+    salida
+}
+
+/// `DeletionDate` en ISO 8601, tal como pide la especificación de la
+/// papelera.
+///
+/// En UTC y no en hora local: este crate no lleva ninguna dependencia de
+/// zonas horarias, y la especificación pide "una fecha", sin exigir el
+/// desplazamiento local. Dolphin y Nautilus la leen igual.
+fn fecha_papelera() -> String {
+    let ahora = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let segundos = ahora.as_secs() as i64;
+    let dias = segundos.div_euclid(86_400);
+    let resto = segundos.rem_euclid(86_400);
+    let (h, m, s) = (resto / 3600, (resto / 60) % 60, resto % 60);
+    let (y, mes, d) = civil_desde_dias(dias);
+    format!("{y:04}-{mes:02}-{d:02}T{h:02}:{m:02}:{s:02}")
+}
+
+/// De días desde 1970-01-01 a año/mes/día del calendario gregoriano.
+///
+/// El algoritmo de Howard Hinnant, de dominio público: aritmética entera
+/// pura, sin tabla de meses ni de años bisiestos escrita a mano. Comprobado
+/// contra `datetime` de Python en varias fechas, incluyendo negativas y
+/// bisiestos.
+fn civil_desde_dias(dias: i64) -> (i64, u32, u32) {
+    let z = dias + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let mes = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if mes <= 2 { y + 1 } else { y };
+    (y, mes, d)
+}
+
 fn carpeta_escritorio() -> Option<PathBuf> {
     // La escotilla es para la previsualización y para las pruebas: apuntar a
     // una carpeta de mentira es la única forma de mirar la rejilla sin
@@ -557,10 +750,10 @@ fn carpeta_escritorio() -> Option<PathBuf> {
         return Some(PathBuf::from(dir));
     }
     let home = PathBuf::from(std::env::var_os("HOME")?);
-    if let Some(dir) = leer_user_dirs(&home) {
-        if dir.is_dir() {
-            return Some(dir);
-        }
+    if let Some(dir) = leer_user_dirs(&home)
+        && dir.is_dir()
+    {
+        return Some(dir);
     }
     [home.join("Escritorio"), home.join("Desktop")]
         .into_iter()
@@ -671,5 +864,105 @@ mod tests {
     fn la_ruta_va_entrecomillada() {
         let orden = entrecomillar(Path::new("/tmp/a b'; rm -rf ~"));
         assert_eq!(orden, r"'/tmp/a b'\''; rm -rf ~'");
+    }
+
+    #[test]
+    fn civil_desde_dias_coincide_con_el_calendario() {
+        // (días desde 1970-01-01, año, mes, día). Incluye negativos —antes de
+        // la época— y un bisiesto, que es donde este tipo de aritmética suele
+        // fallar.
+        for (dias, y, m, d) in [
+            (0i64, 1970i64, 1u32, 1u32),
+            (1, 1970, 1, 2),
+            (365, 1971, 1, 1),
+            (366, 1971, 1, 2),
+            (19_000, 2022, 1, 8),
+            (20_000, 2024, 10, 4),
+            (-1, 1969, 12, 31),
+            (-365, 1969, 1, 1),
+        ] {
+            assert_eq!(civil_desde_dias(dias), (y, m, d), "días={dias}");
+        }
+    }
+
+    #[test]
+    fn codificar_ruta_deja_intactos_los_caracteres_normales_y_escapa_el_resto() {
+        assert_eq!(
+            codificar_ruta(Path::new("/home/eve/Escritorio/informe.pdf")),
+            "/home/eve/Escritorio/informe.pdf"
+        );
+        assert_eq!(
+            codificar_ruta(Path::new("/home/eve/Mi carpeta (2)")),
+            "/home/eve/Mi%20carpeta%20%282%29"
+        );
+    }
+
+    /// Crear y eliminar de verdad, sobre un directorio temporal: es la única
+    /// forma de comprobar que la carpeta aparece donde toca y que lo borrado
+    /// llega a la papelera, y no solo que la aritmética de nombres es
+    /// correcta.
+    #[test]
+    fn crear_y_eliminar_una_carpeta_de_verdad() {
+        let sufijo = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        );
+        let escritorio_tmp = std::env::temp_dir().join(format!("bookos-test-escritorio-{sufijo}"));
+        let datos_tmp = std::env::temp_dir().join(format!("bookos-test-datos-{sufijo}"));
+        std::fs::create_dir_all(&escritorio_tmp).expect("crear el escritorio de prueba");
+        // SAFETY: `BOOKOS_ESCRITORIO` es la escotilla que existe justo para
+        // esto, y ningún otro test de este binario lee `XDG_DATA_HOME`: los
+        // dos son seguros de tocar aquí sin pisarle una variable a otro test.
+        unsafe {
+            std::env::set_var("BOOKOS_ESCRITORIO", &escritorio_tmp);
+            std::env::set_var("XDG_DATA_HOME", &datos_tmp);
+        }
+
+        let mut e = Escritorio::new(32.0, (1440.0, 900.0));
+        assert_eq!(e.cuantos(), 0, "el directorio de prueba nace vacío");
+
+        assert!(e.crear_carpeta(32.0, (1440.0, 900.0)));
+        assert_eq!(e.cuantos(), 1);
+        assert!(escritorio_tmp.join("Nueva carpeta").is_dir());
+        assert!(
+            e.elementos[0].seleccionado,
+            "la carpeta recién creada queda seleccionada"
+        );
+
+        // Una segunda no choca con el nombre de la primera.
+        assert!(e.crear_carpeta(32.0, (1440.0, 900.0)));
+        assert_eq!(e.cuantos(), 2);
+        assert!(escritorio_tmp.join("Nueva carpeta (2)").is_dir());
+
+        for elemento in &mut e.elementos {
+            elemento.seleccionado = elemento.nombre == "Nueva carpeta";
+        }
+        assert!(e.eliminar_seleccionados(32.0, (1440.0, 900.0)));
+        assert_eq!(e.cuantos(), 1, "la eliminada ya no está en la lista");
+        assert!(
+            !escritorio_tmp.join("Nueva carpeta").exists(),
+            "salió de donde estaba"
+        );
+        assert!(
+            datos_tmp.join("Trash/files/Nueva carpeta").is_dir(),
+            "llegó a la papelera, no se borró de verdad"
+        );
+        let info = std::fs::read_to_string(datos_tmp.join("Trash/info/Nueva carpeta.trashinfo"))
+            .expect("hay .trashinfo");
+        assert!(info.starts_with("[Trash Info]\n"));
+        assert!(info.contains("Path="));
+        assert!(info.contains("DeletionDate="));
+
+        let _ = std::fs::remove_dir_all(&escritorio_tmp);
+        let _ = std::fs::remove_dir_all(&datos_tmp);
+        // SAFETY: mismo argumento que al ponerlas.
+        unsafe {
+            std::env::remove_var("BOOKOS_ESCRITORIO");
+            std::env::remove_var("XDG_DATA_HOME");
+        }
     }
 }

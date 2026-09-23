@@ -67,44 +67,47 @@ fn en(base: &Path, carpeta: &str, archivo: &str) -> Option<PathBuf> {
 
 /// Las familias completas que hay instaladas, sin repetir nombre.
 ///
-/// Una familia solo cuenta si tiene **las dos** imágenes: media pareja no sirve
-/// para lo que existe esto. Se devuelven ordenadas por nombre para que la
-/// tarjeta las enseñe siempre en el mismo sitio; el orden del directorio no lo
-/// garantiza y los iconos bailarían entre sesiones.
+/// Una familia solo cuenta si tiene **las dos** imágenes del mismo formato:
+/// media pareja no sirve para lo que existe esto. PNG va primero para que los
+/// SVG que hoy acompañan a los fondos como previsualización no los sustituyan
+/// según el orden arbitrario del directorio. Se devuelven ordenadas por nombre
+/// para que los iconos no bailen entre sesiones.
 pub fn instaladas(claro: bool) -> Vec<Familia> {
     let mut familias: Vec<Familia> = Vec::new();
     for base in bases() {
-        let Ok(entradas) = std::fs::read_dir(base.join("Light")) else {
-            continue;
-        };
-        for entrada in entradas.flatten() {
-            let ruta = entrada.path();
-            if ruta.extension().and_then(|e| e.to_str()) != Some("png") {
+        for formato in ["png", "webp", "jpg", "jpeg", "svg"] {
+            let Ok(entradas) = std::fs::read_dir(base.join("Light")) else {
                 continue;
+            };
+            for entrada in entradas.flatten() {
+                let ruta = entrada.path();
+                if ruta.extension().and_then(|e| e.to_str()) != Some(formato) {
+                    continue;
+                }
+                let Some(nombre) = ruta.file_stem().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                // Una base más preferente manda; dentro de ella, el primer
+                // formato de la tabla. Así la elección no depende de readdir.
+                if familias.iter().any(|f| f.nombre == nombre) {
+                    continue;
+                }
+                let Some(oscuro) = en(&base, "Dark", &oscuro_de(nombre, formato)) else {
+                    tracing::debug!(nombre, formato, "fondo sin pareja oscura; no se ofrece");
+                    continue;
+                };
+                let vista = if claro {
+                    en(&base, "Light", &format!("{nombre}.svg"))
+                } else {
+                    en(&base, "Dark", &oscuro_de(nombre, "svg"))
+                };
+                familias.push(Familia {
+                    nombre: nombre.to_string(),
+                    claro: ruta,
+                    oscuro,
+                    vista,
+                });
             }
-            let Some(nombre) = ruta.file_stem().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            // Una que ya salió de una base más preferente manda: lo del usuario
-            // gana a lo del sistema.
-            if familias.iter().any(|f| f.nombre == nombre) {
-                continue;
-            }
-            let Some(oscuro) = en(&base, "Dark", &oscuro_de(nombre, "png")) else {
-                tracing::debug!(nombre, "fondo sin pareja oscura; no se ofrece");
-                continue;
-            };
-            let vista = if claro {
-                en(&base, "Light", &format!("{nombre}.svg"))
-            } else {
-                en(&base, "Dark", &oscuro_de(nombre, "svg"))
-            };
-            familias.push(Familia {
-                nombre: nombre.to_string(),
-                claro: ruta,
-                oscuro,
-                vista,
-            });
         }
     }
     familias.sort_by(|a, b| a.nombre.cmp(&b.nombre));

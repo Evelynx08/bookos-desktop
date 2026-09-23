@@ -83,7 +83,13 @@ fn entradas() -> Vec<Entrada> {
             etiqueta: "BookOS Store…",
             icono: "tienda",
             atajo: None,
-            accion: || Accion::Lanzar("bookos-store".into()),
+            // `bookos-store` todavía no existe —no hay ni un crate con ese
+            // nombre en el repositorio—, así que pulsar aquí no hacía nada:
+            // `sh -c bookos-store` fallaba con "orden no encontrada" y el
+            // menú se cerraba como si hubiera funcionado. Mientras no haya
+            // tienda propia, cae a Discover, que es la que ya trae esta base
+            // y hace lo mismo de verdad: instalar software.
+            accion: || Accion::Lanzar("bookos-store || plasma-discover".into()),
         },
         Divisor,
         Item {
