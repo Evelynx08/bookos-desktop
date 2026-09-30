@@ -89,7 +89,7 @@ pub fn avanzar_animaciones(state: &mut BookosComp) {
             shell.actividad_clase() != Some(bookos_shell::actividad::Clase::Player)
                 || !app_en_foco
                     .as_deref()
-                    .is_some_and(|foco| bookos_shell::mismo_programa(actividad, foco))
+                    .is_some_and(|foco| ventana_de_actividad(actividad, foco))
         });
         if shell.actividad_visible(visible) {
             state.needs_redraw = true;
@@ -250,6 +250,17 @@ fn componer(
                 },
             ));
         }
+    }
+
+    // El recuadro de la elegida y su rótulo: detrás de las miniaturas —la
+    // ventana viva tapa el relleno y deja ver el marco— y delante de la tarjeta.
+    if let Some(shell) = state.shell.as_ref() {
+        elementos.extend(
+            shell
+                .conmutador_extras(renderer)
+                .into_iter()
+                .map(OverlayElement::Memory),
+        );
     }
 
     // El selector es modal y se mantiene incluso sobre pantalla completa. Va
@@ -628,7 +639,7 @@ fn componer(
         // una textura la primera vez y a partir de ahí la dibuja el genio, no
         // sus superficies. Sin shader se sigue por el camino de abajo, que la
         // encoge sin deformarla.
-        if let (Some(e), Some(genio)) = (encogido, state.genio.as_ref()) {
+        if let (Some(e), Some(genio), true) = (encogido, state.genio.as_ref(), state.genio_activo) {
             if !state.capturas.iter().any(|(w, _)| *w == window)
                 && let Some(captura) = crate::genio::capturar(renderer, &window, scale)
             {
@@ -1349,6 +1360,17 @@ fn fallar(state: &mut BookosComp, indices: &[usize]) {
 /// Vive aquí y no en `keybinds` porque decodificar y subir necesita el
 /// `GlesRenderer`, que es del backend. Quien quiere el cambio pone
 /// `state.recargar_fondo` y esto lo consume, igual que `needs_redraw`.
+/// ¿Es `foco` la ventana de la app que publica la actividad?
+///
+/// La actividad llega con el identificador de Tauri (`com.bookos.player`) y la
+/// ventana con el nombre del binario (`bookos-player`: es lo que manda GTK en
+/// `set_app_id`, visto con `WAYLAND_DEBUG`). Con solo `mismo_programa` nunca
+/// casaban y la isla seguía encima del propio reproductor.
+fn ventana_de_actividad(actividad: &str, foco: &str) -> bool {
+    let binario = actividad.split('.').skip(1).collect::<Vec<_>>().join("-");
+    bookos_shell::mismo_programa(actividad, foco) || foco.eq_ignore_ascii_case(&binario)
+}
+
 pub fn recargar_fondo(state: &mut BookosComp, renderer: &mut GlesRenderer) {
     if !std::mem::take(&mut state.recargar_fondo) {
         return;
@@ -1791,11 +1813,15 @@ pub fn watch_hardware(state: &mut BookosComp) {
     // estaba a fuego y cualquier evento releía las cuatro fuentes de sysfs.
     //
     // El shell incluye también `leds`: la tarjeta de brillo muestra el teclado.
-    let subsistemas = state
+    let mut subsistemas = state
         .shell
         .as_ref()
         .map(|s| s.subsistemas())
         .unwrap_or_default();
+    // El aviso del cargador no depende de que el panel lleve la batería.
+    if !subsistemas.contains(&"power_supply") {
+        subsistemas.push("power_supply");
+    }
     if subsistemas.is_empty() {
         tracing::debug!("ningún widget pide avisos de hardware");
         return;
@@ -1828,6 +1854,7 @@ pub fn watch_hardware(state: &mut BookosComp) {
             if cambios > 0 {
                 tracing::debug!(cambios, "aviso de hardware, releyendo el panel");
                 refresh_panel(state);
+                crate::multimedia::cargador(state);
             }
             Ok(PostAction::Continue)
         });
@@ -1838,6 +1865,23 @@ pub fn watch_hardware(state: &mut BookosComp) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn la_isla_reconoce_la_ventana_de_su_app() {
+        assert!(super::ventana_de_actividad(
+            "com.bookos.player",
+            "bookos-player"
+        ));
+        assert!(super::ventana_de_actividad(
+            "com.bookos.player",
+            "com.bookos.player"
+        ));
+        assert!(!super::ventana_de_actividad("com.bookos.player", "konsole"));
+        assert!(!super::ventana_de_actividad(
+            "com.bookos.player",
+            "bookos-clock"
+        ));
+    }
+
     use super::escala_sugerida;
 
     #[test]

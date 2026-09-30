@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use iced_core::alignment::Vertical;
 use iced_core::{Border, Color, Length};
-use iced_widget::{Space, container, row, text};
+use iced_widget::{Space, container, row, stack, text};
 
 use crate::icono::{self, Icono};
 use crate::tema;
@@ -98,6 +98,8 @@ const SURCO: Color = tema::hex(0xc7c7cc);
 
 pub struct Osd {
     icono: Option<Icono>,
+    /// Lleva encima la raya roja de «apagado»: ver [`cargar_icono`].
+    tachado: bool,
     /// De 0 a 100. `None` para lo que no tiene nivel, como apagar el touchpad.
     nivel: Option<u8>,
     /// La barra, que persigue a `nivel` en vez de saltar. Guarda la fracción
@@ -105,19 +107,24 @@ pub struct Osd {
     barra: tema::Transicion,
     /// Texto en vez de barra, para lo que no es un nivel.
     texto: Option<String>,
+    /// Cuándo empezó a **entrar**. Solo se reinicia si ya se estaba yendo.
     desde: Instant,
+    /// La última vez que se pulsó la tecla: de ahí cuenta el tiempo quieto.
+    visto: Instant,
 }
 
 impl Osd {
     pub fn new(icono: &str, nivel: Option<u8>, texto: Option<String>) -> Self {
         Self {
-            icono: icono::propio(icono).or_else(|| icono::cargar(icono)),
+            icono: cargar_icono(icono).0,
+            tachado: cargar_icono(icono).1,
             nivel,
             // Recién creado, la barra ya está en su sitio: el primer aviso
             // enseña el volumen que hay, no lo dibuja creciendo desde cero.
             barra: tema::Transicion::nueva(fraccion_nivel(nivel), tema::D_HOVER, tema::C_SUAVE),
             texto,
             desde: Instant::now(),
+            visto: Instant::now(),
         }
     }
 
@@ -138,31 +145,38 @@ impl Osd {
         if nivel.is_none() && self.texto != texto {
             return false;
         }
-        self.icono = icono::propio(icono).or_else(|| icono::cargar(icono));
+        (self.icono, self.tachado) = cargar_icono(icono);
         self.nivel = nivel;
         self.texto = texto;
         self.barra.ir_a(fraccion_nivel(nivel));
-        self.desde = Instant::now();
+        // Mantener la tecla llama aquí cada pocos milisegundos. Reiniciar
+        // también la entrada devolvía el alfa a 0 y la escala a 0,92 en cada
+        // repetición, y la cápsula parpadeaba mientras la barra subía. Solo se
+        // rearma la entrada si ya había empezado a irse.
+        if self.visto.elapsed() >= QUIETO {
+            self.desde = Instant::now();
+        }
+        self.visto = Instant::now();
         true
     }
 
     /// Cuánto queda para que desaparezca del todo. `None` si ya se fue.
     pub fn queda(&self) -> Option<Duration> {
-        (QUIETO + SALIDA).checked_sub(self.desde.elapsed())
+        (QUIETO + SALIDA).checked_sub(self.visto.elapsed())
     }
 
     /// Opacidad de ahora mismo: entrando, entero mientras está quieto, y
     /// bajando al final.
     pub fn alfa(&self) -> f32 {
-        let t = self.desde.elapsed();
-        if t < QUIETO {
-            // La entrada va con la curva sin rebote aunque el tamaño sí rebote:
-            // un muelle en el alfa lo llevaría por encima de 1 y habría que
-            // recortarlo, gastando la parte interesante de la curva en nada.
-            return tema::C_ENTRADA.eval(tema::fraccion(t, ENTRADA));
+        // La entrada va con la curva sin rebote aunque el tamaño sí rebote:
+        // un muelle en el alfa lo llevaría por encima de 1 y habría que
+        // recortarlo, gastando la parte interesante de la curva en nada.
+        let entrada = tema::C_ENTRADA.eval(tema::fraccion(self.desde.elapsed(), ENTRADA));
+        let quieto = self.visto.elapsed();
+        if quieto < QUIETO {
+            return entrada;
         }
-        let fuera = tema::fraccion(t - QUIETO, SALIDA);
-        1.0 - tema::C_SUAVE.eval(fuera)
+        entrada * (1.0 - tema::C_SUAVE.eval(tema::fraccion(quieto - QUIETO, SALIDA)))
     }
 
     /// La escala con la que se compone: entra creciendo desde el 92 % con
@@ -216,9 +230,17 @@ impl Osd {
     }
 
     pub fn view(&self) -> PanelElement<'_> {
-        let dibujo = match &self.icono {
+        let base = match &self.icono {
             Some(ic) => icono::ver_teñido(ic, LADO_ICONO, Some(tema::texto())),
             None => crate::widget::vacio(),
+        };
+        let dibujo = match icono::propio("tachado").filter(|_| self.tachado) {
+            Some(raya) => stack![
+                base,
+                icono::ver_teñido_propio(&raya, LADO_ICONO, tema::rojo())
+            ]
+            .into(),
+            None => base,
         };
         // El nivel manda sobre el texto: si hay barra, el número sobra — la
         // barra ya dice cuánto, y a un OSD que se va en un segundo no le sobra
@@ -299,6 +321,17 @@ impl Osd {
     }
 }
 
+/// El icono de un aviso y si va tachado. Un nombre acabado en `-desactivado` es
+/// el mismo icono con la raya roja encima: así «touchpad» y «cámara» tienen su
+/// versión apagada sin duplicar el dibujo.
+fn cargar_icono(nombre: &str) -> (Option<Icono>, bool) {
+    let (base, tachado) = match nombre.strip_suffix("-desactivado") {
+        Some(base) => (base, true),
+        None => (nombre, false),
+    };
+    (icono::propio(base).or_else(|| icono::cargar(base)), tachado)
+}
+
 /// El nivel como fracción del ancho de la barra. Sin nivel, vacía.
 fn fraccion_nivel(nivel: Option<u8>) -> f32 {
     nivel.unwrap_or(0).min(100) as f32 / 100.0
@@ -324,6 +357,18 @@ fn fondo() -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mantener la tecla actualiza el aviso sin parar: el alfa y la escala no
+    /// pueden volver a la entrada, que es lo que se veía como parpadeo.
+    #[test]
+    fn actualizar_estando_visible_no_reinicia_la_entrada() {
+        let mut osd = Osd::new("brillo", Some(50), None);
+        std::thread::sleep(ENTRADA);
+        assert!(osd.actualizar("brillo", Some(55), None));
+        assert_eq!(osd.alfa(), 1.0);
+        assert_eq!(osd.escala(), 1.0);
+        assert!(osd.queda().is_some_and(|q| q > QUIETO));
+    }
 
     /// Aparece entrando, se queda entero durante su rato y se va al final.
     #[test]

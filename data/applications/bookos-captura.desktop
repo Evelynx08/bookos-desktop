@@ -1,5 +1,6 @@
 [Desktop Entry]
-Name=Captura
+Name=Screenshot
+Name[es]=Captura
 Comment=Captura de pantalla de BookOS
 Exec=bookos-captura
 TryExec=bookos-captura

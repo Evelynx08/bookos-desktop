@@ -397,6 +397,89 @@ fn las_tarjetas_de_conectividad_se_pintan() {
     }
 }
 
+/// El centro de notificaciones con avisos dentro: repetidos, críticos, con
+/// progreso y con acciones.
+///
+/// Con `BOOKOS_NOTIF_LLENO_PNG=/ruta.png` guarda lo que pinta.
+#[test]
+fn el_centro_de_notificaciones_con_avisos_se_pinta() {
+    use bookos_shell::notificaciones::{Accion, Notificacion};
+
+    let mut shell = shell(1.0);
+    let acc = |c: &str, e: &str| Accion {
+        clave: c.into(),
+        etiqueta: e.into(),
+    };
+    for (id, app, resumen, cuerpo, critica, acciones, progreso) in [
+        (
+            1,
+            "KDE Connect",
+            "Instagram",
+            "pero el problema no es ese es que no se ve bien la notificacion",
+            false,
+            vec![acc("r", "Responder"), acc("l", "Leído")],
+            None,
+        ),
+        (
+            2,
+            "KDE Connect",
+            "WhatsApp",
+            "¿Quedamos mañana?",
+            false,
+            vec![],
+            None,
+        ),
+        (
+            3,
+            "Firefox",
+            "Descarga terminada",
+            "bookos-desktop.tar.gz",
+            false,
+            vec![],
+            Some(60),
+        ),
+        (
+            4,
+            "Sistema",
+            "Batería crítica",
+            "Conecta el cargador",
+            true,
+            vec![],
+            None,
+        ),
+    ] {
+        shell.notificar(
+            Notificacion::nueva_con_datos(
+                id,
+                app.into(),
+                resumen.into(),
+                cuerpo.into(),
+                "",
+                critica,
+                acciones,
+                progreso,
+                false,
+            ),
+            -1,
+        );
+    }
+    shell.abrir(bookos_shell::Emergente::notificaciones());
+    let (w, h) = shell.emergente_buffer_size().expect("tiene superficie");
+    let mut buf = vec![0u8; (w * h * 4) as usize];
+    shell.draw_emergente(&mut buf);
+    volcar("BOOKOS_NOTIF_LLENO_PNG", &buf, w, h);
+    assert!(tinta(&buf, w, h, 0, w) > 0, "la tarjeta sale en blanco");
+
+    // Pulsar la fila de Instagram (la última: la lista va del más nuevo al más
+    // viejo) la despliega y la tarjeta crece.
+    assert!(shell.emergente_pulsar(100.0, 250.0).is_none());
+    let (w2, h2) = shell.emergente_buffer_size().expect("tiene superficie");
+    assert!(h2 > h, "desplegar no hizo crecer la tarjeta");
+    let mut buf = vec![0u8; (w2 * h2 * 4) as usize];
+    shell.draw_emergente(&mut buf);
+    volcar("BOOKOS_NOTIF_DESPLEGADO_PNG", &buf, w2, h2);
+}
+
 /// El aviso de volumen, con la cápsula del diseño.
 ///
 /// Con `BOOKOS_OSD_PNG=/ruta.png` guarda lo que pinta.
@@ -409,6 +492,32 @@ fn el_osd_se_pinta() {
     shell.draw_osd(&mut buf);
     volcar("BOOKOS_OSD_PNG", &buf, w, h);
     assert!(tinta(&buf, w, h, 0, w) > 0, "el aviso sale en blanco");
+
+    // El de la cámara, con su icono propio.
+    for (icono, texto, var) in [
+        ("camara", "Cámara activada", "BOOKOS_OSD_CAMARA_PNG"),
+        (
+            "camara-desactivado",
+            "Cámara desactivada",
+            "BOOKOS_OSD_CAMARA_OFF_PNG",
+        ),
+    ] {
+        shell.mostrar_osd(icono, None, Some(texto.into()));
+        let (w, h) = shell.osd_buffer_size().expect("tiene superficie");
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        shell.draw_osd(&mut buf);
+        volcar(var, &buf, w, h);
+    }
+
+    shell.mostrar_osd(
+        "touchpad-desactivado",
+        None,
+        Some("Touchpad desactivado".into()),
+    );
+    let (w, h) = shell.osd_buffer_size().expect("tiene superficie");
+    let mut buf = vec![0u8; (w * h * 4) as usize];
+    shell.draw_osd(&mut buf);
+    volcar("BOOKOS_OSD_TOUCHPAD_OFF_PNG", &buf, w, h);
 
     // Y el de estado, que lleva texto en vez de barra.
     shell.mostrar_osd("touchpad", None, Some("Touchpad desactivado".into()));
@@ -922,6 +1031,8 @@ fn el_bloqueo_se_pinta_con_reloj_avatar_y_campo() {
     if let Some(b) = shell.bloqueo_mut() {
         b.estado = Estado::Fallo;
         b.medios.push(Medio {
+            fuente: None,
+            caratula: None,
             bus: "org.mpris.MediaPlayer2.prueba".into(),
             titulo: "Recording".into(),
             detalle: "0:37".into(),
@@ -1345,6 +1456,42 @@ fn las_notificaciones_se_listan_y_se_cierran() {
     let ids = shell.borrar_notificaciones();
     assert_eq!(ids.len(), 2);
     assert!(shell.notificaciones().is_empty());
+}
+
+/// El aviso con cuerpo y botones —el de KDE Connect— cabe entero en su tarjeta.
+///
+/// Con `BOOKOS_TOAST_ACCIONES_PNG=/ruta.png` guarda lo que pinta.
+#[test]
+fn el_aviso_con_botones_se_pinta() {
+    use bookos_shell::notificaciones::{Accion, Notificacion};
+
+    let accion = |clave: &str, etiqueta: &str| Accion {
+        clave: clave.into(),
+        etiqueta: etiqueta.into(),
+    };
+    let mut shell = shell(1.0);
+    shell.notificar(
+        Notificacion::nueva_con_datos(
+            1,
+            "KDE Connect".into(),
+            "Instagram".into(),
+            "pero el problema no es ese es que no se ve bien la notificacion".into(),
+            "",
+            false,
+            vec![
+                accion("responder", "Responder"),
+                accion("leido", "Marcar como leído"),
+            ],
+            None,
+            false,
+        ),
+        -1,
+    );
+    let (w, h) = shell.toast_buffer_size(1).expect("tiene superficie");
+    let mut buf = vec![0u8; (w * h * 4) as usize];
+    shell.draw_toast(1, &mut buf);
+    volcar("BOOKOS_TOAST_ACCIONES_PNG", &buf, w, h);
+    assert!(tinta(&buf, w, h, 0, w) > 0, "el aviso sale en blanco");
 }
 
 /// El aviso de una notificación se pinta arriba a la derecha y se va solo.
@@ -1884,6 +2031,8 @@ fn el_bloqueo_no_se_solapa_a_1280x800() {
     shell.bloquear("23:50".into(), "jueves, 17 de septiembre".into(), pantalla);
     if let Some(b) = shell.bloqueo_mut() {
         b.medios.push(Medio {
+            fuente: None,
+            caratula: None,
             bus: "org.mpris.MediaPlayer2.prueba".into(),
             titulo: "Surface of a Glass Lake".into(),
             detalle: "_1_975".into(),

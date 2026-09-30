@@ -10,20 +10,27 @@
 //! consulta —listar, estado y metadatos—, así que en reposo esto no corre: el
 //! centro de control cerrado no existe.
 //!
-//! Lo que no hay: carátula. La trae `mpris:artUrl`, casi siempre como fichero
-//! en `/tmp`, y descodificar un JPEG por cada canción para pintarlo de fondo es
-//! trabajo que aún no se ha medido. La tarjeta se dibuja con el color del
-//! sistema mientras tanto.
+//! La carátula se lee si `mpris:artUrl` es un fichero local —lo que dan
+//! kdeconnect (BookOS Link) y los reproductores de escritorio— o una `data:`
+//! URL, que es como la publica BookOS Player. Las URL `https` de los
+//! navegadores no se descargan desde aquí.
 
 use std::process::{Command, Stdio};
+
+use iced_core::Color;
+use iced_widget::image::Handle;
 
 /// Lo que está sonando ahora mismo.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sonando {
     /// El nombre del bus, para mandarle las órdenes: `org.mpris.MediaPlayer2.vlc`.
     pub bus: String,
-    /// Cómo se llama el reproductor, ya legible: `vlc`, `firefox`.
+    /// Cómo se llama el reproductor, ya legible: `VLC`, o con BookOS Link
+    /// `BitChord - Galaxy S22 Ultra`, que dice también de qué móvil viene.
     pub aplicacion: String,
+    /// La carátula como ruta local o como `data:` URL, si el reproductor
+    /// publica una. Ver [`cargar_caratula`].
+    pub caratula: Option<String>,
     pub titulo: String,
     pub artista: String,
     pub reproduciendo: bool,
@@ -58,20 +65,36 @@ impl Sonando {
             return None;
         }
         let titulo = campo(metadatos, "xesam:title")?;
+        let reproduciendo = estado.contains("Playing");
+        let posicion = propiedad(&bus, "Position")
+            .and_then(|s| numero(&s))
+            // Los micros del `Position` de MPRIS a segundos.
+            .map(|us| us / 1_000_000);
+        let duracion = campo_numero(metadatos, "mpris:length").map(|us| us / 1_000_000);
+        if caducado(posicion, duracion) {
+            return None;
+        }
         Some(Self {
-            aplicacion: bus
-                .rsplit('.')
-                .next()
-                .unwrap_or(&bus)
-                .replace("instance", "")
-                .to_string(),
+            // `Identity` es el nombre que el propio reproductor quiere enseñar.
+            // El sufijo del bus solo vale de reserva: el de kdeconnect es
+            // `mpris_d4b8b016…`, un identificador de dispositivo ilegible.
+            aplicacion: identidad(&bus).unwrap_or_else(|| {
+                bus.rsplit('.')
+                    .next()
+                    .unwrap_or(&bus)
+                    .replace("instance", "")
+            }),
+            caratula: campo(metadatos, "mpris:artUrl").and_then(|url| {
+                if url.starts_with("data:image/") {
+                    Some(url)
+                } else {
+                    url.strip_prefix("file://").map(str::to_string)
+                }
+            }),
             artista: campo(metadatos, "xesam:artist").unwrap_or_default(),
-            reproduciendo: estado.contains("Playing"),
-            posicion: propiedad(&bus, "Position")
-                .and_then(|s| numero(&s))
-                // Los micros del `Position` de MPRIS a segundos.
-                .map(|us| us / 1_000_000),
-            duracion: campo_numero(metadatos, "mpris:length").map(|us| us / 1_000_000),
+            reproduciendo,
+            posicion,
+            duracion,
             titulo,
             bus,
         })
@@ -107,6 +130,47 @@ impl Sonando {
     }
 }
 
+/// La carátula cuadrada, reducida a `lado` píxeles con las esquinas de `radio`,
+/// y el color que la resume. `fuente` es lo que guarda [`Sonando::caratula`].
+///
+/// La comparten el centro de control y el bloqueo; cada uno la llama solo al
+/// cambiar de fuente, no por lectura.
+pub fn cargar_caratula(fuente: &str, lado: u32, radio: f32) -> Option<(Handle, Color)> {
+    use base64::Engine;
+    let bytes = match fuente.strip_prefix("data:image/") {
+        Some(resto) => base64::engine::general_purpose::STANDARD
+            .decode(resto.split_once(',')?.1)
+            .inspect_err(|err| tracing::debug!("carátula data: ilegible: {err}"))
+            .ok()?,
+        None => std::fs::read(fuente)
+            .inspect_err(|err| tracing::debug!(fuente, "carátula ilegible: {err}"))
+            .ok()?,
+    };
+    let imagen = image::load_from_memory(&bytes)
+        .inspect_err(|err| tracing::debug!("carátula ilegible: {err}"))
+        .ok()?;
+    let (ancho, alto) = (imagen.width(), imagen.height());
+    let corte = ancho.min(alto);
+    let cuadrada = image::imageops::crop_imm(
+        &imagen,
+        (ancho - corte) / 2,
+        (alto - corte) / 2,
+        corte,
+        corte,
+    )
+    .to_image();
+    let escalada =
+        image::imageops::resize(&cuadrada, lado, lado, image::imageops::FilterType::Triangle);
+    let mut rgba = escalada.into_raw();
+    let color = crate::actividad::color_dominante(&crate::actividad::Portada {
+        rgba: rgba.clone(),
+        width: lado,
+        height: lado,
+    });
+    crate::redondear_esquinas(&mut rgba, lado, lado, radio, crate::Alfa::Recto);
+    Some((Handle::from_rgba(lado, lado, rgba), color))
+}
+
 /// La variante para una vista que ya guardó solo el nombre del bus.
 pub fn ejecutar_en(bus: &str, que: Orden) -> bool {
     let metodo = match que {
@@ -140,6 +204,25 @@ pub enum Orden {
 /// Formatea unos segundos como `m:ss`.
 pub fn reloj(segundos: u64) -> String {
     format!("{}:{:02}", segundos / 60, segundos % 60)
+}
+
+/// ¿Dice estar en un punto que no existe, pasado el final de la canción?
+///
+/// KDE Connect no pregunta al móvil por la posición: la calcula sumando el
+/// tiempo desde la última noticia. Si el móvil deja de avisar (la app se
+/// cerró, el teléfono durmió la conexión), el puente se queda en «Playing» con
+/// la misma canción para siempre. Visto en esta máquina: BitChord «sonando»
+/// en el segundo 6411 de una canción de 198, y el vídeo en pausa del otro
+/// puente en ese mismo segundo 6411 de uno de 568 —la cuenta no se para ni en
+/// pausa—. Un reproductor de verdad cambia de pista o para al llegar al final,
+/// así que pasarse de la duración delata un estado viejo. Se descarta entero y
+/// no solo se pausa: el título tampoco es de fiar. Los 5 s de margen cubren el
+/// cambio de pista, que en MPRIS no es atómico.
+fn caducado(posicion: Option<u64>, duracion: Option<u64>) -> bool {
+    match (posicion, duracion) {
+        (Some(p), Some(d)) => d > 0 && p > d + 5,
+        _ => false,
+    }
 }
 
 fn reproductores() -> Vec<String> {
@@ -197,13 +280,25 @@ fn es_imagen(bus: &str, metadatos: &str) -> bool {
 }
 
 fn propiedad(bus: &str, nombre: &str) -> Option<String> {
+    propiedad_de(bus, "org.mpris.MediaPlayer2.Player", nombre)
+}
+
+fn identidad(bus: &str) -> Option<String> {
+    // `busctl` la imprime como `s "Nombre"`.
+    let volcado = propiedad_de(bus, "org.mpris.MediaPlayer2", "Identity")?;
+    let (_, resto) = volcado.split_once('"')?;
+    let nombre = resto.rsplit_once('"')?.0.trim();
+    (!nombre.is_empty()).then(|| nombre.to_string())
+}
+
+fn propiedad_de(bus: &str, interfaz: &str, nombre: &str) -> Option<String> {
     let salida = Command::new("busctl")
         .args([
             "--user",
             "get-property",
             bus,
             "/org/mpris/MediaPlayer2",
-            "org.mpris.MediaPlayer2.Player",
+            interfaz,
             nombre,
         ])
         .stderr(Stdio::null())
@@ -281,6 +376,19 @@ mod tests {
     }
 
     #[test]
+    fn pasarse_del_final_es_un_estado_viejo() {
+        assert!(caducado(Some(6411), Some(198)), "el caso de KDE Connect");
+        assert!(
+            !caducado(Some(200), Some(198)),
+            "margen del cambio de pista"
+        );
+        assert!(!caducado(Some(60), Some(198)));
+        // Sin duración (radios, directos) no se puede saber.
+        assert!(!caducado(Some(6411), None));
+        assert!(!caducado(Some(6411), Some(0)));
+    }
+
+    #[test]
     fn el_reloj_lleva_dos_cifras_en_los_segundos() {
         assert_eq!(reloj(43), "0:43");
         assert_eq!(reloj(300), "5:00");
@@ -293,5 +401,29 @@ mod tests {
         assert!(es_imagen("org.mpris.MediaPlayer2.Gwenview", VOLCADO));
         assert!(es_imagen("org.mpris.MediaPlayer2.otro", imagen));
         assert!(!es_imagen("org.mpris.MediaPlayer2.vlc", VOLCADO));
+    }
+
+    /// BookOS Player publica la carátula como `data:`; antes se descartaba
+    /// por no ser `file://` y ni el bloqueo ni el centro de control la veían.
+    #[test]
+    fn la_caratula_en_data_url_se_carga_con_su_color() {
+        use base64::Engine;
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(40, 24, image::Rgba([200, 30, 30, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("PNG en memoria");
+        let url = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&png)
+        );
+        let volcado = format!(r#"a{{sv}} 2 "mpris:artUrl" s "{url}" "xesam:title" s "T""#);
+        let s = Sonando::desde_mpris("org.mpris.MediaPlayer2.bookos".into(), "Playing", &volcado)
+            .expect("hay canción");
+        assert_eq!(s.caratula.as_deref(), Some(url.as_str()));
+        let (_, color) = cargar_caratula(&url, 30, 6.0).expect("se descodifica");
+        assert!(
+            color.r > color.g && color.r > color.b,
+            "el color sale del rojo"
+        );
     }
 }

@@ -106,7 +106,7 @@ fn config_json(config: &bookos_shell::Config) -> serde_json::Value {
             })
         })
         .collect();
-    serde_json::json!({
+    let mut json = serde_json::json!({
         "version": 1,
         "centro": config.centro,
         "derecha": config.derecha,
@@ -156,7 +156,14 @@ fn config_json(config: &bookos_shell::Config) -> serde_json::Value {
         "velocidad_raton": config.entrada.velocidad_raton,
         "toque_para_clic": config.entrada.toque_para_clic,
         "scroll_natural": config.entrada.scroll_natural,
-    })
+    });
+    // Fuera del `json!`: con una clave más, el macro pasa del límite de
+    // recursión de rustc.
+    json["sonido_volumen"] = config.sonido_volumen.into();
+    json["genio"] = config.genio.into();
+    json["bloqueo_nombre"] = config.bloqueo.nombre.into();
+    json["bloqueo_energia"] = config.bloqueo.energia.into();
+    json
 }
 
 fn validar_config_json(json: &str) -> Result<Vec<(String, String)>, String> {
@@ -310,10 +317,14 @@ fn validar_config_json(json: &str) -> Result<Vec<(String, String)>, String> {
             "bloqueo_avatar_tamano" => numero(valor, clave, 64.0, 220.0)?,
             "bloqueo_animaciones"
             | "bloqueo_fecha"
+            | "bloqueo_nombre"
+            | "bloqueo_energia"
             | "bloqueo_medios"
             | "actividades"
             | "actividades_animaciones"
             | "temporizador_siempre_visible"
+            | "sonido_volumen"
+            | "genio"
             | "toque_para_clic"
             | "scroll_natural" => booleano(valor, clave)?,
             "tema" => {
@@ -371,8 +382,11 @@ pub enum Aviso {
     Salidas(Vec<Peticion>, mpsc::Sender<Result<(), String>>),
     /// Algo cambió en el hardware: volver a censar y avisar por la señal.
     Redetectar,
-    Actividad(bookos_shell::actividad::Estado),
+    /// La actividad y el nombre único de la conexión que la publicó.
+    Actividad(bookos_shell::actividad::Estado, Option<String>),
     CerrarActividad(String),
+    /// Una conexión del bus se ha ido: la app se cerró, se colgó o la mataron.
+    RemitenteCaido(String),
     AbrirActividadPrevisualizacion(String),
     CapturarTecla(bool),
 }
@@ -424,6 +438,10 @@ struct ItemColaJson {
     favorita: bool,
     #[serde(default)]
     actual: bool,
+    /// Carátula como data: URL. El reproductor solo la manda cuando cambia la
+    /// cola; vacía significa «la de antes».
+    #[serde(default)]
+    portada: String,
 }
 
 fn volumen_defecto() -> u8 {
@@ -543,7 +561,13 @@ impl Servidor {
     /// Publica una tarea viva. El identificador está en una lista cerrada: una
     /// app cualquiera no puede convertir la isla en una segunda bandeja de
     /// notificaciones.
-    fn publish_activity(&self, app_id: String, kind: String, state_json: String) -> bool {
+    fn publish_activity(
+        &self,
+        #[zbus(header)] cabecera: zbus::message::Header<'_>,
+        app_id: String,
+        kind: String,
+        state_json: String,
+    ) -> bool {
         let Some(clase) = clase_permitida(&app_id, &kind) else {
             tracing::warn!(app_id, kind, "publicador de actividad rechazado");
             return false;
@@ -583,10 +607,12 @@ impl Servidor {
                     duracion_ms: i.duracion_ms.max(0),
                     favorita: i.favorita,
                     actual: i.actual,
+                    portada: decodificar_portada(&i.portada),
                 })
                 .collect(),
         };
-        self.canal.send(Aviso::Actividad(estado)).is_ok()
+        let remitente = cabecera.sender().map(|u| u.to_string());
+        self.canal.send(Aviso::Actividad(estado, remitente)).is_ok()
     }
 
     fn close_activity(&self, app_id: String) -> bool {
@@ -644,19 +670,43 @@ pub fn recibir(state: &mut crate::state::BookosComp, aviso: Aviso) {
         }
         Aviso::Redetectar => redetectar(state),
         Aviso::CapturarTecla(armar) => state.captura_tecla = armar,
-        Aviso::Actividad(estado) => {
+        Aviso::Actividad(estado, remitente) => {
+            match remitente {
+                Some(r) => state.remitentes_actividad.insert(estado.app_id.clone(), r),
+                None => state.remitentes_actividad.remove(&estado.app_id),
+            };
             if let Some(shell) = state.shell.as_mut() {
                 shell.publicar_actividad(estado);
                 state.needs_redraw = true;
             }
         }
         Aviso::CerrarActividad(app_id) => {
+            state.remitentes_actividad.remove(&app_id);
             if state
                 .shell
                 .as_mut()
                 .is_some_and(|s| s.cerrar_actividad(&app_id))
             {
                 state.needs_redraw = true;
+            }
+        }
+        Aviso::RemitenteCaido(nombre) => {
+            let huerfanas: Vec<String> = state
+                .remitentes_actividad
+                .iter()
+                .filter(|(_, r)| **r == nombre)
+                .map(|(app_id, _)| app_id.clone())
+                .collect();
+            for app_id in huerfanas {
+                state.remitentes_actividad.remove(&app_id);
+                tracing::info!(app_id, "actividad retirada: su app ya no está en el bus");
+                if state
+                    .shell
+                    .as_mut()
+                    .is_some_and(|s| s.cerrar_actividad(&app_id))
+                {
+                    state.needs_redraw = true;
+                }
             }
         }
         Aviso::AbrirActividadPrevisualizacion(app_id) => {
@@ -793,6 +843,10 @@ fn recargar(state: &mut crate::state::BookosComp, seccion: &str) {
     }
     if matches!(seccion, "appearance" | "apariencia" | "all") {
         crate::backend::programar_fondo_animado(state);
+    }
+    if seccion == "all" {
+        state.sonido_volumen = config.sonido_volumen;
+        state.genio_activo = config.genio;
     }
     if matches!(seccion, "brightness" | "brillo" | "all") {
         crate::brillo_auto::elegir(state, config.brillo_automatico);
@@ -969,19 +1023,117 @@ pub fn arrancar(
     canal: Sender<Aviso>,
     compartido: Arc<Compartido>,
 ) -> Option<zbus::blocking::Connection> {
+    let canal_vigia = canal.clone();
     let conexion = zbus::blocking::connection::Builder::session()
         .and_then(|b| b.name(NOMBRE))
-        .and_then(|b| b.serve_at(RUTA, Servidor { canal, compartido }))
+        .and_then(|b| {
+            b.serve_at(
+                RUTA,
+                Servidor {
+                    canal: canal.clone(),
+                    compartido,
+                },
+            )
+        })
         .and_then(|b| b.build());
     match conexion {
         Ok(conexion) => {
             tracing::info!("interfaz de ajustes de BookOS en el bus");
+            vigilar_remitentes(&conexion, canal_vigia);
             Some(conexion)
         }
         Err(err) => {
             tracing::warn!("sin interfaz de ajustes de BookOS: {err}");
             None
         }
+    }
+}
+
+/// Avisa cuando se va del bus una conexión cualquiera, para retirar las
+/// actividades que publicó.
+///
+/// Sin esto la isla dependía de que la app llamase a `CloseActivity` antes de
+/// irse, y ninguna lo hace al cerrar la ventana: el Player y el Reloj dejaban
+/// su actividad colgada hasta reiniciar la sesión. Tampoco sirve mirar las
+/// ventanas: el Player sigue sonando con la ventana cerrada en la bandeja, y
+/// una app colgada o matada con `kill` no avisa de nada. La conexión al bus sí
+/// muere con el proceso, pase lo que pase.
+///
+/// La regla filtra en el propio bus por `new_owner` vacío: solo llegan las
+/// desapariciones, no cada nombre que se pide o se cede.
+fn vigilar_remitentes(conexion: &zbus::blocking::Connection, canal: Sender<Aviso>) {
+    let conexion = conexion.clone();
+    let hilo = std::thread::Builder::new()
+        .name("vigia-actividades".into())
+        .spawn(move || {
+            let señales = zbus::blocking::fdo::DBusProxy::new(&conexion)
+                .and_then(|p| p.receive_name_owner_changed_with_args(&[(2, "")]));
+            let señales = match señales {
+                Ok(s) => s,
+                Err(err) => {
+                    tracing::warn!("sin vigía de actividades: {err}");
+                    return;
+                }
+            };
+            for señal in señales {
+                let Ok(args) = señal.args() else { continue };
+                // Solo los nombres únicos (`:1.42`): son los que se anotan al
+                // publicar, y un nombre conocido que cambia de dueño no
+                // significa que el proceso haya muerto.
+                if let zbus::names::BusName::Unique(nombre) = args.name()
+                    && canal
+                        .send(Aviso::RemitenteCaido(nombre.to_string()))
+                        .is_err()
+                {
+                    return;
+                }
+            }
+        });
+    if let Err(err) = hilo {
+        tracing::warn!("sin vigía de actividades: {err}");
+    }
+}
+
+/// Vuelve a pedir los nombres del bus si alguien los suelta.
+///
+/// El log de sesión mostró `monitor_name_lost` para los tres nombres del
+/// escritorio en el mismo milisegundo, sin que el compositor hiciera nada: la
+/// conexión seguía viva pero sin nombre, y como solo se piden al arrancar
+/// se quedaron así hasta reiniciar sesión (sin notificaciones ni ajustes).
+/// Pedir un nombre que ya es nuestro devuelve Ok, así que basta con repetir.
+/// Cada 5 s: un sondeo cuesta una llamada al bus y perder el nombre unos
+/// segundos es aceptable.
+pub fn vigilar_nombres(conexiones: Vec<(zbus::blocking::Connection, &'static str)>) {
+    if conexiones.is_empty() {
+        return;
+    }
+    let hilo = std::thread::Builder::new()
+        .name("vigia-bus".into())
+        .spawn(move || {
+            let mut caidos: Vec<&'static str> = Vec::new();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                for (conexion, nombre) in &conexiones {
+                    match conexion.request_name(*nombre) {
+                        Ok(()) => {
+                            if let Some(i) = caidos.iter().position(|n| n == nombre) {
+                                caidos.swap_remove(i);
+                                tracing::info!("nombre {nombre} recuperado en el bus");
+                            }
+                        }
+                        // Otro escritorio lo tiene (Plasma debajo, desarrollando
+                        // anidado): se avisa una vez y se sigue intentando.
+                        Err(err) if !caidos.contains(nombre) => {
+                            caidos.push(nombre);
+                            tracing::warn!("no se pudo recuperar {nombre}: {err}");
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+        });
+    if let Err(err) = hilo {
+        tracing::warn!("sin vigía de nombres del bus: {err}");
     }
 }
 
@@ -1057,6 +1209,11 @@ mod pruebas {
         assert!(json.get("bloqueo_inactividad").is_some());
         assert_eq!(json["suspension_inactividad"], 0);
         assert!(json.get("velocidad_touchpad").is_some());
+        assert_eq!(json["sonido_volumen"], true);
+        assert_eq!(
+            validar_config_json(r#"{"sonido_volumen":false}"#),
+            Ok(vec![("sonido_volumen".into(), "no".into())])
+        );
     }
 
     /// `tema` es la preferencia y `tema_efectivo` el color pintado. Con

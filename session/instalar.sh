@@ -96,5 +96,12 @@ fi
 install -Dm644 "$aqui/bookos.portal" /usr/share/xdg-desktop-portal/portals/bookos.portal
 install -Dm644 "$aqui/bookos-portals.conf" /usr/share/xdg-desktop-portal/BookOS-portals.conf
 
+# La tapa de la cámara del Galaxy Book: el compositor la lee directamente para
+# el aviso de «Cámara desactivada». Va en /etc y no en /usr/local, que udev no
+# lee; se recarga y se aplica ya para no tener que reiniciar.
+install -Dm644 "$aqui/70-bookos-camara.rules" /etc/udev/rules.d/70-bookos-camara.rules
+udevadm control --reload-rules || true
+udevadm trigger --subsystem-match=input --action=change || true
+
 echo "Instalado. En la pantalla de login ya sale 'BookOS' en la lista de sesiones."
 echo "El registro de cada arranque queda en \$XDG_RUNTIME_DIR/bookos-session.log"

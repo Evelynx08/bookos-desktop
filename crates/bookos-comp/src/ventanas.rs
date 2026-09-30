@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use smithay::desktop::Window;
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
-use smithay::utils::{Logical, Point, Rectangle, SERIAL_COUNTER, Scale, Size};
+use smithay::utils::{IsAlive, Logical, Point, Rectangle, SERIAL_COUNTER, Scale, Size};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::shell::xdg::ToplevelSurface;
 
@@ -114,6 +114,21 @@ pub struct Estado {
     /// repartir el área útil, sino de dejar de respetarla: mientras esté
     /// puesto, el shell no se dibuja.
     completa: Cell<bool>,
+    /// El tamaño con que se miraron las barras por última vez. Ver
+    /// [`tamano_nuevo`].
+    tamano_visto: Cell<Size<i32, Logical>>,
+}
+
+/// ¿Ha cambiado de tamaño desde la última vez que se preguntó?
+///
+/// Maximizar le **pide** el tamaño al cliente y `revisar_barras` se llamaba en
+/// ese momento, con la ventana todavía en el tamaño de antes: sin llegar al
+/// dock, que se quedaba a la vista encima de ella. El tamaño de verdad llega en
+/// un commit posterior, y ahí es donde hay que volver a mirar. Solo cuando
+/// cambia: un vídeo hace sesenta commits por segundo sin moverse.
+pub fn tamano_nuevo(window: &Window) -> bool {
+    let tamano = window.geometry().size;
+    estado(window).tamano_visto.replace(tamano) != tamano
 }
 
 /// Un minimizar o un restaurar a medio camino.
@@ -279,6 +294,9 @@ pub fn restaurar_minimizada(state: &mut BookosComp, app_id: &str) -> bool {
     let destino = destino_dock(state, app_id, origen);
     encoger(&window, origen, destino, false);
     state.enfocar(&window);
+    // Vuelve al `Space` sin pasar por mover ni mapear, que es donde se miran
+    // las barras: una maximizada traída del dock dejaba el panel encima.
+    state.revisar_barras();
     state.needs_redraw = true;
     true
 }
@@ -335,6 +353,8 @@ pub fn animar_minimizados(state: &mut BookosComp) -> bool {
     // La ventana sigue abierta aunque ya no esté mapeada: el dock debe
     // enterarse de inmediato para conservar su indicador y permitir restaurarla.
     state.actualizar_dock();
+    // Ya no está donde estaba: si era la que tapaba una barra, que vuelva.
+    state.revisar_barras();
     state.needs_redraw = true;
     sigue
 }
@@ -1633,11 +1653,22 @@ impl BookosComp {
         let geometrias: Vec<Rectangle<i32, Logical>> = self
             .space
             .elements()
-            .filter(|w| colocada(w))
+            // `toplevel_destroyed` llama aquí con la ventana muerta aún en el
+            // `Space` (lo vacía `space.refresh()` al final de la vuelta). Si
+            // estaba maximizada seguía «tapando» las barras y en modo esquivar
+            // no volvían. Pasa con los clientes que destruyen el toplevel sin
+            // desmapear antes, como GTK/Tauri.
+            .filter(|w| w.alive() && colocada(w))
             .filter_map(|w| {
-                self.space
-                    .element_location(w)
-                    .map(|loc| Rectangle::new(loc, w.geometry().size))
+                let cuerpo = Rectangle::new(self.space.element_location(w)?, w.geometry().size);
+                // La barra de título que dibujamos nosotros va **encima** de la
+                // geometría del cliente. Sin contarla, una ventana maximizada
+                // empezaba en y=32 —justo el alto del panel— y nunca lo
+                // tocaba: el panel en modo esquivar volvía al instante.
+                Some(match crate::decoracion::barra_rect(self, w) {
+                    Some(barra) => cuerpo.merge(barra),
+                    None => cuerpo,
+                })
             })
             .collect();
         let mut repintar = false;

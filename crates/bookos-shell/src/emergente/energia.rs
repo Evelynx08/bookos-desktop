@@ -42,8 +42,9 @@ const FILA: f32 = 44.0;
 /// Hueco entre filas de perfil. Casi pegadas: dentro del grupo son una elección
 /// de tres, no tres tarjetas.
 const HUECO_FILA: f32 = 2.0;
-/// Diámetro del punto de color de un perfil.
-const PUNTO: f32 = 18.0;
+/// Diámetro del círculo de color de un perfil, con su icono blanco dentro.
+const PUNTO: f32 = 26.0;
+const ICONO_PUNTO: f32 = 15.0;
 /// Lado del icono que marca el perfil elegido.
 const MARCA: f32 = 16.0;
 /// Alto del grupo de la cabecera: título con su renglón de estado a la
@@ -81,7 +82,35 @@ struct Perfil {
     /// el rótulo al lado es lo que lo distingue para quien no separa el
     /// amarillo del verde.
     color: Color,
+    /// El pictograma blanco que va dentro del círculo de color: el segundo
+    /// canal, además del rótulo, para quien no distingue los colores.
+    icono: Option<Icono>,
 }
+
+/// Los pictogramas de los perfiles, **macizos**: el teñido de iced sustituye
+/// el relleno, y uno de solo trazo saldría hueco. Balanza y cohete son los
+/// `24/solid` de Heroicons; la hoja no existe allí y es la silueta de la de
+/// Lucide, sin el nervio.
+fn icono_perfil(clave: &str) -> Option<Icono> {
+    let d = match clave {
+        "power-saver" => {
+            "M11 20A7 7 0 0 1 9.8 6.1C15.5 5 17 4.48 19 2c1 2 2 4.18 2 8 0 5.5-4.78 10-10 10Z"
+        }
+        "balanced" => {
+            "M12 2.25a.75.75 0 0 1 .75.75v.756a49.106 49.106 0 0 1 9.152 1 .75.75 0 0 1-.152 1.485h-1.918l2.474 10.124a.75.75 0 0 1-.375.84A6.723 6.723 0 0 1 18.75 18a6.723 6.723 0 0 1-3.181-.795.75.75 0 0 1-.375-.84l2.474-10.124H12.75v13.28c1.293.076 2.534.343 3.697.776a.75.75 0 0 1-.262 1.453h-8.37a.75.75 0 0 1-.262-1.453c1.162-.433 2.404-.7 3.697-.775V6.24H6.332l2.474 10.124a.75.75 0 0 1-.375.84A6.723 6.723 0 0 1 5.25 18a6.723 6.723 0 0 1-3.181-.795.75.75 0 0 1-.375-.84L4.168 6.241H2.25a.75.75 0 0 1-.152-1.485 49.105 49.105 0 0 1 9.152-1V3a.75.75 0 0 1 .75-.75Zm4.878 13.543 1.872-7.662 1.872 7.662h-3.744Zm-9.756 0L5.25 8.131l-1.872 7.662h3.744Z"
+        }
+        "performance" => {
+            "M9.315 7.584C12.195 3.883 16.695 1.5 21.75 1.5a.75.75 0 0 1 .75.75c0 5.056-2.383 9.555-6.084 12.436A6.75 6.75 0 0 1 9.75 22.5a.75.75 0 0 1-.75-.75v-4.131A15.838 15.838 0 0 1 6.382 15H2.25a.75.75 0 0 1-.75-.75 6.75 6.75 0 0 1 7.815-6.666ZM15 6.75a2.25 2.25 0 1 0 0 4.5 2.25 2.25 0 0 0 0-4.5Z M5.26 17.242a.75.75 0 1 0-.897-1.203 5.243 5.243 0 0 0-2.05 5.022.75.75 0 0 0 .625.627 5.243 5.243 0 0 0 5.022-2.051.75.75 0 1 0-1.202-.897 3.744 3.744 0 0 1-3.008 1.51c0-1.23.592-2.323 1.51-3.008Z"
+        }
+        _ => return None,
+    };
+    Some(icono::desde_svg(&format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#fff"><path fill-rule="evenodd" clip-rule="evenodd" d="{d}"/></svg>"##
+    )))
+}
+
+/// El rayo de AC de la cabecera: el mismo `bolt` que el panel, macizo.
+const RAYO: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#fff"><path fill-rule="evenodd" clip-rule="evenodd" d="M14.615 1.595a.75.75 0 0 1 .359.852L12.982 9.75h7.268a.75.75 0 0 1 .548 1.262l-10.5 11.25a.75.75 0 0 1-1.272-.71l1.992-7.302H3.75a.75.75 0 0 1-.548-1.262l10.5-11.25a.75.75 0 0 1 .913-.143Z"/></svg>"##;
 
 /// Traduce la clave del daemon: etiqueta y color. Los rótulos son los del
 /// diseño.
@@ -134,6 +163,7 @@ fn perfiles() -> Vec<Perfil> {
         .map(|clave| {
             let (etiqueta, color) = nombrar(&clave);
             Perfil {
+                icono: icono_perfil(&clave),
                 clave,
                 etiqueta,
                 color,
@@ -201,6 +231,7 @@ pub struct Energia {
     /// los mismos en cada repintado.
     marca: Option<Icono>,
     flecha: Option<Icono>,
+    rayo: Icono,
 }
 
 impl Energia {
@@ -215,6 +246,7 @@ impl Energia {
             señalado: tema::Realce::nuevo(),
             marca: icono::propio("comprobado"),
             flecha: icono::propio("chevron-derecha"),
+            rayo: icono::desde_svg(RAYO),
         }
     }
 
@@ -332,6 +364,13 @@ impl Energia {
     /// perfil.
     fn pila(&self) -> PanelElement<'_> {
         const ANCHO_PILA: f32 = 30.0;
+        // Con AC, el rayo verde en el hueco de la pila, igual que en el panel.
+        if self.bateria.is_some_and(|b| b.plugged) {
+            return container(icono::ver_teñido(&self.rayo, 20.0, Some(tema::verde())))
+                .width(Length::Fixed(ANCHO_PILA + 3.0))
+                .center_x(Length::Fixed(ANCHO_PILA + 3.0))
+                .into();
+        }
         const ALTO_PILA: f32 = 14.0;
         const BORDE: f32 = 1.5;
         let (porciento, color) = match self.bateria {
@@ -421,18 +460,13 @@ impl Energia {
             return "Sin batería".into();
         };
         let mut partes = Vec::new();
-        partes.push(
-            if bat.charging {
-                "Cargando"
-            } else if bat.plugged {
-                "Conectado"
-            } else {
-                "Con batería"
-            }
-            .to_string(),
-        );
-        if let Some(m) = bat.minutes.filter(|_| !bat.charging) {
-            partes.push(format!("{}:{:02} restantes", m / 60, m % 60));
+        // De dónde come el equipo, como lo dice el diseño: «Batería» o «AC».
+        // Que esté cargando ya lo cuenta el tiempo que falta para llenarse.
+        partes.push(if bat.plugged { "AC" } else { "Batería" }.to_string());
+        match bat.minutes {
+            Some(m) if bat.charging => partes.push(format!("llena en {}:{:02}", m / 60, m % 60)),
+            Some(m) if !bat.plugged => partes.push(format!("{}:{:02} restantes", m / 60, m % 60)),
+            _ => {}
         }
         // El tope solo cuando ya está frenando la carga: dicho siempre sería
         // ruido, y dicho justo ahí explica el 80 % que no sube.
@@ -492,17 +526,23 @@ impl Energia {
             )
         };
         let color_punto = perfil.color;
-        let punto = container(Space::new())
-            .width(Length::Fixed(PUNTO))
-            .height(Length::Fixed(PUNTO))
-            .style(move |_theme: &iced_widget::Theme| container::Style {
-                background: Some(color_punto.into()),
-                border: Border {
-                    radius: (PUNTO / 2.0).into(),
-                    ..Default::default()
-                },
+        let punto = container(icono_o_hueco(
+            perfil.icono.as_ref(),
+            ICONO_PUNTO,
+            tema::tinta_sobre(color_punto),
+        ))
+        .width(Length::Fixed(PUNTO))
+        .height(Length::Fixed(PUNTO))
+        .center_x(Length::Fixed(PUNTO))
+        .center_y(Length::Fixed(PUNTO))
+        .style(move |_theme: &iced_widget::Theme| container::Style {
+            background: Some(color_punto.into()),
+            border: Border {
+                radius: (PUNTO / 2.0).into(),
                 ..Default::default()
-            });
+            },
+            ..Default::default()
+        });
         let mut contenido = row![
             punto,
             Space::new().width(Length::Fixed(12.0)),
@@ -567,6 +607,7 @@ mod tests {
                 clave: c.into(),
                 etiqueta: "X",
                 color: tema::TEXTO2,
+                icono: None,
             })
             .collect();
         let y0 = e.y_lista();
@@ -585,6 +626,7 @@ mod tests {
             clave: "a".into(),
             etiqueta: "X",
             color: tema::TEXTO2,
+            icono: None,
         }];
         let con = e.size().1;
         e.perfiles.clear();

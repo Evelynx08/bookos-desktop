@@ -13,7 +13,8 @@
 use std::time::{Duration, Instant};
 
 use iced_core::alignment::Vertical;
-use iced_core::{Border, Color, Length};
+use iced_core::font::Weight;
+use iced_core::{Border, Color, Font, Length};
 use iced_widget::{Space, column, container, row, text};
 
 use crate::notificaciones::Notificacion;
@@ -22,12 +23,15 @@ use crate::view::PanelElement;
 
 /// Ancho de la tarjeta. Más estrecha que las del panel: es un aviso de paso, no
 /// algo que se lea entero.
-const ANCHO: f32 = 340.0;
-const ALTO: f32 = 76.0;
-const ALTO_ACCIONES: f32 = 112.0;
-const MARGEN: f32 = 14.0;
+const ANCHO: f32 = 360.0;
+const MARGEN: f32 = 16.0;
 /// Lado del icono de la aplicación.
-const ICONO: f32 = 32.0;
+const ICONO: f32 = 40.0;
+/// Aire entre la cabecera, el cuerpo y los botones.
+const RESPIRO: f32 = 10.0;
+/// Alto de una línea del cuerpo, a 13 px, y de la barra de progreso con su aire.
+const LINEA_CUERPO: f32 = 17.0;
+const ALTO_PROGRESO: f32 = 4.0 + RESPIRO;
 /// Hueco para que el desenfoque y su desplazamiento quepan dentro del buffer.
 pub const MARGEN_SOMBRA: f32 = 24.0;
 /// Separación desde el borde derecho y desde el panel.
@@ -37,6 +41,8 @@ pub const MARGEN_SUPERIOR: f32 = 8.0;
 /// tapa lo que se está haciendo; los que no caben siguen en la tarjeta de la
 /// campana.
 pub const MAXIMO_A_LA_VISTA: usize = 3;
+const ALTO_BOTON: f32 = 30.0;
+const HUECO_BOTONES: f32 = 6.0;
 /// Entre una tarjeta y la siguiente, el mismo aire que hay entre el panel y la
 /// primera: la pila tiene un solo ritmo.
 pub const HUECO: f32 = MARGEN_SUPERIOR;
@@ -148,36 +154,79 @@ impl Toast {
         self.desde.elapsed() < ENTRADA
     }
 
+    /// Las acciones que van en botón. `default` no es un botón: según la
+    /// especificación es lo que pasa al pulsar el aviso, y las apps la mandan
+    /// con etiqueta vacía o «Activate», que se pintaba como un botón más.
+    fn botones(&self) -> Vec<&crate::notificaciones::Accion> {
+        self.notificacion
+            .acciones
+            .iter()
+            .filter(|a| a.clave != "default")
+            .collect()
+    }
+
+    /// Dónde está cada botón, en x, relativo a la tarjeta. Lo usan el dibujo y
+    /// el clic, que antes calculaban cada uno a su manera: los botones se
+    /// dibujaban al ancho de su texto y el clic repartía la tarjeta a partes
+    /// iguales, así que con «Responder» y «Marcar como leído» pulsar el
+    /// segundo ejecutaba el primero.
+    fn huecos_botones(n: usize) -> impl Iterator<Item = (f32, f32)> {
+        let ancho = (ANCHO - 2.0 * MARGEN - HUECO_BOTONES * (n as f32 - 1.0)) / n as f32;
+        (0..n).map(move |i| (MARGEN + i as f32 * (ancho + HUECO_BOTONES), ancho))
+    }
+
+    /// Si pulsar el cuerpo tiene algo que hacer: la acción `default`.
+    pub fn accion_por_defecto(&self) -> Option<String> {
+        self.notificacion
+            .acciones
+            .iter()
+            .find(|a| a.clave == "default")
+            .map(|a| a.clave.clone())
+    }
+
+    /// Alto de la tarjeta según lo que lleva: la cabecera siempre, y el
+    /// cuerpo, la barra y los botones solo si hay. Con alto fijo, un aviso sin
+    /// cuerpo dejaba un hueco y uno con cuerpo y botones no cabía.
+    fn alto(&self) -> f32 {
+        let n = &self.notificacion;
+        let mut alto = MARGEN * 2.0 + ICONO;
+        if !n.cuerpo.is_empty() {
+            alto += RESPIRO + LINEA_CUERPO * 2.0;
+        }
+        if n.progreso.is_some() || n.progreso_indeterminado {
+            alto += ALTO_PROGRESO;
+        }
+        if !self.botones().is_empty() {
+            alto += RESPIRO + ALTO_BOTON;
+        }
+        alto
+    }
+
+    /// Dónde empiezan los botones, desde arriba de la tarjeta: pegados al
+    /// margen inferior.
+    fn y_botones(&self) -> f32 {
+        self.alto() - MARGEN - ALTO_BOTON
+    }
+
     pub fn size(&self) -> (f32, f32) {
-        let alto = if self.notificacion.acciones.is_empty() {
-            ALTO
-        } else {
-            ALTO_ACCIONES
-        };
-        (ANCHO + MARGEN_SOMBRA * 2.0, alto + MARGEN_SOMBRA * 2.0)
+        (
+            ANCHO + MARGEN_SOMBRA * 2.0,
+            self.alto() + MARGEN_SOMBRA * 2.0,
+        )
     }
 
     /// Devuelve la clave de la acción pulsada, en coordenadas relativas a la
     /// tarjeta (sin el margen reservado para la sombra).
     pub fn accion_en(&self, x: f32, y: f32) -> Option<String> {
-        if self.notificacion.acciones.is_empty() || !(0.0..=ANCHO).contains(&x) {
+        let botones = self.botones();
+        let y_botones = self.y_botones();
+        if botones.is_empty() || !(y_botones..=y_botones + ALTO_BOTON).contains(&y) {
             return None;
         }
-        let y0 = ALTO_ACCIONES - 30.0;
-        if !(y0..=ALTO_ACCIONES).contains(&y) {
-            return None;
-        }
-        let hueco = 6.0;
-        let total = self.notificacion.acciones.len() as f32;
-        let ancho = (ANCHO - 2.0 * MARGEN - hueco * (total - 1.0)) / total;
-        let i = ((x - MARGEN) / (ancho + hueco)) as usize;
-        if i >= self.notificacion.acciones.len() {
-            return None;
-        }
-        let local = x - MARGEN - i as f32 * (ancho + hueco);
-        (0.0..=ancho)
-            .contains(&local)
-            .then(|| self.notificacion.acciones[i].clave.clone())
+        Self::huecos_botones(botones.len())
+            .zip(botones)
+            .find(|((x0, ancho), _)| (*x0..=x0 + ancho).contains(&x))
+            .map(|(_, a)| a.clave.clone())
     }
 
     pub fn view(&self) -> PanelElement<'_> {
@@ -186,106 +235,151 @@ impl Toast {
             Some(ic) => crate::icono::ver(ic, ICONO, ICONO),
             None => Space::new().width(Length::Fixed(ICONO)).into(),
         };
-        let ancho_texto = ANCHO - MARGEN * 2.0 - ICONO - 12.0;
-        let mut textos = column![
-            // Quién avisa. En rojo si es crítica: es lo único que la distingue
-            // de las demás sin meterle un fondo de color que taparía su icono.
-            text(n.app.clone()).size(11.0).color(if n.critica {
+        let ancho_texto = ANCHO - MARGEN * 2.0;
+        let ancho_titulos = ancho_texto - ICONO - 12.0;
+        // Quién avisa, en negrita, y debajo el resumen. En rojo si es crítica:
+        // es lo único que la distingue de las demás sin meterle un fondo de
+        // color que taparía su icono.
+        let titulos = column![
+            text(crate::emergente::recortar_texto(
+                &n.app,
+                ancho_titulos,
+                15.0
+            ))
+            .size(15.0)
+            .font(Font {
+                weight: Weight::Bold,
+                ..Font::DEFAULT
+            })
+            .color(if n.critica {
                 tema::rojo()
             } else {
-                tema::TEXTO2
+                tema::texto()
             }),
             text(crate::emergente::recortar_texto(
                 &n.resumen,
-                ancho_texto,
-                14.0
+                ancho_titulos,
+                13.0
             ))
-            .size(14.0)
-            .color(tema::texto()),
+            .size(13.0)
+            .color(tema::TEXTO2),
         ];
-        if !n.cuerpo.is_empty() {
-            textos = textos.push(
-                // Dos líneas y no una: en una sola, un aviso normal de
-                // «Descarga completada» se quedaba en el nombre del archivo
-                // cortado a la mitad. Caben en el alto fijo de la tarjeta.
-                text(crate::escritorio::dos_lineas(&n.cuerpo, ancho_texto, 11.0))
-                    .size(11.0)
-                    .color(tema::TEXTO2),
-            );
-        }
-
-        let cuerpo = row![
+        let cabecera = row![
             dibujo,
             Space::new().width(Length::Fixed(12.0)),
             // Ancho fijo: sin él, iced parte el resumen en dos líneas y la
             // tarjeta se desborda por abajo.
-            container(textos).width(Length::Fixed(ancho_texto)),
+            container(titulos).width(Length::Fixed(ancho_titulos)),
         ]
         .align_y(Vertical::Center);
-        let mut contenido = column![cuerpo];
+        let mut contenido = column![cabecera];
+        if !n.cuerpo.is_empty() {
+            contenido = contenido
+                .push(Space::new().height(Length::Fixed(RESPIRO)))
+                .push(
+                    // Dos líneas y no una: en una sola, un aviso normal de
+                    // «Descarga completada» se quedaba en el nombre del archivo
+                    // cortado a la mitad. El alto de la tarjeta las reserva.
+                    text(crate::escritorio::dos_lineas(&n.cuerpo, ancho_texto, 13.0))
+                        .size(13.0)
+                        .color(tema::texto()),
+                );
+        }
         if let Some(valor) = n.progreso {
             let lleno = (ancho_texto * valor as f32 / 100.0).max(2.0);
-            contenido = contenido.push(
-                container(
-                    container(Space::new())
-                        .width(Length::Fixed(lleno))
-                        .height(Length::Fixed(4.0))
-                        .style(|_| iced_widget::container::Style {
-                            background: Some(tema::acento().into()),
-                            ..Default::default()
-                        }),
-                )
-                .width(Length::Fixed(ancho_texto))
-                .height(Length::Fixed(4.0))
-                .style(|_| container::Style {
-                    background: Some(tema::surco().into()),
-                    border: Border {
-                        radius: 2.0.into(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                }),
-            );
-        }
-        if n.progreso_indeterminado && n.progreso.is_none() {
-            contenido = contenido.push(text("En curso…").size(10.0).color(tema::TEXTO2));
-        }
-        if !n.acciones.is_empty() {
-            let botones = n.acciones.iter().fold(row![], |fila, accion| {
-                fila.push(
+            contenido = contenido
+                .push(Space::new().height(Length::Fixed(RESPIRO)))
+                .push(
                     container(
-                        text(accion.etiqueta.clone())
-                            .size(11.0)
-                            .color(tema::sobre_acento()),
+                        container(Space::new())
+                            .width(Length::Fixed(lleno))
+                            .height(Length::Fixed(4.0))
+                            .style(|_| iced_widget::container::Style {
+                                background: Some(tema::acento().into()),
+                                ..Default::default()
+                            }),
                     )
-                    .padding([4, 8])
+                    .width(Length::Fixed(ancho_texto))
+                    .height(Length::Fixed(4.0))
                     .style(|_| container::Style {
-                        background: Some(tema::acento().into()),
+                        background: Some(tema::surco().into()),
                         border: Border {
-                            radius: tema::R_BOTON_PEQUENO.into(),
+                            radius: 2.0.into(),
                             ..Default::default()
                         },
                         ..Default::default()
                     }),
-                )
-                .push(Space::new().width(Length::Fixed(6.0)))
-            });
-            contenido = contenido.push(botones);
+                );
+        } else if n.progreso_indeterminado {
+            // Ocupa lo mismo que la barra: `alto()` reserva ese hueco.
+            contenido = contenido
+                .push(Space::new().height(Length::Fixed(RESPIRO - 4.0)))
+                .push(text("En curso…").size(10.0).color(tema::TEXTO2));
         }
-        let alto = if n.acciones.is_empty() {
-            ALTO
-        } else {
-            ALTO_ACCIONES
-        };
+        let acciones = self.botones();
+        if !acciones.is_empty() {
+            let huecos: Vec<_> = Self::huecos_botones(acciones.len()).collect();
+            // Solo la primera acción es primaria; las demás van en el fondo de
+            // hover, como el botón secundario del sistema (AI-DESIGN-SYSTEM §4).
+            // Con todos en acento no había un botón principal que mirar.
+            let botones = acciones.iter().zip(huecos).enumerate().fold(
+                row![],
+                |fila, (i, (accion, (_, ancho)))| {
+                    let primario = i == 0;
+                    fila.push(
+                        container(
+                            text(crate::emergente::recortar_texto(
+                                &accion.etiqueta,
+                                ancho - 12.0,
+                                13.0,
+                            ))
+                            .size(13.0)
+                            .font(Font {
+                                weight: Weight::Semibold,
+                                ..Font::DEFAULT
+                            })
+                            .color(if primario {
+                                tema::sobre_acento()
+                            } else {
+                                tema::texto()
+                            }),
+                        )
+                        .width(Length::Fixed(ancho))
+                        .height(Length::Fixed(ALTO_BOTON))
+                        .center_x(Length::Fixed(ancho))
+                        .center_y(Length::Fixed(ALTO_BOTON))
+                        .style(move |_| container::Style {
+                            background: Some(if primario {
+                                tema::acento().into()
+                            } else {
+                                tema::hover().into()
+                            }),
+                            border: Border {
+                                radius: tema::R_BOTON_PEQUENO.into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }),
+                    )
+                    .push(Space::new().width(Length::Fixed(HUECO_BOTONES)))
+                },
+            );
+            // Se empuja hasta el fondo con un hueco que estira: así los
+            // botones quedan a la altura que mira `accion_en` aunque el cuerpo
+            // ocupe una línea o dos.
+            contenido = contenido
+                .push(Space::new().height(Length::Fill))
+                .push(botones);
+        }
+        let alto = self.alto();
         let tarjeta = container(contenido)
             .width(Length::Fixed(ANCHO))
             .height(Length::Fixed(alto))
-            .center_y(Length::Fixed(alto))
-            .padding([0, MARGEN as u16])
+            .padding(MARGEN as u16)
             .style(|_theme: &iced_widget::Theme| container::Style {
                 background: Some(tema::card().into()),
                 border: Border {
-                    radius: tema::R_CONTROL.into(),
+                    radius: tema::R_DIALOGO.into(),
                     ..Default::default()
                 },
                 // En oscuro la sombra negra se lee como un borde. El fondo
@@ -368,6 +462,49 @@ mod tests {
         assert!(t.alfa() < 1.0, "no se está yendo");
     }
 
+    /// El caso de KDE Connect: `default` más dos botones de largo distinto.
+    /// Cada punto del botón dibujado tiene que devolver **ese** botón.
+    #[test]
+    fn cada_boton_responde_donde_se_dibuja() {
+        let accion = |clave: &str, etiqueta: &str| crate::notificaciones::Accion {
+            clave: clave.into(),
+            etiqueta: etiqueta.into(),
+        };
+        let t = Toast::new(
+            Notificacion::nueva_con_datos(
+                9,
+                "KDE Connect".into(),
+                "Mensaje".into(),
+                "Hola".into(),
+                "",
+                false,
+                vec![
+                    accion("default", ""),
+                    accion("responder", "Responder"),
+                    accion("leido", "Marcar como leído"),
+                ],
+                None,
+                false,
+            ),
+            -1,
+        );
+        assert_eq!(t.botones().len(), 2, "`default` no es un botón");
+        assert_eq!(t.accion_por_defecto().as_deref(), Some("default"));
+        let y = t.y_botones() + ALTO_BOTON / 2.0;
+        for ((x0, ancho), clave) in Toast::huecos_botones(2).zip(["responder", "leido"]) {
+            for x in [x0 + 1.0, x0 + ancho / 2.0, x0 + ancho - 1.0] {
+                assert_eq!(t.accion_en(x, y).as_deref(), Some(clave), "x={x}");
+            }
+        }
+        // La mitad de arriba del botón también es el botón.
+        assert_eq!(
+            t.accion_en(MARGEN + 5.0, t.y_botones() + 1.0).as_deref(),
+            Some("responder")
+        );
+        // Por encima de los botones es el cuerpo, no una acción.
+        assert_eq!(t.accion_en(MARGEN + 5.0, t.y_botones() - 10.0), None);
+    }
+
     #[test]
     fn las_acciones_amplian_el_toast_y_devuelven_su_clave() {
         let t = Toast::new(
@@ -387,9 +524,10 @@ mod tests {
             ),
             -1,
         );
-        assert!(t.size().1 > ALTO + MARGEN_SOMBRA * 2.0);
+        assert!(t.size().1 > MARGEN * 2.0 + ICONO + MARGEN_SOMBRA * 2.0);
         assert_eq!(
-            t.accion_en(80.0, ALTO_ACCIONES - 10.0).as_deref(),
+            t.accion_en(80.0, t.y_botones() + ALTO_BOTON / 2.0)
+                .as_deref(),
             Some("abrir")
         );
     }

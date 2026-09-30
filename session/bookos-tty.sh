@@ -8,7 +8,7 @@
 #
 # Ojo: el límite solo cubre el caso de que el compositor se **cuelgue**. Si
 # responde, ya no hace falta esperar a que se agote — el compositor atiende
-# Ctrl+Alt+Fn y Ctrl+Alt+Retroceso él mismo (ver "Dentro de la sesión").
+# Ctrl+Alt+Fn y Meta+Alt+Retroceso él mismo (ver "Dentro de la sesión").
 #
 # Uso, desde un TTY libre (Ctrl+Alt+F3), NO desde dentro de KDE:
 #     ./session/bookos-tty.sh              # 180 s de límite
@@ -19,7 +19,7 @@
 #     Ctrl+Alt+F1..F12    cambiar de TTY (F1 o donde corra SDDM vuelve a KDE)
 #     Meta+Return         abrir otro terminal — BOOKOS_TERMINAL manda
 #     Meta+Q              cerrar la ventana con foco
-#     Ctrl+Alt+Retroceso  terminar el compositor y volver aquí
+#     Meta+Alt+Retroceso  terminar el compositor y volver aquí
 set -u
 
 : "${BOOKOS_TTY_TIMEOUT:=180}"

@@ -5,9 +5,9 @@
 //! proporcional al tanto por ciento y un terminal de 2 px a la derecha. Un icono
 //! del tema solo tiene diez escalones y su color lo decide el tema; aquí el
 //! relleno es continuo, el color dice el **perfil de energía** —amarillo en
-//! ahorro, verde equilibrado, azul rendimiento— y el símbolo de dentro dice de
-//! dónde come el equipo: enchufe usando AC, rayo cargando y exclamación cuando
-//! la batería necesita atención.
+//! ahorro, verde equilibrado, azul rendimiento— y la exclamación de dentro
+//! avisa cuando la batería necesita atención. Enchufado a AC no se dibuja la
+//! pila: se dibuja un rayo verde en su hueco (ver [`rayo_ac`]).
 
 use std::time::{Duration, Instant};
 
@@ -165,6 +165,41 @@ fn pictograma(porciento: u8, simbolo: Simbolo, color: iced_core::Color) -> Strin
     svg
 }
 
+/// Enchufado a AC, el panel no dibuja la pila sino un rayo verde en el mismo
+/// hueco: de un vistazo dice «come de la red» mejor que un símbolo diminuto
+/// dentro de la carcasa. Mismo `viewBox` que la pila, así que el porcentaje
+/// no se mueve al enchufar.
+///
+/// Es el `bolt` 16/solid del sistema de diseño, centrado en (15, 12.75), que es
+/// el centro de la tinta de la pila.
+fn rayo_ac(color: iced_core::Color) -> String {
+    format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="{VIEWBOX}">
+<g transform="translate(7 4.75)" fill="{}">
+<path fill-rule="evenodd" d="M9.58 1.077a.75.75 0 0 1 .405.82L9.165 6h4.085a.75.75 0 0 1 .567 1.241l-6.5 7.5a.75.75 0 0 1-1.302-.638L6.835 10H2.75a.75.75 0 0 1-.567-1.241l6.5-7.5a.75.75 0 0 1 .897-.182Z" clip-rule="evenodd"/></g></svg>"##,
+        hex(color)
+    )
+}
+
+/// El icono del aviso de conectar o desconectar el cargador: el mismo dibujo
+/// que el panel en ese momento, para que la notificación y la barra cuenten lo
+/// mismo con el mismo símbolo. Con el icono del tema salía otra batería, de
+/// otro estilo, al lado del rayo propio del panel.
+///
+/// El perfil de energía no se lee: es una llamada a la ACPI (ver
+/// [`Bateria::perfil`]) y el color de perfil no aporta nada en un aviso de
+/// tres segundos.
+pub fn icono_aviso(bat: &Battery) -> Icono {
+    if bat.plugged {
+        return icono::desde_svg(&rayo_ac(tema::verde()));
+    }
+    icono::desde_svg(&pictograma(
+        bat.percent,
+        Simbolo::de(bat),
+        Bateria::color(bat, None),
+    ))
+}
+
 pub struct Bateria {
     dato: Option<Battery>,
     /// El icono que toca para el nivel y el estado de carga actuales.
@@ -232,6 +267,14 @@ impl Bateria {
             self.icono_nombre.clear();
             return;
         };
+        if bat.plugged {
+            let clave = "ac".to_string();
+            if clave != self.icono_nombre {
+                self.icono = Some(icono::desde_svg(&rayo_ac(tema::verde())));
+                self.icono_nombre = clave;
+            }
+            return;
+        }
         let color = Self::color(&bat, self.perfil.as_deref());
         let simbolo = Simbolo::de(&bat);
         let clave = format!("{}-{}-{}", bat.percent, simbolo.clave(), hex(color));
@@ -299,6 +342,15 @@ impl Bateria {
     /// lo que se quiere es un número estable, no uno que reaccione rápido.
     fn suavizar(&mut self, fresco: &mut Battery, leido: bool) {
         const PESO: f32 = 0.25;
+        // Enchufar o desenchufar cambia el signo de lo que se mide: la media
+        // anterior ya no vale de nada y se empieza de cero. Tiene que ir antes
+        // del `return` de abajo: el evento de udev del cargador llega casi
+        // siempre en un refresco sin lectura, y si ahí se copiaba la media,
+        // `dato` ya pasaba a «cargando» y la lectura siguiente no veía cambio.
+        // El panel seguía con la autonomía de descarga (1:35 en vez de ~0:30).
+        if self.dato.map(|b| b.charging) != Some(fresco.charging) {
+            self.minutos = None;
+        }
         // Sin lectura nueva se conserva la media que había. Sin esto, los
         // refrescos de entre medias —los que solo miran el porcentaje— dejarían
         // `minutes` en `None` y la etiqueta perdería el «2:15» hasta la
@@ -306,11 +358,6 @@ impl Bateria {
         if !leido {
             fresco.minutes = self.minutos.map(|m| (m / 5.0).round() as u32 * 5);
             return;
-        }
-        // Enchufar o desenchufar cambia el signo de lo que se mide: la media
-        // anterior ya no vale de nada y se empieza de cero.
-        if self.dato.map(|b| b.charging) != Some(fresco.charging) {
-            self.minutos = None;
         }
         let Some(crudo) = fresco.minutes else {
             self.minutos = None;
@@ -502,6 +549,32 @@ mod tests {
             plugged,
             minutes: None,
         }
+    }
+
+    /// Enchufar entre dos lecturas de corriente no puede dejar en el panel la
+    /// autonomía de descarga como si fuera el tiempo de carga.
+    #[test]
+    fn al_enchufar_no_se_arrastra_la_autonomia() {
+        let mut w = Bateria::new();
+        let mut descarga = Battery {
+            minutes: Some(95),
+            ..bat(67, false, false)
+        };
+        w.suavizar(&mut descarga, true);
+        w.dato = Some(descarga);
+
+        // El evento del cargador, sin lectura cara.
+        let mut enchufado = bat(67, true, true);
+        w.suavizar(&mut enchufado, false);
+        assert_eq!(enchufado.minutes, None);
+        w.dato = Some(enchufado);
+
+        let mut carga = Battery {
+            minutes: Some(31),
+            ..bat(67, true, true)
+        };
+        w.suavizar(&mut carga, true);
+        assert_eq!(carga.minutes, Some(30));
     }
 
     /// El símbolo solo se pinta en negro cuando el relleno lo tapa ENTERO.

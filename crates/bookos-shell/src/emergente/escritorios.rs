@@ -458,9 +458,13 @@ impl Escritorios {
     /// El fondo de la franja. No lo pinta el contenedor de fuera de
     /// [`Self::view`] sino la limpieza del buffer: medido, el repintado pasó
     /// de 31 a 14 ms.
+    ///
+    /// 0,80 y no 0,62: sin el cristal que iba debajo, con menos opacidad los
+    /// nombres de los escritorios se mezclan con la barra de herramientas de
+    /// la ventana que pase por detrás.
     pub fn fondo(&self) -> Color {
         Color {
-            a: 0.62,
+            a: 0.80,
             ..tema::bg()
         }
     }

@@ -509,6 +509,20 @@ pub fn superficie() -> Color {
     alfa(texto(), if es_claro() { 0.06 } else { 0.08 })
 }
 
+/// [`superficie`] ya compuesta sobre [`card`]: el mismo color en pantalla,
+/// pero **opaco**. Para los fondos grandes dentro de una tarjeta, que siempre
+/// va sobre `card()`.
+///
+/// Opaco porque tiny-skia copia un relleno opaco y mezcla uno translúcido
+/// píxel a píxel. Medido en release con 704×896 px, la tarjeta del centro de
+/// control a escala 2: **0,21 ms opaco contra 3,57 translúcido**
+/// (`examples/rasterizado.rs`). Los grupos grises eran casi toda la tarjeta y
+/// se pagaban en cada repintado de un hover.
+pub fn superficie_en_tarjeta() -> Color {
+    let s = superficie();
+    mezclar(card(), Color { a: 1.0, ..s }, s.a)
+}
+
 /// El color de la tinta, para rellenos y bordes con muy poco alfa.
 ///
 /// Es lo que había escrito como `Color { a: 0.12, ..Color::WHITE }` por todo el

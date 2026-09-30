@@ -127,6 +127,17 @@ impl Red {
     }
 
     pub fn pulsar(&mut self, x: f32, y: f32) -> Option<Accion> {
+        // El interruptor se dibujaba pero nadie miraba si se pulsaba. Mismo
+        // trato que en la tarjeta de Bluetooth.
+        if lista::interruptor_en(x, y) {
+            self.encendida = !self.encendida;
+            self.interruptor.ir_a(self.encendida as u8 as f32);
+            bookos_system::request(bookos_system::Operation::WifiPower {
+                enabled: self.encendida,
+            });
+            self.ultimo = Value::Null;
+            return None;
+        }
         if self.pie_en(x, y).is_some() {
             return Some(Accion::Lanzar("bookos-settings --page wifi".into()));
         }

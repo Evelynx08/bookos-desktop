@@ -100,6 +100,18 @@ impl Lane {
         {
             queue.pop_back();
         }
+        // Con la tecla mantenida llegan 25 pasos por segundo y cada uno cuesta
+        // un `wpctl`, un `pactl` y un `GetState`: encolados uno a uno, el
+        // volumen seguía subiendo segundos después de soltar. Sumarlos al que
+        // espera no reordena nada, porque solo se juntan dos pasos seguidos.
+        let op = match (queue.back(), op) {
+            (Some(Operation::VolumeStep { step: previo }), Operation::VolumeStep { step }) => {
+                let step = (previo + step).clamp(-100, 100);
+                queue.pop_back();
+                Operation::VolumeStep { step }
+            }
+            (_, op) => op,
+        };
         if queue.len() >= 64 {
             return false;
         }
@@ -330,6 +342,27 @@ mod tests {
         assert!(matches!(
             lane.next().await,
             Operation::Volume { value: 42, .. }
+        ));
+    }
+    #[tokio::test]
+    async fn pasos_seguidos_de_volumen_se_suman() {
+        let lane = Lane::default();
+        for _ in 0..30 {
+            assert!(lane.push(Operation::VolumeStep { step: 5 }));
+        }
+        assert!(lane.push(Operation::Mute {
+            target: "output".into(),
+            muted: None
+        }));
+        assert!(lane.push(Operation::VolumeStep { step: -5 }));
+        assert!(matches!(
+            lane.next().await,
+            Operation::VolumeStep { step: 100 }
+        ));
+        assert!(matches!(lane.next().await, Operation::Mute { .. }));
+        assert!(matches!(
+            lane.next().await,
+            Operation::VolumeStep { step: -5 }
         ));
     }
     #[test]

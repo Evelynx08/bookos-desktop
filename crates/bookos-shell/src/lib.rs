@@ -123,8 +123,8 @@ pub fn entrada_de_ventana(app_id: &str, titulo: &str) -> conmutador::Entrada {
 pub use config::{
     Actividades as ConfigActividades, Bloqueo as ConfigBloqueo, BrilloAutomatico, Config, Efectos,
     Entrada, MAXIMO_ESCRITORIOS, guardar_apariencia, guardar_brillo_automatico,
-    guardar_configuracion, guardar_dock, guardar_efectos, guardar_escritorios, guardar_fondo,
-    olvidar_fondo,
+    guardar_configuracion, guardar_dock, guardar_efectos, guardar_escritorios, guardar_esquiva,
+    guardar_fondo, olvidar_fondo,
 };
 pub use dock::{
     Dock, DockItem, ICON as DOCK_ICON, MARGIN as DOCK_MARGIN, PAD as DOCK_PAD,
@@ -353,6 +353,17 @@ pub fn brillo_actual() -> Option<u8> {
     state::read_brightness()
 }
 
+/// Si está enchufado y el porcentaje, para avisar al conectar el cargador.
+/// `None` en un equipo sin batería.
+pub fn cargador() -> Option<(bool, u8)> {
+    state::Battery::read(false).map(|b| (b.plugged, b.percent))
+}
+
+/// El pictograma de la batería del panel, para el aviso del cargador.
+pub fn icono_cargador() -> Option<icono::Icono> {
+    state::Battery::read(false).map(|b| widgets::icono_aviso_bateria(&b))
+}
+
 pub mod retroiluminacion;
 
 /// Nombre, nivel actual y máximo de la luz de teclado detectada.
@@ -485,6 +496,8 @@ pub enum TeclaPulsada {
     /// las flechas recorren la rejilla.
     Tabulador,
     Retroceso,
+    /// Ctrl+Retroceso: vaciar el campo de texto de una vez.
+    BorrarTodo,
     Caracter(char),
 }
 
@@ -662,6 +675,9 @@ pub struct Shell {
     /// Todas las tareas publicadas. La isla enseña una por prioridad, pero una
     /// grabación no debe borrar la música: al parar vuelve la que seguía viva.
     actividades: std::collections::HashMap<String, actividad::Estado>,
+    /// La actividad que el usuario pasó a la píldora pulsando su burbuja. Sin
+    /// elección, o si la elegida terminó, manda la prioridad.
+    actividad_principal: Option<String>,
 
     /// Las notificaciones que han llegado. Las recibe el compositor por D-Bus
     /// y las deja aquí; el panel y su tarjeta las leen de un solo sitio.
@@ -769,6 +785,7 @@ impl Shell {
             toasts: Vec::new(),
             actividad: None,
             actividades: std::collections::HashMap::new(),
+            actividad_principal: None,
             barras: std::collections::HashMap::new(),
             // Sin alto todavía: lo sabe el compositor y llega por
             // `escritorio_pantalla` antes del primer frame.
@@ -899,6 +916,11 @@ impl Shell {
         // «No molestar» caduca solo y nadie avisa de que ha caducado: se mira
         // aquí, que se llama al menos una vez por minuto con el reloj.
         cambio |= self.widgets.no_molestar(self.notificaciones_silenciadas());
+        // Por el mismo motivo, las agujas del reloj y el día del calendario en
+        // el dock: la app reescribe el icono en disco y nadie avisa.
+        if self.dock_items.refrescar_dinamicos() {
+            self.dock.painted_once = false;
+        }
         let cambio_emergente = self.refresh_emergente();
         cambio || cambio_emergente || !self.panel.painted_once
     }
@@ -950,7 +972,13 @@ impl Shell {
     }
 
     fn sincronizar_actividad(&mut self) {
-        let estado = self
+        let prioridad = |e: &actividad::Estado| match e.clase {
+            actividad::Clase::Recorder => 40,
+            actividad::Clase::Timer if e.restante_ms < 0 => 30,
+            actividad::Clase::Timer => 20,
+            actividad::Clase::Player => 10,
+        };
+        let mut vivas: Vec<&actividad::Estado> = self
             .actividades
             .values()
             .filter(|e| {
@@ -958,21 +986,37 @@ impl Shell {
                     || self.actividades_config.temporizador_siempre
                     || e.restante_ms <= 60_000
             })
-            .max_by_key(|e| match e.clase {
-                actividad::Clase::Recorder => 40,
-                actividad::Clase::Timer if e.restante_ms < 0 => 30,
-                actividad::Clase::Timer => 20,
-                actividad::Clase::Player => 10,
-            })
-            .cloned();
-        let Some(estado) = estado else {
+            .collect();
+        // De más a menos prioridad, y por app_id a igualdad para que las
+        // burbujas no bailen entre publicaciones.
+        vivas.sort_by(|a, b| {
+            prioridad(b)
+                .cmp(&prioridad(a))
+                .then(a.app_id.cmp(&b.app_id))
+        });
+        let principal = vivas
+            .iter()
+            .position(|e| Some(&e.app_id) == self.actividad_principal.as_ref())
+            .unwrap_or(0);
+        if vivas.is_empty() {
             self.actividad = None;
             return;
-        };
+        }
+        let estado = vivas.remove(principal).clone();
+        let burbujas = vivas
+            .iter()
+            .map(|e| actividad::Burbuja {
+                app_id: e.app_id.clone(),
+                clase: e.clase,
+                color: actividad::color_burbuja(e),
+                activa: e.activo && !e.pausado,
+            })
+            .collect();
         let escala = self.panel.scale;
         match self.actividad.as_mut() {
             Some((actual, canvas)) if actual.app_id() == estado.app_id => {
                 actual.actualizar(estado);
+                actual.poner_burbujas(burbujas);
                 let (w, h) = actual.size();
                 let objetivo = Size::new(w, h);
                 if canvas.size != objetivo {
@@ -982,8 +1026,9 @@ impl Shell {
                 }
             }
             _ => {
-                let actividad =
+                let mut actividad =
                     actividad::Actividad::nueva(estado, self.actividades_config.animaciones);
+                actividad.poner_burbujas(burbujas);
                 let (w, h) = actividad.size();
                 self.actividad = Some((actividad, Canvas::new(Size::new(w, h), escala)));
             }
@@ -1057,7 +1102,22 @@ impl Shell {
         cambio
     }
 
+    /// La parte visible de la isla como `(x, ancho)` dentro de la tarjeta.
+    pub fn actividad_zona(&self) -> Option<(f32, f32)> {
+        self.actividad.as_ref().map(|(a, _)| a.zona())
+    }
+
     pub fn actividad_pulsar(&mut self, x: f32, y: f32) -> Option<actividad::Accion> {
+        let elegida = self
+            .actividad
+            .as_ref()
+            .and_then(|(a, _)| a.burbuja_en(x, y))
+            .map(str::to_string);
+        if let Some(app_id) = elegida {
+            self.actividad_principal = Some(app_id);
+            self.sincronizar_actividad();
+            return None;
+        }
         let (accion, size) = {
             let (actividad, _) = self.actividad.as_mut()?;
             let accion = actividad.pulsar(x, y);
@@ -1080,6 +1140,18 @@ impl Shell {
             return false;
         };
         if actividad.app_id() != app_id || !actividad.abrir_previsualizacion() {
+            return false;
+        }
+        let (w, h) = actividad.size();
+        *canvas = Canvas::new(Size::new(w, h), self.panel.scale);
+        true
+    }
+
+    pub fn recoger_actividad(&mut self) -> bool {
+        let Some((actividad, canvas)) = self.actividad.as_mut() else {
+            return false;
+        };
+        if !actividad.recoger() {
             return false;
         }
         let (w, h) = actividad.size();
@@ -1207,6 +1279,11 @@ impl Shell {
 
     pub fn toast_accion_relativa(&self, id: u32, x: f32, y: f32) -> Option<String> {
         self.toast(id).and_then(|(t, _)| t.accion_en(x, y))
+    }
+
+    /// La acción `default` del aviso, que es lo que hace pulsar su cuerpo.
+    pub fn toast_accion_por_defecto(&self, id: u32) -> Option<String> {
+        self.toast(id).and_then(|(t, _)| t.accion_por_defecto())
     }
 
     pub fn toast_buffer_size(&self, id: u32) -> Option<(u32, u32)> {
@@ -1461,6 +1538,9 @@ impl Shell {
             *n = emergente::notificaciones_con(self.silencio);
             n.actualizar(self.notificaciones.lista().to_vec());
         }
+        if let Emergente::Centro(c) = &mut emergente {
+            c.poner_no_molestar(self.notificaciones_silenciadas());
+        }
         let (w, h) = emergente.size();
         let canvas = Canvas::new(Size::new(w, h), self.panel.scale);
         tracing::debug!(que = emergente.nombre(), w, h, "abriendo emergente");
@@ -1536,13 +1616,20 @@ impl Shell {
         let Some((e, canvas)) = self.emergente.as_mut() else {
             return false;
         };
+        let pagina = |e: &Emergente| match e {
+            Emergente::Launchpad(l) => Some(l.pagina()),
+            _ => None,
+        };
+        let antes = pagina(e);
         if !e.puntero(punto) {
             return false;
         }
         // Una emergente con realce propio resuelve el hover moviendo esa
         // superficie, sin tocar su buffer. Las demás son pequeñas y se repintan
-        // enteras, que sale más barato que llevar la cuenta.
-        if !e.usa_realce() {
+        // enteras, que sale más barato que llevar la cuenta. La excepción es el
+        // launchpad pasando de página con un icono arrastrado contra el borde:
+        // ahí cambia la rejilla entera.
+        if !e.usa_realce() || pagina(e) != antes {
             canvas.painted_once = false;
         }
         true
@@ -2313,6 +2400,40 @@ impl Shell {
         self.conmutador.as_ref().is_some_and(|(c, _)| c.animando())
     }
 
+    /// La celda elegida del conmutador de ventanas, en lógicos de su tarjeta.
+    pub fn conmutador_realce(&self) -> Option<Rectangle> {
+        self.conmutador.as_ref()?.0.realce()
+    }
+
+    /// El renglón del rótulo del conmutador de ventanas, en lógicos de su tarjeta.
+    pub fn conmutador_rotulo(&self) -> Option<Rectangle> {
+        self.conmutador.as_ref()?.0.rotulo()
+    }
+
+    /// Pinta el recuadro de la elegida en `buf`, de `ancho` × `alto` lógicos.
+    /// Se pinta una vez al abrir: moverlo de celda es cosa del compositor.
+    pub fn draw_conmutador_realce(&mut self, buf: &mut [u8], ancho: f32, alto: f32) {
+        let mut canvas = Canvas::new(Size::new(ancho, alto), self.panel.scale);
+        let vista = conmutador::Conmutador::view_realce();
+        Self::paint(&mut canvas, &mut self.renderer, &self.theme, vista, buf);
+    }
+
+    /// Pinta el rótulo de la elegida en `buf`, de `ancho` × `alto` lógicos. Es
+    /// lo único que se repinta al cambiar de celda, y mide un renglón.
+    pub fn draw_conmutador_rotulo(&mut self, buf: &mut [u8], ancho: f32, alto: f32) {
+        let Some((c, _)) = self.conmutador.as_ref() else {
+            return;
+        };
+        let mut canvas = Canvas::new(Size::new(ancho, alto), self.panel.scale);
+        Self::paint(
+            &mut canvas,
+            &mut self.renderer,
+            &self.theme,
+            c.view_rotulo(),
+            buf,
+        );
+    }
+
     pub fn draw_conmutador(&mut self, buf: &mut [u8]) -> Vec<Damage> {
         let Some((c, canvas)) = self.conmutador.as_mut() else {
             return Vec::new();
@@ -2375,6 +2496,11 @@ impl Shell {
     }
 
     /// El recuadro marcado, que es donde el velo tiene el agujero.
+    /// La forma que pide el cursor sobre la capa en ese punto.
+    pub fn captura_forma(&self, x: f32, y: f32) -> Option<captura::Forma> {
+        self.captura.as_ref().map(|(c, _, _)| c.forma(x, y))
+    }
+
     pub fn captura_marcado(&self) -> Option<captura::Recuadro> {
         self.captura.as_ref().and_then(|(c, _, _)| c.marcado())
     }
@@ -2477,6 +2603,12 @@ impl Shell {
     /// ayudante de PAM.
     /// ¿Se está moviendo algo del bloqueo? Es lo que mantiene al compositor
     /// dibujando mientras el menú de apagado entra o sale.
+    /// El color de arriba del velo de la canción del bloqueo. Ver
+    /// [`bloqueo::Bloqueo::velo_medios`].
+    pub fn bloqueo_velo(&self) -> Option<Color> {
+        self.bloqueo.as_ref()?.0.velo_medios()
+    }
+
     pub fn bloqueo_animando(&self) -> bool {
         self.bloqueo.as_ref().is_some_and(|(b, _)| b.animando())
     }

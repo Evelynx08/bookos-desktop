@@ -463,6 +463,34 @@ pub(crate) fn dos_lineas(nombre: &str, ancho: f32, tamaño: f32) -> String {
     format!("{primera}\n{}…", segunda.trim_end())
 }
 
+/// Parte `texto` en renglones que quepan en `ancho`, respetando los saltos de
+/// línea, hasta `max`. Lo que sobra se remata con puntos suspensivos en el
+/// último renglón, como [`dos_lineas`] pero para cualquier número de líneas.
+pub(crate) fn lineas(texto: &str, ancho: f32, tamaño: f32, max: usize) -> Vec<String> {
+    let mut salida: Vec<String> = Vec::new();
+    for parrafo in texto.lines() {
+        let mut resto = parrafo.to_string();
+        loop {
+            if salida.len() == max {
+                // Ya no caben más: el último renglón avisa de que hay más.
+                if let Some(ultima) = salida.last_mut() {
+                    let hueco = ancho - crate::widget::ancho_de("…", tamaño);
+                    let (recorte, _) = cortar(ultima, hueco.max(0.0), tamaño);
+                    *ultima = format!("{}…", recorte.trim_end());
+                }
+                return salida;
+            }
+            let (linea, sobra) = cortar(&resto, ancho, tamaño);
+            salida.push(linea);
+            if sobra.is_empty() {
+                break;
+            }
+            resto = sobra;
+        }
+    }
+    salida
+}
+
 /// Corta `texto` por donde quepa en `ancho`: devuelve el trozo y lo que queda.
 ///
 /// La primera tijera se pone con el ancho medio por letra y se corrige midiendo
@@ -549,7 +577,7 @@ impl Elemento {
         // texto: enseña su `Name` y su icono, y al abrirlo se ejecuta su
         // `Exec`. Es lo único que distingue un escritorio de un listado.
         if ruta.extension().is_some_and(|e| e == "desktop")
-            && let Some(app) = crate::apps::leer_una(ruta)
+            && let Some(app) = crate::apps::leer_lanzador(ruta)
         {
             return Some(Self {
                 nombre: app.nombre,

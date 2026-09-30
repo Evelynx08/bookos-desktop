@@ -1,5 +1,6 @@
 [Desktop Entry]
-Name=Ajustes
+Name=Settings
+Name[es]=Ajustes
 Comment=Preferencias del sistema BookOS
 Exec=bookos-settings
 TryExec=bookos-settings

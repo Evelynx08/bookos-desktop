@@ -41,6 +41,7 @@ fn estado(clase: Clase, con_portada: bool, cola: usize) -> Estado {
                 duracion_ms: 200_000,
                 favorita: i % 2 == 0,
                 actual: i == 0,
+                portada: None,
             })
             .collect(),
     }

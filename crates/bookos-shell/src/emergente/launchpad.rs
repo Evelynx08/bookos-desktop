@@ -25,11 +25,12 @@
 //! `foldersJson` del plasmoide: leer JSON aquí sería una dependencia nueva para
 //! guardar dos listas de nombres.
 //!
-//! **Las carpetas van primero y las aplicaciones sueltas después**, cada grupo
-//! por orden alfabético. El plasmoide guarda además el orden manual completo
-//! (`orderJson`); aquí no, y por eso el sitio de cada icono es siempre
-//! deducible de lo que hay instalado: nada de un fichero que decide dónde va
-//! cada cosa y que se desincroniza en cuanto instalas algo.
+//! **Las carpetas van primero y las aplicaciones sueltas después.** Las
+//! carpetas, por orden alfabético; las sueltas, en el orden en que el usuario
+//! las haya colocado arrastrándolas —soltar en el hueco de una celda, no sobre
+//! el icono, que eso crea carpeta— y el resto detrás, alfabético. Lo instalado
+//! después de colocar nada cae al final, así que el orden guardado nunca
+//! decide por una aplicación que no conoce.
 //!
 //! Abierta, una carpeta es un **panel** —un diálogo: radio 26, sombra de modal,
 //! teñido de su color— con su propia rejilla de 4×3. Antes reusaba la de 6×5
@@ -103,8 +104,11 @@ const UNIDAD: f32 = 18.0;
 const BUSQUEDA: f32 = UNIDAD * 3.0;
 /// Ancho de la barra: 20 unidades.
 const BUSQUEDA_ANCHO: f32 = UNIDAD * 20.0;
-/// Separación entre la barra de búsqueda y la rejilla.
-const HUECO: f32 = UNIDAD * 2.0;
+/// Separación entre la barra de búsqueda y la rejilla. Con 2 unidades la
+/// primera fila quedaba pegada al campo y se leían como un solo bloque; con 4
+/// la búsqueda queda aparte, como cabecera. El bloque va centrado, así que
+/// esto sube el campo la mitad y baja la rejilla y los puntos la otra mitad.
+const HUECO: f32 = UNIDAD * 4.0;
 /// Alto de la fila de puntos de página, con su margen.
 const PUNTOS: f32 = UNIDAD * 3.0;
 /// Alto reservado a la etiqueta bajo cada icono: 2 unidades.
@@ -328,6 +332,8 @@ pub struct Launchpad {
     /// sin querer una vez y se lamenta el resto de la tarde. Se vuelven a ver
     /// borrando su nombre de `launchpad.conf`.
     ocultas: Vec<String>,
+    /// Los `exec` de las sueltas colocadas a mano. Ver [`Launchpad::mover_a`].
+    orden: Vec<String>,
     /// El modo de edición: con él, cada icono lleva su ✕ para quitarlo. Se
     /// entra con el botón derecho, como el menú contextual del dock.
     editando: bool,
@@ -354,8 +360,12 @@ pub struct Launchpad {
     seleccion: Option<usize>,
     /// Desplazamiento acumulado del touchpad desde el último cambio de página.
     acumulado: f32,
-    /// Cuándo se cambió de página por última vez, para no encadenar saltos.
-    ultimo_paso: Option<std::time::Instant>,
+    /// Si el gesto en curso ya pasó su página, cuándo llegó su último evento.
+    /// Ver [`Launchpad::desplazar`].
+    gesto_gastado: Option<std::time::Instant>,
+    /// Cuándo pasó de página el icono arrastrado contra el borde. `None`
+    /// fuera del borde. Ver [`Launchpad::puntero`].
+    paso_por_borde: Option<std::time::Instant>,
     /// El icono que se está arrastrando, si hay alguno.
     arrastre: Option<Arrastre>,
     /// Dónde está el dock en la pantalla, si se está viendo debajo.
@@ -397,6 +407,7 @@ impl Launchpad {
             })
             .collect();
         let ocultas = guardado.ocultas;
+        let orden = guardado.orden;
         tracing::debug!(
             n = apps.len(),
             carpetas = carpetas.len(),
@@ -407,6 +418,7 @@ impl Launchpad {
             apps,
             carpetas,
             ocultas,
+            orden,
             editando: false,
             dentro: None,
             paleta_abierta: false,
@@ -417,7 +429,8 @@ impl Launchpad {
             pagina: 0,
             seleccion: None,
             acumulado: 0.0,
-            ultimo_paso: None,
+            gesto_gastado: None,
+            paso_por_borde: None,
             arrastre: None,
             zona_dock: None,
             transicion: None,
@@ -450,16 +463,22 @@ impl Launchpad {
             .collect();
         let ocultas: std::collections::HashSet<&str> =
             self.ocultas.iter().map(String::as_str).collect();
-        let mut visibles: Vec<Item> = (0..self.carpetas.len()).map(Item::Carpeta).collect();
-        visibles.extend(
-            self.apps
+        let mut sueltas: Vec<usize> = (0..self.apps.len())
+            .filter(|&i| {
+                let exec = self.apps[i].exec.as_str();
+                !en_carpetas.contains(exec) && !ocultas.contains(exec)
+            })
+            .collect();
+        // Estable: las que no están en `orden` conservan el alfabético de
+        // `apps` detrás de las colocadas.
+        sueltas.sort_by_key(|&i| {
+            self.orden
                 .iter()
-                .enumerate()
-                .filter(|(_, app)| {
-                    !en_carpetas.contains(app.exec.as_str()) && !ocultas.contains(app.exec.as_str())
-                })
-                .map(|(i, _)| Item::App(i)),
-        );
+                .position(|e| *e == self.apps[i].exec)
+                .unwrap_or(usize::MAX)
+        });
+        let mut visibles: Vec<Item> = (0..self.carpetas.len()).map(Item::Carpeta).collect();
+        visibles.extend(sueltas.into_iter().map(Item::App));
         self.visibles = visibles;
     }
 
@@ -806,7 +825,11 @@ impl Launchpad {
             return;
         };
         let nombre = nombre.trim();
-        if nombre.is_empty() || self.carpetas[c].nombre == nombre {
+        // Las claves reservadas de `launchpad.conf`: una carpeta llamada así
+        // se leería al volver como la lista de ocultas o el orden.
+        let reservado =
+            [crate::config::CLAVE_OCULTAS, crate::config::CLAVE_ORDEN].contains(&nombre);
+        if nombre.is_empty() || reservado || self.carpetas[c].nombre == nombre {
             return;
         }
         self.carpetas[c].nombre = nombre.to_string();
@@ -828,6 +851,7 @@ impl Launchpad {
                 })
                 .collect(),
             ocultas: self.ocultas.clone(),
+            orden: self.orden.clone(),
         };
         if let Err(err) = crate::config::guardar_launchpad(&datos) {
             tracing::warn!("no se pudo guardar el launchpad: {err}");
@@ -1162,6 +1186,12 @@ impl Launchpad {
 
     /// Qué celda de la página cae en un punto lógico.
     fn celda_en(&self, x: f32, y: f32) -> Option<usize> {
+        self.posicion_en(x, y).filter(|&i| i < self.visibles.len())
+    }
+
+    /// Como [`Launchpad::celda_en`], pero también las celdas vacías del final
+    /// de la última página: soltar ahí manda el icono al final.
+    fn posicion_en(&self, x: f32, y: f32) -> Option<usize> {
         let (x0, y0) = self.origen_rejilla();
         if y < y0 {
             return None;
@@ -1179,8 +1209,72 @@ impl Launchpad {
             return None;
         }
         let en_pagina = fila * self.columnas() + col;
-        let indice = self.pagina * self.por_pagina() + en_pagina;
-        (indice < self.visibles.len()).then_some(indice)
+        Some(self.pagina * self.por_pagina() + en_pagina)
+    }
+
+    /// Dónde se colocaría lo arrastrado si se suelta en `(x, y)`: la posición
+    /// en `visibles` delante de la que se insertaría. `None` si ahí no se
+    /// recoloca —sobre el icono crea carpeta, y fuera de la rejilla nada—.
+    ///
+    /// Solo cuenta lo horizontal: el icono ocupa el centro de la celda y lo
+    /// que queda a los lados es el hueco entre dos, que es donde se apunta
+    /// para meter algo en medio.
+    fn hueco_en(&self, x: f32, y: f32) -> Option<usize> {
+        if self.dentro.is_some() || !self.consulta.is_empty() {
+            return None;
+        }
+        let i = self.posicion_en(x, y)?;
+        if i >= self.visibles.len() {
+            return Some(self.visibles.len());
+        }
+        let medio = self.rect_celda(i)?.center_x();
+        if (x - medio).abs() <= self.icono_px() / 2.0 {
+            return None;
+        }
+        Some(if x < medio { i } else { i + 1 })
+    }
+
+    /// Recoloca la aplicación de `origen` delante de la posición `hasta`.
+    ///
+    /// Se guarda el orden **entero** de las sueltas y no solo la que se ha
+    /// movido: «esta va en la 31» dejaría de ser cierto en cuanto se instalase
+    /// algo que cae antes alfabéticamente.
+    fn mover_a(&mut self, origen: usize, hasta: usize) -> bool {
+        let Some(&Item::App(app)) = self.visibles.get(origen) else {
+            // Las carpetas van siempre primero: no tienen a dónde moverse.
+            return true;
+        };
+        let carpetas = self.carpetas.len();
+        let mut sueltas: Vec<usize> = self
+            .visibles
+            .iter()
+            .filter_map(|v| match *v {
+                Item::App(a) => Some(a),
+                Item::Carpeta(_) => None,
+            })
+            .collect();
+        // Quitarla primero corre una posición todo lo que iba detrás de ella.
+        let mut hasta = hasta.saturating_sub(carpetas);
+        let desde = origen - carpetas;
+        if desde < hasta {
+            hasta -= 1;
+        }
+        sueltas.remove(desde);
+        sueltas.insert(hasta.min(sueltas.len()), app);
+        self.orden = sueltas.iter().map(|&a| self.apps[a].exec.clone()).collect();
+        self.guardar();
+        self.rehacer_visibles();
+        let nueva = carpetas + hasta.min(sueltas.len() - 1);
+        self.pagina = nueva / self.por_pagina();
+        self.seleccion = Some(nueva);
+        self.preparar_pagina();
+        true
+    }
+
+    /// La página que se está viendo. Para que el shell sepa si el arrastre la
+    /// ha cambiado y hay que repintar la rejilla.
+    pub fn pagina(&self) -> usize {
+        self.pagina
     }
 
     pub fn puntero(&mut self, punto: Option<(f32, f32)>) -> bool {
@@ -1191,6 +1285,9 @@ impl Launchpad {
                 arrastre.movido = true;
             }
             let movido = arrastre.movido;
+            if movido && self.pasar_por_borde(x) {
+                return true;
+            }
             // Mientras se arrastra, lo señalado es **el destino**: es lo que
             // dice sobre qué se va a soltar. El realce va en su propia
             // superficie, así que moverlo no repinta la rejilla.
@@ -1216,6 +1313,43 @@ impl Launchpad {
             return false;
         }
         self.seleccion = seleccion;
+        true
+    }
+
+    /// Con un icono en el aire que sale de la rejilla por la izquierda o por la
+    /// derecha, pasa de página, que es la única forma de llevarlo a otra: con
+    /// el botón pulsado no hay gesto de touchpad. Si se sigue moviendo fuera,
+    /// pasa otra cada 700 ms, lo bastante despacio para volver a la que se
+    /// quiere.
+    ///
+    /// Fuera y no «cerca del borde»: agarrado, el punto sigue llegando aunque
+    /// se salga del buffer —la rejilla es el 72 % central—, y una franja por
+    /// dentro se comería el hueco izquierdo de la primera columna, que es
+    /// donde se suelta para poner algo el primero.
+    fn pasar_por_borde(&mut self, x: f32) -> bool {
+        const CADA: std::time::Duration = std::time::Duration::from_millis(700);
+        if self.dentro.is_some() || !self.consulta.is_empty() {
+            return false;
+        }
+        let hacia: isize = if x < 0.0 {
+            -1
+        } else if x > self.size().0 {
+            1
+        } else {
+            self.paso_por_borde = None;
+            return false;
+        };
+        if self.paso_por_borde.is_some_and(|t| t.elapsed() < CADA) {
+            return false;
+        }
+        let destino = self.pagina as isize + hacia;
+        if destino < 0 || destino >= self.paginas() as isize {
+            return false;
+        }
+        self.pagina = destino as usize;
+        self.seleccion = None;
+        self.preparar_pagina();
+        self.paso_por_borde = Some(std::time::Instant::now());
         true
     }
 
@@ -1377,6 +1511,10 @@ impl Launchpad {
         if self.sobre_el_dock(x, y) {
             return (true, self.anclar_en_el_dock(arrastre.origen));
         }
+        self.paso_por_borde = None;
+        if let Some(hasta) = self.hueco_en(x, y) {
+            return (self.mover_a(arrastre.origen, hasta), None);
+        }
         let destino = self.celda_en(x, y);
         (self.soltar_en(arrastre.origen, destino), None)
     }
@@ -1385,9 +1523,8 @@ impl Launchpad {
     ///
     /// Las tres cosas que se pueden hacer con una carpeta, y ninguna más:
     /// crearla juntando dos aplicaciones, meter otra dentro, y sacar una
-    /// soltándola fuera de la rejilla. **Reordenar no está**: el sitio de cada
-    /// icono lo decide el orden alfabético, así que no hay dónde guardar «este
-    /// va antes que aquel» ni forma de que sobreviva a instalar algo nuevo.
+    /// soltándola fuera de la rejilla. Recolocar no pasa por aquí: lo decide
+    /// [`Launchpad::hueco_en`] antes, según se suelte en el icono o a su lado.
     fn soltar_en(&mut self, origen: usize, destino: Option<usize>) -> bool {
         let Some(&item_origen) = self.visibles.get(origen) else {
             return false;
@@ -1539,10 +1676,13 @@ impl Launchpad {
 
     /// Desplazamiento del touchpad o de la rueda, en píxeles lógicos.
     ///
-    /// Devuelve `true` si ha cambiado de página. El umbral y la espera son los
-    /// del plasmoide: 20 px horizontales y 180 ms entre cambios. Sin la espera,
-    /// un gesto normal de touchpad —que manda decenas de eventos— saltaría
-    /// cinco páginas de una pasada.
+    /// Devuelve `true` si ha cambiado de página. **Una página por gesto**: tras
+    /// el salto se traga todo hasta que pasan 180 ms sin eventos, que es
+    /// levantar los dedos. Antes la espera contaba desde el salto, y un gesto
+    /// largo —dura más de 180 ms— pasaba dos o tres páginas. libinput no tiene
+    /// inercia (esa la simulan los clientes), así que mientras llegan eventos
+    /// seguidos es el mismo gesto. Con la rueda cada muesca va separada y pasa
+    /// su página, como antes.
     pub fn desplazar(&mut self, dx: f32, dy: f32) -> bool {
         const UMBRAL: f32 = 20.0;
         const ESPERA: std::time::Duration = std::time::Duration::from_millis(180);
@@ -1551,11 +1691,14 @@ impl Launchpad {
         // natural sobre una rejilla es el horizontal, pero con rueda de ratón
         // solo hay vertical y quedarse quieto sería raro.
         let delta = if dx.abs() >= dy.abs() { dx } else { dy };
-        if self.ultimo_paso.is_some_and(|t| t.elapsed() < ESPERA) {
-            // Dentro de la espera se sigue tragando el gesto para que el
-            // acumulador no arrastre el impulso de la página anterior.
-            self.acumulado = 0.0;
-            return false;
+        let ahora = std::time::Instant::now();
+        if let Some(anterior) = self.gesto_gastado {
+            if anterior.elapsed() < ESPERA {
+                self.gesto_gastado = Some(ahora);
+                self.acumulado = 0.0;
+                return false;
+            }
+            self.gesto_gastado = None;
         }
         self.acumulado += delta;
         if self.acumulado.abs() < UMBRAL {
@@ -1569,8 +1712,7 @@ impl Launchpad {
         }
         self.pagina = destino as usize;
         self.preparar_pagina();
-        let ahora = std::time::Instant::now();
-        self.ultimo_paso = Some(ahora);
+        self.gesto_gastado = Some(ahora);
         true
     }
 
@@ -1586,6 +1728,10 @@ impl Launchpad {
                 }
                 T::Retroceso => {
                     nombre.pop();
+                    Tecla::Consumida
+                }
+                T::BorrarTodo => {
+                    nombre.clear();
                     Tecla::Consumida
                 }
                 T::Intro => {
@@ -1628,6 +1774,11 @@ impl Launchpad {
             }
             T::Retroceso => {
                 self.consulta.pop();
+                self.filtrar();
+                Tecla::Consumida
+            }
+            T::BorrarTodo => {
+                self.consulta.clear();
                 self.filtrar();
                 Tecla::Consumida
             }
@@ -2505,6 +2656,7 @@ mod tests {
             apps,
             carpetas,
             ocultas: Vec::new(),
+            orden: Vec::new(),
             editando: false,
             dentro: None,
             paleta_abierta: false,
@@ -2515,7 +2667,8 @@ mod tests {
             pagina: 0,
             seleccion: None,
             acumulado: 0.0,
-            ultimo_paso: None,
+            gesto_gastado: None,
+            paso_por_borde: None,
             arrastre: None,
             zona_dock: None,
             transicion: None,
@@ -2552,11 +2705,11 @@ mod tests {
         let mut l = con_apps(&["Firefox", "Kate", "Konsole"]);
         assert_eq!(l.visibles.len(), 3);
 
-        // Se agarra la primera y se suelta sobre la segunda.
+        // Se agarra la primera y se suelta sobre el icono de la segunda.
         let origen = l.rect_celda(0).expect("la celda 0 se ve");
         let destino = l.rect_celda(1).expect("la celda 1 se ve");
         l.pulsar(origen.x + 10.0, origen.y + 10.0);
-        l.puntero(Some((destino.x + 10.0, destino.y + 10.0)));
+        l.puntero(Some((destino.center_x(), destino.y + 10.0)));
         let (repintar, accion) = l.soltar();
         assert!(repintar && accion.is_none(), "arrastrar no lanza nada");
 
@@ -2565,6 +2718,48 @@ mod tests {
         // Una carpeta y la aplicación que quedó fuera.
         assert_eq!(l.visibles.len(), 2);
         assert_eq!(l.visibles[0], Item::Carpeta(0), "las carpetas van primero");
+    }
+
+    /// Soltar en el hueco de al lado de un icono lo recoloca, no crea carpeta,
+    /// y el orden se queda para la próxima vez.
+    #[test]
+    fn soltar_en_el_hueco_recoloca() {
+        sin_tocar_el_disco();
+        let mut l = con_apps(&["Firefox", "Kate", "Konsole"]);
+        let origen = l.rect_celda(0).expect("la celda 0 se ve");
+        let destino = l.rect_celda(2).expect("la celda 2 se ve");
+        l.pulsar(origen.center_x(), origen.center_y());
+        // El lado derecho de la última: detrás de Konsole.
+        l.puntero(Some((destino.x + destino.width - 2.0, destino.center_y())));
+        l.soltar();
+
+        assert!(l.carpetas.is_empty(), "en el hueco no nace carpeta");
+        assert_eq!(l.primeros(3), ["Kate", "Konsole", "Firefox"]);
+        assert_eq!(l.orden, ["kate", "konsole", "firefox"]);
+    }
+
+    /// Sacando el icono por un lado de la rejilla se pasa de página, una sola vez aunque se
+    /// siga empujando, y al soltar en una celda vacía el icono va al final.
+    #[test]
+    fn arrastrar_al_borde_lleva_a_otra_pagina() {
+        sin_tocar_el_disco();
+        let nombres: Vec<String> = (0..45).map(|i| format!("App{i:02}")).collect();
+        let refs: Vec<&str> = nombres.iter().map(String::as_str).collect();
+        let mut l = con_apps(&refs);
+        let origen = l.rect_celda(0).expect("la celda 0 se ve");
+        l.pulsar(origen.center_x(), origen.center_y());
+        let derecha = l.size().0 + 10.0;
+        assert!(l.puntero(Some((derecha, origen.center_y()))));
+        assert_eq!(l.pagina, 1);
+        l.puntero(Some((derecha + 1.0, origen.center_y())));
+        assert_eq!(l.pagina, 1, "seguir fuera no encadena páginas");
+
+        // La celda 44 es la última ocupada; la 50 está vacía.
+        let vacia = l.rect_celda(50).expect("la celda 50 es de la página 1");
+        l.puntero(Some((vacia.center_x(), vacia.center_y())));
+        l.soltar();
+        assert_eq!(l.pagina, 1);
+        assert_eq!(l.primeros(45).last().map(String::as_str), Some("App00"));
     }
 
     /// Pulsar sin mover **sí** lanza: el arrastre no puede robarle el clic a
@@ -2896,6 +3091,18 @@ mod tests {
         // decenas de eventos y sin la espera se recorrerían cinco páginas.
         assert!(!l.desplazar(40.0, 0.0));
         assert_eq!(l.pagina, 1);
+
+        // Un gesto largo sigue siendo uno: cada evento alarga la espera, y
+        // aunque el salto quede lejos, 100 ms desde el último evento no bastan.
+        let hace = |ms| Some(std::time::Instant::now() - std::time::Duration::from_millis(ms));
+        l.gesto_gastado = hace(100);
+        assert!(!l.desplazar(-40.0, 0.0));
+        assert_eq!(l.pagina, 1);
+
+        // Tras levantar los dedos, el gesto siguiente pasa su página.
+        l.gesto_gastado = hace(200);
+        assert!(l.desplazar(-40.0, 0.0));
+        assert_eq!(l.pagina, 0);
     }
 
     #[test]

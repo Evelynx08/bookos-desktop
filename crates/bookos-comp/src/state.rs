@@ -251,6 +251,13 @@ pub struct BookosComp {
     /// hasta la fecha exacta del bloqueo.
     pub tick_bloqueo: Option<smithay::reexports::calloop::RegistrationToken>,
     pub tick_suspension: Option<smithay::reexports::calloop::RegistrationToken>,
+    /// El segundero del centro de control abierto. Ver `multimedia::vigilar_centro`.
+    pub tick_centro: Option<smithay::reexports::calloop::RegistrationToken>,
+    /// Repetición de Retroceso sobre una capa del shell: ver `input::repetir_retroceso`.
+    pub repeticion_retroceso: Option<smithay::reexports::calloop::RegistrationToken>,
+    /// Qué conexión del bus publicó cada actividad viva, por `app_id`. Ver
+    /// `ajustes::vigilar_remitentes`.
+    pub remitentes_actividad: std::collections::HashMap<String, String>,
     /// Alarma que apaga físicamente las salidas unos segundos después de
     /// echar el bloqueo.
     pub tick_dpms: Option<smithay::reexports::calloop::RegistrationToken>,
@@ -319,7 +326,7 @@ pub struct BookosComp {
     /// Un clic que empezó sobre el selector no debe entregar su liberación al
     /// cliente que acaba de recibir el foco.
     pub conmutador_clic: bool,
-    /// Cuándo se pulsó Ctrl+Alt+Retroceso la primera vez: la segunda, poco
+    /// Cuándo se pulsó Meta+Alt+Retroceso la primera vez: la segunda, poco
     /// después, es la que cierra.
     pub salida_armada: Option<std::time::Instant>,
     /// Meta se pulsó y desde entonces no ha pasado nada más.
@@ -398,10 +405,25 @@ pub struct BookosComp {
     /// porque tras un cambio de TTY libinput los vuelve a crear de cero: sin
     /// esto, el touchpad que habías apagado volvería encendido.
     pub touchpad_activo: bool,
+    /// `sonido_volumen` de `panel.conf`; la config entera no se guarda.
+    pub sonido_volumen: bool,
+    /// `genio` de `panel.conf`: el shader sigue compilado, esto solo decide si se usa.
+    pub genio_activo: bool,
+    /// Si estaba enchufado en el último aviso de `power_supply`, para sonar
+    /// solo cuando cambia. Ver `multimedia::cargador`.
+    pub enchufado: Option<bool>,
     /// Cómo encender y apagar los touchpads que ya están abiertos. Lo rellena
     /// el backend de sesión real; anidado se queda en `None` porque ahí la
     /// entrada la da el compositor de debajo.
     pub aplicar_touchpad: Option<Box<dyn Fn(bool)>>,
+    /// Cómo encender las luces de Bloq Mayús, Bloq Num y Bloq Despl en los
+    /// teclados abiertos. Con libinput las luces no van solas: si el
+    /// compositor no las manda, Bloq Mayús funciona pero no se enciende. Lo
+    /// rellena el backend de sesión real, igual que `aplicar_touchpad`.
+    pub aplicar_leds: Option<Box<dyn Fn(smithay::input::keyboard::LedState)>>,
+    /// Las últimas luces que pidió el teclado, para un teclado que se conecte
+    /// después con Bloq Mayús ya puesto.
+    pub leds: smithay::input::keyboard::LedState,
     /// Rutas del fondo que pide la configuración: la de siempre y, si las hay,
     /// una por tema. Copiadas por lo mismo que la escala: la `Config` se la
     /// lleva el shell al construirse.
@@ -621,6 +643,11 @@ pub struct BookosComp {
     pub pointer_constraints_state: PointerConstraintsState,
     #[allow(dead_code)]
     pub relative_pointer_state: RelativePointerManagerState,
+    /// `zwp_pointer_gestures_v1`: pellizcos y «mantener» del touchpad para las
+    /// ventanas. Sin él, el zoom con dos dedos de Figma o de un navegador no
+    /// llegaba nunca: el compositor se quedaba todos los gestos.
+    #[allow(dead_code)]
+    pub pointer_gestures_state: smithay::wayland::pointer_gestures::PointerGesturesState,
     /// Entrada de texto v3 y canal para métodos de entrada (IBus/Fcitx).
     #[allow(dead_code)]
     pub text_input_state: TextInputManagerState,
@@ -761,6 +788,8 @@ impl BookosComp {
         let idle_notifier_state = IdleNotifierState::new(&dh, loop_handle.clone());
         let pointer_constraints_state = PointerConstraintsState::new::<Self>(&dh);
         let relative_pointer_state = RelativePointerManagerState::new::<Self>(&dh);
+        let pointer_gestures_state =
+            smithay::wayland::pointer_gestures::PointerGesturesState::new::<Self>(&dh);
         let text_input_state = TextInputManagerState::new::<Self>(&dh);
         let input_method_state = InputMethodManagerState::new::<Self, _>(&dh, |_| true);
         let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
@@ -842,6 +871,16 @@ impl BookosComp {
             })
             .map_err(|err| anyhow::anyhow!("insert_source(portal): {err}"))?;
         let bus_portal = crate::portal::arrancar(portal, &socket_name);
+        crate::ajustes::vigilar_nombres(
+            [
+                (bus_notificaciones.clone(), crate::notificaciones::INTERFAZ),
+                (bus_ajustes.clone(), crate::ajustes::NOMBRE),
+                (bus_portal.clone(), crate::portal::NOMBRE),
+            ]
+            .into_iter()
+            .filter_map(|(c, n)| c.map(|c| (c, n)))
+            .collect(),
+        );
 
         // MPRIS puede lanzar varios procesos `busctl`; se consulta después de
         // que el bloqueo ya esté visible y en un hilo corto. El resultado
@@ -890,6 +929,9 @@ impl BookosComp {
             suspension_inactividad,
             tick_bloqueo: None,
             tick_suspension: None,
+            tick_centro: None,
+            repeticion_retroceso: None,
+            remitentes_actividad: Default::default(),
             tick_dpms: None,
             dpms_encendido: true,
             aplicar_dpms: None,
@@ -939,11 +981,18 @@ impl BookosComp {
             decoracion: crate::decoracion::Interaccion::default(),
             minimizadas: Vec::new(),
             minimizando: Vec::new(),
+            sonido_volumen: config.sonido_volumen,
+            genio_activo: config.genio,
+            // Leído al arrancar: entrar en la sesión con el cargador puesto no
+            // es «conectarlo».
+            enchufado: bookos_shell::cargador().map(|(e, _)| e),
             config: Some(config),
             escala_forzada,
             entrada,
             touchpad_activo: true,
             aplicar_touchpad: None,
+            aplicar_leds: None,
+            leds: Default::default(),
             cursor_nominal,
             fondo_config,
             recargar_fondo: false,
@@ -996,6 +1045,7 @@ impl BookosComp {
             idle_notifier_state,
             pointer_constraints_state,
             relative_pointer_state,
+            pointer_gestures_state,
             text_input_state,
             input_method_state,
             layer_shell_state,

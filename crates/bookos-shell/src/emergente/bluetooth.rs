@@ -138,6 +138,19 @@ impl Bluetooth {
     }
 
     pub fn pulsar(&mut self, x: f32, y: f32) -> Option<Accion> {
+        // El interruptor se dibujaba pero nadie miraba si se pulsaba.
+        if lista::interruptor_en(x, y) {
+            self.encendido = !self.encendido;
+            self.interruptor.ir_a(self.encendido as u8 as f32);
+            bookos_system::request(Operation::BluetoothPower {
+                enabled: self.encendido,
+            });
+            // Se olvida lo último recibido para que el próximo refresco lo
+            // aplique aunque no haya cambiado: si la orden falla, el
+            // interruptor vuelve a su sitio en vez de quedarse mintiendo.
+            self.ultimo = Value::Null;
+            return None;
+        }
         if self.pie_en(x, y).is_some() {
             return Some(Accion::Lanzar("bookos-settings --page bluetooth".into()));
         }

@@ -513,6 +513,18 @@ void main() {
         // que queda bajo la línea sí sale en la foto.
         float marco = dentro * smoothstep(-borde - aa, -borde + aa, d);
         color = vec4(0.0, 0.0, 0.0, velo) * (1.0 - dentro) + vec4(acento, 1.0) * marco;
+
+        // Las asas: un trazo claro por fuera de cada esquina que sigue su
+        // curva, para que se vea que de ahí se tira. Por fuera y no encima del
+        // marco porque lo de dentro sale en la foto. Van en lógicos: 2 de aire,
+        // 4 de grueso y 16 de largo desde la esquina, que quedan dentro de los
+        // 8 de agarre de `bookos_shell::captura` y se leen a cualquier escala.
+        vec2 e = abs(p - recuadro.xy - medio) - medio;
+        float esquina = step(-16.0, e.x) * step(-16.0, e.y);
+        float asa = esquina
+            * smoothstep(2.0 - aa, 2.0 + aa, d)
+            * (1.0 - smoothstep(6.0 - aa, 6.0 + aa, d));
+        color = mix(color, vec4(0.87, 0.87, 0.87, 1.0), asa);
     }
     gl_FragColor = color * alpha;
 #if defined(DEBUG_FLAGS)

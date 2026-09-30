@@ -23,11 +23,12 @@ impl Red {
         }
     }
 
-    /// Caída se atenúa, como el texto que había antes: no es un fallo, es una
+    /// Conectada va en acento, con la misma regla que el Bluetooth: el acento
+    /// dice «esto está funcionando». Caída se atenúa: no es un fallo, es una
     /// cosa menos encendida.
     fn color(&self) -> iced_core::Color {
         match self.dato {
-            Some(red) if red.up => tema::texto(),
+            Some(red) if red.up => tema::acento(),
             _ => tema::TEXTO2,
         }
     }

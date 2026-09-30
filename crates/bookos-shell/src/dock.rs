@@ -293,6 +293,22 @@ impl Dock {
         }
     }
 
+    /// Vuelve a leer los iconos que cambian solos (reloj, calendario).
+    /// Devuelve `true` si hay alguno en el dock, que es cuando hay que
+    /// repintarlo.
+    pub fn refrescar_dinamicos(&mut self) -> bool {
+        let mut alguno = false;
+        for item in self
+            .items
+            .iter_mut()
+            .filter(|i| icono::es_dinamico(&i.icono_nombre))
+        {
+            item.icon = icono::cargar(&item.icono_nombre);
+            alguno = true;
+        }
+        alguno
+    }
+
     /// Marca qué lanzadores tienen ventana abierta, a partir de los `app_id`
     /// que hay en el escritorio. Devuelve `true` si cambió algo.
     ///

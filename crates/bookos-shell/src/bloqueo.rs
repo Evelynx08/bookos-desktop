@@ -28,12 +28,19 @@ use iced_widget::{Space, column, container, row, text};
 use crate::tema;
 use crate::view::PanelElement;
 
-/// Ancho del campo de contraseña.
-const CAMPO: f32 = 260.0;
+/// Ancho de la píldora de contraseña, con su candado y su botón dentro. Es lo
+/// que ocupaban el campo de 260 y el botón suelto de al lado, así que el
+/// bloque no cambia de ancho.
+const CAMPO: f32 = 312.0;
+/// Lado del botón redondo de dentro de la píldora.
+const BOTON: f32 = 36.0;
+/// La ola de los puntos mientras PAM comprueba: dos vueltas y se para. No dura
+/// lo que tarde PAM a propósito, para no repintar la pantalla entera todo ese
+/// rato; si tarda más, los puntos se quedan quietos y el texto dice
+/// «Comprobando…».
+const D_OLA: Duration = Duration::from_millis(1040);
 /// Alto del campo y lado del botón redondo que lleva al lado.
 const ALTO_CAMPO: f32 = 44.0;
-/// Separación entre el campo y su botón.
-const HUECO_CAMPO: f32 = 8.0;
 /// Cuerpo de la fecha, bajo el reloj.
 const FECHA: f32 = 22.0;
 /// Diámetro de los puntos de la contraseña.
@@ -127,8 +134,12 @@ pub struct Medio {
     pub bus: String,
     pub titulo: String,
     pub detalle: String,
-    /// Color de la tarjeta: cada aplicación trae el suyo.
+    /// Color de la tarjeta: el de la carátula, o el acento si no hay.
     pub color: Color,
+    /// De dónde salió la carátula, para no volver a descodificarla en cada
+    /// lectura de la misma canción.
+    pub fuente: Option<String>,
+    pub caratula: Option<iced_widget::image::Handle>,
     pub progreso: Option<f32>,
     pub posicion: Option<u64>,
     pub duracion: Option<u64>,
@@ -136,9 +147,22 @@ pub struct Medio {
 }
 
 impl Medio {
-    fn desde_sonando(sonando: crate::medios::Sonando) -> Self {
+    /// `previo` es la tarjeta anterior: si la carátula viene de la misma
+    /// fuente se reutiliza con su color.
+    fn desde_sonando(sonando: crate::medios::Sonando, previo: Option<&Medio>) -> Self {
         let progreso = sonando.avance();
+        let (caratula, color) = match (sonando.caratula.as_deref(), previo) {
+            (Some(f), Some(p)) if p.fuente.as_deref() == Some(f) => (p.caratula.clone(), p.color),
+            // Tres píxeles por punto, como el centro de control.
+            (Some(f), _) => {
+                crate::medios::cargar_caratula(f, (MEDIOS_ARTE * 3.0) as u32, tema::R_CONTROL * 3.0)
+                    .map_or((None, tema::acento()), |(h, c)| (Some(h), c))
+            }
+            (None, _) => (None, tema::acento()),
+        };
         Self {
+            fuente: sonando.caratula,
+            caratula,
             bus: sonando.bus,
             titulo: sonando.titulo,
             detalle: if sonando.artista.is_empty() {
@@ -146,7 +170,7 @@ impl Medio {
             } else {
                 sonando.artista
             },
-            color: tema::acento(),
+            color,
             progreso,
             posicion: sonando.posicion,
             duracion: sonando.duracion,
@@ -317,7 +341,15 @@ pub struct Bloqueo {
     /// contraseña ni ningún dato extra sobre ella.
     estado_desde: Instant,
     medio_desde: Option<Instant>,
+    /// Pictogramas del campo, hechos una vez: un `Handle` nuevo por fotograma
+    /// obligaría a iced a volver a rasterizar el SVG en cada repintado.
+    candado: crate::icono::Icono,
+    flecha: crate::icono::Icono,
 }
+
+/// Candado y flecha de Heroicons, macizos: el teñido sustituye el relleno.
+const CANDADO: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#fff"><path fill-rule="evenodd" clip-rule="evenodd" d="M12 1.5a5.25 5.25 0 0 0-5.25 5.25v3a3 3 0 0 0-3 3v6.75a3 3 0 0 0 3 3h10.5a3 3 0 0 0 3-3v-6.75a3 3 0 0 0-3-3v-3c0-2.9-2.35-5.25-5.25-5.25Zm3.75 8.25v-3a3.75 3.75 0 1 0-7.5 0v3h7.5Z"/></svg>"##;
+const FLECHA: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#fff"><path fill-rule="evenodd" clip-rule="evenodd" d="M12.97 3.97a.75.75 0 0 1 1.06 0l7.5 7.5a.75.75 0 0 1 0 1.06l-7.5 7.5a.75.75 0 1 1-1.06-1.06l6.22-6.22H3a.75.75 0 0 1 0-1.5h16.19l-6.22-6.22a.75.75 0 0 1 0-1.06Z"/></svg>"##;
 
 impl Bloqueo {
     pub fn new(
@@ -344,6 +376,8 @@ impl Bloqueo {
             entrada_desde: ahora,
             estado_desde: ahora - ESTADO_TOTAL,
             medio_desde: None,
+            candado: crate::icono::desde_svg(CANDADO),
+            flecha: crate::icono::desde_svg(FLECHA),
         }
     }
 
@@ -394,25 +428,28 @@ impl Bloqueo {
         .height(Length::Fixed(pantalla.1));
 
         let avatar = self.config.avatar_tamano * (0.90 + 0.10 * acceso_avance);
-        let acceso = column![
-            self.avatar(avatar, acceso_avance),
-            Space::new().height(Length::Fixed(12.0)),
-            text(self.usuario.nombre.clone())
-                .size(20.0)
-                .font(iced_core::Font {
-                    weight: iced_core::font::Weight::Semibold,
-                    ..iced_core::Font::DEFAULT
-                })
-                .color(Color {
-                    a: acceso_avance,
-                    ..Color::WHITE
-                }),
-            Space::new().height(Length::Fixed(16.0)),
+        let mut acceso = column![self.avatar(avatar, acceso_avance)];
+        if self.config.nombre {
+            acceso = acceso.push(Space::new().height(Length::Fixed(12.0))).push(
+                text(self.usuario.nombre.clone())
+                    .size(20.0)
+                    .font(iced_core::Font {
+                        weight: iced_core::font::Weight::Semibold,
+                        ..iced_core::Font::DEFAULT
+                    })
+                    .color(Color {
+                        a: acceso_avance,
+                        ..Color::WHITE
+                    }),
+            );
+        }
+        let acceso = acceso.extend([
+            Space::new().height(Length::Fixed(16.0)).into(),
             self.campo(acceso_avance),
-            Space::new().height(Length::Fixed(10.0)),
+            Space::new().height(Length::Fixed(10.0)).into(),
             self.mensaje(acceso_avance),
             self.aviso_huella(acceso_avance),
-        ]
+        ])
         .align_x(Horizontal::Center);
 
         let sacudida = self.sacudida();
@@ -432,7 +469,10 @@ impl Bloqueo {
         .width(Length::Fixed(pantalla.0))
         .height(Length::Fixed(pantalla.1));
 
-        let mut capas = iced_widget::stack![capa_reloj, capa_acceso];
+        let mut capas = iced_widget::stack![];
+        // El velo de la canción no va aquí: lo pinta el compositor en la GPU.
+        // Ver `velo_medios`.
+        capas = capas.push(capa_reloj).push(capa_acceso);
         if self.config.medios && !self.medios.is_empty() {
             let mut tarjetas = column![].align_x(Horizontal::Center);
             for medio in self.medios.iter().take(2) {
@@ -451,12 +491,14 @@ impl Bloqueo {
             capas = capas.push(capa_medios);
         }
 
-        let esquina = container(self.energia(energia_avance))
-            .width(Length::Fixed(pantalla.0))
-            .height(Length::Fixed(pantalla.1))
-            .align_x(Horizontal::Left)
-            .align_y(Vertical::Bottom);
-        capas = capas.push(esquina);
+        if self.config.energia {
+            let esquina = container(self.energia(energia_avance))
+                .width(Length::Fixed(pantalla.0))
+                .height(Length::Fixed(pantalla.1))
+                .align_x(Horizontal::Left)
+                .align_y(Vertical::Bottom);
+            capas = capas.push(esquina);
+        }
         if let Some((_, c)) = &self.confirmacion {
             capas = capas.push(
                 container(c.view())
@@ -534,6 +576,22 @@ impl Bloqueo {
     /// terminaba de asentarse.
     fn medios_y_actual(&self, alto_pantalla: f32, medios_avance: f32) -> f32 {
         self.medios_y_asentada(alto_pantalla) + (1.0 - medios_avance) * 28.0
+    }
+
+    /// El color con que empieza, arriba, el velo de la canción: baja desde
+    /// arriba y se apaga del todo al 60 % del alto. `None` sin música.
+    ///
+    /// Lo pinta el compositor, no esta vista. Era un degradado translúcido a
+    /// pantalla completa rasterizado en CPU, y medido a escala 2 con música
+    /// sonando cada tecla de la contraseña costaba **55 ms** en vez de 3–7
+    /// (`examples/bloqueo_bench.rs`): el punto de cada carácter nacía a cuatro
+    /// fotogramas por segundo y parecía que las letras llegaban con retraso.
+    pub fn velo_medios(&self) -> Option<Color> {
+        let m = self.medios.first().filter(|_| self.config.medios)?;
+        Some(Color {
+            a: 0.30 * self.medio_avance(),
+            ..m.color
+        })
     }
 
     fn medio_avance(&self) -> f32 {
@@ -616,7 +674,10 @@ impl Bloqueo {
     /// Actualiza la tarjeta multimedia cuando termina la consulta asíncrona.
     pub fn poner_medio(&mut self, sonando: Option<crate::medios::Sonando>) -> bool {
         let nuevos = if self.config.medios {
-            sonando.map(Medio::desde_sonando).into_iter().collect()
+            sonando
+                .map(|s| Medio::desde_sonando(s, self.medios.first()))
+                .into_iter()
+                .collect()
         } else {
             Vec::new()
         };
@@ -733,7 +794,7 @@ impl Bloqueo {
                 }
             }
         }
-        if dentro(self.boton_energia(pantalla)) {
+        if self.config.energia && dentro(self.boton_energia(pantalla)) {
             if self.menu {
                 self.cerrar_menu();
             } else {
@@ -807,8 +868,11 @@ impl Bloqueo {
     pub fn animando(&self) -> bool {
         let entrada = self.config.animaciones && self.entrada_desde.elapsed() < ENTRADA_TOTAL;
         let estado = self.config.animaciones
-            && matches!(self.estado, Estado::Comprobando | Estado::Fallo)
-            && self.estado_desde.elapsed() < ESTADO_TOTAL;
+            && match self.estado {
+                Estado::Fallo => self.estado_desde.elapsed() < ESTADO_TOTAL,
+                Estado::Comprobando => self.estado_desde.elapsed() < D_OLA,
+                _ => false,
+            };
         let huella = self.config.animaciones
             && self.huella == Huella::NoCoincide
             && self.huella_desde.elapsed() < ESTADO_TOTAL;
@@ -1019,6 +1083,20 @@ impl Bloqueo {
                     .into()
             }
         };
+        // Con música, el aro del avatar lleva el color de la carátula: ata la
+        // identidad a lo que suena, igual que el velo de arriba. Sin música,
+        // el blanco tenue de siempre.
+        let aro = self.medios.first().map_or(
+            Color {
+                a: 0.35 * alfa,
+                ..tema::tinta()
+            },
+            |m| Color {
+                a: 0.85 * alfa,
+                ..m.color
+            },
+        );
+        let ancho_aro = if self.medios.is_empty() { 2.0 } else { 3.0 };
         let redondo = container(dentro)
             .width(Length::Fixed(lado))
             .height(Length::Fixed(lado))
@@ -1035,11 +1113,8 @@ impl Bloqueo {
                 ),
                 border: Border {
                     radius: (lado / 2.0).into(),
-                    width: 2.0,
-                    color: Color {
-                        a: 0.35 * alfa,
-                        ..tema::tinta()
-                    },
+                    width: ancho_aro,
+                    color: aro,
                 },
                 ..Default::default()
             });
@@ -1048,50 +1123,55 @@ impl Bloqueo {
 
     /// Cuántos puntos caben en el campo sin salirse.
     fn caben(&self) -> usize {
-        ((CAMPO - 40.0) / (PUNTO + 6.0)) as usize
+        // Quitando el candado con su aire (16 + 22 + 10) y el botón (36 + 6).
+        ((CAMPO - 90.0) / (PUNTO + 6.0)) as usize
     }
 
-    /// El campo de contraseña: la píldora con los puntos y el botón redondo.
+    /// El campo de contraseña: una sola píldora con el candado, los puntos y
+    /// el botón de entrar dentro.
     fn campo<'a>(&self, alfa: f32) -> PanelElement<'a> {
+        let visibles = self.escritos.min(self.caben());
+        let animar = self.config.animaciones;
+        let ola = (animar && self.estado == Estado::Comprobando)
+            .then(|| tema::fraccion(self.estado_desde.elapsed(), D_OLA))
+            .filter(|t| *t < 1.0);
         let mut puntos = row![].spacing(6.0).align_y(Vertical::Center);
         // Un punto por carácter, hasta donde caben. Más allá no se añaden: una
         // fila que se sale del campo no dice nada que no diga ya.
-        for _ in 0..self.escritos.min(self.caben()) {
-            puntos = puntos.push(
-                container(Space::new())
-                    .width(Length::Fixed(PUNTO))
-                    .height(Length::Fixed(PUNTO))
-                    .style(move |_| container::Style {
-                        background: Some(con_alfa(tema::acento(), alfa).into()),
-                        border: Border {
-                            radius: (PUNTO / 2.0).into(),
-                            ..Default::default()
-                        },
+        for i in 0..visibles {
+            // Aparece de golpe, sin crecer. Antes nacía con un muelle de
+            // 250 ms, y eso eran ~30 repintados a pantalla completa por tecla
+            // —cada uno de 7 a 10 ms a escala 2—: escribiendo seguido la CPU
+            // no paraba y las teclas esperaban detrás de los fotogramas, que
+            // es lo que se veía como letras llegando poco a poco.
+            let lado = PUNTO;
+            // La ola sube cada punto un poco después que el anterior.
+            let alza = ola.map_or(0.0, |t| {
+                ((t * 2.0 - i as f32 * 0.08) * std::f32::consts::TAU)
+                    .sin()
+                    .max(0.0)
+                    * 5.0
+            });
+            let punto = container(Space::new())
+                .width(Length::Fixed(lado.max(0.0)))
+                .height(Length::Fixed(lado.max(0.0)))
+                .style(move |_| container::Style {
+                    background: Some(con_alfa(Color::WHITE, alfa).into()),
+                    border: Border {
+                        radius: (lado / 2.0).max(0.0).into(),
                         ..Default::default()
-                    }),
+                    },
+                    ..Default::default()
+                });
+            puntos = puntos.push(
+                container(punto)
+                    .width(Length::Fixed(PUNTO))
+                    .height(Length::Fixed(PUNTO + 10.0))
+                    .center_x(Length::Fixed(PUNTO))
+                    .padding(iced_core::Padding::ZERO.bottom(alza * 2.0))
+                    .center_y(Length::Fixed(PUNTO + 10.0)),
             );
         }
-        // El campo lleva **siempre** un borde de acento: en el bloqueo el foco
-        // no se puede mover a ninguna otra parte, y sin borde no había nada que
-        // dijera dónde va lo que escribes. En rojo cuando la contraseña no era.
-        let mut borde = match self.estado {
-            Estado::Fallo | Estado::Espera(_) => tema::rojo(),
-            Estado::Comprobando => Color {
-                a: 0.35,
-                ..Color::WHITE
-            },
-            Estado::Escribiendo => Color {
-                a: 0.85,
-                ..tema::acento()
-            },
-        };
-        // Un pulso corto comunica que la comprobación ha empezado sin dejar la
-        // pantalla repintando durante todo lo que tarde PAM.
-        if self.estado == Estado::Comprobando && self.config.animaciones {
-            let t = tema::fraccion(self.estado_desde.elapsed(), ESTADO_TOTAL);
-            borde.a = (0.42 + (t * std::f32::consts::TAU * 2.0).sin().abs() * 0.42).min(1.0);
-        }
-        borde = con_alfa(borde, alfa);
         // El cursor va detrás del último punto y **no parpadea**: parpadear
         // obliga a repintar la pantalla entera dos veces por segundo, y este
         // escritorio no gasta despertares en eso. Quieto dice lo mismo.
@@ -1116,10 +1196,75 @@ impl Bloqueo {
                     }),
             );
         }
-        let pildora = container(puntos)
+        // El borde de la píldora es el foco: en el bloqueo no se puede ir a
+        // ninguna otra parte, y sin él no hay nada que diga dónde va lo que se
+        // escribe. En rojo cuando la contraseña no era.
+        let borde = con_alfa(
+            match self.estado {
+                Estado::Fallo | Estado::Espera(_) => tema::rojo(),
+                Estado::Comprobando => Color {
+                    a: 0.35,
+                    ..Color::WHITE
+                },
+                _ => Color {
+                    a: 0.85,
+                    ..tema::acento()
+                },
+            },
+            alfa,
+        );
+        // El botón se enciende con el acento cuando hay algo que mandar. Vacío
+        // no lleva a ninguna parte, y un botón encendido que no hace nada se
+        // prueba dos veces antes de mirar el teclado.
+        let lleno = self.escritos > 0;
+        let fondo_boton = if lleno {
+            con_alfa(tema::acento(), alfa)
+        } else {
+            Color {
+                a: 0.12 * alfa,
+                ..Color::WHITE
+            }
+        };
+        let tinta_flecha = Color {
+            a: if lleno { alfa } else { 0.45 * alfa },
+            ..Color::WHITE
+        };
+        let boton = container(crate::icono::ver_teñido_propio(
+            &self.flecha,
+            18.0,
+            tinta_flecha,
+        ))
+        .width(Length::Fixed(BOTON))
+        .height(Length::Fixed(BOTON))
+        .center_x(Length::Fixed(BOTON))
+        .center_y(Length::Fixed(BOTON))
+        .style(move |_| container::Style {
+            background: Some(fondo_boton.into()),
+            border: Border {
+                radius: (BOTON / 2.0).into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let dentro = row![
+            crate::icono::ver_teñido_propio(
+                &self.candado,
+                16.0,
+                Color {
+                    a: 0.6 * alfa,
+                    ..Color::WHITE
+                },
+            ),
+            Space::new().width(Length::Fixed(10.0)),
+            puntos,
+            Space::new().width(Length::Fill),
+            boton,
+        ]
+        .align_y(Vertical::Center);
+        container(dentro)
             .width(Length::Fixed(CAMPO))
             .height(Length::Fixed(ALTO_CAMPO))
-            .padding([0.0, 20.0])
+            .padding(iced_core::Padding::ZERO.left(18.0).right(4.0))
             // Fijo y no `Fill`: `center_y(Fill)` **fija la altura a Fill**, no
             // solo centra, y el campo se estiraba hasta ocupar media pantalla.
             .center_y(Length::Fixed(ALTO_CAMPO))
@@ -1131,47 +1276,8 @@ impl Bloqueo {
                     color: borde,
                 },
                 ..Default::default()
-            });
-        // La flecha se apaga con el campo vacío: sin nada escrito no lleva a
-        // ninguna parte, y un botón encendido que no hace nada se prueba dos
-        // veces antes de mirar el teclado.
-        let tinta_flecha = if self.escritos > 0 {
-            Color {
-                a: alfa,
-                ..Color::WHITE
-            }
-        } else {
-            Color {
-                a: 0.35 * alfa,
-                ..Color::WHITE
-            }
-        };
-        let boton = container(
-            text("→")
-                .size(20.0)
-                .color(tinta_flecha)
-                .align_x(Horizontal::Center)
-                .align_y(Vertical::Center),
-        )
-        .width(Length::Fixed(ALTO_CAMPO))
-        .height(Length::Fixed(ALTO_CAMPO))
-        .center_x(Length::Fixed(ALTO_CAMPO))
-        .center_y(Length::Fixed(ALTO_CAMPO))
-        .style(move |_| container::Style {
-            background: Some(con_alfa(FONDO_CAMPO, alfa).into()),
-            border: Border {
-                radius: (ALTO_CAMPO / 2.0).into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        });
-        row![
-            pildora,
-            Space::new().width(Length::Fixed(HUECO_CAMPO)),
-            boton
-        ]
-        .align_y(Vertical::Center)
-        .into()
+            })
+            .into()
     }
 
     /// Una tarjeta de lo que está sonando.
@@ -1187,21 +1293,26 @@ impl Bloqueo {
             ),
             None => Space::new().width(Length::Fixed(30.0)).into(),
         };
-        let arte = container(nota)
-            .width(Length::Fixed(MEDIOS_ARTE))
-            .height(Length::Fixed(MEDIOS_ARTE))
-            .center_x(Length::Fixed(MEDIOS_ARTE))
-            .center_y(Length::Fixed(MEDIOS_ARTE))
-            .style(move |_| container::Style {
-                background: Some(
-                    con_alfa(tema::mezclar(medio.color, Color::BLACK, 0.18), alfa).into(),
-                ),
-                border: Border {
-                    radius: tema::R_CONTROL.into(),
-                    ..Default::default()
-                },
+        let arte = container(match medio.caratula.clone() {
+            Some(h) => iced_widget::image(h)
+                .width(MEDIOS_ARTE)
+                .height(MEDIOS_ARTE)
+                .opacity(alfa)
+                .into(),
+            None => nota,
+        })
+        .width(Length::Fixed(MEDIOS_ARTE))
+        .height(Length::Fixed(MEDIOS_ARTE))
+        .center_x(Length::Fixed(MEDIOS_ARTE))
+        .center_y(Length::Fixed(MEDIOS_ARTE))
+        .style(move |_| container::Style {
+            background: Some(con_alfa(tema::mezclar(medio.color, Color::BLACK, 0.18), alfa).into()),
+            border: Border {
+                radius: tema::R_CONTROL.into(),
                 ..Default::default()
-            });
+            },
+            ..Default::default()
+        });
 
         let progreso = medio.progreso.unwrap_or(0.0).clamp(0.0, 1.0);
         let lleno = MEDIOS_INFO * progreso;
@@ -1323,11 +1434,11 @@ impl Bloqueo {
                     ..Color::WHITE
                 },
             },
-            shadow: {
-                let mut sombra = tema::sombra_popover();
-                sombra.color.a *= alfa;
-                sombra
-            },
+            // Sin sombra, a diferencia de las tarjetas del escritorio: iced la
+            // calcula en CPU píxel a píxel en cada repintado, y el bloqueo se
+            // repinta en cada tecla de la contraseña. Medido a escala 2 con
+            // música, 16 ms de los 26 de cada tecla. Sobre el fondo oscurecido
+            // y el velo de la canción un 18 % de negro apenas se distinguía.
             ..Default::default()
         })
         .into()
@@ -1485,6 +1596,8 @@ mod tests {
         };
         let mut b = Bloqueo::new("12:30".into(), "lunes".into(), None, config);
         b.medios.push(Medio {
+            fuente: None,
+            caratula: None,
             bus: "org.mpris.MediaPlayer2.prueba".into(),
             titulo: "Canción".into(),
             detalle: "Artista".into(),
@@ -1528,6 +1641,7 @@ mod tests {
             titulo: "Canción".into(),
             artista: "Artista".into(),
             aplicacion: "Prueba".into(),
+            caratula: None,
             posicion: Some(30),
             duracion: Some(60),
             reproduciendo: true,

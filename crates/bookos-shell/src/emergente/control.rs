@@ -230,7 +230,7 @@ pub fn grupo<'a>(contenido: PanelElement<'a>, ancho: f32, relleno: f32) -> Panel
         .width(Length::Fixed(ancho))
         .padding(relleno)
         .style(|_| container::Style {
-            background: Some(tema::superficie().into()),
+            background: Some(tema::superficie_en_tarjeta().into()),
             border: Border {
                 radius: tema::R_ITEM_POPOVER.into(),
                 ..Default::default()

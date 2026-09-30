@@ -72,6 +72,7 @@ fn main() -> anyhow::Result<()> {
                        programa           cliente que lanzar dentro (p. ej. konsole)\n\n\
                      Atajos:\n  \
                        Meta+Return        abrir un terminal (BOOKOS_TERMINAL, konsole por defecto)\n  \
+                       Ctrl+Alt+T         lo mismo\n  \
                        Meta+Espacio       buscar aplicaciones, comandos y estados\n  \
                        Meta               abrir o cerrar el launchpad\n  \
                        Alt+Tab            elegir aplicación por icono\n  \
@@ -85,7 +86,7 @@ fn main() -> anyhow::Result<()> {
                        arrastrar al borde encaja: los lados dan mitades y las esquinas cuartos\n\n\
                      Solo en sesión real (TTY):\n  \
                        Ctrl+Alt+F1..F12   cambiar de terminal virtual\n  \
-                       Ctrl+Alt+Retroceso terminar el compositor\n\n\
+                       Meta+Alt+Retroceso terminar el compositor\n\n\
                      Salir del modo pantalla completa: cierra la ventana con la tecla\n\
                      de tu compositor anfitrión, o mata el proceso desde otra TTY."
                 );

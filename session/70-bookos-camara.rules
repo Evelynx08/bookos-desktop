@@ -1,0 +1,10 @@
+# Deja al usuario de la sesión activa leer la tapa de la cámara del Galaxy Book.
+#
+# El driver samsung-galaxybook la publica como un dispositivo de entrada con un
+# solo interruptor (SW_CAMERA_LENS_COVER). libinput no entiende ese interruptor
+# y logind no entrega dos veces el mismo dispositivo, así que el compositor lo
+# abre por su ruta para enseñar el aviso de «Cámara desactivada». Solo este
+# dispositivo: el teclado y el resto siguen yendo por libseat.
+#
+# Antes del 73: ahí es donde systemd convierte `uaccess` en permisos.
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="Samsung Galaxy Book Camera Lens Cover", TAG+="uaccess"

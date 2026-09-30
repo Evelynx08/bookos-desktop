@@ -83,9 +83,9 @@ struct EstadoBarra {
 }
 
 impl EstadoBarra {
-    fn new() -> Self {
+    fn new(modo: Visibilidad) -> Self {
         Self {
-            modo: Visibilidad::Siempre,
+            modo,
             escondida: false,
             pedida: false,
             desde: std::time::Instant::now(),
@@ -238,6 +238,10 @@ pub struct ShellHost {
     /// escritorio aparecía de golpe en el mismo fotograma en que PAM decía que
     /// sí: se entraba sin transición.
     desbloqueo: Option<(Surface, std::time::Instant)>,
+    /// El velo del color de la canción que va detrás del bloqueo, con el color
+    /// con que se pintó. Un degradado vertical en una textura de 1 × `ALTO_VELO`
+    /// que la GPU estira a pantalla completa: ver `Bloqueo::velo_medios`.
+    bloqueo_velo: Option<(Surface, [u8; 4])>,
     /// La barra de modos de la capa de captura, mientras se elige qué capturar.
     /// Su velo no es una superficie: ver [`Self::velo_captura`].
     captura: Option<Surface>,
@@ -259,6 +263,13 @@ pub struct ShellHost {
     barras: std::collections::HashMap<u64, Surface>,
     /// La del conmutador de Alt+Tab, mientras el modificador siga pulsado.
     conmutador: Option<Surface>,
+    /// En el de ventanas, el recuadro de la elegida y el rótulo con su nombre,
+    /// cada uno en su superficie: son lo único que cambia al pasar el cursor, y
+    /// así elegir no repinta la tarjeta entera. Ver `Conmutador::animando`.
+    conmutador_realce: Option<Surface>,
+    conmutador_rotulo: Option<Surface>,
+    /// De dónde venía el recuadro del conmutador y cuándo empezó a deslizarse.
+    conmutador_desde: Option<(Point<f64, Physical>, std::time::Instant)>,
     /// Una superficie por icono del escritorio. Van detrás de las ventanas, así
     /// que se emiten aparte del resto del shell — ver
     /// [`ShellHost::elementos_escritorio`].
@@ -336,10 +347,16 @@ impl ShellHost {
         let logical_width = (width as f32 / scale).round().max(1.0) as u32;
         // Sin configuración se lee del disco, que es lo que hacía siempre: los
         // tests construyen el shell sin pasar nada.
-        let shell = match config {
-            Some(config) => Shell::con_config(logical_width, scale, config),
-            None => Shell::new(logical_width, scale),
+        let config = config.unwrap_or_else(bookos_shell::Config::cargar);
+        let modo = |esquiva| {
+            if esquiva {
+                Visibilidad::Esquivando
+            } else {
+                Visibilidad::Siempre
+            }
         };
+        let (modo_panel, modo_dock) = (modo(config.panel_esquiva), modo(config.dock_esquiva));
+        let shell = Shell::con_config(logical_width, scale, config);
         let mut host = Self {
             panel: Surface::new(shell.panel_buffer_size(), shell.panel_logical_size()),
             dock: Surface::new(shell.dock_buffer_size(), shell.dock_logical_size()),
@@ -357,10 +374,11 @@ impl ShellHost {
             agarrado: None,
             arrastre_dock: None,
             puntero_en: (0.0, 0.0),
-            panel_barra: EstadoBarra::new(),
-            dock_barra: EstadoBarra::new(),
+            panel_barra: EstadoBarra::new(modo_panel),
+            dock_barra: EstadoBarra::new(modo_dock),
             bloqueo: None,
             desbloqueo: None,
+            bloqueo_velo: None,
             captura: None,
             captura_pastilla: None,
             osd: None,
@@ -369,6 +387,9 @@ impl ShellHost {
             actividad: None,
             actividad_visible: true,
             conmutador: None,
+            conmutador_realce: None,
+            conmutador_rotulo: None,
+            conmutador_desde: None,
             barras: std::collections::HashMap::new(),
             escritorio: Vec::new(),
             banda: None,
@@ -515,11 +536,20 @@ impl ShellHost {
         // Una tarjeta abierta nace de la barra y debe conservarla visible para
         // que el usuario sepa de dónde sale. El modo «esquivar ventanas» no
         // puede ocultar una barra mientras cuelga algo de ella.
+        //
+        // Se retiene con `pedida` y no tocando `escondida`: esta sigue diciendo
+        // la verdad sobre la ventana de debajo, y `pedida` se recalcula con el
+        // cursor al cerrar (ver `cerrar_emergente`). Forzando `escondida` la
+        // barra se quedaba a la vista tras cerrar la tarjeta hasta que alguna
+        // ventana se moviera.
         if self.retenida_por_emergente(cual) {
             let barra = self.barra_mut(cual);
-            if barra.modo == Visibilidad::Esquivando && barra.escondida {
+            if barra.modo != Visibilidad::Esquivando {
+                return false;
+            }
+            barra.escondida = hay_ventana;
+            if !barra.pedida {
                 barra.arrancar();
-                barra.escondida = false;
                 barra.pedida = true;
                 return true;
             }
@@ -1082,30 +1112,13 @@ impl ShellHost {
                 FUERZA_PANTALLA,
             )];
         }
-        // La franja de la vista de escritorios es translúcida y se abre sobre
-        // las ventanas: sin cristal, los nombres de los escritorios se
-        // pintaban encima de la barra de herramientas de la ventana de debajo
-        // y se mezclaban con sus botones. El cristal enseña el fondo
-        // desenfocado, no las ventanas. Va **sola**, como la del launchpad: el
-        // backend no pintaba cristal con la vista abierta, y dar aquí también
-        // la del dock podría dejarla flotando sin su dock. Sin radio: la franja
-        // va pegada al borde de arriba de lado a lado.
+        // La franja de la vista de escritorios **no lleva cristal**. Lo tuvo,
+        // y el desenfoque solo cubría la franja: bajo su borde el fondo pasaba
+        // de emborronado a nítido en una línea recta, que se veía como un corte
+        // en el wallpaper. Lo que la separa de las ventanas de debajo es su
+        // propio fondo, más opaco (`Escritorios::fondo`).
         if self.vista_escritorios_abierta() {
-            return self
-                .emergente
-                .as_ref()
-                .map(|s| {
-                    (
-                        Rectangle::new(
-                            (s.location.x.round() as i32, s.location.y.round() as i32).into(),
-                            (s.src.size.w.round() as i32, s.src.size.h.round() as i32).into(),
-                        ),
-                        0.0,
-                        1.0,
-                    )
-                })
-                .into_iter()
-                .collect();
+            return Vec::new();
         }
         // **El panel no lleva cristal.** Lo tuvo, y sobre un fondo con degradado
         // como el de serie el desenfoque no aporta nada: la franja es de 32 px
@@ -1211,6 +1224,14 @@ impl ShellHost {
         if self.shell.hay_emergente() {
             return true;
         }
+        // `dock_rect` es su sitio de siempre y no se mueve al apartarse. La
+        // guardia de arriba solo corta con las **dos** barras escondidas; con el
+        // panel a la vista y el dock fuera, sin esto la franja de abajo seguía
+        // siendo del shell y un clic ahí minimizaba la ventana de un icono que
+        // no se veía.
+        if !self.a_la_vista(Barra::Dock) {
+            return false;
+        }
         let (dx, dy, dw, dh) = self.dock_rect();
         x >= dx && x < dx + dw && y >= dy && y < dy + dh
     }
@@ -1239,8 +1260,9 @@ impl ShellHost {
         // margen antes de entregarle el punto. Sin esto el hover del volumen
         // quedaba desplazado 26 px arriba y a la izquierda.
         let margen_actividad = bookos_shell::actividad::MARGEN_SOMBRA;
+        let x0 = self.shell.actividad_zona().map_or(0.0, |(x0, _)| x0);
         let punto_actividad = Self::dentro(self.actividad_rect(), x, y)
-            .map(|(px, py)| (px + margen_actividad, py + margen_actividad));
+            .map(|(px, py)| (px + margen_actividad + x0, py + margen_actividad));
         let repintar_actividad = self
             .guard("puntero actividad", |host| {
                 host.shell.actividad_puntero(punto_actividad)
@@ -1691,6 +1713,18 @@ impl ShellHost {
         }
         self.shell.cerrar_emergente();
         self.resaltar_panel();
+        // Con la tarjeta abierta `reclamada` no mira el cursor, así que `pedida`
+        // se quedó como estaba al abrirla —el cursor arriba, pulsando el
+        // widget— aunque luego se bajara a pulsar fuera. Sin volver a mirarlo
+        // aquí el panel no se escondía hasta el siguiente movimiento del ratón.
+        let (ancho, alto) = self.area_principal();
+        let escala = self.escala_principal();
+        let (x, y) = self.puntero_en;
+        if x >= 0.0 && y >= 0.0 && x < ancho && y < alto {
+            for cual in [Barra::Panel, Barra::Dock] {
+                self.reclamada(cual, (x * escala, y * escala));
+            }
+        }
         // Las superficies **no** se sueltan aquí: se quedan mientras dura la
         // salida. El realce sí, porque señalar algo que ya se está yendo no
         // significa nada; sin esto, además, se quedaba su recuadro gris
@@ -1730,6 +1764,7 @@ impl ShellHost {
             .is_some_and(|(_, t)| t.elapsed() >= Self::DESBLOQUEO)
         {
             self.desbloqueo = None;
+            self.bloqueo_velo = None;
         }
         if self.emergente.is_none()
             && let Some(nombre) = self.emergente_pendiente.take()
@@ -2085,15 +2120,22 @@ impl ShellHost {
         if let Some((id, clave)) = self.toast_accion(x, y) {
             return Some(Accion::NotificacionAccion { id, clave });
         }
+        // Pulsar el cuerpo lo despide y, si la app ofrece `default`, la
+        // ejecuta: es lo que abre la conversación de un aviso de mensajería.
+        let defecto = self
+            .toast_bajo(x, y)
+            .and_then(|(id, _)| Some((id, self.shell.toast_accion_por_defecto(id)?)));
         if self.toast_pulsado(x, y) {
-            return None;
+            return defecto.map(|(id, clave)| Accion::NotificacionAccion { id, clave });
         }
 
         if let Some((ax, ay)) = Self::dentro(self.actividad_rect(), x, y) {
             let margen = bookos_shell::actividad::MARGEN_SOMBRA;
+            // `dentro` mide desde la zona visible; la isla, desde su buffer.
+            let x0 = self.shell.actividad_zona().map_or(0.0, |(x0, _)| x0);
             let accion = self
                 .guard("pulsar actividad", |host| {
-                    host.shell.actividad_pulsar(ax + margen, ay + margen)
+                    host.shell.actividad_pulsar(ax + margen + x0, ay + margen)
                 })
                 .flatten()
                 .map(Accion::Actividad);
@@ -2180,6 +2222,9 @@ impl ShellHost {
             }
         }
 
+        if !self.a_la_vista(Barra::Dock) {
+            return None;
+        }
         let (ex, ey) = Self::dentro(Some(self.dock_rect()), x, y)?;
         self.guard("pulsar", |host| host.shell.dock_pulsar(ex, ey))
             .flatten()
@@ -2362,8 +2407,7 @@ impl ShellHost {
             self.actividad = Some(Surface::new((w, h), (lw as i32, lh as i32)));
         }
         let escala = self.shell.scale() as f64;
-        let arriba =
-            self.shell.panel_height() as f64 + bookos_shell::actividad::SEPARACION_PANEL as f64;
+        let arriba = bookos_shell::actividad::ARRIBA as f64;
         if let Some(s) = self.actividad.as_mut() {
             s.location = (
                 (self.screen.0 as f64 - w as f64) / 2.0,
@@ -2373,6 +2417,20 @@ impl ShellHost {
             let shell = &mut self.shell;
             paint(&mut s.buffer, |buf| shell.draw_actividad(buf));
         }
+    }
+
+    /// Un clic fuera de la tarjeta abierta la recoge. No se come el clic: el
+    /// usuario pulsaba otra cosa y tiene que llegarle.
+    pub fn recoger_actividad_fuera(&mut self, x: f64, y: f64) -> bool {
+        if self.dead || Self::dentro(self.actividad_rect(), x, y).is_some() {
+            return false;
+        }
+        let recogida =
+            self.guard("recoger actividad", |host| host.shell.recoger_actividad()) == Some(true);
+        if recogida {
+            self.pintar_actividad();
+        }
+        recogida
     }
 
     pub fn animar_actividad(&mut self) {
@@ -2389,10 +2447,13 @@ impl ShellHost {
         let s = self.actividad.as_ref()?;
         let escala = self.shell.scale() as f64;
         let sombra = bookos_shell::actividad::MARGEN_SOMBRA as f64;
+        // Solo lo que se ve: con burbujas, el buffer reserva el mismo ancho a
+        // la izquierda para dejar la píldora centrada, y ese hueco es panel.
+        let (x0, ancho) = self.shell.actividad_zona()?;
         Some((
-            s.location.x / escala + sombra,
+            s.location.x / escala + sombra + x0 as f64,
             s.location.y / escala + sombra,
-            s.logical.w as f64 - sombra * 2.0,
+            ancho as f64,
             s.logical.h as f64 - sombra * 2.0,
         ))
     }
@@ -2582,21 +2643,26 @@ impl ShellHost {
         self.guard("animar toast", |host| host.pintar_toasts());
     }
 
-    /// El aviso bajo el punto y el rectángulo de su **tarjeta** en físicos: el
+    /// El aviso bajo el punto y el rectángulo de su **tarjeta** en lógicos: el
     /// buffer lleva el margen de la sombra, que no se pulsa. Se mira en el
     /// sitio donde está ahora dentro de la pila.
+    ///
+    /// En lógicos, como `actividad_rect` y como el punto que llega de la
+    /// entrada. Estaba en físicos: a escala 1 daba igual, pero a 1,75 o 2 el
+    /// rectángulo caía fuera de la pantalla y ningún clic llegaba nunca a un
+    /// aviso —ni sus botones ni el clic para despedirlo—.
     fn toast_bajo(&self, x: f64, y: f64) -> Option<(u32, (f64, f64, f64, f64))> {
         let escala = self.shell.scale() as f64;
-        let sombra = bookos_shell::toast::MARGEN_SOMBRA as f64 * escala;
+        let sombra = bookos_shell::toast::MARGEN_SOMBRA as f64;
         self.toasts_desplazamientos()
             .into_iter()
             .find_map(|(id, dy)| {
                 let (_, s) = self.toasts.iter().find(|(t, _)| *t == id)?;
                 let rect = (
-                    s.location.x + sombra,
-                    s.location.y + dy as f64 * escala + sombra,
-                    s.logical.w as f64 * escala - sombra * 2.0,
-                    s.logical.h as f64 * escala - sombra * 2.0,
+                    s.location.x / escala + sombra,
+                    s.location.y / escala + dy as f64 + sombra,
+                    s.logical.w as f64 - sombra * 2.0,
+                    s.logical.h as f64 - sombra * 2.0,
                 );
                 Self::dentro(Some(rect), x, y).map(|_| (id, rect))
             })
@@ -2618,14 +2684,11 @@ impl ShellHost {
 
     pub fn toast_accion(&mut self, x: f64, y: f64) -> Option<(u32, String)> {
         let (id, (tx, ty, _, _)) = self.toast_bajo(x, y)?;
-        let escala = self.shell.scale() as f64;
         let clave = self
             .guard("acción del toast", |host| {
-                let clave = host.shell.toast_accion_relativa(
-                    id,
-                    ((x - tx) / escala) as f32,
-                    ((y - ty) / escala) as f32,
-                );
+                let clave = host
+                    .shell
+                    .toast_accion_relativa(id, (x - tx) as f32, (y - ty) as f32);
                 if clave.is_some() {
                     host.shell.descartar_toast(id);
                 }
@@ -2745,6 +2808,19 @@ impl ShellHost {
         let Some((lw, lh)) = self.shell.osd_logical_size() else {
             return;
         };
+        // Con el aviso ya en pantalla y del mismo tamaño se pinta **sobre su
+        // propio buffer**. Crear otro por cada pulsación —mantener la tecla de
+        // brillo son decenas por segundo— tiraba la textura y su identidad en
+        // el compositor cada vez, y el aviso entero se rehacía en vez de
+        // cambiar solo su barra.
+        let tam = (w as f64, h as f64).into();
+        if let Some(surface) = self.osd.as_mut()
+            && surface.src.size == tam
+            && surface.logical == (lw as i32, lh as i32).into()
+        {
+            paint(&mut surface.buffer, |buf| self.shell.draw_osd(buf));
+            return;
+        }
         let mut surface = Surface::new((w, h), (lw as i32, lh as i32));
         // Centrado y por encima del dock: taparlo al subir el volumen es justo
         // lo que molesta del OSD de otros escritorios.
@@ -2860,9 +2936,18 @@ impl ShellHost {
             })
             .unwrap_or(false);
         if abierto {
+            // Otra tarjeta, quizá de otro tamaño: la de antes no vale.
+            self.soltar_conmutador();
             self.pintar_conmutador();
         }
         abierto
+    }
+
+    fn soltar_conmutador(&mut self) {
+        self.conmutador = None;
+        self.conmutador_realce = None;
+        self.conmutador_rotulo = None;
+        self.conmutador_desde = None;
     }
 
     pub fn conmutador_mover(&mut self, pasos: i32) {
@@ -2974,7 +3059,7 @@ impl ShellHost {
         let elegida = self
             .guard("cerrar conmutador", |host| host.shell.cerrar_conmutador())
             .flatten();
-        self.conmutador = None;
+        self.soltar_conmutador();
         elegida
     }
 
@@ -2984,7 +3069,7 @@ impl ShellHost {
                 host.shell.cancelar_conmutador()
             })
             .unwrap_or(false);
-        self.conmutador = None;
+        self.soltar_conmutador();
         habia
     }
 
@@ -2995,9 +3080,15 @@ impl ShellHost {
     /// nuevo cuesta dos restas.
     fn pintar_conmutador(&mut self) {
         let Some((w, h)) = self.shell.conmutador_buffer_size() else {
-            self.conmutador = None;
+            self.soltar_conmutador();
             return;
         };
+        // El de ventanas pinta la tarjeta una sola vez: lo que cambia al elegir
+        // va en el recuadro y el rótulo.
+        if self.shell.conmutador_realce().is_some() && self.conmutador.is_some() {
+            self.sincronizar_conmutador();
+            return;
+        }
         let Some((lw, lh)) = self.shell.conmutador_logical_size() else {
             return;
         };
@@ -3011,6 +3102,127 @@ impl ShellHost {
             .into();
         paint(&mut surface.buffer, |buf| self.shell.draw_conmutador(buf));
         self.conmutador = Some(surface);
+        self.sincronizar_conmutador();
+    }
+
+    /// Coloca el recuadro de la elegida y repinta su rótulo.
+    ///
+    /// El recuadro se pinta una vez y luego solo se mueve —y se desliza, como
+    /// el realce del launchpad—. El rótulo sí se repinta, pero mide un renglón.
+    fn sincronizar_conmutador(&mut self) {
+        let (Some(celda), Some(renglon)) = (
+            self.shell.conmutador_realce(),
+            self.shell.conmutador_rotulo(),
+        ) else {
+            return;
+        };
+        let Some(origen) = self.conmutador.as_ref().map(|s| s.location) else {
+            return;
+        };
+        let escala = self.shell.scale();
+        // Cuadrados al píxel entero con la misma función que `Canvas::new`: con
+        // `(w * escala).round()` el buffer no mide lo que espera el shell a
+        // escala fraccionaria y el pintado se niega. Ver `sincronizar_realce`.
+        let medida = |w: f32, h: f32| {
+            let logico = (
+                bookos_shell::a_pixel_entero(w, escala),
+                bookos_shell::a_pixel_entero(h, escala),
+            );
+            let fisico = (
+                (logico.0 * escala).round().max(1.0) as u32,
+                (logico.1 * escala).round().max(1.0) as u32,
+            );
+            (logico, fisico)
+        };
+        let colocar = |x: f32, y: f32| {
+            Point::<f64, Physical>::from((
+                origen.x + (x * escala) as f64,
+                origen.y + (y * escala) as f64,
+            ))
+        };
+
+        let destino = colocar(celda.x, celda.y);
+        match self.conmutador_realce.as_ref().map(|s| s.location) {
+            Some(antes) => {
+                if antes != destino {
+                    // Desde donde va **ahora**, no desde su destino anterior:
+                    // cruzar tres celdas seguidas no puede dar saltos.
+                    self.conmutador_desde =
+                        Some((self.conmutador_location(antes), std::time::Instant::now()));
+                    if let Some(surface) = self.conmutador_realce.as_mut() {
+                        surface.location = destino;
+                    }
+                }
+            }
+            None => {
+                let (logico, fisico) = medida(celda.width, celda.height);
+                let mut surface = Surface::new(fisico, (logico.0 as i32, logico.1 as i32));
+                surface.location = destino;
+                self.guard("pintar recuadro del conmutador", |host| {
+                    paint(&mut surface.buffer, |buf| {
+                        host.shell.draw_conmutador_realce(buf, logico.0, logico.1);
+                        Vec::new()
+                    });
+                });
+                self.conmutador_realce = Some(surface);
+            }
+        }
+
+        let (logico, fisico) = medida(renglon.width, renglon.height);
+        let mut surface = Surface::new(fisico, (logico.0 as i32, logico.1 as i32));
+        surface.location = colocar(renglon.x, renglon.y);
+        self.guard("pintar rótulo del conmutador", |host| {
+            paint(&mut surface.buffer, |buf| {
+                host.shell.draw_conmutador_rotulo(buf, logico.0, logico.1);
+                Vec::new()
+            });
+        });
+        self.conmutador_rotulo = Some(surface);
+    }
+
+    /// Dónde está el recuadro del conmutador **ahora**, contando el deslizamiento.
+    /// Misma curva y duración que el realce del launchpad: es un hover.
+    fn conmutador_location(&self, destino: Point<f64, Physical>) -> Point<f64, Physical> {
+        let Some((desde, t0)) = self.conmutador_desde else {
+            return destino;
+        };
+        use bookos_shell::tema;
+        let s = tema::C_SUAVE.eval(tema::fraccion(t0.elapsed(), Self::DESLIZ)) as f64;
+        (
+            desde.x + (destino.x - desde.x) * s,
+            desde.y + (destino.y - desde.y) * s,
+        )
+            .into()
+    }
+
+    /// El recuadro y el rótulo del conmutador de ventanas, para componerlos
+    /// entre las miniaturas y la tarjeta.
+    pub fn conmutador_extras<R>(&self, renderer: &mut R) -> Vec<MemoryRenderBufferRenderElement<R>>
+    where
+        R: Renderer + ImportMem,
+        R::TextureId: Send + Clone + 'static,
+    {
+        [
+            self.conmutador_rotulo.as_ref().map(|s| (s, s.location)),
+            self.conmutador_realce
+                .as_ref()
+                .map(|s| (s, self.conmutador_location(s.location))),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|(surface, location)| {
+            MemoryRenderBufferRenderElement::from_buffer(
+                renderer,
+                location,
+                &surface.buffer,
+                Some(1.0),
+                Some(surface.src),
+                Some(surface.logical),
+                Kind::Unspecified,
+            )
+            .ok()
+        })
+        .collect()
     }
 
     /// Echa el bloqueo y prepara su superficie, del tamaño de la pantalla.
@@ -3120,6 +3332,13 @@ impl ShellHost {
         self.repintar_captura();
     }
 
+    pub fn captura_forma(&self, x: f64, y: f64) -> Option<bookos_shell::captura::Forma> {
+        if self.dead {
+            return None;
+        }
+        self.shell.captura_forma(x as f32, y as f32)
+    }
+
     pub fn captura_pulsar(&mut self, x: f64, y: f64) -> Option<bookos_shell::Accion> {
         if !self.hay_captura() {
             return None;
@@ -3170,6 +3389,9 @@ impl ShellHost {
     /// habiendo algo que animar, que es lo que impide que el bucle se duerma a
     /// mitad de la transición.
     pub fn animar_bloqueo(&mut self) -> bool {
+        // Antes de mirar si anima: la música llega al bloqueo después de
+        // echarlo, y el velo tiene que salir aunque no haya nada moviéndose.
+        self.sincronizar_velo_bloqueo();
         if self.dead || !self.shell.bloqueo_animando() {
             return false;
         }
@@ -3181,6 +3403,50 @@ impl ShellHost {
             paint(buffer, |buf| host.shell.draw_bloqueo(buf));
         });
         true
+    }
+
+    /// Pone al día el velo de la canción. Solo repinta cuando cambia su color,
+    /// o sea durante su entrada: escribir la contraseña no lo toca.
+    fn sincronizar_velo_bloqueo(&mut self) {
+        // Tras desbloquear se deja como está: se desvanece con el bloqueo.
+        if self.dead || self.bloqueo.is_none() {
+            return;
+        }
+        let Some(color) = self.shell.bloqueo_velo() else {
+            self.bloqueo_velo = None;
+            return;
+        };
+        let clave = [color.r, color.g, color.b, color.a].map(|v| (v * 255.0).round() as u8);
+        if self.bloqueo_velo.as_ref().is_some_and(|(_, c)| *c == clave) {
+            return;
+        }
+        // Cien filas bastan: la GPU interpola entre ellas, y un degradado
+        // lineal interpolado linealmente sale igual que pintado a 1800 filas.
+        const ALTO_VELO: u32 = 100;
+        let escala = self.shell.scale();
+        let logico = (
+            (self.screen.0 as f32 / escala).ceil() as i32,
+            (self.screen.1 as f32 / escala).ceil() as i32,
+        );
+        let mut surface = Surface::new((1, ALTO_VELO), logico);
+        paint(&mut surface.buffer, |buf| {
+            for (y, px) in buf.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                // Del alfa de arriba a cero al 60 % del alto, como el
+                // degradado que pintaba el bloqueo.
+                let t = (y as f32 + 0.5) / ALTO_VELO as f32;
+                let a = color.a * (1.0 - t / 0.6).max(0.0);
+                // Premultiplicado y en B, G, R, A: ver `Surface::new`.
+                let byte = |v: f32| (v * a * 255.0).round() as u8;
+                px.copy_from_slice(&[byte(color.b), byte(color.g), byte(color.r), byte(1.0)]);
+            }
+            vec![bookos_shell::Damage {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: ALTO_VELO as i32,
+            }]
+        });
+        self.bloqueo_velo = Some((surface, clave));
     }
 
     /// Un clic sobre el bloqueo, en coordenadas lógicas de la pantalla.
@@ -3302,6 +3568,11 @@ impl ShellHost {
             .take()
             .filter(|_| !bookos_shell::tema::efectos_reducidos())
             .map(|s| (s, std::time::Instant::now()));
+        // Sin desvanecido el velo se va con el bloqueo; con él, se desvanece
+        // a la vez y lo suelta el final de la animación.
+        if self.desbloqueo.is_none() {
+            self.bloqueo_velo = None;
+        }
     }
 
     /// Lo que dura la salida del bloqueo: la de una página, que es lo que es
@@ -3678,6 +3949,9 @@ impl ShellHost {
                 .realce_desde
                 .is_some_and(|(_, t)| t.elapsed() < Self::DESLIZ)
             || self
+                .conmutador_desde
+                .is_some_and(|(_, t)| t.elapsed() < Self::DESLIZ)
+            || self
                 .desbloqueo
                 .as_ref()
                 .is_some_and(|(_, t)| t.elapsed() < Self::DESBLOQUEO)
@@ -3911,6 +4185,18 @@ impl ShellHost {
                 (s, Papel::Desbloqueo(t))
             })
             .chain(self.bloqueo.iter().map(|s| (s, Papel::Barra(Barra::Panel))))
+            // El velo de la canción, detrás del bloqueo y con su mismo papel:
+            // fijo mientras está echado y desvaneciéndose con él al quitarlo.
+            .chain(self.bloqueo_velo.iter().map(|(s, _)| {
+                let papel = match &self.desbloqueo {
+                    Some((_, t0)) => Papel::Desbloqueo(
+                        bookos_shell::tema::C_SUAVE
+                            .eval(bookos_shell::tema::fraccion(t0.elapsed(), Self::DESBLOQUEO)),
+                    ),
+                    None => Papel::Barra(Barra::Panel),
+                };
+                (s, papel)
+            }))
             // La capa de captura no va en esta lista: su velo es de color
             // sólido y tiene que quedar entre ella y todo lo de aquí, así que
             // la pone la escena con `captura_elements` y `velo_captura`.
@@ -4328,6 +4614,50 @@ mod tests {
         assert_eq!(host.visibilidad(Barra::Dock), Visibilidad::Esquivando);
         assert!(host.dock_barra.escondida, "el dock no inició su ocultación");
         assert_eq!(host.reserva(Barra::Dock), 0.0, "esquivando no reserva");
+    }
+
+    /// Con el dock apartado su franja no es de nadie: el clic tiene que llegar
+    /// a la ventana de debajo, no a un icono que no se ve.
+    #[test]
+    fn el_dock_escondido_no_recibe_clics() {
+        let mut host = ShellHost::new(1280, 800, 1.0, Some(bookos_shell::Config::default()));
+        let (dx, dy, dw, dh) = host.dock_rect();
+        let (x, y) = (dx + dw / 2.0, dy + dh / 2.0);
+        assert!(host.contiene(x, y), "a la vista, el dock es del shell");
+
+        // Escondido del todo, sin esperar a la animación.
+        host.dock_barra.escondida = true;
+        host.dock_barra.desde_fraccion = 1.0;
+        assert!(!host.a_la_vista(Barra::Dock));
+        assert!(host.a_la_vista(Barra::Panel), "el caso del fallo: panel sí, dock no");
+        assert!(!host.contiene(x, y), "la franja del dock fantasma se tragaba el clic");
+        assert_eq!(host.pulsar(x, y), None);
+    }
+
+    /// Cerrar una tarjeta pulsando fuera devuelve el panel a su sitio sin
+    /// esperar a que se mueva el ratón: se abrió con el cursor arriba, pero
+    /// para pulsar fuera se bajó, y eso es lo que manda al cerrar.
+    #[test]
+    fn cerrar_la_tarjeta_esconde_el_panel_sin_mover_el_raton() {
+        let mut host = ShellHost::new(1280, 800, 1.0, Some(bookos_shell::Config::default()));
+        host.alternar_visibilidad(Barra::Panel);
+        assert_eq!(host.visibilidad(Barra::Panel), Visibilidad::Esquivando);
+        host.estorbada(Barra::Panel, true);
+
+        // El cursor arriba para pulsar el widget: el panel vuelve.
+        host.puntero(640.0, 2.0);
+        host.reclamada(Barra::Panel, (640.0, 2.0));
+        host.abrir_acerca();
+        assert_eq!(host.panel_barra.destino(), 0.0);
+
+        // Se baja a pulsar fuera, con la ventana aún debajo.
+        host.puntero(640.0, 400.0);
+        host.reclamada(Barra::Panel, (640.0, 400.0));
+        host.estorbada(Barra::Panel, true);
+        assert_eq!(host.panel_barra.destino(), 0.0, "abierta, la retiene");
+
+        host.cerrar_emergente();
+        assert_eq!(host.panel_barra.destino(), 1.0, "cerrada, se aparta");
     }
 
     #[test]

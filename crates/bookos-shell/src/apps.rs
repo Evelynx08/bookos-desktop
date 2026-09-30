@@ -133,6 +133,22 @@ fn startup_wm_class(texto: &str) -> Option<&str> {
 }
 
 pub(crate) fn leer_una(ruta: &std::path::Path) -> Option<App> {
+    leer_entrada(ruta).and_then(|(app, sin_menu)| (!sin_menu).then_some(app))
+}
+
+/// Un lanzador puesto a mano en el escritorio, aunque diga `NoDisplay=true`.
+///
+/// `NoDisplay` solo significa «no lo enseñes en los menús», y hay lanzadores
+/// que lo llevan justo para que únicamente se vean donde alguien los coloca:
+/// el `liveinst.desktop` de Anaconda es uno. Descartarlo aquí hacía que el
+/// escritorio cayera a `xdg-open`, y el lanzador se abría en el bloc de notas
+/// como texto (`application/x-desktop` hereda de `text/plain`).
+pub(crate) fn leer_lanzador(ruta: &std::path::Path) -> Option<App> {
+    leer_entrada(ruta).map(|(app, _)| app)
+}
+
+/// La aplicación y si pide quedarse fuera de los menús (`NoDisplay`).
+fn leer_entrada(ruta: &std::path::Path) -> Option<(App, bool)> {
     let texto = std::fs::read_to_string(ruta).ok()?;
 
     let mut nombre = None;
@@ -140,6 +156,7 @@ pub(crate) fn leer_una(ruta: &std::path::Path) -> Option<App> {
     let mut exec = None;
     let mut icono = None;
     let mut oculta = false;
+    let mut sin_menu = false;
     let mut es_app = false;
     let mut en_entrada = false;
 
@@ -166,7 +183,10 @@ pub(crate) fn leer_una(ruta: &std::path::Path) -> Option<App> {
             "Name[es]" => nombre_es = Some(valor.trim().to_string()),
             "Exec" => exec = Some(limpiar_exec(valor.trim())),
             "Icon" => icono = Some(valor.trim().to_string()),
-            "NoDisplay" | "Hidden" => oculta |= valor.trim() == "true",
+            // `Hidden` es «esta entrada está borrada»; `NoDisplay`, solo «no
+            // en los menús».
+            "Hidden" => oculta = valor.trim() == "true",
+            "NoDisplay" => sin_menu = valor.trim() == "true",
             "Type" => es_app = valor.trim() == "Application",
             _ => {}
         }
@@ -182,12 +202,15 @@ pub(crate) fn leer_una(ruta: &std::path::Path) -> Option<App> {
     }?;
     let exec = exec.filter(|e| !e.is_empty())?;
     let normalizado = normalizar(&nombre);
-    Some(App {
-        icono: icono.unwrap_or_else(|| nombre.clone()),
-        nombre,
-        exec,
-        normalizado,
-    })
+    Some((
+        App {
+            icono: icono.unwrap_or_else(|| nombre.clone()),
+            nombre,
+            exec,
+            normalizado,
+        },
+        sin_menu,
+    ))
 }
 
 /// Quita los códigos de campo de la especificación.
@@ -324,6 +347,26 @@ mod tests {
         let camara = app("Cámara");
         assert_eq!(puntuar(&camara, "camara"), Some(0));
         assert_eq!(puntuar(&camara, "cam"), Some(1));
+    }
+
+    /// El lanzador del instalador lleva `NoDisplay=true`: fuera del launchpad,
+    /// pero en el escritorio tiene que ejecutarse y no abrirse como texto.
+    #[test]
+    fn no_display_sale_del_menu_pero_se_lanza_desde_el_escritorio() {
+        let ruta = std::env::temp_dir().join(format!(
+            "bookos-test-liveinst-{}.desktop",
+            std::process::id()
+        ));
+        std::fs::write(
+            &ruta,
+            "[Desktop Entry]\nName=Install to Hard Drive\nExec=liveinst\nType=Application\nNoDisplay=true\n",
+        )
+        .expect("escribir el .desktop de prueba");
+        let en_menu = leer_una(&ruta);
+        let lanzador = leer_lanzador(&ruta).map(|app| app.exec);
+        let _ = std::fs::remove_file(&ruta);
+        assert!(en_menu.is_none());
+        assert_eq!(lanzador.as_deref(), Some("liveinst"));
     }
 
     #[test]

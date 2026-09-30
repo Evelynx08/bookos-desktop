@@ -30,6 +30,15 @@ export XDG_SESSION_TYPE=wayland
 export QT_QPA_PLATFORM=wayland
 export GDK_BACKEND=wayland,x11
 export MOZ_ENABLE_WAYLAND=1
+# Electron (ChatGPT, VS Code, Discord…) usa X11 por defecto y XWayland no
+# escala: se veía borroso. Desde Electron 28 esta pista lo manda a Wayland; las
+# versiones viejas la ignoran y siguen por XWayland.
+export ELECTRON_OZONE_PLATFORM_HINT=wayland
+# LibreOffice no reconoce XDG_CURRENT_DESKTOP=BookOS y cae a gtk3, que en
+# Wayland pinta con cairo en la CPU y va a tirones al hacer scroll. Con x11
+# iba fluido pero borroso (XWayland no escala); kf6 es Wayland nativo y fue el
+# único nítido y fluido a la vez al probarlos.
+export SAL_USE_VCLPLUGIN=kf6
 
 # Cursores. Sin XCURSOR_THEME el compositor cae a "BookOS-Dark", que es un tema
 # de ICONOS: bookos-icons instala apps y lugares, no cursores, así que salía la
@@ -115,7 +124,7 @@ registro="${XDG_RUNTIME_DIR:-/tmp}/bookos-session.log"
 # OnlyShowIn/NotShowIn contra el nombre de esta sesión, y TryExec. De Exec se
 # quitan los códigos %f %u %U… , que solo tienen sentido al abrir ficheros.
 lanzar_autostart() {
-    local vistos=" " entrada nombre valor orden
+    local vistos=" " entrada nombre valor orden rc grupo clave defecto
     for dir in "${XDG_CONFIG_HOME:-$HOME/.config}/autostart" /etc/xdg/autostart; do
         [ -d "$dir" ] || continue
         for entrada in "$dir"/*.desktop; do
@@ -125,6 +134,20 @@ lanzar_autostart() {
             case "$vistos" in *" $nombre "*) continue ;; esac
             vistos="$vistos$nombre "
             [ "$(sed -n 's/^Hidden=//p' "$entrada" | head -n1)" = true ] && continue
+            # Así es como se desactiva una entrada del sistema sin tocarla:
+            # sealertauto trae `false` y, sin esto, seapplet arrancaba igual.
+            [ "$(sed -n 's/^X-GNOME-Autostart-enabled=//p' "$entrada" | head -n1)" = false ] && continue
+            # `rc:grupo:clave:por_defecto`, lo que mira Plasma. Es la única vía
+            # de apagar kalendarac (que levanta akonadi, ~1,2 GB medidos) o
+            # baloo desde sus ajustes. Sin kreadconfig6 manda el por defecto.
+            valor=$(sed -n 's/^X-KDE-autostart-condition=//p' "$entrada" | head -n1)
+            if [ -n "$valor" ]; then
+                IFS=: read -r rc grupo clave defecto <<<"$valor"
+                if command -v kreadconfig6 >/dev/null 2>&1; then
+                    defecto=$(kreadconfig6 --file "$rc" --group "$grupo" --key "$clave" --default "$defecto")
+                fi
+                [ "$defecto" = false ] && continue
+            fi
             valor=$(sed -n 's/^OnlyShowIn=//p' "$entrada" | head -n1)
             if [ -n "$valor" ]; then
                 case ";$valor" in *";BookOS;"*) ;; *) continue ;; esac
@@ -194,12 +217,12 @@ while true; do
         if command -v dbus-update-activation-environment >/dev/null 2>&1; then
             dbus-update-activation-environment --systemd \
                 WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP \
-                XDG_SESSION_TYPE QT_QPA_PLATFORM GDK_BACKEND MOZ_ENABLE_WAYLAND \
+                XDG_SESSION_TYPE QT_QPA_PLATFORM GDK_BACKEND MOZ_ENABLE_WAYLAND ELECTRON_OZONE_PLATFORM_HINT SAL_USE_VCLPLUGIN \
                 XCURSOR_THEME XCURSOR_SIZE >/dev/null 2>&1 || true
         else
             systemctl --user import-environment \
                 WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP \
-                XDG_SESSION_TYPE QT_QPA_PLATFORM GDK_BACKEND MOZ_ENABLE_WAYLAND \
+                XDG_SESSION_TYPE QT_QPA_PLATFORM GDK_BACKEND MOZ_ENABLE_WAYLAND ELECTRON_OZONE_PLATFORM_HINT SAL_USE_VCLPLUGIN \
                 XCURSOR_THEME XCURSOR_SIZE >/dev/null 2>&1 || true
         fi
         # Y ahora sí se declara la sesión gráfica, **después** de meter el

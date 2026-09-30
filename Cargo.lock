@@ -369,6 +369,7 @@ dependencies = [
 name = "bookos-shell"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bookos-system",
  "iced_core",
  "iced_graphics",

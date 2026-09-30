@@ -10,9 +10,9 @@
 //! terminan en el mismo sitio, [`set_pointer`].
 
 use smithay::backend::input::{
-    AbsolutePositionEvent, Axis, ButtonState, Event, GestureBeginEvent, GesturePinchUpdateEvent,
-    GestureSwipeUpdateEvent, InputBackend, InputEvent, KeyState, KeyboardKeyEvent,
-    PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
+    AbsolutePositionEvent, Axis, ButtonState, Event, GestureBeginEvent, GestureEndEvent,
+    GesturePinchUpdateEvent, GestureSwipeUpdateEvent, InputBackend, InputEvent, KeyState,
+    KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
 };
 use smithay::input::keyboard::{FilterResult, Keycode, keysyms};
 use smithay::input::pointer::RelativeMotionEvent;
@@ -63,6 +63,12 @@ pub fn tecla(state: &mut BookosComp, codigo: Keycode, estado: KeyState, time: u3
     };
     let serial = SERIAL_COUNTER.next_serial();
     let pulsada = estado == KeyState::Pressed;
+    // Cualquier tecla, pulsada o suelta, corta la repetición: si sigue
+    // Retroceso mantenido, la pulsación siguiente la vuelve a armar.
+    if let Some(token) = state.repeticion_retroceso.take() {
+        state.loop_handle.remove(token);
+    }
+    let mut repetir = false;
     // Hay un menú abierto que aún no tiene el teclado: se le da ahora, antes
     // de que la tecla salga hacia el cliente. El grab de popups ignora los
     // cambios de foco mientras está puesto, así que se quita y se vuelve a
@@ -96,9 +102,11 @@ pub fn tecla(state: &mut BookosComp, codigo: Keycode, estado: KeyState, time: u3
                 if !pulsada {
                     return FilterResult::Intercept(None);
                 }
-                let accion = traducir_tecla(&handle)
+                let accion = traducir_tecla(&handle, modifiers.ctrl)
                     .and_then(|t| state.shell.as_mut().map(|s| s.captura_tecla(t)))
                     .and_then(|(_, accion)| accion);
+                // Escape cierra la capa aquí mismo.
+                cursor_de_captura(state);
                 state.needs_redraw = true;
                 // Consumida o no, la tecla se queda aquí: mientras
                 // encuadras, el escritorio no responde a nada más.
@@ -247,7 +255,8 @@ pub fn tecla(state: &mut BookosComp, codigo: Keycode, estado: KeyState, time: u3
             // recorrerlo con las flechas sin que el cliente con foco
             // llegue a verlas. `Intercept(None)` es "consumida, pero no
             // es un atajo del compositor".
-            if let Some(tecla) = traducir_tecla(&handle) {
+            if let Some(tecla) = traducir_tecla(&handle, modifiers.ctrl) {
+                let es_retroceso = matches!(tecla, TeclaPulsada::Retroceso);
                 let (consumida, accion) = state
                     .shell
                     .as_mut()
@@ -255,6 +264,7 @@ pub fn tecla(state: &mut BookosComp, codigo: Keycode, estado: KeyState, time: u3
                     .unwrap_or((false, None));
                 if consumida {
                     state.needs_redraw = true;
+                    repetir = es_retroceso;
                     // La acción no se ejecuta aquí: seguimos dentro del
                     // filtro de `kbd.input`, con el estado prestado.
                     return FilterResult::Intercept(accion.map(crate::keybinds::Accion::DelShell));
@@ -265,6 +275,9 @@ pub fn tecla(state: &mut BookosComp, codigo: Keycode, estado: KeyState, time: u3
     );
     if let Some(Some(accion)) = accion {
         crate::keybinds::ejecutar(state, accion);
+    }
+    if repetir {
+        repetir_retroceso(state);
     }
     // El orden importa y es este: la suelta de Alt ya ha salido hacia el
     // cliente **antiguo** —que es quien vio la pulsación y la espera— y
@@ -282,6 +295,36 @@ pub fn tecla(state: &mut BookosComp, codigo: Keycode, estado: KeyState, time: u3
             shell.bloqueo_caps_lock(caps_lock);
         }
         state.needs_redraw = true;
+    }
+}
+
+/// Repite Retroceso mientras se mantiene, con el ritmo del teclado del seat.
+///
+/// Las repeticiones las genera el **cliente** a partir de la pulsación que
+/// recibe; una tecla que el filtro consume para el shell no le llega a nadie,
+/// así que en el launchpad mantener Retroceso borraba un solo carácter.
+fn repetir_retroceso(state: &mut BookosComp) {
+    use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+    // Mismos valores que `add_keyboard` en state.rs: 600 ms y 25/s.
+    const ESPERA: std::time::Duration = std::time::Duration::from_millis(600);
+    const CADA: std::time::Duration = std::time::Duration::from_millis(40);
+    let token = state
+        .loop_handle
+        .insert_source(Timer::from_duration(ESPERA), |_, _, state| {
+            let seguir = state
+                .shell
+                .as_mut()
+                .is_some_and(|s| s.tecla(TeclaPulsada::Retroceso).0);
+            if !seguir {
+                state.repeticion_retroceso = None;
+                return TimeoutAction::Drop;
+            }
+            state.needs_redraw = true;
+            TimeoutAction::ToDuration(CADA)
+        });
+    match token {
+        Ok(token) => state.repeticion_retroceso = Some(token),
+        Err(err) => tracing::warn!("sin repetición de Retroceso: {err}"),
     }
 }
 
@@ -470,19 +513,7 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
                     // sostener: se abre y se queda, y se cierra al elegir una
                     // miniatura, con Esc o con el gesto contrario. El `0` es que
                     // no mueva la selección al abrir —no hay Tab que aplicar—.
-                    Gesto::Exponer => {
-                        if !state.shell.as_ref().is_some_and(|s| s.hay_conmutador()) {
-                            crate::keybinds::ejecutar(
-                                state,
-                                crate::keybinds::Accion::Conmutar(
-                                    bookos_shell::conmutador::Modo::Ventanas,
-                                    0,
-                                ),
-                            );
-                            state.conmutador_pegado =
-                                state.shell.as_ref().is_some_and(|s| s.hay_conmutador());
-                        }
-                    }
+                    Gesto::Exponer => exponer(state),
                     Gesto::CerrarExposicion => {
                         if state.shell.as_ref().is_some_and(|s| s.hay_conmutador()) {
                             crate::keybinds::ejecutar(
@@ -501,6 +532,30 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
 
         InputEvent::GesturePinchBegin { event } => {
             state.gestos.pellizco_inicio(event.fingers());
+            if state.gestos.pellizco_de_la_ventana() {
+                let pointer = state.pointer.clone();
+                pointer.gesture_pinch_begin(
+                    state,
+                    &smithay::input::pointer::GesturePinchBeginEvent {
+                        serial: SERIAL_COUNTER.next_serial(),
+                        time: event.time_msec(),
+                        fingers: event.fingers(),
+                    },
+                );
+            }
+        }
+
+        InputEvent::GesturePinchUpdate { event } if state.gestos.pellizco_de_la_ventana() => {
+            let pointer = state.pointer.clone();
+            pointer.gesture_pinch_update(
+                state,
+                &smithay::input::pointer::GesturePinchUpdateEvent {
+                    time: event.time_msec(),
+                    delta: (event.delta_x(), event.delta_y()).into(),
+                    scale: event.scale(),
+                    rotation: event.rotation(),
+                },
+            );
         }
 
         InputEvent::GesturePinchUpdate { event } => {
@@ -520,7 +575,46 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
             }
         }
 
-        InputEvent::GesturePinchEnd { .. } => state.gestos.pellizco_fin(),
+        InputEvent::GesturePinchEnd { event } => {
+            if state.gestos.pellizco_de_la_ventana() {
+                let pointer = state.pointer.clone();
+                pointer.gesture_pinch_end(
+                    state,
+                    &smithay::input::pointer::GesturePinchEndEvent {
+                        serial: SERIAL_COUNTER.next_serial(),
+                        time: event.time_msec(),
+                        cancelled: event.cancelled(),
+                    },
+                );
+            }
+            state.gestos.pellizco_fin();
+        }
+
+        // «Mantener» —dedos quietos sobre el touchpad— no es de nadie del
+        // escritorio. Los navegadores lo usan para frenar el scroll con inercia.
+        InputEvent::GestureHoldBegin { event } => {
+            let pointer = state.pointer.clone();
+            pointer.gesture_hold_begin(
+                state,
+                &smithay::input::pointer::GestureHoldBeginEvent {
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time: event.time_msec(),
+                    fingers: event.fingers(),
+                },
+            );
+        }
+
+        InputEvent::GestureHoldEnd { event } => {
+            let pointer = state.pointer.clone();
+            pointer.gesture_hold_end(
+                state,
+                &smithay::input::pointer::GestureHoldEndEvent {
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time: event.time_msec(),
+                    cancelled: event.cancelled(),
+                },
+            );
+        }
 
         _ => {}
     }
@@ -531,7 +625,10 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
 /// El shell no conoce xkb a propósito: su enum es una docena de variantes sin
 /// ninguna dependencia, así que la frontera aguanta aunque debajo cambie la
 /// capa de teclado.
-fn traducir_tecla(handle: &smithay::input::keyboard::KeysymHandle<'_>) -> Option<TeclaPulsada> {
+fn traducir_tecla(
+    handle: &smithay::input::keyboard::KeysymHandle<'_>,
+    ctrl: bool,
+) -> Option<TeclaPulsada> {
     use smithay::input::keyboard::keysyms;
     let sym = handle.modified_sym();
     let tecla = match sym.raw() {
@@ -546,6 +643,7 @@ fn traducir_tecla(handle: &smithay::input::keyboard::KeysymHandle<'_>) -> Option
         keysyms::KEY_Prior | keysyms::KEY_KP_Prior => TeclaPulsada::PaginaArriba,
         keysyms::KEY_Next | keysyms::KEY_KP_Next => TeclaPulsada::PaginaAbajo,
         keysyms::KEY_Tab | keysyms::KEY_ISO_Left_Tab => TeclaPulsada::Tabulador,
+        keysyms::KEY_BackSpace if ctrl => TeclaPulsada::BorrarTodo,
         keysyms::KEY_BackSpace => TeclaPulsada::Retroceso,
         // Lo demás solo interesa si escribe algo: es lo que alimentará la
         // búsqueda del launchpad. Los controles se descartan para que un
@@ -587,6 +685,7 @@ pub fn boton(state: &mut BookosComp, button: u32, pulsado: ButtonState, time: u3
         if let Some(accion) = accion {
             crate::keybinds::hacer(state, accion);
         }
+        cursor_de_captura(state);
         state.needs_redraw = true;
         return;
     }
@@ -723,6 +822,14 @@ pub fn boton(state: &mut BookosComp, button: u32, pulsado: ButtonState, time: u3
     {
         state.needs_redraw = true;
         return;
+    }
+    if pulsado == ButtonState::Pressed
+        && state
+            .shell
+            .as_mut()
+            .is_some_and(|s| s.recoger_actividad_fuera(punto.x, punto.y))
+    {
+        state.needs_redraw = true;
     }
     if state
         .shell
@@ -944,6 +1051,7 @@ pub fn set_pointer(state: &mut BookosComp, destino: Point<f64, Logical>, time: u
         if let Some(shell) = state.shell.as_mut() {
             shell.captura_puntero(location.x, location.y);
         }
+        cursor_de_captura(state);
         state.needs_redraw = true;
         return;
     }
@@ -1377,6 +1485,45 @@ fn logical_size(state: &BookosComp) -> (i32, i32) {
             )
         })
         .unwrap_or((1, 1))
+}
+
+/// Pone el cursor que toca sobre la capa de captura, o la flecha si ya no está.
+///
+/// Lo pone el compositor y no un cliente porque la capa es suya, y mientras
+/// está abierta nadie tiene el foco del puntero. Al cerrarla hay que devolver
+/// la flecha a mano: sobre el escritorio vacío ningún cliente va a pedir otro
+/// cursor y se quedaría la cruz.
+pub fn cursor_de_captura(state: &mut BookosComp) {
+    use bookos_shell::captura::Forma;
+    use smithay::input::pointer::{CursorIcon, CursorImageStatus};
+    let (x, y) = (state.pointer_location.x, state.pointer_location.y);
+    let forma = state.shell.as_ref().and_then(|s| s.captura_forma(x, y));
+    state.cursor_status = match forma {
+        None => CursorImageStatus::default_named(),
+        Some(forma) => CursorImageStatus::Named(match forma {
+            Forma::Cruz => CursorIcon::Crosshair,
+            Forma::Mover => CursorIcon::Move,
+            Forma::Horizontal => CursorIcon::EwResize,
+            Forma::Vertical => CursorIcon::NsResize,
+            Forma::DiagonalBajando => CursorIcon::NwseResize,
+            Forma::DiagonalSubiendo => CursorIcon::NeswResize,
+            Forma::Flecha => CursorIcon::Default,
+        }),
+    };
+}
+
+/// Tres dedos hacia arriba: el conmutador de ventanas, abierto hasta elegir.
+/// Aparte porque el guion de los autotests la llama igual: en el anidado no
+/// llegan gestos.
+pub fn exponer(state: &mut BookosComp) {
+    if state.shell.as_ref().is_some_and(|s| s.hay_conmutador()) {
+        return;
+    }
+    crate::keybinds::ejecutar(
+        state,
+        crate::keybinds::Accion::Conmutar(bookos_shell::conmutador::Modo::Ventanas, 0),
+    );
+    state.conmutador_pegado = state.shell.as_ref().is_some_and(|s| s.hay_conmutador());
 }
 
 #[cfg(test)]

@@ -59,7 +59,7 @@ use std::task::{Context, Poll, Waker};
 use smithay::reexports::calloop::channel::Sender;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
-const NOMBRE: &str = "org.bookos.portal.desktop";
+pub const NOMBRE: &str = "org.bookos.portal.desktop";
 const RUTA: &str = "/org/freedesktop/portal/desktop";
 
 /// Códigos de respuesta del protocolo: 0 correcto, 1 cancelado por el usuario,
@@ -585,6 +585,7 @@ impl Ajustes {
 /// Se llama desde el bucle de frames al aplicar apariencia o efectos. Sin la
 /// señal, una app GTK ya abierta se queda con el tema con el que arrancó.
 pub fn apariencia_cambiada(conexion: Option<&zbus::blocking::Connection>) {
+    tema_gtk();
     let Some(conexion) = conexion else {
         return;
     };
@@ -607,6 +608,132 @@ pub fn apariencia_cambiada(conexion: Option<&zbus::blocking::Connection>) {
             tracing::warn!(clave, "no se pudo avisar del cambio de aspecto: {err}");
         }
     }
+}
+
+/// Pone el tema GTK que corresponde al tema y al acento del escritorio.
+///
+/// El `color-scheme` del portal no basta: GTK 3 no lo lee. LibreOffice —que va
+/// con `libvclplug_gtk3lo`— y el resto de apps GTK 3 se guían por el **nombre**
+/// del tema en GSettings y en `settings.ini`, y ahí se quedaba escrito
+/// `BookOS-Dark-Blue` para siempre: cambiar a claro no les llegaba. GSettings
+/// avisa en caliente a las que ya están abiertas; `settings.ini` es lo que leen
+/// las que arrancan sin dconf.
+///
+/// Solo en la sesión de BookOS: el compositor anidado corre dentro de KDE y
+/// esto reescribiría el tema GTK del anfitrión.
+pub fn tema_gtk() {
+    if std::env::var("XDG_CURRENT_DESKTOP").as_deref() != Ok("BookOS") {
+        return;
+    }
+    let claro = bookos_shell::tema::es_claro();
+    // Del tema GTK solo hay variantes azul y verde; los acentos que no son
+    // verdosos se quedan con la azul, que es la de serie.
+    use bookos_shell::tema::Acento;
+    let color = match bookos_shell::tema::acento_actual() {
+        Acento::Verde | Acento::Turquesa => "Green",
+        _ => "Blue",
+    };
+    let tema = format!("BookOS-{}-{color}", if claro { "Light" } else { "Dark" });
+    let iconos = tema_iconos(claro);
+    for (clave, valor) in [
+        ("gtk-theme", tema.as_str()),
+        ("icon-theme", iconos),
+        (
+            "color-scheme",
+            if claro { "prefer-light" } else { "prefer-dark" },
+        ),
+    ] {
+        // Sin esperar: `gsettings` habla con dconf por D-Bus y no hay nada que
+        // hacer con su respuesta. Mismo trato que `canberra-gtk-play`.
+        let _ = std::process::Command::new("gsettings")
+            .args(["set", "org.gnome.desktop.interface", clave, valor])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+    let Some(config) =
+        std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
+    else {
+        return;
+    };
+    let oscuro = if claro { "false" } else { "true" };
+    for version in ["gtk-3.0", "gtk-4.0"] {
+        let ruta = config.join(version).join("settings.ini");
+        if let Err(err) = reescribir_ini(
+            &ruta,
+            &[
+                ("gtk-theme-name", &tema),
+                ("gtk-icon-theme-name", iconos),
+                // Si se quedara en `true`, GTK cargaría `gtk-dark.css` del
+                // tema claro y seguiría saliendo oscuro.
+                ("gtk-application-prefer-dark-theme", oscuro),
+            ],
+        ) {
+            tracing::warn!(?ruta, "no se pudo escribir el tema GTK: {err}");
+        }
+    }
+}
+
+/// El pack de iconos de BookOS si está instalado; si no, Breeze.
+///
+/// Lo que al pack le falte ya lo busca GTK en Breeze por el `Inherits` de su
+/// `index.theme`. Aquí solo hay que evitar nombrar un tema que no existe: GTK
+/// no cae a nada razonable y las apps se quedan sin iconos.
+fn tema_iconos(claro: bool) -> &'static str {
+    let (bookos, breeze) = if claro {
+        ("BookOS-Light", "breeze")
+    } else {
+        ("BookOS-Dark", "breeze-dark")
+    };
+    let mut bases = vec![std::path::PathBuf::from("/usr/share/icons")];
+    if let Some(home) = std::env::var_os("HOME") {
+        bases.push(std::path::PathBuf::from(home).join(".local/share/icons"));
+    }
+    if bases
+        .iter()
+        .any(|b| b.join(bookos).join("index.theme").is_file())
+    {
+        bookos
+    } else {
+        breeze
+    }
+}
+
+/// Sustituye esas claves en un `settings.ini` de GTK, o las añade bajo
+/// `[Settings]`, sin tocar el resto: lo escriben también KDE y el usuario.
+fn reescribir_ini(ruta: &std::path::Path, valores: &[(&str, &str)]) -> std::io::Result<()> {
+    let anterior = match std::fs::read_to_string(ruta) {
+        Ok(t) => t,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => "[Settings]\n".to_string(),
+        Err(err) => return Err(err),
+    };
+    let mut vistos = vec![false; valores.len()];
+    let mut salida: Vec<String> = anterior
+        .lines()
+        .map(|linea| {
+            let clave = linea.split_once('=').map(|(k, _)| k.trim());
+            match valores.iter().position(|(k, _)| Some(*k) == clave) {
+                Some(i) => {
+                    vistos[i] = true;
+                    format!("{}={}", valores[i].0, valores[i].1)
+                }
+                None => linea.to_string(),
+            }
+        })
+        .collect();
+    let seccion = salida
+        .iter()
+        .position(|l| l.trim() == "[Settings]")
+        .map_or(salida.len(), |i| i + 1);
+    for (i, (clave, valor)) in valores.iter().enumerate().rev() {
+        if !vistos[i] {
+            salida.insert(seccion, format!("{clave}={valor}"));
+        }
+    }
+    if let Some(dir) = ruta.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(ruta, salida.join("\n") + "\n")
 }
 
 struct Screenshot {
@@ -1261,6 +1388,34 @@ fn capturar(state: &mut crate::state::BookosComp, respuesta: Emisario<PathBuf>) 
 #[cfg(test)]
 mod pruebas {
     use super::*;
+
+    /// Cambia las claves en su sitio, añade las que faltan bajo `[Settings]` y
+    /// deja intacto lo que escribió KDE.
+    #[test]
+    fn el_ini_de_gtk_conserva_lo_ajeno() {
+        let dir = std::env::temp_dir().join(format!("bookos-ini-{}", std::process::id()));
+        let ruta = dir.join("settings.ini");
+        std::fs::create_dir_all(&dir).expect("directorio temporal");
+        std::fs::write(
+            &ruta,
+            "[Settings]\ngtk-application-prefer-dark-theme=true\ngtk-font-name=Noto Sans,  10\n",
+        )
+        .expect("escribir el ini de partida");
+        reescribir_ini(
+            &ruta,
+            &[
+                ("gtk-theme-name", "BookOS-Light-Blue"),
+                ("gtk-application-prefer-dark-theme", "false"),
+            ],
+        )
+        .expect("reescribir");
+        let texto = std::fs::read_to_string(&ruta).expect("leer");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            texto,
+            "[Settings]\ngtk-theme-name=BookOS-Light-Blue\ngtk-application-prefer-dark-theme=false\ngtk-font-name=Noto Sans,  10\n"
+        );
+    }
 
     #[test]
     fn save_files_solo_acepta_nombres_base() {

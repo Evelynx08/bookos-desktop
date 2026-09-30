@@ -136,7 +136,20 @@ impl smithay::xwayland::XwmHandler for BookosComp {
         // meterse bajo el panel.
         let geo = window.geometry();
         let _ = window.configure(Rectangle::new(geo.loc, geo.size));
+        // En X11 no hay `xdg-decoration`: la barra la ponemos nosotros salvo que
+        // la ventana declare (`_MOTIF_WM_HINTS`) que dibuja la suya, o que sea
+        // un menú, un tooltip o algo que no es una ventana de verdad. Sin esto
+        // VirtualBox, Steam o cualquier programa Qt/GTK sobre X11 salían sin
+        // botones de ventana. Va antes de `map_element` para que
+        // `colocar_si_es_nueva` cuente con el sitio de la barra.
+        use smithay::xwayland::xwm::WmWindowType as T;
+        let con_barra = !window.is_decorated()
+            && matches!(
+                window.window_type(),
+                None | Some(T::Normal | T::Dialog | T::Utility)
+            );
         let elemento = smithay::desktop::Window::new_x11_window(window);
+        crate::decoracion::decorar(&elemento, con_barra);
         self.space.map_element(elemento, area.loc, false);
         self.needs_redraw = true;
         self.actualizar_dock();
@@ -232,8 +245,13 @@ impl smithay::xwayland::XwmHandler for BookosComp {
         let Some(elemento) = self.window_de_x11(&window) else {
             return;
         };
+        let nuevo_tamano = crate::ventanas::tamano_nuevo(&elemento);
         if self.space.element_location(&elemento) != Some(geometry.loc) {
             self.space.map_element(elemento, geometry.loc, false);
+        }
+        // Un cliente X11 confirma aquí su tamaño nuevo: ver `tamano_nuevo`.
+        if nuevo_tamano {
+            self.revisar_barras();
         }
         self.needs_redraw = true;
     }

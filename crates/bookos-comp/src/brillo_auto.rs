@@ -77,6 +77,12 @@ pub struct Estado {
     /// que el usuario tenga encendido.
     teclado_encendido: u32,
     escrito: Option<Instant>,
+    /// Último nivel pedido con la tecla. Mientras sysfs no lo refleje, la
+    /// siguiente pulsación parte de aquí y no de la lectura atrasada.
+    a_mano: Option<u8>,
+    /// Último nivel de teclado pedido. Sus LEDs también tardan en reflejar la
+    /// escritura asíncrona, pero tienen escala propia y no comparten el nivel.
+    teclado_a_mano: Option<(String, u32, Instant)>,
     espera: Option<RegistrationToken>,
     rampa: Option<RegistrationToken>,
 }
@@ -109,6 +115,8 @@ impl Estado {
             teclado_oscuro: None,
             teclado_encendido: 1,
             escrito: None,
+            a_mano: None,
+            teclado_a_mano: None,
             espera: None,
             rampa: None,
         };
@@ -214,6 +222,50 @@ pub fn elegir(state: &mut BookosComp, elegido: bookos_shell::BrilloAutomatico) {
     if let Some(shell) = state.shell.as_mut() {
         shell.refresh();
     }
+}
+
+/// Nivel del que parte la tecla de brillo.
+///
+/// Con la tecla mantenida llegan 25 pulsaciones por segundo y cada escritura
+/// tarda en verse en sysfs (va por `busctl`): partir de la lectura repetía el
+/// mismo nivel varias veces y luego saltaba, y la pantalla seguía moviéndose
+/// después de soltar.
+pub fn partida_tecla(state: &BookosComp) -> Option<u8> {
+    let e = &state.brillo_auto;
+    match (e.a_mano, e.escrito) {
+        (Some(nivel), Some(t)) if t.elapsed() < MARGEN_ESCRITURA => Some(nivel),
+        _ => bookos_shell::brillo_actual(),
+    }
+}
+
+/// La tecla ha pedido `nivel`. El automático lo aprende como desvío en el acto
+/// y suelta su rampa: si no, la rampa en curso seguía escribiendo su objetivo
+/// encima del de la tecla y el brillo bailaba al soltar.
+pub fn tecla(state: &mut BookosComp, nivel: u8) {
+    let e = &mut state.brillo_auto;
+    if let Some(token) = e.rampa.take() {
+        state.loop_handle.remove(token);
+    }
+    if let Some(puesta) = e.pantalla_puesta {
+        e.desvio = (e.desvio + i32::from(nivel) - i32::from(puesta)).clamp(-60, 60);
+        e.pantalla_puesta = Some(nivel);
+    }
+    e.a_mano = Some(nivel);
+    e.escrito = Some(Instant::now());
+}
+
+pub fn partida_tecla_teclado(state: &BookosComp, dispositivo: &str, actual: u32) -> u32 {
+    state
+        .brillo_auto
+        .teclado_a_mano
+        .as_ref()
+        .filter(|(d, _, t)| d == dispositivo && t.elapsed() < MARGEN_ESCRITURA)
+        .map_or(actual, |(_, nivel, _)| *nivel)
+}
+
+pub fn tecla_teclado(state: &mut BookosComp, dispositivo: &str, nivel: u32) {
+    state.brillo_auto.teclado_a_mano = Some((dispositivo.to_owned(), nivel, Instant::now()));
+    state.brillo_auto.escrito = Some(Instant::now());
 }
 
 fn recibir(state: &mut BookosComp, lux: f64) {

@@ -21,7 +21,7 @@ use image::AnimationDecoder as _;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::memory::{
-    MemoryRenderBuffer, MemoryRenderBufferRenderElement,
+    MemoryBuffer, MemoryRenderBuffer, MemoryRenderBufferRenderElement,
 };
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::Transform;
@@ -90,7 +90,11 @@ pub struct Fondo {
     /// Los píxeles en crudo, que hacen falta otra vez para la textura con
     /// mipmaps que usa el cristal. Son 20 MB: se guardan porque volver a
     /// decodificar el PNG al cambiar de resolución costaría más.
-    rgba: Vec<u8>,
+    ///
+    /// Es la **misma** memoria que la de `buffer` y la del gemelo: el
+    /// `MemoryBuffer` va en un `Arc` y `from_memory` no copia. Antes eran tres
+    /// `Vec` iguales, 60 de los 70 MB del heap del compositor en reposo.
+    rgba: MemoryBuffer,
     /// El fondo reducido, y una copia **por miniatura**.
     ///
     /// Hace falta una copia por cada una porque `MemoryRenderBufferRenderElement`
@@ -110,8 +114,9 @@ pub struct Fondo {
     /// de daño el mismo rectángulo teletransportándose, y uno de los dos no se
     /// dibujaría.
     ///
-    /// Se crea la primera vez que se cambia de escritorio y se queda: son otros
-    /// 20 MB, y quien no use escritorios virtuales no los paga.
+    /// Solo el id es distinto: los píxeles son los de `rgba`, sin copia. La
+    /// textura en GPU sí es otra, y esa se crea la primera vez que se cambia de
+    /// escritorio.
     gemelo: std::cell::RefCell<Option<MemoryRenderBuffer>>,
     /// Decodificador incremental. Solo conserva el fotograma actual y el
     /// estado comprimido: guardar todos los RGBA de un fondo largo ocuparía
@@ -205,20 +210,14 @@ impl Fondo {
         // Abgr8888: en little-endian son los bytes R,G,B,A, que es justo lo que
         // devuelve el decodificador. Con Argb8888 —el del shell— saldría con el
         // rojo y el azul cambiados; ya pasó una vez con el panel.
-        let buffer = MemoryRenderBuffer::from_slice(
-            &pixeles,
-            Fourcc::Abgr8888,
-            (w as i32, h as i32),
-            1,
-            Transform::Normal,
-            None,
-        );
         let (mini_rgba, mini_pixeles) = reducir(&pixeles, (w as i32, h as i32), MINIATURA_ANCHO);
+        let rgba = MemoryBuffer::from_slice(&pixeles, Fourcc::Abgr8888, (w as i32, h as i32));
+        drop(pixeles);
         Some(Self {
             ruta,
-            buffer,
+            buffer: compartido(&rgba),
             pixeles: (w as i32, h as i32),
-            rgba: pixeles,
+            rgba,
             mini_rgba,
             mini_pixeles,
             mini: std::cell::RefCell::new(Vec::new()),
@@ -254,16 +253,9 @@ impl Fondo {
             self.animacion = None;
             return false;
         };
-        self.buffer = MemoryRenderBuffer::from_slice(
-            &rgba,
-            Fourcc::Abgr8888,
-            (w as i32, h as i32),
-            1,
-            Transform::Normal,
-            None,
-        );
+        self.rgba = MemoryBuffer::from_slice(&rgba, Fourcc::Abgr8888, (w as i32, h as i32));
+        self.buffer = compartido(&self.rgba);
         self.pixeles = (w as i32, h as i32);
-        self.rgba = rgba;
         (self.mini_rgba, self.mini_pixeles) = reducir(&self.rgba, self.pixeles, MINIATURA_ANCHO);
         self.mini.get_mut().clear();
         *self.gemelo.get_mut() = None;
@@ -337,16 +329,7 @@ impl Fondo {
     ) -> Option<MemoryRenderBufferRenderElement<GlesRenderer>> {
         use smithay::utils::Rectangle;
         let mut gemelo = self.gemelo.borrow_mut();
-        let buffer = gemelo.get_or_insert_with(|| {
-            MemoryRenderBuffer::from_slice(
-                &self.rgba,
-                Fourcc::Abgr8888,
-                self.pixeles,
-                1,
-                Transform::Normal,
-                None,
-            )
-        });
+        let buffer = gemelo.get_or_insert_with(|| compartido(&self.rgba));
         let src = Rectangle::from_size((self.pixeles.0 as f64, self.pixeles.1 as f64).into());
         MemoryRenderBufferRenderElement::from_buffer(
             renderer,
@@ -413,6 +396,12 @@ impl Fondo {
         .inspect_err(|err| tracing::warn!("no se pudo subir la miniatura del fondo: {err}"))
         .ok()
     }
+}
+
+/// Un buffer de dibujo nuevo —con su propio id para el seguimiento de daño—
+/// sobre los mismos píxeles, sin copiarlos.
+fn compartido(rgba: &MemoryBuffer) -> MemoryRenderBuffer {
+    MemoryRenderBuffer::from_memory(rgba.clone(), 1, Transform::Normal, None)
 }
 
 fn decodificar_estatico(ruta: &Path) -> Option<(Vec<u8>, u32, u32)> {

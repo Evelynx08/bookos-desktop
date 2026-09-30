@@ -30,7 +30,7 @@ pub enum Accion {
     Terminal,
     /// Meta+Q — cerrar la ventana con foco (petición educada al cliente).
     CerrarVentana,
-    /// Ctrl+Alt+Retroceso — terminar el compositor y devolver el TTY.
+    /// Meta+Alt+Retroceso — terminar el compositor y devolver el TTY.
     Salir,
     /// Meta+Espacio — abrir o cerrar el launchpad.
     Launchpad,
@@ -285,8 +285,11 @@ pub fn resolver(
         if (F1..=F12).contains(&base) {
             return Some(Accion::CambiarVt((base - F1 + 1) as i32));
         }
-        if base == keysyms::KEY_BackSpace {
-            return Some(Accion::Salir);
+        // Ctrl+Alt+T, el atajo de terminal de GNOME y de Plasma. Va aquí y no
+        // en el brazo de Meta porque es el gesto que traen los dedos de quien
+        // viene de otro escritorio.
+        if base == keysyms::KEY_t || base == keysyms::KEY_T {
+            return Some(Accion::Terminal);
         }
         if base == keysyms::KEY_Delete {
             return Some(Accion::DelShell(bookos_shell::Accion::CerrarSesion));
@@ -381,6 +384,12 @@ pub fn resolver(
     // Meta+Alt va antes que Meta a secas: si no, `Meta+Alt+D` entraría por el
     // brazo de Meta y no llegaría nunca aquí.
     if modifiers.logo && modifiers.alt {
+        // Salida de emergencia. Antes era Ctrl+Alt+Retroceso, pero Ctrl+Retroceso
+        // es «borrar la palabra» en cualquier campo y con Alt rozado se cerraba
+        // la sesión. Se mira el símbolo sin modificadores por lo mismo que arriba.
+        if handle.raw_syms().first().map(|s| s.raw()).unwrap_or(sym) == keysyms::KEY_BackSpace {
+            return Some(Accion::Salir);
+        }
         match sym {
             keysyms::KEY_a | keysyms::KEY_A => return Some(Accion::Asistente),
             keysyms::KEY_t | keysyms::KEY_T => return Some(Accion::SiempreEncima),
@@ -523,7 +532,7 @@ pub fn ejecutar(state: &mut BookosComp, accion: Accion) {
             // emergencia y tiene que funcionar aunque el shell no responda.
             const VENTANA: std::time::Duration = std::time::Duration::from_secs(2);
             if state.salida_armada.is_some_and(|t| t.elapsed() < VENTANA) {
-                tracing::info!("salida pedida con Ctrl+Alt+Retroceso");
+                tracing::info!("salida pedida con Meta+Alt+Retroceso");
                 state.loop_signal.stop();
                 return;
             }
@@ -578,6 +587,14 @@ pub fn ejecutar(state: &mut BookosComp, accion: Accion) {
             let modo = state.shell.as_mut().map(|s| s.alternar_visibilidad(cual));
             if let Some(modo) = modo {
                 tracing::info!(?cual, ?modo, "visibilidad de la barra");
+                let clave = match cual {
+                    crate::shell::Barra::Panel => "panel_esquiva",
+                    crate::shell::Barra::Dock => "dock_esquiva",
+                };
+                let esquiva = modo == crate::shell::Visibilidad::Esquivando;
+                if let Err(err) = bookos_shell::guardar_esquiva(clave, esquiva) {
+                    tracing::warn!("no se pudo guardar la visibilidad de la barra: {err}");
+                }
                 // Al pasar a esquivar, el área útil crece; al volver a fija,
                 // mengua. Las ventanas encajadas hay que recolocarlas o se
                 // quedan con el hueco del panel de más o de menos.
@@ -594,6 +611,7 @@ pub fn ejecutar(state: &mut BookosComp, accion: Accion) {
                 if let Some(shell) = state.shell.as_mut() {
                     shell.cerrar_captura();
                 }
+                crate::input::cursor_de_captura(state);
             } else {
                 // Una VM suele tener el puntero bloqueado y el cursor del
                 // compositor oculto. La captura es una capa modal del sistema:
@@ -604,6 +622,7 @@ pub fn ejecutar(state: &mut BookosComp, accion: Accion) {
                 if let Some(shell) = state.shell.as_mut() {
                     shell.abrir_captura();
                 }
+                crate::input::cursor_de_captura(state);
             }
             state.needs_redraw = true;
         }
@@ -766,7 +785,14 @@ pub fn hacer(state: &mut BookosComp, accion: bookos_shell::Accion) {
             match energia {
                 Energia::Bloquear => bloquear(state),
                 Energia::CerrarSesion => state.loop_signal.stop(),
-                Energia::Suspender => lanzar(state, "systemctl suspend"),
+                // Bloqueada **antes** de dormir, no al despertar: al volver lo
+                // primero que se pinta tiene que ser el bloqueo. `systemctl`
+                // pasa por logind y tarda bastante más que un fotograma, así
+                // que el bloqueo ya está en pantalla cuando el equipo se duerme.
+                Energia::Suspender => {
+                    bloquear(state);
+                    lanzar(state, "systemctl suspend");
+                }
                 Energia::Reiniciar => lanzar(state, "systemctl reboot"),
                 Energia::Apagar => lanzar(state, "systemctl poweroff"),
             }
@@ -872,6 +898,7 @@ pub fn hacer(state: &mut BookosComp, accion: bookos_shell::Accion) {
             if let Some(shell) = state.shell.as_mut() {
                 shell.cerrar_captura();
             }
+            crate::input::cursor_de_captura(state);
             state.captura_pedida = Some(crate::state::CapturaPedida {
                 x,
                 y,
@@ -961,6 +988,20 @@ pub fn hacer(state: &mut BookosComp, accion: bookos_shell::Accion) {
         }
         bookos_shell::Accion::NotificacionAccion { id, clave } => {
             crate::notificaciones::accion_invocada(state.bus_notificaciones.as_ref(), id, &clave);
+            // Atendida: la especificación pide cerrarla tras la acción, y
+            // hay apps que esperan `NotificationClosed` para limpiar lo suyo.
+            // Antes se quedaba en la lista de la campana como sin leer.
+            if state
+                .shell
+                .as_mut()
+                .is_some_and(|s| s.cerrar_notificacion(id))
+            {
+                crate::notificaciones::cerrada(
+                    state.bus_notificaciones.as_ref(),
+                    id,
+                    crate::notificaciones::CERRADA_POR_EL_USUARIO,
+                );
+            }
             state.needs_redraw = true;
         }
         bookos_shell::Accion::BorrarNotificaciones => {
@@ -1041,7 +1082,13 @@ pub fn hacer(state: &mut BookosComp, accion: bookos_shell::Accion) {
                 return;
             }
             match state.ventana_de_app(&app_id) {
-                Some(window) => crate::ventanas::minimizar(state, window),
+                // Solo se minimiza la que ya estaba delante con el foco. Si
+                // estás en otra aplicación, el clic la trae: minimizarla y
+                // tener que pulsar otra vez para recuperarla es un paso tonto.
+                Some(window) if state.ventana_con_foco().as_ref() == Some(&window) => {
+                    crate::ventanas::minimizar(state, window)
+                }
+                Some(window) => state.enfocar(&window),
                 // El dock creía que estaba abierta y no la encontramos: pasa si
                 // el cliente declara un `app_id` distinto del de su `.desktop`.
                 // Lanzar es mejor que quedarse quieto — un icono que no responde

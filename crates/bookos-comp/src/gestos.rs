@@ -13,10 +13,12 @@
 //! cubierta por pruebas: es lo único que se puede comprobar sin arrancar en un
 //! TTY.
 //!
-//! **Nadie más se queda sin estos eventos.** El compositor no anuncia todavía el
-//! global `wp_pointer_gestures`, así que ningún cliente recibe pellizcos hoy;
-//! consumirlos aquí no le quita nada a nadie. Cuando se anuncie, habrá que
-//! decidir qué gestos son del escritorio y cuáles pasan a la ventana con foco.
+//! **Qué es del escritorio y qué de la ventana.** El compositor anuncia
+//! `zwp_pointer_gestures_v1`, así que las ventanas pueden recibir gestos. Se
+//! quedan aquí los deslizamientos —tres y cuatro dedos, que libinput no da con
+//! menos— y los pellizcos de [`DEDOS`], que abren el launchpad. El pellizco de
+//! dos dedos, que es el zoom de Figma, de un navegador o de un visor de
+//! imágenes, pasa a la ventana: ver [`Gestos::pellizco_de_la_ventana`].
 
 /// Lo que un gesto completado le pide al compositor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +90,12 @@ const ABRIR: f64 = 1.9;
 /// dedos que solo pretendía ser un roce ya cambiaba de escritorio.
 const DESLIZAR: f64 = 120.0;
 
+/// Lo mismo, pero para cambiar de escritorio, que pide el doble: con 120 un
+/// movimiento corto ya te sacaba del escritorio, y equivocarse aquí cuesta más
+/// que en los verticales —desaparece todo lo que tenías delante—. 240 son unos
+/// dos tercios del recorrido del touchpad, todavía sin levantar la mano.
+const CAMBIAR_ESCRITORIO: f64 = 240.0;
+
 /// Cuánto tiene que dominar un eje sobre el otro para que el gesto cuente.
 ///
 /// Sin esto, un deslizamiento en diagonal dispara el horizontal y el vertical a
@@ -148,7 +156,7 @@ impl Gestos {
                 Gesto::CerrarExposicion
             });
         }
-        let gesto = if x.abs() > DESLIZAR && x.abs() > y.abs() * DOMINIO {
+        let gesto = if x.abs() > CAMBIAR_ESCRITORIO && x.abs() > y.abs() * DOMINIO {
             // **Los dedos empujan el contenido, no el foco.** Deslizar a la
             // izquierda manda las ventanas de aquí hacia la izquierda y trae las
             // del escritorio de la **derecha**, que es lo que hacen macOS y
@@ -192,12 +200,18 @@ impl Gestos {
                 x = format_args!("{x:.0}"),
                 y = format_args!("{y:.0}"),
                 umbral = DESLIZAR,
+                umbral_escritorio = CAMBIAR_ESCRITORIO,
                 disparo = self.disparado,
                 "deslizamiento: termina"
             );
         }
         self.deslizamiento = None;
         self.disparado = false;
+    }
+
+    /// ¿El pellizco en curso es de la ventana y no del escritorio?
+    pub fn pellizco_de_la_ventana(&self) -> bool {
+        self.pellizco.is_some_and(|dedos| !DEDOS.contains(&dedos))
     }
 
     /// Empieza un pellizco.
@@ -254,6 +268,21 @@ mod tests {
 
     /// Cerrar la mano con cuatro dedos abre el launchpad, y solo una vez por
     /// gesto por mucho que siga llegando el evento.
+    /// El pellizco de dos dedos es de la ventana —el zoom de Figma— y no abre
+    /// nada del escritorio; el de cuatro y cinco sigue siendo del launchpad.
+    #[test]
+    fn el_pellizco_de_dos_dedos_es_de_la_ventana() {
+        let mut g = Gestos::default();
+        g.pellizco_inicio(2);
+        assert!(g.pellizco_de_la_ventana());
+        assert_eq!(g.pellizco_avance(0.3, false), None, "no abre el launchpad");
+        g.pellizco_fin();
+        assert!(!g.pellizco_de_la_ventana(), "acabado, no es de nadie");
+
+        g.pellizco_inicio(4);
+        assert!(!g.pellizco_de_la_ventana());
+    }
+
     #[test]
     fn el_pellizco_hacia_dentro_abre_una_sola_vez() {
         let mut g = Gestos::default();
@@ -330,13 +359,14 @@ mod tests {
     fn el_deslizamiento_cambia_de_escritorio_una_vez() {
         let mut g = Gestos::default();
         g.deslizamiento_inicio(4);
-        // Cuatro eventos de 40 px: hasta pasar de 120 no cuenta.
-        assert_eq!(g.deslizamiento_avance(-40.0, 0.0), None);
-        assert_eq!(g.deslizamiento_avance(-40.0, 0.0), None);
+        // Eventos de 40 px: hasta pasar de 240 no cuenta.
+        for _ in 0..5 {
+            assert_eq!(g.deslizamiento_avance(-40.0, 0.0), None);
+        }
         assert_eq!(
             g.deslizamiento_avance(-40.0, 0.0),
             None,
-            "120 justos no bastan"
+            "240 justos no bastan"
         );
         assert_eq!(
             g.deslizamiento_avance(-40.0, 0.0),
@@ -353,7 +383,7 @@ mod tests {
         let mut g = Gestos::default();
         g.deslizamiento_inicio(4);
         assert_eq!(
-            g.deslizamiento_avance(200.0, 0.0),
+            g.deslizamiento_avance(260.0, 0.0),
             Some(Gesto::Escritorio(-1))
         );
     }

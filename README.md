@@ -192,8 +192,8 @@ dark themes and a reduced-motion option.
 
 **Displays and BookOS Settings** — the compositor exposes over D-Bus the census
 of outputs, modes, refresh rate, fractional scale, rotation and VRR. BookOS
-Settings uses that contract when it detects a BookOS session and keeps its KDE
-path when it runs under Plasma. Appearance, wallpaper, lock screen, activities
+Settings uses that contract; it no longer has a KDE path (no Kvantum, no Plasma
+wallpaper packages). Appearance, wallpaper, lock screen, activities
 and effects also reload live; migrating the rest of the preferences is still in
 progress.
 
@@ -345,7 +345,7 @@ translates the saved floating geometry using logical coordinates.
 
 | Shortcut | What it does |
 |---|---|
-| <kbd>Meta</kbd>+<kbd>Return</kbd> | Open a terminal (`BOOKOS_TERMINAL`, `konsole` by default) |
+| <kbd>Meta</kbd>+<kbd>Return</kbd>, <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>T</kbd> | Open a terminal (`BOOKOS_TERMINAL`, `konsole` by default) |
 | <kbd>Meta</kbd> alone | Open or close the launchpad |
 | <kbd>Meta</kbd>+<kbd>Space</kbd> | Central search: applications, settings, commands and states |
 | <kbd>Meta</kbd>+<kbd>W</kbd> | The overview: desktop thumbnails and the current desktop's windows in a grid |
@@ -528,6 +528,14 @@ cargo build --release -p bookos-system
 sudo ./session/instalar.sh
 ```
 
+It also **mounts removable drives on its own**, the job `kded` did under
+Plasma: USB sticks, external disks and SD cards are mounted through udisks2 in
+`/run/media/$USER/<label>` when the session starts and whenever one is plugged
+in. Only what udisks does not mark as a system disk and that has a physical
+drive behind it (no loop devices); internal partitions and encrypted volumes are
+left alone, and a drive unmounted by hand is not mounted again. It asks polkit
+without interaction, so it never pops up a password dialog.
+
 It needs NetworkManager, BlueZ, `rfkill`, `pactl` and `wpctl` (PipeWire with
 pipewire-pulse). For development, `cargo run -p bookos-system` on the session bus
 works without installing it.
@@ -631,6 +639,7 @@ BOOKOS_INPUT_SELFTEST=1 BOOKOS_SELFTEST_GUION=/tmp/guion.txt \
 
 The script takes one order per line: `espera ms`, `mover x y`, `clic x y [der]`,
 `pulsar x y` / `soltar` for drags, `tecla meta+w` (combinations with `+`),
+`escribir palabra` to type into a search box,
 `tema claro|oscuro`, `captura` and `fin`. `mover`, `clic` and `tecla` accept a
 trailing wait in milliseconds — the default 250 ms swallows short animations
 whole. Coordinates are logical; screenshots go to `$XDG_PICTURES_DIR/Capturas`.
@@ -792,7 +801,7 @@ energy chooser, Ctrl+Alt+Delete and the lock-screen power menu. Tab/left/right
 select a button; Enter activates it; Escape cancels. **Locking is not
 confirmed**: nothing is lost and the password undoes it, so Meta+L locks at once,
 as it does everywhere else. Automatic locking and suspend handling do not wait
-for a dialog. Ctrl+Alt+Backspace, pressed twice, remains the explicit emergency
+for a dialog. Meta+Alt+Backspace, pressed twice, remains the explicit emergency
 exit.
 
 Settings → Desktop exposes `dock_tamano` (32–80 logical pixels, default 50).

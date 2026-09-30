@@ -26,6 +26,13 @@
 //! decide qué hacer con la captura **viéndola ya encuadrada**, y se puede
 //! rehacer el recuadro las veces que haga falta antes de elegir.
 //!
+//! ## Lo marcado se ajusta
+//!
+//! Con un recuadro ya marcado, pulsar cerca de un borde o de una esquina tira
+//! de ese lado, y pulsar dentro lo mueve entero. Solo fuera empieza uno nuevo.
+//! Sin esto, corregir cinco píxeles de alto obligaba a repetir el arrastre
+//! entero y acertar otra vez las otras tres aristas.
+//!
 //! El recuadro lleva las esquinas redondeadas, con el radio de un control del
 //! sistema: las redondea el shader del velo en el compositor.
 
@@ -69,6 +76,62 @@ const DIVISOR_HUECO: f32 = DIVISOR_ANCHO + DIVISOR_AIRE * 2.0;
 /// Por debajo de esto es un clic con la mano temblando, no un recuadro: sin el
 /// umbral, pulsar para cancelar acababa guardando una captura de tres píxeles.
 const MINIMO: f32 = 8.0;
+
+/// Hasta dónde, a cada lado de una arista, se la puede agarrar. 8 lógicos son
+/// 14 físicos a escala 1,75: menos que eso cuesta acertar con el touchpad, y
+/// más se come el interior de recuadros pequeños, que es donde se mueve.
+const AGARRE: f32 = 8.0;
+
+/// Qué arista mueve un agarre en un eje.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lado {
+    Ninguno,
+    /// La de arriba o la de la izquierda.
+    Inicio,
+    /// La de abajo o la de la derecha.
+    Fin,
+}
+
+/// De dónde se ha cogido un recuadro ya marcado.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Agarre {
+    /// Por dentro: se mueve entero sin cambiar de tamaño.
+    Mover,
+    /// Por un borde o una esquina: cada eje dice qué arista estira.
+    Estirar { x: Lado, y: Lado },
+}
+
+/// Qué forma pide el cursor según lo que haría un clic ahí. El shell no sabe
+/// de temas de cursor: esto lo traduce el compositor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Forma {
+    /// Marcar un recuadro nuevo.
+    Cruz,
+    Mover,
+    Horizontal,
+    Vertical,
+    /// Esquina de arriba a la izquierda o de abajo a la derecha.
+    DiagonalBajando,
+    /// Esquina de arriba a la derecha o de abajo a la izquierda.
+    DiagonalSubiendo,
+    /// La barra de botones.
+    Flecha,
+}
+
+/// El arrastre en curso.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Arrastre {
+    /// Un recuadro nuevo: dónde empezó y por dónde va.
+    Nuevo((f32, f32), (f32, f32)),
+    /// Ajustando uno marcado: cómo era al cogerlo, por dónde se cogió, y el
+    /// punto de partida y el actual del ratón.
+    Ajuste {
+        antes: Recuadro,
+        agarre: Agarre,
+        desde: (f32, f32),
+        hasta: (f32, f32),
+    },
+}
 
 /// A dónde va la captura. Son los dos botones que la **hacen**: marcar solo
 /// encuadra, y lo que pase con la foto se decide después de verla marcada.
@@ -152,14 +215,66 @@ impl Recuadro {
     fn vale(&self) -> bool {
         self.w >= MINIMO && self.h >= MINIMO
     }
+
+    /// Por dónde se coge el recuadro en ese punto, o `None` si queda fuera.
+    ///
+    /// Los bordes ganan al interior hasta [`AGARRE`] hacia dentro: si no, en un
+    /// recuadro estrecho no habría forma de coger la arista.
+    fn agarre(&self, x: f32, y: f32) -> Option<Agarre> {
+        let dentro_x = x >= self.x - AGARRE && x <= self.x + self.w + AGARRE;
+        let dentro_y = y >= self.y - AGARRE && y <= self.y + self.h + AGARRE;
+        if !(dentro_x && dentro_y) {
+            return None;
+        }
+        let lado = |p: f32, ini: f32, fin: f32| {
+            if (p - ini).abs() <= AGARRE {
+                Lado::Inicio
+            } else if (p - fin).abs() <= AGARRE {
+                Lado::Fin
+            } else {
+                Lado::Ninguno
+            }
+        };
+        match (
+            lado(x, self.x, self.x + self.w),
+            lado(y, self.y, self.y + self.h),
+        ) {
+            (Lado::Ninguno, Lado::Ninguno) => Some(Agarre::Mover),
+            (x, y) => Some(Agarre::Estirar { x, y }),
+        }
+    }
+
+    /// El recuadro tras arrastrar `d` desde el agarre, dentro de la pantalla.
+    fn ajustado(&self, agarre: Agarre, d: (f32, f32), pantalla: (f32, f32)) -> Self {
+        match agarre {
+            // Se para en el borde en vez de encogerse: moverlo no cambia qué
+            // tamaño se eligió.
+            Agarre::Mover => Self {
+                x: (self.x + d.0).clamp(0.0, (pantalla.0 - self.w).max(0.0)),
+                y: (self.y + d.1).clamp(0.0, (pantalla.1 - self.h).max(0.0)),
+                ..*self
+            },
+            Agarre::Estirar { x, y } => {
+                let tira = |lado, ini: f32, fin: f32, d: f32, max: f32| match lado {
+                    Lado::Inicio => ((ini + d).clamp(0.0, max), fin),
+                    Lado::Fin => (ini, (fin + d).clamp(0.0, max)),
+                    Lado::Ninguno => (ini, fin),
+                };
+                let (x0, x1) = tira(x, self.x, self.x + self.w, d.0, pantalla.0);
+                let (y0, y1) = tira(y, self.y, self.y + self.h, d.1, pantalla.1);
+                // `entre` da la vuelta si una arista cruza la de enfrente, que
+                // es lo que se espera al pasarse tirando.
+                Self::entre((x0, y0), (x1, y1))
+            }
+        }
+    }
 }
 
 pub struct Captura {
     /// La pantalla, en lógicos.
     pantalla: (f32, f32),
     modo: Modo,
-    /// El arrastre en curso: dónde empezó y por dónde va.
-    arrastre: Option<((f32, f32), (f32, f32))>,
+    arrastre: Option<Arrastre>,
     /// Lo último que se marcó y sigue marcado tras soltar.
     hecho: Option<Recuadro>,
     /// Qué celda de la barra tiene el ratón encima.
@@ -199,7 +314,17 @@ impl Captura {
     /// último que quedó marcado.
     fn marcando(&self) -> Option<Recuadro> {
         match self.arrastre {
-            Some((a, b)) => Some(Recuadro::entre(a, b)),
+            Some(Arrastre::Nuevo(a, b)) => Some(Recuadro::entre(a, b)),
+            Some(Arrastre::Ajuste {
+                antes,
+                agarre,
+                desde,
+                hasta,
+            }) => Some(antes.ajustado(
+                agarre,
+                (hasta.0 - desde.0, hasta.1 - desde.1),
+                self.pantalla,
+            )),
             None => self.hecho,
         }
     }
@@ -313,10 +438,41 @@ impl Captura {
         let señalada = self.celda_en(x, y);
         let cambio_señal = señalada != self.señalada;
         self.señalada = señalada;
-        if let Some((_, hasta)) = self.arrastre.as_mut() {
-            *hasta = (x.clamp(0.0, self.pantalla.0), y.clamp(0.0, self.pantalla.1));
+        let punto = (x.clamp(0.0, self.pantalla.0), y.clamp(0.0, self.pantalla.1));
+        match self.arrastre.as_mut() {
+            Some(Arrastre::Nuevo(_, hasta)) | Some(Arrastre::Ajuste { hasta, .. }) => {
+                *hasta = punto
+            }
+            None => {}
         }
         cambio_señal
+    }
+
+    /// La forma del cursor en ese punto: lo que haría un clic ahí, o lo que se
+    /// está haciendo si hay un arrastre.
+    pub fn forma(&self, x: f32, y: f32) -> Forma {
+        let agarre = match self.arrastre {
+            Some(Arrastre::Nuevo(..)) => return Forma::Cruz,
+            Some(Arrastre::Ajuste { agarre, .. }) => Some(agarre),
+            None if self.en_la_barra(x, y) => return Forma::Flecha,
+            None => self.hecho_ajustable().and_then(|r| r.agarre(x, y)),
+        };
+        match agarre {
+            None => Forma::Cruz,
+            Some(Agarre::Mover) => Forma::Mover,
+            Some(Agarre::Estirar { x, y }) => match (x, y) {
+                (Lado::Ninguno, _) => Forma::Vertical,
+                (_, Lado::Ninguno) => Forma::Horizontal,
+                (a, b) if a == b => Forma::DiagonalBajando,
+                _ => Forma::DiagonalSubiendo,
+            },
+        }
+    }
+
+    /// Lo marcado, si se puede ajustar: en modo pantalla no hay aristas que
+    /// coger, la foto es toda.
+    fn hecho_ajustable(&self) -> Option<Recuadro> {
+        self.hecho.filter(|_| self.modo == Modo::Seleccion)
     }
 
     /// Empieza un arrastre o pulsa un botón de la barra. `Some` solo al pulsar
@@ -335,9 +491,20 @@ impl Captura {
         if self.en_la_barra(x, y) {
             return None;
         }
-        self.modo = Modo::Seleccion;
         let punto = (x.clamp(0.0, self.pantalla.0), y.clamp(0.0, self.pantalla.1));
-        self.arrastre = Some((punto, punto));
+        if let Some(antes) = self.hecho_ajustable()
+            && let Some(agarre) = antes.agarre(x, y)
+        {
+            self.arrastre = Some(Arrastre::Ajuste {
+                antes,
+                agarre,
+                desde: punto,
+                hasta: punto,
+            });
+            return None;
+        }
+        self.modo = Modo::Seleccion;
+        self.arrastre = Some(Arrastre::Nuevo(punto, punto));
         self.hecho = None;
         None
     }
@@ -348,9 +515,17 @@ impl Captura {
     /// Un clic suelto sobre el velo no deja nada marcado: se entiende como «no
     /// quiero nada de aquí» y la capa sigue abierta para volver a intentarlo.
     pub fn soltar(&mut self) {
-        if let Some((a, b)) = self.arrastre.take() {
-            self.hecho = Some(Recuadro::entre(a, b)).filter(Recuadro::vale);
-        }
+        let Some(arrastre) = self.arrastre else {
+            return;
+        };
+        let nuevo = self.marcando().filter(Recuadro::vale);
+        self.arrastre = None;
+        self.hecho = match arrastre {
+            Arrastre::Nuevo(..) => nuevo,
+            // Encogerlo por debajo del mínimo no borra lo marcado: se queda
+            // como estaba, que perderlo por un tirón de más es peor.
+            Arrastre::Ajuste { antes, .. } => nuevo.or(Some(antes)),
+        };
     }
 
     fn accion(&self, destino: Destino) -> Option<Accion> {
@@ -656,6 +831,86 @@ mod tests {
         c.soltar();
         assert_eq!(c.recuadro(), Some(r), "lo marcado sigue ahí al soltar");
         assert!(!c.animando());
+    }
+
+    /// Marca el recuadro (200,150)-(600,450) y lo suelta.
+    fn marcada() -> Captura {
+        let mut c = Captura::new(PANTALLA);
+        c.pulsar(200.0, 150.0);
+        c.puntero(600.0, 450.0);
+        c.soltar();
+        c
+    }
+
+    fn medidas(c: &Captura) -> (f32, f32, f32, f32) {
+        let r = c.recuadro().expect("hay algo marcado");
+        (r.x, r.y, r.w, r.h)
+    }
+
+    /// Tirar de la arista de la derecha cambia solo el ancho; de la de abajo,
+    /// solo el alto; de una esquina, los dos.
+    #[test]
+    fn las_aristas_ajustan_ancho_y_alto() {
+        let mut c = marcada();
+        // Relativo a donde se cogió: la arista no salta al cursor.
+        c.pulsar(602.0, 300.0);
+        c.puntero(702.0, 280.0);
+        c.soltar();
+        assert_eq!(medidas(&c), (200.0, 150.0, 500.0, 300.0));
+
+        c.pulsar(400.0, 448.0);
+        c.puntero(400.0, 498.0);
+        c.soltar();
+        assert_eq!(medidas(&c), (200.0, 150.0, 500.0, 350.0));
+
+        // La esquina de arriba a la izquierda mueve el origen y encoge.
+        c.pulsar(200.0, 150.0);
+        c.puntero(250.0, 200.0);
+        c.soltar();
+        assert_eq!(medidas(&c), (250.0, 200.0, 450.0, 300.0));
+    }
+
+    /// Por dentro se mueve entero, sin cambiar de tamaño y sin salirse.
+    #[test]
+    fn por_dentro_se_mueve() {
+        let mut c = marcada();
+        c.pulsar(400.0, 300.0);
+        c.puntero(450.0, 320.0);
+        assert_eq!(medidas(&c), (250.0, 170.0, 400.0, 300.0));
+        c.puntero(-5000.0, -5000.0);
+        c.soltar();
+        assert_eq!(medidas(&c), (0.0, 0.0, 400.0, 300.0));
+    }
+
+    /// Fuera del recuadro se empieza uno nuevo, como antes.
+    #[test]
+    fn fuera_se_marca_otro() {
+        let mut c = marcada();
+        c.pulsar(1000.0, 700.0);
+        c.puntero(1100.0, 800.0);
+        c.soltar();
+        assert_eq!(medidas(&c), (1000.0, 700.0, 100.0, 100.0));
+    }
+
+    /// Encogerlo hasta nada no borra lo marcado: vuelve a como estaba.
+    #[test]
+    fn encoger_de_mas_no_lo_borra() {
+        let mut c = marcada();
+        c.pulsar(600.0, 300.0);
+        c.puntero(203.0, 300.0);
+        c.soltar();
+        assert_eq!(medidas(&c), (200.0, 150.0, 400.0, 300.0));
+    }
+
+    #[test]
+    fn el_cursor_dice_que_hara_el_clic() {
+        let c = marcada();
+        assert_eq!(c.forma(600.0, 300.0), Forma::Horizontal);
+        assert_eq!(c.forma(400.0, 150.0), Forma::Vertical);
+        assert_eq!(c.forma(200.0, 150.0), Forma::DiagonalBajando);
+        assert_eq!(c.forma(600.0, 150.0), Forma::DiagonalSubiendo);
+        assert_eq!(c.forma(400.0, 300.0), Forma::Mover);
+        assert_eq!(c.forma(1000.0, 700.0), Forma::Cruz);
     }
 
     /// El centro de la celda `i` de la barra.

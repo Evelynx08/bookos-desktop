@@ -350,6 +350,22 @@ pub fn run(
         }));
     }
 
+    // Solo en la sesión real: anidado, la luz del teclado es del anfitrión.
+    crate::multimedia::vigilar_luz_teclado(state);
+    crate::multimedia::vigilar_tapa_camara(state);
+
+    // Los teclados, por lo mismo: sus luces las tiene que mandar el
+    // compositor, y hay que poder hacerlo cuando cambie Bloq Mayús.
+    let teclados: Rc<RefCell<Vec<InputDevice>>> = Rc::new(RefCell::new(Vec::new()));
+    {
+        let teclados = teclados.clone();
+        state.aplicar_leds = Some(Box::new(move |leds| {
+            for device in teclados.borrow_mut().iter_mut() {
+                device.led_update(luces(leds));
+            }
+        }));
+    }
+
     let mut libinput = Libinput::new_with_udev(LibinputSessionInterface::from(session.clone()));
     libinput
         .udev_assign_seat(&session.seat())
@@ -366,6 +382,13 @@ pub fn run(
                 if let smithay::backend::input::InputEvent::DeviceAdded { device } = &event {
                     let mut device = device.clone();
                     configurar_dispositivo(&mut device, &state.entrada, state.touchpad_activo);
+                    if device.has_capability(smithay::reexports::input::DeviceCapability::Keyboard)
+                    {
+                        // Nace con las luces de ahora: tras un cambio de TTY,
+                        // o un teclado USB enchufado con Bloq Mayús puesto.
+                        device.led_update(luces(state.leds));
+                        teclados.borrow_mut().push(device.clone());
+                    }
                     if device.config_tap_finger_count() > 0 {
                         touchpads.borrow_mut().push(device);
                     }
@@ -497,6 +520,9 @@ pub fn run(
     // El despertar del tema automático, si está puesto. Con un modo fijo no
     // deja ningún temporizador. Ver `crate::apariencia`.
     crate::apariencia::programar_cambio(state);
+    // El tema pudo cambiar con la sesión cerrada —el automático, o editando
+    // `panel.conf`—: las apps GTK tienen que arrancar ya con el que toca.
+    crate::portal::tema_gtk();
     crate::backend::watch_hardware(state);
 
     // Primer frame: deja el escritorio pintado antes de que arranque nada más,
@@ -507,7 +533,7 @@ pub fn run(
 
     tracing::info!(
         "atajos: Ctrl+Alt+F1..F12 cambia de TTY · Meta+Return abre un terminal · \
-         Meta+Q cierra la ventana · Ctrl+Alt+Retroceso sale"
+         Meta+Q cierra la ventana · Meta+Alt+Retroceso sale"
     );
 
     if let Some(cmd) = client {
@@ -1172,6 +1198,7 @@ fn dibujar_todas(state: &mut BookosComp, u: &mut Udev) {
     // Antes de componer nada: si el tema cambió, el fondo y el cristal tienen
     // que ser ya los nuevos en este mismo fotograma.
     crate::backend::recargar_fondo(state, renderer);
+    crate::multimedia::vigilar_centro(state);
     if state.needs_redraw || animando {
         for salida in salidas.iter_mut() {
             salida.pendiente = true;
@@ -1486,4 +1513,15 @@ fn configurar_dispositivo(
             "entrada configurada"
         );
     }
+}
+
+/// Las luces de Smithay en el formato de libinput. `None` es «este teclado no
+/// sabe de esa luz»: se deja apagada.
+fn luces(leds: smithay::input::keyboard::LedState) -> smithay::reexports::input::Led {
+    use smithay::reexports::input::Led;
+    let mut luces = Led::empty();
+    luces.set(Led::CAPSLOCK, leds.caps == Some(true));
+    luces.set(Led::NUMLOCK, leds.num == Some(true));
+    luces.set(Led::SCROLLLOCK, leds.scroll == Some(true));
+    luces
 }

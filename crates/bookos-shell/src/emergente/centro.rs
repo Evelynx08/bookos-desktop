@@ -24,6 +24,7 @@
 //! lo guarda el shell.
 
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 use iced_core::alignment::{Horizontal, Vertical};
 use iced_core::font::Weight;
@@ -110,7 +111,7 @@ fn tinta_apagado() -> Color {
 /// veía ninguna. En claro pasaba lo mismo de forma más suave: `bg` al 80 %
 /// sobre la tarjeta blanca deja `#f5f5f9`, tres puntos por canal.
 fn contenedor() -> Color {
-    tema::superficie()
+    tema::superficie_en_tarjeta()
 }
 
 /// Un conmutador o una acción de la rejilla.
@@ -172,10 +173,20 @@ pub struct Centro {
     volumen_inicial: u8,
     backlight: Option<(String, u32)>,
     sonando: Option<Sonando>,
-    /// El `systemd-inhibit` que impide que la pantalla se apague mientras esté
-    /// puesto. Matarlo es apagar el conmutador.
-    inhibidor: Option<Child>,
+    /// La carátula de `sonando`, ya descodificada.
+    caratula: Option<iced_widget::image::Handle>,
+    /// Donde deja su última lectura el hilo que vigila lo que suena.
+    lectura: Arc<Mutex<Option<Lectura>>>,
 }
+
+/// El `systemd-inhibit` que impide que la pantalla se apague mientras esté
+/// puesto. Matarlo es apagar el conmutador.
+///
+/// Vive aquí y no en `Centro` porque la tarjeta se destruye al cerrarla: el
+/// proceso seguía vivo, la baldosa volvía a nacer apagada y pulsarla lanzaba
+/// un segundo inhibidor, dejando el primero sin forma de quitarlo y el equipo
+/// sin suspenderse. El shell vive lo que la sesión, así que esto también.
+static INHIBIDOR: Mutex<Option<Child>> = Mutex::new(None);
 
 impl Centro {
     pub fn refrescar(&mut self) -> bool {
@@ -214,6 +225,16 @@ impl Centro {
         self.volumen = volumen;
         self.silenciado = silenciado;
         let mut changed = changed;
+        let lectura = self
+            .lectura
+            .lock()
+            .expect("nadie suelta el cerrojo a medias")
+            .take();
+        if let Some(l) = lectura {
+            changed |= self.sonando != l.sonando || self.caratula != l.caratula;
+            self.sonando = l.sonando;
+            self.caratula = l.caratula;
+        }
         if self.agarre != Agarre::Brillo {
             let backlight = crate::backlight();
             let brillo = crate::brillo_actual().unwrap_or(0);
@@ -275,9 +296,21 @@ impl Centro {
             agarre: Agarre::Nada,
             volumen_inicial: 0,
             backlight: crate::backlight(),
-            sonando: Sonando::leer(),
-            inhibidor: None,
+            sonando: None,
+            caratula: None,
+            lectura: Arc::default(),
         };
+        // La primera lectura en el sitio: si fuera por el hilo, la tarjeta
+        // abriría sin la parte de la música y crecería un segundo después.
+        let primera = Lectura::nueva(Sonando::leer(), None);
+        c.sonando = primera.sonando;
+        c.caratula = primera.caratula;
+        let previa = c
+            .sonando
+            .as_ref()
+            .and_then(|s| s.caratula.clone())
+            .zip(c.caratula.clone());
+        vigilar_medios(&c.lectura, previa);
         c.baldosas = baldosas();
         c
     }
@@ -505,10 +538,18 @@ impl Centro {
             return None;
         }
         if let Some(orden) = self.medio_en(x, y) {
-            return self
-                .sonando
-                .as_ref()
-                .map(|s| Accion::Lanzar(s.orden(orden)));
+            // Directo al reproductor y sin `Accion`: `Lanzar` es para abrir
+            // aplicaciones y cierra la tarjeta, y aquí el usuario quiere seguir
+            // viendo lo que suena.
+            if let Some(sonando) = self.sonando.as_mut()
+                && sonando.ejecutar(orden)
+                && orden == medios::Orden::Alternar
+            {
+                // Sin esperar a leer el estado de vuelta: con el móvil detrás
+                // de BookOS Link la respuesta tarda y el botón parecería muerto.
+                sonando.reproduciendo = !sonando.reproduciendo;
+            }
+            return None;
         }
         if let Some(bluetooth) = self.conexion_en(x, y) {
             // El círculo enciende y apaga la radio; el resto de la tarjeta abre
@@ -566,11 +607,24 @@ impl Centro {
         self.baldosas[i].accion.clone()
     }
 
+    /// «No molestar» lo guarda el shell, que es quien lo sabe; la tarjeta solo
+    /// lo enseña. Ver `Shell::abrir`.
+    pub fn poner_no_molestar(&mut self, activo: bool) {
+        if let Some(b) = self
+            .baldosas
+            .iter_mut()
+            .find(|b| b.icono == "notificaciones")
+        {
+            b.activa = activo;
+        }
+    }
+
     /// Enciende o apaga un conmutador cuyo estado vive en el shell.
     fn alternar(&mut self, cual: Interna, i: usize) {
         match cual {
             Interna::Mantener => {
-                if let Some(mut hijo) = self.inhibidor.take() {
+                let mut inhibidor = INHIBIDOR.lock().expect("nadie suelta el cerrojo a medias");
+                if let Some(mut hijo) = inhibidor.take() {
                     // Matar el `systemd-inhibit` suelta el bloqueo: es lo que
                     // hace el plasmoide, y garantiza que no quede un inhibidor
                     // colgado si el shell se cae.
@@ -579,7 +633,7 @@ impl Centro {
                     self.baldosas[i].activa = false;
                     return;
                 }
-                self.inhibidor = Command::new("systemd-inhibit")
+                *inhibidor = Command::new("systemd-inhibit")
                     .args([
                         "--what=idle:sleep",
                         "--who=BookOS",
@@ -591,7 +645,7 @@ impl Centro {
                     .stderr(Stdio::null())
                     .spawn()
                     .ok();
-                self.baldosas[i].activa = self.inhibidor.is_some();
+                self.baldosas[i].activa = inhibidor.is_some();
             }
         }
     }
@@ -955,9 +1009,13 @@ impl Centro {
         let ancho = ANCHO - (MARGEN + GRUPO_MARGEN) * 2.0;
         let avance = (sonando.avance().unwrap_or(0.0) * 100.0).round() as u8;
         let ancho_texto = ancho - CARATULA - 12.0;
-        let caratula = container(match icono::propio("musica") {
-            Some(ic) => icono::ver_teñido_propio(&ic, 22.0, tema::TEXTO2),
-            None => Space::new().width(Length::Fixed(22.0)).into(),
+        let caratula = container(match (&self.caratula, icono::propio("musica")) {
+            (Some(foto), _) => iced_widget::image(foto.clone())
+                .width(Length::Fixed(CARATULA))
+                .height(Length::Fixed(CARATULA))
+                .into(),
+            (None, Some(ic)) => icono::ver_teñido_propio(&ic, 22.0, tema::TEXTO2),
+            (None, None) => Space::new().width(Length::Fixed(22.0)).into(),
         })
         .width(Length::Fixed(CARATULA))
         .height(Length::Fixed(CARATULA))
@@ -972,13 +1030,11 @@ impl Centro {
             ..Default::default()
         });
         let textos = column![
-            text(recortar_px(
-                &format!("Reproduciendo en {}", sonando.aplicacion),
-                ancho_texto,
-                11.0
-            ))
-            .size(11.0)
-            .color(tema::TEXTO2),
+            // Sin «Reproduciendo en»: con BookOS Link el nombre ya es largo
+            // («BitChord - Galaxy S22 Ultra») y el prefijo cortaba el móvil.
+            text(recortar_px(&sonando.aplicacion, ancho_texto, 11.0))
+                .size(11.0)
+                .color(tema::TEXTO2),
             text(recortar_px(&sonando.titulo, ancho_texto, 14.0))
                 .size(14.0)
                 .font(control::peso(Weight::Medium))
@@ -1136,7 +1192,10 @@ fn baldosas() -> Vec<Baldosa> {
         Baldosa {
             icono: "mantener",
             nombre: "Despierta",
-            activa: false,
+            activa: INHIBIDOR
+                .lock()
+                .expect("nadie suelta el cerrojo a medias")
+                .is_some(),
             accion: None,
             interna: Some(Interna::Mantener),
         },
@@ -1210,6 +1269,81 @@ fn emparejado_con() -> Option<String> {
         .find(|d| d["connected"] == true)?["name"]
         .as_str()
         .map(str::to_owned)
+}
+
+/// Descodifica la carátula, recortada al cuadrado central y con las esquinas
+/// del hueco ya redondeadas.
+///
+/// El redondeo va en los píxeles porque el renderizador de CPU de iced ignora
+/// el radio de las imágenes. Solo al cambiar de carátula, no por frame.
+/// Lo que suena y su carátula ya lista para pintar.
+struct Lectura {
+    sonando: Option<Sonando>,
+    caratula: Option<iced_widget::image::Handle>,
+}
+
+impl Lectura {
+    /// Descodifica la carátula solo si ha cambiado de fichero. `previa` es la
+    /// de la lectura anterior, que se reutiliza tal cual: un JPEG por segundo
+    /// para la misma canción sería trabajo tirado.
+    fn nueva(
+        sonando: Option<Sonando>,
+        previa: Option<(String, iced_widget::image::Handle)>,
+    ) -> Self {
+        let ruta = sonando.as_ref().and_then(|s| s.caratula.as_deref());
+        let caratula = match (ruta, previa) {
+            (Some(r), Some((p, h))) if r == p => Some(h),
+            (Some(r), _) => caratula(r),
+            (None, _) => None,
+        };
+        Self { sonando, caratula }
+    }
+}
+
+/// Relee lo que suena cada segundo mientras la tarjeta exista.
+///
+/// En un hilo porque cada lectura son varios `busctl`, y con el móvil detrás
+/// de BookOS Link la respuesta puede tardar: en el hilo del compositor serían
+/// tirones. El hilo solo guarda un `Weak`: al cerrarse la tarjeta el `Arc`
+/// muere con ella y el hilo termina en la vuelta siguiente, sin avisarle.
+/// El compositor recoge la lectura con su propio temporizador de un segundo
+/// (`multimedia::vigilar_centro`).
+///
+/// `previa` es la carátula ya descodificada con su ruta, para reutilizarla.
+fn vigilar_medios(
+    lectura: &Arc<Mutex<Option<Lectura>>>,
+    mut previa: Option<(String, iced_widget::image::Handle)>,
+) {
+    let destino = Arc::downgrade(lectura);
+    let resultado = std::thread::Builder::new()
+        .name("bookos-centro-medios".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                if destino.strong_count() == 0 {
+                    return;
+                }
+                let l = Lectura::nueva(Sonando::leer(), previa.take());
+                previa = l
+                    .sonando
+                    .as_ref()
+                    .and_then(|s| s.caratula.clone())
+                    .zip(l.caratula.clone());
+                let Some(destino) = destino.upgrade() else {
+                    return;
+                };
+                *destino.lock().expect("nadie suelta el cerrojo a medias") = Some(l);
+            }
+        });
+    if let Err(err) = resultado {
+        tracing::warn!("sin hilo para seguir lo que suena: {err}");
+    }
+}
+
+fn caratula(ruta: &str) -> Option<iced_widget::image::Handle> {
+    // Tres píxeles por punto: nítida hasta escala 3 y aun así 144×144.
+    medios::cargar_caratula(ruta, (CARATULA * 3.0) as u32, tema::R_BOTON_PEQUENO * 3.0)
+        .map(|(h, _)| h)
 }
 
 #[cfg(test)]
@@ -1335,12 +1469,18 @@ mod tests {
         };
         c.alternar(Interna::Mantener, i);
         // Sin `systemd-inhibit` en el sistema no hay nada más que comprobar.
-        if c.inhibidor.is_none() {
+        if !c.baldosas[i].activa {
             return;
         }
-        assert!(c.baldosas[i].activa);
+        // Cerrar la tarjeta y abrir otra: el conmutador sigue encendido.
+        drop(c);
+        let mut c = Centro::new();
+        assert!(c.baldosas[i].activa, "la tarjeta nueva olvidó el inhibidor");
         c.alternar(Interna::Mantener, i);
-        assert!(c.inhibidor.is_none(), "el inhibidor sigue vivo");
+        assert!(
+            INHIBIDOR.lock().expect("cerrojo").is_none(),
+            "el inhibidor sigue vivo"
+        );
         assert!(!c.baldosas[i].activa);
     }
 }

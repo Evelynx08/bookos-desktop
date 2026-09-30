@@ -29,6 +29,20 @@ const FILA_NOTIF: f32 = 52.0;
 /// Cuántas caben antes de que la tarjeta sea más alta que la pantalla. Las
 /// demás siguen en la cola —y en el contador del panel—, pero no se dibujan.
 const VISIBLES: usize = 4;
+/// Alto de un renglón del cuerpo desplegado, a 11 px.
+const LINEA_DET: f32 = 15.0;
+/// Renglones máximos del cuerpo desplegado. Con más, la tarjeta pasaría de la
+/// pantalla; el último termina en «…».
+const MAX_LINEAS: usize = 8;
+const ALTO_ACCION: f32 = 28.0;
+/// Alto de la línea de la app y de la del resumen: fijos para que el alto de
+/// una fila desplegada se calcule sin medir texto.
+const ALTO_CAB: f32 = 14.0;
+const ALTO_RES: f32 = 17.0;
+const PAD_V: f32 = 6.0;
+/// Ancho de los textos de una fila: la baldosa menos su padding, el icono y el
+/// hueco entre los dos.
+const ANCHO_TEXTO: f32 = lista::BALDOSA - 24.0 - 26.0 - 12.0;
 /// Zona de la ✕ de cerrar, pegada al borde derecho de la fila.
 const CIERRE: f32 = 30.0;
 /// Alto de cada botón de duración.
@@ -37,6 +51,11 @@ const DURACION: f32 = 34.0;
 const HUECO: f32 = 6.0;
 /// Hueco entre los dos chips de la cabecera.
 const ENTRE_CHIPS: f32 = 8.0;
+/// La etiqueta del botón que vacía la lista. «Borrar» y no «Borrar todo»: con
+/// el título y «Config» no cabía en los 296 px de la cabecera y el título
+/// quedaba pegado al botón. Lo que borra está justo debajo, y se lee igual.
+/// Una sola constante para el dibujo y para la zona de clic.
+const BORRAR: &str = "Borrar";
 
 /// Cuánto dura el silencio, en la rejilla de dos por dos del diseño.
 const DURACIONES: &[(&str, Option<Duration>)] = &[
@@ -65,6 +84,9 @@ pub struct Notificaciones {
     fila: tema::Realce,
     /// Fila activa para navegación sin ratón.
     seleccionada: Option<usize>,
+    /// La notificación desplegada, por id: una sola a la vez, como en Android.
+    /// Por id y no por posición porque la lista se reordena al llegar avisos.
+    desplegada: Option<u32>,
 }
 
 impl Notificaciones {
@@ -99,7 +121,101 @@ impl Notificaciones {
             lista: Vec::new(),
             fila: tema::Realce::nuevo(),
             seleccionada: None,
+            desplegada: None,
         }
+    }
+
+    /// El cuerpo partido en renglones del ancho de la fila.
+    fn detalle(notif: &crate::notificaciones::Notificacion) -> Vec<String> {
+        crate::escritorio::lineas(&notif.cuerpo, ANCHO_TEXTO, 11.0, MAX_LINEAS)
+    }
+
+    /// Lo que se ofrece como botón al desplegar: las acciones de la aplicación
+    /// y, si la tiene, «Abrir» por la acción `default`, que la especificación
+    /// reserva para pulsar el aviso y que en la lista ya no se dispara al pulsar
+    /// la fila —pulsarla ahora despliega—.
+    fn botones(notif: &crate::notificaciones::Notificacion) -> Vec<(String, String)> {
+        let mut botones: Vec<_> = notif
+            .acciones
+            .iter()
+            .filter(|a| a.clave != "default")
+            .map(|a| (a.clave.clone(), a.etiqueta.clone()))
+            .collect();
+        if notif.acciones.iter().any(|a| a.clave == "default") {
+            botones.push(("default".into(), "Abrir".into()));
+        }
+        botones
+    }
+
+    /// ¿Tiene algo más que enseñar al desplegarse? Si no, la fila se comporta
+    /// como siempre: un toque la ejecuta o la cierra.
+    fn desplegable(notif: &crate::notificaciones::Notificacion) -> bool {
+        !Self::botones(notif).is_empty() || Self::detalle(notif).len() > 1
+    }
+
+    fn esta_desplegada(&self, notif: &crate::notificaciones::Notificacion) -> bool {
+        self.desplegada == Some(notif.id) && Self::desplegable(notif)
+    }
+
+    /// Alto de una fila: la de siempre, o la que pide su cuerpo entero y sus
+    /// botones si está desplegada.
+    fn alto_fila(&self, notif: &crate::notificaciones::Notificacion) -> f32 {
+        if !self.esta_desplegada(notif) {
+            return FILA_NOTIF;
+        }
+        let botones = if Self::botones(notif).is_empty() {
+            0.0
+        } else {
+            HUECO + ALTO_ACCION
+        };
+        PAD_V * 2.0 + ALTO_CAB + ALTO_RES + Self::detalle(notif).len() as f32 * LINEA_DET + botones
+    }
+
+    /// Dónde empieza cada fila visible, relativo a la lista, y cuánto mide.
+    fn geometria_filas(&self) -> Vec<(f32, f32)> {
+        let mut y = 0.0;
+        self.lista
+            .iter()
+            .take(VISIBLES)
+            .map(|n| {
+                let alto = self.alto_fila(n);
+                let fila = (y, alto);
+                y += alto + HUECO;
+                fila
+            })
+            .collect()
+    }
+
+    /// Qué botón de la fila `i` desplegada cae en un punto.
+    #[cfg(test)]
+    fn pulsar_sin_efecto(&self, x: f32, y: f32) -> Option<String> {
+        self.fila_en(x, y).and_then(|i| self.boton_en(i, x, y))
+    }
+
+    fn boton_en(&self, i: usize, x: f32, y: f32) -> Option<String> {
+        let notif = self.lista.get(i)?;
+        let botones = Self::botones(notif);
+        if !self.esta_desplegada(notif) || botones.is_empty() {
+            return None;
+        }
+        let (arriba, _) = self.geometria_filas()[i];
+        let y0 = self.y_lista()
+            + arriba
+            + PAD_V
+            + ALTO_CAB
+            + ALTO_RES
+            + Self::detalle(notif).len() as f32 * LINEA_DET
+            + HUECO;
+        if !(y0..=y0 + ALTO_ACCION).contains(&y) {
+            return None;
+        }
+        let n = botones.len();
+        let ancho = (ANCHO_TEXTO - HUECO * (n as f32 - 1.0)) / n as f32;
+        let x0 = lista::MARGEN + GRUPO + 12.0 + 26.0 + 12.0;
+        botones.into_iter().enumerate().find_map(|(k, (clave, _))| {
+            let ini = x0 + k as f32 * (ancho + HUECO);
+            (ini..=ini + ancho).contains(&x).then_some(clave)
+        })
     }
 
     pub fn size(&self) -> (f32, f32) {
@@ -120,8 +236,11 @@ impl Notificaciones {
     /// «No hay notificaciones», y sin ese hueco la tarjeta daría un salto al
     /// llegar la primera.
     fn alto_lista(&self) -> f32 {
-        let n = self.lista.len().clamp(1, VISIBLES) as f32;
-        n * FILA_NOTIF + (n - 1.0) * HUECO
+        let filas = self.geometria_filas();
+        match filas.last() {
+            Some((y, alto)) => y + alto,
+            None => FILA_NOTIF,
+        }
     }
 
     /// La `y` donde empieza la lista: bajo la cabecera y dentro del grupo.
@@ -138,6 +257,9 @@ impl Notificaciones {
         self.seleccionada = self
             .seleccionada
             .filter(|i| *i < self.lista.len().min(VISIBLES));
+        if !self.lista.iter().any(|n| Some(n.id) == self.desplegada) {
+            self.desplegada = None;
+        }
     }
 
     /// Qué fila de la lista cae en un punto.
@@ -149,17 +271,15 @@ impl Notificaciones {
         if rel < 0.0 {
             return None;
         }
-        let i = (rel / (FILA_NOTIF + HUECO)) as usize;
-        if rel - i as f32 * (FILA_NOTIF + HUECO) > FILA_NOTIF {
-            return None;
-        }
-        (i < self.lista.len().min(VISIBLES)).then_some(i)
+        self.geometria_filas()
+            .iter()
+            .position(|(arriba, alto)| (*arriba..=arriba + alto).contains(&rel))
     }
 
     /// El «Borrar todo» de la cabecera. Se mide desde el borde derecho porque
     /// es donde está anclado, igual que se dibuja.
     fn rect_borrar(&self) -> iced_core::Rectangle {
-        let ancho = control::ancho_chip("Borrar todo");
+        let ancho = control::ancho_chip(BORRAR);
         iced_core::Rectangle {
             x: lista::ANCHO - lista::MARGEN - 4.0 - ancho,
             y: lista::MARGEN + (lista::CABECERA - control::CHIP) / 2.0,
@@ -272,9 +392,24 @@ impl Notificaciones {
         // tocar el cuerpo ejecuta la primera (la habitual es «Abrir»), y el
         // teclado puede hacer lo mismo con Intro.
         if let Some(i) = self.fila_en(x, y) {
+            if let Some(clave) = self.boton_en(i, x, y) {
+                return Some(Accion::NotificacionAccion {
+                    id: self.lista[i].id,
+                    clave,
+                });
+            }
             let notif = &self.lista[i];
-            if x >= lista::ANCHO - lista::MARGEN - CIERRE {
+            // La ✕ solo vale en la línea de arriba de la fila: desplegada, el
+            // borde derecho de los renglones de abajo es texto.
+            let (arriba, _) = self.geometria_filas()[i];
+            if x >= lista::ANCHO - lista::MARGEN - CIERRE
+                && y - self.y_lista() - arriba <= FILA_NOTIF
+            {
                 return Some(Accion::CerrarNotificacion(notif.id));
+            }
+            if Self::desplegable(notif) {
+                self.desplegada = (self.desplegada != Some(notif.id)).then_some(notif.id);
+                return None;
             }
             if let Some(accion) = notif.acciones.first() {
                 return Some(Accion::NotificacionAccion {
@@ -361,6 +496,21 @@ impl Notificaciones {
                 let Some(notif) = self.lista.get(i) else {
                     return Tecla::Ignorada;
                 };
+                // Con el teclado, el primer Intro despliega y el segundo hace
+                // lo que haría el botón principal: sin ratón no hay otro modo
+                // de llegar a los botones.
+                if Self::desplegable(notif) {
+                    if self.esta_desplegada(notif)
+                        && let Some((clave, _)) = Self::botones(notif).into_iter().next()
+                    {
+                        return Tecla::Hacer(Accion::NotificacionAccion {
+                            id: notif.id,
+                            clave,
+                        });
+                    }
+                    self.desplegada = (self.desplegada != Some(notif.id)).then_some(notif.id);
+                    return Tecla::Consumida;
+                }
                 if let Some(accion) = notif.acciones.first() {
                     Tecla::Hacer(Accion::NotificacionAccion {
                         id: notif.id,
@@ -415,35 +565,11 @@ impl Notificaciones {
             (acciones, _, _) if acciones > 0 => format!("{} acciones", acciones),
             _ => String::new(),
         };
-        let cabecera = row![
-            text(app).size(11.0).color(color_app),
-            Space::new().width(Length::Fill),
-            text(indicador).size(10.0).color(tema::TEXTO2),
-            Space::new().width(Length::Fixed(6.0)),
-            text(notif.hace()).size(11.0).color(tema::TEXTO2),
-            // El hueco de la ✕, siempre reservado: si apareciera y
-            // desapareciera, el texto de la derecha bailaría al pasar el ratón.
-            Space::new().width(Length::Fixed(CIERRE - 12.0)),
-        ]
-        .align_y(Vertical::Center);
-
-        let ancho_texto = ancho - 24.0 - 26.0 - 12.0 - CIERRE;
-        let mut textos = column![
-            cabecera,
-            text(lista::recortar(&notif.resumen, ancho_texto, 13.0))
-                .size(13.0)
-                .font(control::peso(Weight::Medium))
-                .color(tema::texto()),
-        ];
-        if !notif.cuerpo.is_empty() {
-            textos = textos.push(
-                text(lista::recortar(&notif.cuerpo, ancho_texto, 11.0))
-                    .size(11.0)
-                    .color(tema::TEXTO2),
-            );
-        }
-
-        let cierre: PanelElement<'a> = if señalada > 0.02 {
+        // La hora y la ✕ comparten el mismo sitio, en el borde derecho de la
+        // fila: al señalarla la ✕ ocupa el lugar de la hora, como en macOS. Antes
+        // la ✕ tenía su propio hueco a la derecha, y la hora quedaba flotando
+        // a media fila, lejos del borde.
+        let derecha: PanelElement<'a> = if señalada > 0.02 {
             match crate::icono::propio("cerrar") {
                 Some(ic) => {
                     crate::icono::ver_teñido_propio(&ic, 12.0, tema::alfa(tema::texto(), señalada))
@@ -451,8 +577,98 @@ impl Notificaciones {
                 None => Space::new().into(),
             }
         } else {
-            Space::new().into()
+            text(notif.hace()).size(11.0).color(tema::TEXTO2).into()
         };
+
+        let cabecera = row![
+            text(app).size(11.0).color(color_app),
+            Space::new().width(Length::Fill),
+            text(indicador).size(10.0).color(tema::TEXTO2),
+            Space::new().width(Length::Fixed(6.0)),
+            derecha,
+        ]
+        .align_y(Vertical::Center);
+
+        let ancho_texto = ANCHO_TEXTO;
+        let resumen = text(lista::recortar(&notif.resumen, ancho_texto, 13.0))
+            .size(13.0)
+            .font(control::peso(Weight::Medium))
+            .color(tema::texto());
+        let desplegada = self.esta_desplegada(notif);
+        let mut textos = if desplegada {
+            // Alturas fijas: el alto de la fila se calcula sin medir texto y
+            // tiene que coincidir con lo que se dibuja aquí.
+            column![
+                container(cabecera).height(Length::Fixed(ALTO_CAB)),
+                container(resumen).height(Length::Fixed(ALTO_RES)),
+            ]
+        } else {
+            column![cabecera, resumen]
+        };
+        if desplegada {
+            for linea in Self::detalle(notif) {
+                textos = textos.push(
+                    container(text(linea).size(11.0).color(tema::TEXTO2))
+                        .height(Length::Fixed(LINEA_DET)),
+                );
+            }
+            let botones = Self::botones(notif);
+            if !botones.is_empty() {
+                let n = botones.len();
+                let ancho_boton = (ancho_texto - HUECO * (n as f32 - 1.0)) / n as f32;
+                let fila =
+                    botones
+                        .into_iter()
+                        .enumerate()
+                        .fold(row![], |fila, (k, (_, etiqueta))| {
+                            let primario = k == 0;
+                            fila.push(
+                                container(
+                                    text(lista::recortar(&etiqueta, ancho_boton - 12.0, 12.0))
+                                        .size(12.0)
+                                        .font(control::peso(Weight::Semibold))
+                                        .color(if primario {
+                                            tema::sobre_acento()
+                                        } else {
+                                            tema::texto()
+                                        }),
+                                )
+                                .width(Length::Fixed(ancho_boton))
+                                .height(Length::Fixed(ALTO_ACCION))
+                                .center_x(Length::Fixed(ancho_boton))
+                                .center_y(Length::Fixed(ALTO_ACCION))
+                                .style(move |_| container::Style {
+                                    background: Some(if primario {
+                                        tema::acento().into()
+                                    } else {
+                                        tema::hover().into()
+                                    }),
+                                    border: Border {
+                                        radius: tema::R_BOTON_PEQUENO.into(),
+                                        ..Default::default()
+                                    },
+                                    ..Default::default()
+                                }),
+                            )
+                            .push(
+                                Space::new().width(Length::Fixed(if k + 1 < n {
+                                    HUECO
+                                } else {
+                                    0.0
+                                })),
+                            )
+                        });
+                textos = textos
+                    .push(Space::new().height(Length::Fixed(HUECO)))
+                    .push(fila);
+            }
+        } else if !notif.cuerpo.is_empty() {
+            textos = textos.push(
+                text(lista::recortar(&notif.cuerpo, ancho_texto, 11.0))
+                    .size(11.0)
+                    .color(tema::TEXTO2),
+            );
+        }
 
         let fondo = control::baldosa(señalada);
         // Los textos van en una caja de ancho fijo: sin ella, iced los deja
@@ -460,29 +676,28 @@ impl Notificaciones {
         // desborda una fila de 52 px. Recortar no basta, porque lo recortado se
         // mide a ojo y el envoltorio ocurre después.
         let textos = container(textos).width(Length::Fixed(ancho_texto));
-        container(
-            row![
-                dibujo,
-                Space::new().width(Length::Fixed(12.0)),
-                textos,
-                Space::new().width(Length::Fill),
-                cierre,
-            ]
-            .align_y(Vertical::Center),
-        )
-        .width(Length::Fixed(ancho))
-        .height(Length::Fixed(FILA_NOTIF))
-        .center_y(Length::Fixed(FILA_NOTIF))
-        .padding([0, 12])
-        .style(move |_theme: &iced_widget::Theme| container::Style {
-            background: Some(fondo.into()),
-            border: Border {
-                radius: tema::R_BOTON_PEQUENO.into(),
+        let alto = self.alto_fila(notif);
+        // Desplegada, el icono se queda arriba con el título en vez de flotar a
+        // media altura del cuerpo.
+        let (alineado, padding) = if desplegada {
+            (Vertical::Top, [PAD_V, 12.0])
+        } else {
+            (Vertical::Center, [0.0, 12.0])
+        };
+        container(row![dibujo, Space::new().width(Length::Fixed(12.0)), textos,].align_y(alineado))
+            .width(Length::Fixed(ancho))
+            .height(Length::Fixed(alto))
+            .center_y(Length::Fixed(alto))
+            .padding(padding)
+            .style(move |_theme: &iced_widget::Theme| container::Style {
+                background: Some(fondo.into()),
+                border: Border {
+                    radius: tema::R_BOTON_PEQUENO.into(),
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
-            ..Default::default()
-        })
-        .into()
+            })
+            .into()
     }
 
     fn boton_duracion(&self, i: usize) -> PanelElement<'_> {
@@ -544,13 +759,9 @@ impl Notificaciones {
                 // se ancla a él, y el rojo de destruir sin nada que destruir
                 // se lee como un aviso.
                 if self.lista.is_empty() {
-                    control::chip(
-                        "Borrar todo",
-                        tema::superficie(),
-                        tema::alfa(tema::TEXTO2, 0.6),
-                    )
+                    control::chip(BORRAR, tema::superficie(), tema::alfa(tema::TEXTO2, 0.6))
                 } else {
-                    control::chip("Borrar todo", tema::alfa(tema::rojo(), 0.14), tema::rojo())
+                    control::chip(BORRAR, tema::alfa(tema::rojo(), 0.14), tema::rojo())
                 },
             ]
             .align_y(Vertical::Center),
@@ -684,9 +895,89 @@ mod tests {
             n.tecla(crate::TeclaPulsada::Abajo),
             Tecla::Consumida
         ));
+        // Con acciones, el primer Intro despliega y el segundo la ejecuta.
+        assert!(matches!(
+            n.tecla(crate::TeclaPulsada::Intro),
+            Tecla::Consumida
+        ));
         assert!(matches!(
             n.tecla(crate::TeclaPulsada::Intro),
             Tecla::Hacer(Accion::NotificacionAccion { id: 7, .. })
         ));
+    }
+
+    fn con_cuerpo(
+        id: u32,
+        cuerpo: &str,
+        acciones: Vec<crate::notificaciones::Accion>,
+    ) -> crate::notificaciones::Notificacion {
+        crate::notificaciones::Notificacion::nueva_con_datos(
+            id,
+            "App".into(),
+            "Resumen".into(),
+            cuerpo.into(),
+            "",
+            false,
+            acciones,
+            None,
+            false,
+        )
+    }
+
+    /// Un cuerpo largo se despliega al pulsar y se recoge al volver a pulsar; la
+    /// tarjeta crece y encoge con él.
+    #[test]
+    fn pulsar_una_fila_larga_la_despliega_y_la_recoge() {
+        let mut n = Notificaciones::new();
+        n.actualizar(vec![con_cuerpo(1, &"palabra ".repeat(40), vec![])]);
+        let cerrada = n.size().1;
+        let (x, y) = (100.0, n.y_lista() + 10.0);
+        assert!(n.pulsar(x, y).is_none(), "desplegar no es una acción");
+        assert!(n.size().1 > cerrada);
+        assert!(n.pulsar(x, y).is_none());
+        assert_eq!(n.size().1, cerrada);
+    }
+
+    /// Una fila corta y sin acciones sigue como antes: un toque la cierra.
+    #[test]
+    fn una_fila_corta_se_sigue_cerrando_con_un_toque() {
+        let mut n = Notificaciones::new();
+        n.actualizar(vec![con_cuerpo(7, "hola", vec![])]);
+        let y = n.y_lista() + 10.0;
+        assert!(matches!(
+            n.pulsar(100.0, y),
+            Some(Accion::CerrarNotificacion(7))
+        ));
+    }
+
+    /// Desplegada, cada botón devuelve su acción; «default» sale como «Abrir».
+    #[test]
+    fn los_botones_desplegados_devuelven_su_accion() {
+        let accion = |c: &str, e: &str| crate::notificaciones::Accion {
+            clave: c.into(),
+            etiqueta: e.into(),
+        };
+        let mut n = Notificaciones::new();
+        n.actualizar(vec![con_cuerpo(
+            3,
+            "hola",
+            vec![accion("default", ""), accion("r", "Responder")],
+        )]);
+        n.pulsar(100.0, n.y_lista() + 10.0);
+        let notif = &n.lista[0];
+        let y = n.y_lista()
+            + PAD_V
+            + ALTO_CAB
+            + ALTO_RES
+            + Notificaciones::detalle(notif).len() as f32 * LINEA_DET
+            + HUECO
+            + ALTO_ACCION / 2.0;
+        let x0 = lista::MARGEN + GRUPO + 50.0;
+        let clave = |x: f32| match n.pulsar_sin_efecto(x, y) {
+            Some(c) => c,
+            None => String::new(),
+        };
+        assert_eq!(clave(x0 + 5.0), "r");
+        assert_eq!(clave(x0 + ANCHO_TEXTO - 5.0), "default");
     }
 }

@@ -414,6 +414,7 @@ fn draw(
     // Si el tema cambió, el fondo y el cristal tienen que ser ya los nuevos en
     // este mismo fotograma.
     crate::backend::recargar_fondo(state, renderer);
+    crate::multimedia::vigilar_centro(state);
 
     // El panel va por delante de las ventanas: `custom_elements` se apila
     // encima de los espacios.

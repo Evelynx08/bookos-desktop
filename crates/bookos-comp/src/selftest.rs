@@ -376,7 +376,7 @@ fn comprobar_encierro(state: &mut BookosComp) {
     use crate::keybinds::Accion;
     for (accion, nombre) in [
         (Accion::CambiarVt(2), "Ctrl+Alt+F2"),
-        (Accion::Salir, "Ctrl+Alt+Retroceso"),
+        (Accion::Salir, "Meta+Alt+Retroceso"),
     ] {
         if accion.es_emergencia() {
             tracing::info!(nombre, "sigue siendo salida de emergencia");
@@ -2149,6 +2149,12 @@ fn paso_de_guion(state: &mut BookosComp, pasos: std::rc::Rc<Vec<String>>, i: usi
             for (n, tecla) in teclas.iter().rev().enumerate() {
                 crate::input::tecla(state, *tecla, KeyState::Released, t + 20 + n as u32);
             }
+            state.needs_redraw = true;
+            despues(2)
+        }
+        // Lo que hacen tres dedos hacia arriba, que en el anidado no llegan.
+        ["exponer"] => {
+            crate::input::exponer(state);
             state.needs_redraw = true;
             despues(2)
         }

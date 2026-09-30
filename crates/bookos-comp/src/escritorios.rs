@@ -629,6 +629,10 @@ fn terminar_deslizamiento(state: &mut BookosComp, salida: &str) {
     // lista del escritorio anterior: un escritorio vacío seguía enseñando con
     // su punto una aplicación abierta en el de al lado.
     state.actualizar_dock();
+    // Y las barras, por lo mismo: pasar de un escritorio con una ventana
+    // pequeña a otro con una maximizada dejaba el panel a la vista encima de
+    // ella, o escondido sobre un escritorio vacío.
+    state.revisar_barras();
     state.needs_redraw = true;
 }
 
@@ -715,6 +719,8 @@ pub fn despejar(state: &mut BookosComp) {
         state.space.unmap_elem(window);
     }
     state.escritorios.escondidas = escondidas;
+    // Sin ventanas no hay nada que esquivar: las barras vuelven.
+    state.revisar_barras();
     state.needs_redraw = true;
 }
 
@@ -739,6 +745,7 @@ pub fn recuperar(state: &mut BookosComp) {
     if let Some(window) = state.space.elements().last().cloned() {
         state.enfocar(&window);
     }
+    state.revisar_barras();
     state.needs_redraw = true;
 }
 

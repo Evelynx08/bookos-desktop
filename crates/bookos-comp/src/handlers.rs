@@ -138,6 +138,9 @@ impl CompositorHandler for BookosComp {
         // que el cliente pueda adjuntar buffer; si no, se queda esperando.
         self.send_initial_configure(&window, &root);
         self.colocar_si_es_nueva(&window);
+        if crate::ventanas::tamano_nuevo(&window) {
+            self.revisar_barras();
+        }
         self.needs_redraw = true;
     }
 }
@@ -489,6 +492,15 @@ impl XdgShellHandler for BookosComp {
         }
     }
 
+    /// Las apps sin barra nuestra (Tauri con `decorations: false`) minimizan
+    /// con `set_minimized` desde su propio botón. El trait lo ignora por
+    /// defecto, así que ese botón no hacía nada.
+    fn minimize_request(&mut self, surface: ToplevelSurface) {
+        if let Some(window) = self.window_de_toplevel(&surface) {
+            crate::ventanas::minimizar(self, window);
+        }
+    }
+
     /// Pantalla completa: el cliente la pide con F11, con su propio botón o al
     /// darle a "reproducir a pantalla completa". La salida `output` se ignora
     /// porque de momento solo hay una pantalla.
@@ -674,6 +686,17 @@ impl SeatHandler for BookosComp {
 
     fn seat_state(&mut self) -> &mut SeatState<Self> {
         &mut self.seat_state
+    }
+
+    fn led_state_changed(
+        &mut self,
+        _seat: &Seat<Self>,
+        led_state: smithay::input::keyboard::LedState,
+    ) {
+        self.leds = led_state;
+        if let Some(aplicar) = self.aplicar_leds.as_ref() {
+            aplicar(led_state);
+        }
     }
 
     /// El portapapeles va **con el foco**: el cliente enfocado es el único al
@@ -935,6 +958,7 @@ impl IdleNotifierHandler for BookosComp {
 
 delegate_idle_notify!(BookosComp);
 delegate_relative_pointer!(BookosComp);
+smithay::delegate_pointer_gestures!(BookosComp);
 
 impl WlrLayerShellHandler for BookosComp {
     fn shell_state(&mut self) -> &mut WlrLayerShellState {

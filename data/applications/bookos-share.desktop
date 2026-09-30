@@ -1,5 +1,6 @@
 [Desktop Entry]
-Name=Compartir
+Name=Share
+Name[es]=Compartir
 Comment=Envía y recibe archivos con otros dispositivos
 Exec=bookos-share
 TryExec=bookos-share

@@ -198,6 +198,11 @@ const PROPIOS: &[(&str, &[u8])] = &[
     ("terminal", include_bytes!("../assets/iconos/terminal.svg")),
     ("teclado", include_bytes!("../assets/iconos/teclado.svg")),
     ("touchpad", include_bytes!("../assets/iconos/touchpad.svg")),
+    ("camara", include_bytes!("../assets/iconos/camara.svg")),
+    // La raya que se pone encima de un icono para decir «apagado». Va aparte y
+    // no dibujada dentro de cada uno porque el OSD la tiñe de rojo mientras el
+    // icono va del color del texto, y un SVG solo admite un tinte.
+    ("tachado", include_bytes!("../assets/iconos/tachado.svg")),
     // El logo del sistema, que es lo que abre: el cajón de todo. Va sin teñir
     // —tiene su propia paleta— y por eso el dock lo trata como un icono de
     // aplicación y no como uno de estado.
@@ -205,8 +210,8 @@ const PROPIOS: &[(&str, &[u8])] = &[
         "launchpad",
         include_bytes!("../assets/iconos/launchpad.svg"),
     ),
-    // La alternativa del cohete, por si algún día se prefiere: `dock =
-    // launchpad:Aplicaciones:launchpad-cohete, ...`
+    // El cohete, que es el que lleva el dock de serie. El logo de arriba sigue
+    // disponible con `dock = launchpad:Aplicaciones:launchpad, ...`
     (
         "launchpad-cohete",
         include_bytes!("../assets/iconos/launchpad-cohete.svg"),
@@ -415,6 +420,9 @@ static CACHE: std::sync::OnceLock<
 /// Primero los propios: un icono de BookOS no debe cambiar de dibujo porque el
 /// usuario instale otro tema.
 pub fn cargar(nombre: &str) -> Option<Icono> {
+    if es_dinamico(nombre) {
+        return cargar_dinamico(nombre);
+    }
     let cache = CACHE.get_or_init(Default::default);
     {
         // No se conserva el bloqueo mientras se resuelve el icono. La ruta de
@@ -442,6 +450,29 @@ pub fn cargar(nombre: &str) -> Option<Icono> {
     mapa.entry(nombre.to_string())
         .or_insert_with(|| icono.clone())
         .clone()
+}
+
+/// Iconos que su aplicación reescribe en disco: el reloj mueve las agujas del
+/// SVG del tema cada minuto (`reloj-dinamico` del pack de iconos) y el
+/// calendario deja el PNG con el día de hoy en hicolor. Con la caché por nombre
+/// se quedaban con el dibujo del arranque de la sesión.
+const DINAMICOS: &[&str] = &["bookos-clock", "bookos-calendar"];
+
+pub fn es_dinamico(nombre: &str) -> bool {
+    DINAMICOS.contains(&nombre)
+}
+
+/// Sin caché, y el SVG desde sus bytes en vez de desde la ruta: el
+/// identificador del `Handle` sale de lo que se le da, así que por ruta iced
+/// seguiría sirviendo el rasterizado de la hora vieja. Por contenido solo se
+/// rasteriza de nuevo cuando el dibujo cambia de verdad.
+fn cargar_dinamico(nombre: &str) -> Option<Icono> {
+    let ruta = resolve_icon(nombre)?;
+    if ruta.extension().is_some_and(|e| e == "svg") {
+        let bytes = std::fs::read(&ruta).ok()?;
+        return Some(Icono::Svg(svg::Handle::from_memory(bytes)));
+    }
+    load_icon(&ruta)
 }
 
 fn cargar_sin_cache(nombre: &str) -> Option<Icono> {
@@ -663,9 +694,9 @@ mod tests {
         let t1 = std::time::Instant::now();
         for nombre in [
             "utilities-terminal",
-            "system-file-manager",
+            "bookos-explorer",
             "firefox",
-            "accessories-text-editor",
+            "bookos-notepad",
         ] {
             assert!(resolve_icon(nombre).is_some(), "sin icono para {nombre}");
         }

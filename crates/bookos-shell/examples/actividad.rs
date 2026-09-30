@@ -58,6 +58,8 @@ fn item(id: &str, titulo: &str, artista: &str, favorita: bool, actual: bool) -> 
         duracion_ms: 234_000,
         favorita,
         actual,
+        // Una de cada dos con carátula, para ver las dos filas lado a lado.
+        portada: (id.len() == 1 && id != "1" && id.as_bytes()[0] % 2 == 1).then(portada),
     }
 }
 
@@ -103,6 +105,17 @@ fn volcar(nombre: &str, buf: &[u8], w: u32, h: u32) {
 /// dibujar, para llegar a la vista abierta o a la cola por el mismo camino que
 /// las daría el usuario.
 fn pinta(nombre: &str, tema: bookos_shell::tema::Tema, estado: Estado, clics: &[(f32, f32)]) {
+    pinta_varias(nombre, tema, vec![estado], clics);
+}
+
+/// Varias actividades vivas a la vez: la principal en la píldora y las demás
+/// como burbujas.
+fn pinta_varias(
+    nombre: &str,
+    tema: bookos_shell::tema::Tema,
+    estados: Vec<Estado>,
+    clics: &[(f32, f32)],
+) {
     // El temporizador solo sale si la configuración lo deja verse siempre; sin
     // esto la vista del temporizador en marcha no se puede previsualizar.
     let actividades = bookos_shell::ConfigActividades {
@@ -115,7 +128,9 @@ fn pinta(nombre: &str, tema: bookos_shell::tema::Tema, estado: Estado, clics: &[
         ..Config::default()
     };
     let mut shell = Shell::con_config(1646, ESCALA, config);
-    shell.publicar_actividad(estado);
+    for estado in estados {
+        shell.publicar_actividad(estado);
+    }
     for (x, y) in clics {
         shell.actividad_pulsar(*x, *y);
     }
@@ -186,6 +201,16 @@ fn main() {
             tema,
             base(Clase::Recorder),
             &[(180.0, 55.0)],
+        );
+        pinta_varias(
+            &format!("tres-a-la-vez-{etiqueta}"),
+            tema,
+            vec![
+                base(Clase::Player),
+                base(Clase::Timer),
+                base(Clase::Recorder),
+            ],
+            &[],
         );
         let mut pausado = base(Clase::Player);
         pausado.pausado = true;

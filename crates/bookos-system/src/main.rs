@@ -1,5 +1,6 @@
 mod audio;
 mod bluetooth;
+mod montaje;
 mod network;
 mod pairing;
 use bookos_system::{NAME, Operation, PATH, State};
@@ -184,6 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(watch_owner(system.clone(), name, domain, changes.clone()));
     }
     tokio::spawn(watch_audio(changes.clone()));
+    tokio::spawn(montaje::vigilar(system.clone()));
     changes.send("all".into()).await?;
     while let Some(domain) = events.recv().await {
         // Batch notifications from the same hardware transaction.

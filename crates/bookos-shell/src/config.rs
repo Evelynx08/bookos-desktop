@@ -14,6 +14,8 @@
 //! bloqueo_animaciones = si
 //! bloqueo_fecha = si
 //! bloqueo_medios = si
+//! bloqueo_nombre = si
+//! bloqueo_energia = si
 //! bloqueo_reloj_y = 0.08
 //! bloqueo_acceso_y = 0.36
 //! bloqueo_medios_y = 0.68
@@ -27,9 +29,13 @@
 //! brillo_automatico_pantalla = no
 //! brillo_automatico_teclado = no
 //! temporizador_siempre_visible = no
+//! sonido_volumen = si
+//! genio = si
+//! panel_esquiva = no
+//! dock_esquiva = no
 //! escritorios = 2
 //! nombres_escritorios = Escritorio 1, Escritorio 2
-//! dock = konsole:Terminal:utilities-terminal, bookos-explorer:Archivos:system-file-manager, firefox:Navegador:firefox, bookos-settings:Ajustes:bookos-settings
+//! dock = konsole:Terminal:utilities-terminal, bookos-explorer:Archivos:bookos-explorer, firefox:Navegador:firefox, bookos-settings:Ajustes:bookos-settings
 //!
 //! # Cursor y entrada. Las velocidades van en la escala de libinput: [-1, 1].
 //! # Uno para cada tema: el cambio de claro a oscuro se lleva el fondo con él.
@@ -170,6 +176,14 @@ pub struct Config {
     /// Settings y permiten desactivar movimiento sin apagar la función.
     pub actividades: Actividades,
     pub brillo_automatico: BrilloAutomatico,
+    /// El chasquido al subir o bajar el volumen con las teclas.
+    pub sonido_volumen: bool,
+    /// El «magic lamp» al minimizar. Apagado, la ventana se encoge sin deformarse.
+    pub genio: bool,
+    /// Si el panel y el dock se apartan de las ventanas (Meta+Alt+B y
+    /// Meta+Alt+D). Se guardan al cambiar para que sobrevivan al reinicio.
+    pub panel_esquiva: bool,
+    pub dock_esquiva: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,6 +213,10 @@ pub struct Bloqueo {
     pub animaciones: bool,
     pub fecha: bool,
     pub medios: bool,
+    /// El nombre del usuario bajo el avatar.
+    pub nombre: bool,
+    /// El botón de apagado de la esquina. Sin él, apagar pide desbloquear antes.
+    pub energia: bool,
     pub reloj_y: f32,
     pub acceso_y: f32,
     pub medios_y: f32,
@@ -212,6 +230,8 @@ impl Default for Bloqueo {
             animaciones: true,
             fecha: true,
             medios: true,
+            nombre: true,
+            energia: true,
             // La referencia: reloj en el primer tercio, identidad en el centro
             // y la tarjeta de lo que suena por debajo del acceso.
             reloj_y: 0.08,
@@ -307,7 +327,7 @@ impl Default for Config {
             dock: [
                 // El primero, como en el dock de macOS: es el cajón de todo lo
                 // demás y conviene que esté donde siempre.
-                (LAUNCHPAD, "Aplicaciones", "launchpad"),
+                (LAUNCHPAD, "Aplicaciones", "launchpad-cohete"),
                 // El mismo por defecto que Meta+Return (`keybinds::TERMINAL`):
                 // `bookos-shell` —lo que había aquí antes— es la biblioteca del
                 // propio panel, no un programa que lanzar. No se lee
@@ -315,13 +335,13 @@ impl Default for Config {
                 // por el validador de `ajustes` (`GetConfig`/`ApplyConfig`),
                 // que rechaza `$`, `{` y `}` por ser metacaracteres de shell.
                 ("konsole", "Terminal", "utilities-terminal"),
-                ("bookos-explorer", "Archivos", "system-file-manager"),
+                ("bookos-explorer", "Archivos", "bookos-explorer"),
                 ("firefox", "Navegador", "firefox"),
                 // Los ajustes son los de BookOS, no los de Plasma: abrir el
                 // panel de otro escritorio desde este es enseñar opciones que
                 // no gobiernan lo que se está usando.
                 ("bookos-settings", "Ajustes", "bookos-settings"),
-                ("bookos-notepad", "Bloc de notas", "accessories-text-editor"),
+                ("bookos-notepad", "Notas", "bookos-notepad"),
             ]
             .into_iter()
             .map(|(e, l, i)| Lanzador {
@@ -362,6 +382,10 @@ impl Default for Config {
             suspension_inactividad: 0,
             actividades: Actividades::default(),
             brillo_automatico: BrilloAutomatico::default(),
+            sonido_volumen: true,
+            genio: true,
+            panel_esquiva: false,
+            dock_esquiva: false,
         }
     }
 }
@@ -443,9 +467,39 @@ impl Config {
                         config.actividades.animaciones = v;
                     }
                 }
+                "genio" => {
+                    if let Some(v) = booleano(valor, ruta, n + 1) {
+                        config.genio = v;
+                    }
+                }
+                "sonido_volumen" => {
+                    if let Some(v) = booleano(valor, ruta, n + 1) {
+                        config.sonido_volumen = v;
+                    }
+                }
+                "panel_esquiva" => {
+                    if let Some(v) = booleano(valor, ruta, n + 1) {
+                        config.panel_esquiva = v;
+                    }
+                }
+                "dock_esquiva" => {
+                    if let Some(v) = booleano(valor, ruta, n + 1) {
+                        config.dock_esquiva = v;
+                    }
+                }
                 "temporizador_siempre_visible" => {
                     if let Some(v) = booleano(valor, ruta, n + 1) {
                         config.actividades.temporizador_siempre = v;
+                    }
+                }
+                "bloqueo_nombre" => {
+                    if let Some(v) = booleano(valor, ruta, n + 1) {
+                        config.bloqueo.nombre = v;
+                    }
+                }
+                "bloqueo_energia" => {
+                    if let Some(v) = booleano(valor, ruta, n + 1) {
+                        config.bloqueo.energia = v;
                     }
                 }
                 "bloqueo_fecha" => {
@@ -810,6 +864,12 @@ pub fn guardar_brillo_automatico(elegido: BrilloAutomatico) -> std::io::Result<(
     ])
 }
 
+/// Persiste si una barra se aparta de las ventanas. `clave` es
+/// `panel_esquiva` o `dock_esquiva`.
+pub fn guardar_esquiva(clave: &str, esquiva: bool) -> std::io::Result<()> {
+    escribir_claves(&[(clave, if esquiva { "si" } else { "no" }.to_string())])
+}
+
 /// Punto único de persistencia para la API estructurada del compositor.
 /// Las claves ya llegan validadas por `org.bookos.Desktop`; esta función
 /// conserva comentarios, orden y claves que una versión nueva aún no conozca.
@@ -885,6 +945,7 @@ fn escribir_claves(valores: &[(&str, String)]) -> std::io::Result<()> {
 /// Utilidades:verde = konsole, kate, kcalc
 /// Internet = firefox, thunderbird
 /// ocultas = xterm, gnome-tetravex
+/// orden = kate, firefox, konsole
 /// ```
 ///
 /// El color es uno de la tabla de [`crate::tema::Acento`]; sin él, la carpeta
@@ -896,6 +957,10 @@ fn escribir_claves(valores: &[(&str, String)]) -> std::io::Result<()> {
 /// escritorio se separan a la primera.
 pub const CLAVE_OCULTAS: &str = "ocultas";
 
+/// El orden manual de las aplicaciones sueltas, para moverlas de página. Es
+/// clave reservada por lo mismo que [`CLAVE_OCULTAS`].
+pub const CLAVE_ORDEN: &str = "orden";
+
 /// Lo que hay en `launchpad.conf`.
 #[derive(Default)]
 pub struct Launchpad {
@@ -903,6 +968,8 @@ pub struct Launchpad {
     pub carpetas: Vec<(String, Option<String>, Vec<String>)>,
     /// Las que el usuario ha quitado de la rejilla.
     pub ocultas: Vec<String>,
+    /// Las sueltas que el usuario ha colocado a mano, en su orden.
+    pub orden: Vec<String>,
 }
 
 pub fn cargar_launchpad() -> Launchpad {
@@ -941,6 +1008,10 @@ fn interpretar_launchpad(texto: &str) -> Launchpad {
             salida.ocultas = valores;
             continue;
         }
+        if clave == CLAVE_ORDEN {
+            salida.orden = valores;
+            continue;
+        }
         let (nombre, color) = match clave.split_once(':') {
             Some((n, c)) => (n.trim(), Some(c.trim().to_string())),
             None => (clave, None),
@@ -975,6 +1046,9 @@ pub fn guardar_launchpad(datos: &Launchpad) -> std::io::Result<()> {
     }
     if !datos.ocultas.is_empty() {
         salida.push_str(&format!("{CLAVE_OCULTAS} = {}\n", datos.ocultas.join(", ")));
+    }
+    if !datos.orden.is_empty() {
+        salida.push_str(&format!("{CLAVE_ORDEN} = {}\n", datos.orden.join(", ")));
     }
     std::fs::write(ruta, salida)
 }
@@ -1057,6 +1131,18 @@ mod tests {
         assert_eq!(parsear("dock_tamano = absurdo").dock_tamano, 50);
         assert!(parsear("bloqueo_huella = si").bloqueo_huella);
         assert!(!parsear("bloqueo_huella = quizá").bloqueo_huella);
+    }
+
+    #[test]
+    fn las_barras_recuerdan_si_esquivan() {
+        let c = parsear("");
+        assert!(
+            !c.panel_esquiva && !c.dock_esquiva,
+            "de serie, siempre a la vista"
+        );
+        let c = parsear("panel_esquiva = si\ndock_esquiva = no");
+        assert!(c.panel_esquiva);
+        assert!(!c.dock_esquiva);
     }
 
     #[test]

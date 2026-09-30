@@ -371,7 +371,10 @@ impl Calendario {
             .center_x(Length::Fixed(CELDA - 2.0))
             .center_y(Length::Fixed(CELDA - 2.0))
             .style(move |_theme| container::Style {
-                background: Some(fondo.into()),
+                // Sin rastro de hover el fondo es transparente del todo, y aun
+                // así tiny-skia lo mezclaría píxel a píxel: 42 celdas por
+                // repintado para no pintar nada.
+                background: (fondo.a > 0.0).then(|| fondo.into()),
                 border: Border {
                     radius: tema::R_BOTON_PEQUENO.into(),
                     ..Default::default()

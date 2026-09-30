@@ -127,6 +127,18 @@ pub fn interruptor<'a>(encendido: f32) -> PanelElement<'a> {
 /// Los 4 px de relleno lateral dejan el título a 20 del borde de la tarjeta,
 /// que es el padding de una fila en el sistema de diseño, mientras el grupo de
 /// debajo se queda a 16.
+/// ¿Cae el punto en el interruptor de la cabecera? En coordenadas de la
+/// tarjeta, con las mismas medidas que [`cabecera`]: pegado a la derecha, con
+/// los 4 de relleno de la cabecera y el margen de la tarjeta.
+///
+/// Toda la altura de la cabecera y 8 más a cada lado: 46×28 es poco para
+/// acertar con el touchpad, y a su izquierda solo está el título.
+pub fn interruptor_en(x: f32, y: f32) -> bool {
+    let derecha = ANCHO - MARGEN - 4.0;
+    let izquierda = derecha - INTERRUPTOR_ANCHO;
+    (izquierda - 8.0..=derecha + 8.0).contains(&x) && (MARGEN..=MARGEN + CABECERA).contains(&y)
+}
+
 pub fn cabecera<'a>(titulo: &'a str, encendido: Option<f32>) -> PanelElement<'a> {
     let mut fila = row![control::titulo(titulo)].align_y(Vertical::Center);
     if let Some(encendido) = encendido {
@@ -318,6 +330,23 @@ pub fn fila_en(x: f32, y: f32, y0: f32, n: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// El centro del interruptor se pulsa y el título no: los dos comparten la
+    /// cabecera, y confundirlos apagaría el Bluetooth al querer leer el título.
+    #[test]
+    fn el_interruptor_de_la_cabecera_responde_donde_se_dibuja() {
+        let centro_x = ANCHO - MARGEN - 4.0 - INTERRUPTOR_ANCHO / 2.0;
+        let centro_y = MARGEN + CABECERA / 2.0;
+        assert!(interruptor_en(centro_x, centro_y));
+        assert!(
+            !interruptor_en(MARGEN + 20.0, centro_y),
+            "el título no es el interruptor"
+        );
+        assert!(
+            !interruptor_en(centro_x, MARGEN + CABECERA + 20.0),
+            "debajo ya es la lista"
+        );
+    }
 
     /// Un SSID largo se recorta con puntos en vez de empujar al número de la
     /// derecha fuera de la tarjeta.

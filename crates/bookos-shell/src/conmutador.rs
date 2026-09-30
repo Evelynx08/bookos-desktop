@@ -146,8 +146,79 @@ impl Conmutador {
     }
 
     /// ¿Se está moviendo el recuadro? Mientras sí, hay que repintar.
+    ///
+    /// En el de ventanas nunca: ahí el recuadro es una superficie aparte que el
+    /// compositor desliza sin repintar nada. Repintar la tarjeta en cada
+    /// fotograma del cambio era el tirón al pasar el cursor por las miniaturas:
+    /// medido en release a 2880 px y escala 1,75, **8,3 ms con tres ventanas,
+    /// 11,4 con seis y 25,4 con diez**, por fotograma, con 8,3 de presupuesto a
+    /// 120 Hz (`examples/conmutador_bench.rs`).
     pub fn animando(&self) -> bool {
-        self.marca.animando()
+        self.rejilla.is_none() && self.marca.animando()
+    }
+
+    /// La celda de la elegida, en lógicos de la tarjeta. Solo en el de
+    /// ventanas, que es el que lleva el recuadro aparte.
+    pub fn realce(&self) -> Option<Rectangle> {
+        let r = self.rejilla?;
+        (self.elegida < self.entradas.len()).then(|| r.celda(self.elegida))
+    }
+
+    /// La franja del rótulo —icono y título de la elegida— en lógicos de la
+    /// tarjeta. Va aparte por lo mismo que el recuadro: es lo único de la
+    /// tarjeta que cambia al elegir, y mide un renglón.
+    pub fn rotulo(&self) -> Option<Rectangle> {
+        let r = self.rejilla?;
+        let (w, h) = r.size();
+        Some(Rectangle {
+            x: MARGEN,
+            y: MARGEN + h,
+            width: w,
+            height: NOMBRE,
+        })
+    }
+
+    /// El recuadro de la elegida, solo, para su propia superficie.
+    ///
+    /// Se compone **encima** de la celda de la tarjeta, que lleva ya su fondo y
+    /// su borde de reposo: por eso el relleno es el acento translúcido y el
+    /// borde el acento entero, los mismos que llevaba la celda elegida.
+    pub fn view_realce() -> PanelElement<'static> {
+        container(Space::new())
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_theme: &iced_widget::Theme| container::Style {
+                background: Some(tema::alfa(tema::acento(), 0.22).into()),
+                border: Border {
+                    radius: tema::R_CONTROL.into(),
+                    width: 3.0,
+                    color: tema::acento(),
+                },
+                ..Default::default()
+            })
+            .into()
+    }
+
+    /// El rótulo de la elegida: su icono y su título. El icono aquí y no en la
+    /// celda porque dos ventanas de la misma terminal son idénticas a este
+    /// tamaño, y hace falta ver de qué programa es la que vas a sacar.
+    pub fn view_rotulo(&self) -> PanelElement<'_> {
+        let elegida = self.entradas.get(self.elegida);
+        let mut rotulo = Row::new().spacing(8).align_y(iced_core::Alignment::Center);
+        if let Some(ic) = elegida.and_then(|e| e.icono.as_ref()) {
+            rotulo = rotulo.push(icono::ver(ic, 18.0, 18.0));
+        }
+        rotulo = rotulo.push(
+            text(elegida.map(|e| e.nombre.clone()).unwrap_or_default())
+                .size(tema::T_CUERPO)
+                .color(tema::texto()),
+        );
+        container(rotulo)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .into()
     }
 
     /// Qué celda cae en un punto, para poder elegir con el ratón.
@@ -290,7 +361,9 @@ impl Conmutador {
             for columna in 0..r.columnas {
                 let i = fila_i * r.columnas + columna;
                 if self.entradas.get(i).is_some() {
-                    let elegida = self.marca.intensidad(i);
+                    // Todas en reposo: la elegida la marca el recuadro, que es
+                    // otra superficie. Así elegir no repinta la tarjeta.
+                    let elegida = 0.0;
                     // La celda va vacía a propósito: lo que se ve dentro es la
                     // ventana del cliente, que el compositor compone encima. Un
                     // icono aquí quedaría medio tapado por ella —se probó, se ve
@@ -332,28 +405,10 @@ impl Conmutador {
             rejilla = rejilla.push(fila);
         }
 
-        // El rótulo de la elegida: su icono y su título. El icono aquí y no en
-        // la celda porque dos ventanas de la misma terminal son idénticas a
-        // este tamaño, y hace falta ver de qué programa es la que vas a sacar.
-        let elegida = self.entradas.get(self.elegida);
-        let mut rotulo = Row::new().spacing(8).align_y(iced_core::Alignment::Center);
-        if let Some(ic) = elegida.and_then(|e| e.icono.as_ref()) {
-            rotulo = rotulo.push(icono::ver(ic, 18.0, 18.0));
-        }
-        rotulo = rotulo.push(
-            text(elegida.map(|e| e.nombre.clone()).unwrap_or_default())
-                .size(tema::T_CUERPO)
-                .color(tema::texto()),
-        );
-        let contenido = column![
-            rejilla,
-            container(rotulo)
-                .width(Length::Fill)
-                .height(Length::Fixed(NOMBRE))
-                .center_x(Length::Fill)
-                .center_y(Length::Fixed(NOMBRE)),
-        ]
-        .align_x(Horizontal::Center);
+        // El renglón del rótulo se queda vacío: lo pone `view_rotulo` en su
+        // propia superficie, encima.
+        let contenido = column![rejilla, Space::new().height(Length::Fixed(NOMBRE))]
+            .align_x(Horizontal::Center);
 
         container(contenido)
             .padding(MARGEN)
@@ -429,6 +484,18 @@ impl Rejilla {
             self.filas as f32 * self.celda_alto
                 + self.filas.saturating_sub(1) as f32 * PREVIA_HUECO,
         )
+    }
+
+    /// La celda entera, marco incluido.
+    fn celda(self, i: usize) -> Rectangle {
+        let columna = i % self.columnas;
+        let fila = i / self.columnas;
+        Rectangle {
+            x: MARGEN + columna as f32 * (self.celda_ancho + PREVIA_HUECO),
+            y: MARGEN + fila as f32 * (self.celda_alto + PREVIA_HUECO),
+            width: self.celda_ancho,
+            height: self.celda_alto,
+        }
     }
 
     fn miniatura(self, i: usize) -> Rectangle {

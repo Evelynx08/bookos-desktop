@@ -5,6 +5,7 @@
 //! hace mirar el estado de la red.
 
 mod bateria;
+pub(crate) use bateria::icono_aviso as icono_aviso_bateria;
 mod bateria_simple;
 mod bluetooth;
 mod brillo;

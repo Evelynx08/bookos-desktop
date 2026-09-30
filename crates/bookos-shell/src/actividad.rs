@@ -24,6 +24,7 @@
 //!   así que la isla de cada disco se ve distinta sin que la aplicación mande
 //!   ningún color. Se calcula una vez al recibir el estado, no por fotograma.
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use iced_core::alignment::{Horizontal, Vertical};
@@ -39,24 +40,32 @@ use crate::view::PanelElement;
 /// Aire alrededor de la tarjeta para que quepa la sombra. El compositor lo
 /// resta al colocar la superficie, así que subirlo no mueve la isla.
 pub const MARGEN_SOMBRA: f32 = 26.0;
-/// Aire entre el final del panel y la actividad. La posición absoluta la
-/// calcula el compositor con la altura real del panel, también en HiDPI.
-pub const SEPARACION_PANEL: f32 = 10.0;
+/// Distancia del canto superior de la tarjeta al borde de la pantalla. La isla
+/// no cuelga por debajo del panel sino que nace **dentro** de él, en el centro:
+/// la píldora compacta del reproductor queda centrada en la barra de 32 px
+/// (3 + 26 + 3) y, al abrirse, la tarjeta crece hacia abajo desde ahí.
+pub const ARRIBA: f32 = 3.0;
 
 // ── Geometría ────────────────────────────────────────────────────────────
 // Todas las medidas del interior de la tarjeta. Ver la nota del módulo: estas
 // constantes las comparten la vista y las zonas de clic.
 
-const COMPACTO_W: f32 = 380.0;
-const COMPACTO_H: f32 = 72.0;
-/// El estado cerrado es una tarjeta redondeada, no una píldora. Mantener el
-/// radio por debajo de la mitad de su alto deja laterales verticales visibles.
-const RADIO_COMPACTO: f32 = 22.0;
-/// La píldora del temporizador es más corta: solo lleva el reloj y la cuenta.
-/// Tiene que estar en `size` y no solo en la vista, porque el compositor centra
-/// **el buffer** en la pantalla y una tarjeta más estrecha dentro de un buffer
-/// ancho se vería descentrada.
-const TIMER_COMPACTO_W: f32 = 236.0;
+/// Las tres píldoras cerradas caben en la barra superior y tienen su alto;
+/// cambia el ancho según lo que lleva cada una. Tiene que estar en `size` y no
+/// solo en la vista, porque el compositor centra **el buffer** en la pantalla
+/// y una píldora más estrecha dentro de un buffer ancho se vería descentrada.
+const TIMER_COMPACTO_W: f32 = 132.0;
+const RECORDER_COMPACTO_W: f32 = 172.0;
+/// Las otras actividades vivas, como círculos a la derecha de la píldora.
+const BURBUJA: f32 = PLAYER_COMPACTO_H;
+const BURBUJA_SEP: f32 = 6.0;
+/// La música cerrada es una píldora baja: una canción de fondo no merece la
+/// tarjeta de 380×72 del temporizador, que tapaba las pestañas de la ventana
+/// de debajo. Una línea de título y el ecualizador bastan para reconocerla; el
+/// resto está a un clic.
+const PLAYER_COMPACTO_W: f32 = 280.0;
+/// Lo que cabe en la barra superior dejando `ARRIBA` por encima y por debajo.
+const PLAYER_COMPACTO_H: f32 = crate::PANEL_HEIGHT as f32 - ARRIBA * 2.0;
 const ABIERTO_W: f32 = 440.0;
 /// Margen interior de las vistas abiertas.
 const PAD: f32 = 22.0;
@@ -101,9 +110,17 @@ const REC_BOTON_Y: f32 = PAD + REC_CAB_H + 16.0 + REC_ONDAS_H + 20.0;
 const REC_BOTON: f32 = 56.0;
 const RECORDER_H: f32 = REC_BOTON_Y + REC_BOTON + PAD;
 
+/// Lado en píxeles de la carátula ya preparada: tres por punto del mayor
+/// tamaño al que se pinta (66), nítida hasta escala 3.
+const ARTE_PX: u32 = 198;
+/// Lo mismo para las miniaturas de 42 puntos de la cola.
+const MINIATURA_PX: u32 = 126;
+
 /// Radio de las tarjetas abiertas. Más generoso que el de una tarjeta normal:
 /// la referencia del sistema de diseño para la isla es casi una píldora.
-const RADIO: f32 = 30.0;
+/// El radio de diálogo del sistema de diseño (tabla cerrada de la sección
+/// 2.3): la tarjeta abierta es una superficie temporal por encima de todo.
+const RADIO: f32 = 26.0;
 
 /// Las ondas son un indicador ambiental, no una visualización de audio de
 /// precisión. Redibujar y subir el bitmap completo de la tarjeta a 120 Hz
@@ -135,6 +152,9 @@ pub struct ItemCola {
     pub duracion_ms: i64,
     pub favorita: bool,
     pub actual: bool,
+    /// Carátula de la pista. La aplicación solo la manda cuando cambia la
+    /// cola; entre medias llega `None` y se reutiliza la ya preparada.
+    pub portada: Option<Portada>,
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +185,16 @@ pub struct Accion {
     pub valor: String,
 }
 
+/// Otra actividad viva que no es la principal. Se pinta como un círculo con
+/// su color y se pulsa para pasarla a la píldora.
+#[derive(Debug, Clone)]
+pub struct Burbuja {
+    pub app_id: String,
+    pub clase: Clase,
+    pub color: Color,
+    pub activa: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Vista {
     Compacta,
@@ -184,14 +214,17 @@ pub struct Actividad {
     /// Las dos cosas se calculan al recibir el estado y no al dibujar: recortar
     /// son 90 000 píxeles por portada, y hacerlo en cada fotograma de una
     /// animación de 220 ms es pagarlo trece veces para ver lo mismo.
-    arte: Option<Portada>,
+    arte: Option<image::Handle>,
     tinte: Option<Color>,
+    /// Miniaturas de la cola por id de pista, ya recortadas y reducidas.
+    miniaturas: HashMap<String, image::Handle>,
+    burbujas: Vec<Burbuja>,
 }
 
 impl Actividad {
     pub fn nueva(estado: Estado, animaciones: bool) -> Self {
-        let (arte, tinte) = preparar_portada(estado.portada.as_ref());
-        Self {
+        let (arte, tinte) = preparar_portada(estado.portada.as_ref(), ARTE_PX).unzip();
+        let mut a = Self {
             estado,
             vista: Vista::Compacta,
             volumen_visible: false,
@@ -200,6 +233,31 @@ impl Actividad {
             ultimo_frame_ondas: Instant::now() - FRAME_ONDAS,
             arte,
             tinte,
+            miniaturas: HashMap::new(),
+            burbujas: Vec::new(),
+        };
+        a.guardar_miniaturas();
+        a
+    }
+
+    /// Prepara las carátulas nuevas de la cola y olvida las de pistas que ya no
+    /// están en ella. Las que llegan vacías conservan la que había: el
+    /// reproductor no las reenvía en cada latido.
+    fn guardar_miniaturas(&mut self) {
+        let cola = &mut self.estado.cola;
+        self.miniaturas
+            .retain(|id, _| cola.iter().any(|i| &i.id == id));
+        for (i, item) in cola.iter_mut().enumerate() {
+            // Se sueltan los píxeles originales: ya están en la miniatura y
+            // guardarlos multiplicaría la memoria por pista. Solo se preparan
+            // las filas que se pintan; reducir veinte portadas en el hilo del
+            // compositor al cambiar de canción es trabajo que nadie ve.
+            if let Some(p) = item.portada.take()
+                && i < COLA_MAX
+                && let Some((h, _)) = preparar_portada(Some(&p), MINIATURA_PX)
+            {
+                self.miniaturas.insert(item.id.clone(), h);
+            }
         }
     }
 
@@ -213,11 +271,21 @@ impl Actividad {
             _ => true,
         };
         if cambio {
-            let (arte, tinte) = preparar_portada(estado.portada.as_ref());
+            let (arte, tinte) = preparar_portada(estado.portada.as_ref(), ARTE_PX).unzip();
             self.arte = arte;
             self.tinte = tinte;
         }
         self.estado = estado;
+        self.guardar_miniaturas();
+    }
+
+    /// Recoge la tarjeta abierta. Es lo que hace un clic fuera de ella.
+    pub fn recoger(&mut self) -> bool {
+        if self.vista == Vista::Compacta {
+            return false;
+        }
+        self.colapsar();
+        true
     }
 
     pub fn app_id(&self) -> &str {
@@ -267,15 +335,55 @@ impl Actividad {
         COLA_SEP + COLA_PAD * 2.0 + COLA_CAB_H + COLA_FILA_H * n as f32
     }
 
+    pub fn poner_burbujas(&mut self, burbujas: Vec<Burbuja>) {
+        self.burbujas = burbujas;
+    }
+
+    fn ancho_pildora(&self) -> f32 {
+        match self.estado.clase {
+            Clase::Player => PLAYER_COMPACTO_W,
+            Clase::Timer => TIMER_COMPACTO_W,
+            Clase::Recorder => RECORDER_COMPACTO_W,
+        }
+    }
+
+    /// Lo que ocupan las burbujas, con su separación. Se reserva **a los dos
+    /// lados** de la píldora: el compositor centra el buffer, y así la
+    /// píldora sigue en el centro de la barra aunque haya burbujas.
+    fn ancho_burbujas(&self) -> f32 {
+        if self.vista != Vista::Compacta {
+            return 0.0;
+        }
+        self.burbujas.len() as f32 * (BURBUJA + BURBUJA_SEP)
+    }
+
+    /// La parte del buffer que se ve y recibe clics, como `(x, ancho)` en
+    /// coordenadas de la tarjeta. El hueco simétrico de la izquierda no es de
+    /// nadie: si el compositor lo contara, se tragaría clics del panel.
+    pub fn zona(&self) -> (f32, f32) {
+        let (w, _) = self.size();
+        let b = self.ancho_burbujas();
+        (b, w - MARGEN_SOMBRA * 2.0 - b)
+    }
+
+    /// El `app_id` de la burbuja bajo el punto, en coordenadas del buffer.
+    pub fn burbuja_en(&self, x: f32, y: f32) -> Option<&str> {
+        if self.vista != Vista::Compacta || y < MARGEN_SOMBRA {
+            return None;
+        }
+        let x0 = MARGEN_SOMBRA + self.ancho_burbujas() + self.ancho_pildora() + BURBUJA_SEP;
+        let i = ((x - x0) / (BURBUJA + BURBUJA_SEP)).floor();
+        (x >= x0 && y <= MARGEN_SOMBRA + BURBUJA)
+            .then(|| self.burbujas.get(i as usize))
+            .flatten()
+            .map(|b| b.app_id.as_str())
+    }
+
     pub fn size(&self) -> (f32, f32) {
         let (w, h) = match self.vista {
             Vista::Compacta => (
-                if self.estado.clase == Clase::Timer {
-                    TIMER_COMPACTO_W
-                } else {
-                    COMPACTO_W
-                },
-                COMPACTO_H,
+                self.ancho_pildora() + self.ancho_burbujas() * 2.0,
+                PLAYER_COMPACTO_H,
             ),
             Vista::Abierta | Vista::Cola => (
                 ABIERTO_W,
@@ -319,7 +427,12 @@ impl Actividad {
         }
         let p = tema::C_MUELLE_POPOVER.eval(tema::fraccion(self.desde.elapsed(), tema::D_TARJETA));
         let alfa = tema::C_ENTRADA.eval(tema::fraccion(self.desde.elapsed(), tema::D_TARJETA));
-        (alfa, 0.94 + 0.06 * p, -18.0 * (1.0 - p))
+        // Crece desde la barra: el compositor escala desde el centro de la
+        // superficie, así que se sube lo que el zoom baja el canto superior de
+        // la tarjeta y el ancla queda arriba, donde está la barra.
+        let zoom = 0.6 + 0.4 * p;
+        let (_, h) = self.size();
+        (alfa, zoom, -(h / 2.0 - MARGEN_SOMBRA) * (1.0 - zoom))
     }
 
     /// La columna del volumen se despliega al pasar por encima de su botón, en
@@ -440,6 +553,14 @@ impl Actividad {
             } else {
                 return None;
             };
+            // El icono cambia ya, sin esperar a que el reproductor conteste:
+            // la ida y vuelta por D-Bus más su publicación agrupada se notaba
+            // como un botón que no responde. Si la orden no llega, el
+            // siguiente latido del reproductor (1 s) deja el estado real.
+            if nombre == "play-pause" {
+                self.estado.pausado = !self.estado.pausado;
+                self.estado.activo = !self.estado.pausado;
+            }
             return Some(self.accion(nombre, String::new()));
         }
         if y < BARRA_Y + BARRA_H {
@@ -519,64 +640,88 @@ impl Actividad {
     }
 
     fn compacta(&self) -> PanelElement<'_> {
+        let b = self.ancho_burbujas();
+        let mut fila = row![
+            Space::new().width(Length::Fixed(b)),
+            self.pildora(),
+            Space::new().width(Length::Fixed(BURBUJA_SEP)),
+        ]
+        .spacing(0);
+        for burbuja in &self.burbujas {
+            fila = fila
+                .push(ver_burbuja(burbuja))
+                .push(Space::new().width(Length::Fixed(BURBUJA_SEP)));
+        }
+        fila.into()
+    }
+
+    fn pildora(&self) -> PanelElement<'_> {
         let color = self.color();
         match self.estado.clase {
             Clase::Player => tarjeta(
-                self.cabecera_player(48.0),
-                COMPACTO_W,
-                COMPACTO_H,
-                RADIO_COMPACTO,
-                Relleno::Negro,
-                [12, 18],
+                row![
+                    caratula(self.arte.as_ref(), 18.0, color),
+                    text(crate::emergente::recortar_texto(
+                        &self.estado.titulo,
+                        PLAYER_COMPACTO_W - 18.0 - 22.0 - 8.0 * 3.0 - 16.0,
+                        12.0
+                    ))
+                    .size(12)
+                    .font(negrita())
+                    .wrapping(iced_core::text::Wrapping::None)
+                    .width(Length::Fill),
+                    ondas(self.estado.nivel, self.sonando(), color, 14.0, 4, 2.5),
+                ]
+                .spacing(8)
+                .align_y(Vertical::Center)
+                .into(),
+                PLAYER_COMPACTO_W,
+                PLAYER_COMPACTO_H,
+                PLAYER_COMPACTO_H / 2.0,
+                Relleno::Tinte(color),
+                [4, 8],
             ),
-            // El temporizador va relleno de color y sin más adornos: un reloj
-            // blanco y la cuenta atrás, que es lo único que importa de él.
+            // Las tres píldoras van igual: el tinte de su color sobre el negro de
+            // la isla y lo único que importa de cada una.
             Clase::Timer => tarjeta(
                 row![
-                    reloj_blanco(40.0, color),
+                    icono_teñido(icono_inline(RELOJ), 16.0, color),
                     text(formato_tiempo(self.estado.restante_ms))
-                        .size(30)
-                        .font(gorda())
-                        .color(Color::WHITE),
-                    Space::new().width(Length::Fill),
+                        .size(13)
+                        .font(negrita()),
                 ]
-                .spacing(14)
+                .spacing(6)
                 .align_y(Vertical::Center)
                 .into(),
                 TIMER_COMPACTO_W,
-                COMPACTO_H,
-                RADIO_COMPACTO,
-                Relleno::Color(color),
-                [12, 16],
+                PLAYER_COMPACTO_H,
+                PLAYER_COMPACTO_H / 2.0,
+                Relleno::Tinte(color),
+                [4, 12],
             ),
             Clase::Recorder => tarjeta(
                 row![
-                    punto(self.sonando(), tema::rojo(), 14.0),
+                    punto(self.sonando(), tema::rojo(), 8.0),
                     text(if self.estado.pausado {
                         "En pausa"
                     } else {
                         "Grabando"
                     })
-                    .size(16)
-                    .font(negrita()),
-                    Space::new().width(Length::Fill),
-                    ondas(
-                        self.estado.nivel,
-                        self.sonando(),
-                        tema::rojo(),
-                        30.0,
-                        17,
-                        5.0
-                    ),
+                    .size(12)
+                    .font(negrita())
+                    .width(Length::Fill),
+                    text(formato_tiempo(self.estado.posicion_ms))
+                        .size(12)
+                        .color(tema::TEXTO2),
                 ]
-                .spacing(14)
+                .spacing(8)
                 .align_y(Vertical::Center)
                 .into(),
-                COMPACTO_W,
-                COMPACTO_H,
-                RADIO_COMPACTO,
-                Relleno::Negro,
-                [12, 20],
+                RECORDER_COMPACTO_W,
+                PLAYER_COMPACTO_H,
+                PLAYER_COMPACTO_H / 2.0,
+                Relleno::Tinte(tema::rojo()),
+                [4, 12],
             ),
         }
     }
@@ -624,7 +769,7 @@ impl Actividad {
                     w,
                     h,
                     RADIO,
-                    Relleno::Negro,
+                    Relleno::Tinte(color),
                     [PAD, PAD, abajo, PAD],
                 )
             }
@@ -880,13 +1025,13 @@ impl Actividad {
             filas = filas.push(
                 container(
                     row![
-                        // La miniatura es del color del disco mientras la
-                        // aplicación no mande una por pista: un cuadrado gris en
-                        // cada fila se ve como un hueco sin cargar.
-                        if actual {
-                            caratula(self.arte.as_ref(), 42.0, color)
-                        } else {
-                            caratula_pequena(color)
+                        // Sin carátula propia, el color del disco: un
+                        // cuadrado gris en cada fila se ve como un hueco sin
+                        // cargar.
+                        match self.miniaturas.get(&item.id) {
+                            Some(m) => caratula(Some(m), 42.0, color),
+                            None if actual => caratula(self.arte.as_ref(), 42.0, color),
+                            None => caratula_pequena(color),
                         },
                         column![
                             text(item.titulo.clone())
@@ -981,6 +1126,9 @@ const VOL_TOLERANCIA_Y: f32 = 14.0;
 enum Relleno {
     /// El fondo de pantalla completa: negro en oscuro, blanco en claro.
     Negro,
+    /// El negro del reproductor con el color de la carátula entrando desde
+    /// arriba: así cada canción tiñe la isla entera, no solo sus botones.
+    Tinte(Color),
     /// Relleno del color, para el temporizador.
     Color(Color),
 }
@@ -1030,6 +1178,18 @@ fn tarjeta_v<'a>(
                 tema::alfa(tema::texto(), if claro { 0.10 } else { 0.12 }),
             )
         }
+        Relleno::Tinte(c) => {
+            let base = tema::bg();
+            let claro = tema::es_claro();
+            // Más tinte en oscuro: sobre blanco un 30 % ya se lee como otra
+            // superficie y el texto negro pierde contraste.
+            let f = if claro { 0.16 } else { 0.30 };
+            (
+                tema::mezclar(base, c, f),
+                tema::mezclar(base, c, f * 0.25),
+                tema::alfa(c, if claro { 0.25 } else { 0.35 }),
+            )
+        }
         Relleno::Color(c) => (
             tema::mezclar(c, Color::WHITE, 0.10),
             tema::mezclar(c, Color::BLACK, 0.12),
@@ -1065,22 +1225,27 @@ fn tarjeta_v<'a>(
 }
 
 /// La carátula, o un cuadrado del color con una nota cuando no hay ninguna.
-fn caratula(arte: Option<&Portada>, lado: f32, color: Color) -> PanelElement<'static> {
+fn caratula(arte: Option<&image::Handle>, lado: f32, color: Color) -> PanelElement<'static> {
     match arte {
-        Some(p) => container(
-            image(image::Handle::from_rgba(p.width, p.height, p.rgba.clone()))
-                .width(lado)
-                .height(lado),
-        )
-        .style(move |_| container::Style {
-            shadow: Shadow {
-                color: tema::alfa(color, 0.45),
-                offset: Vector::new(0.0, 4.0),
-                blur_radius: 14.0,
-            },
-            ..Default::default()
-        })
-        .into(),
+        // Tamaño fijo y el mismo radio que la imagen: la sombra de iced sigue
+        // la caja del contenedor, y sin esto salía un rectángulo borroso más
+        // ancho que la carátula.
+        Some(h) => container(image(h.clone()).width(lado).height(lado))
+            .width(Length::Fixed(lado))
+            .height(Length::Fixed(lado))
+            .style(move |_| container::Style {
+                border: Border {
+                    radius: (lado * 0.22).into(),
+                    ..Default::default()
+                },
+                shadow: Shadow {
+                    color: tema::alfa(color, 0.45),
+                    offset: Vector::new(0.0, 3.0),
+                    blur_radius: lado * 0.2,
+                },
+                ..Default::default()
+            })
+            .into(),
         None => container(icono_teñido(
             icono_propio("musica"),
             lado * 0.46,
@@ -1227,6 +1392,30 @@ fn boton_sobre_color(rotulo: &'static str, fondo: Color, principal: bool) -> Pan
         .into()
 }
 
+fn ver_burbuja(b: &Burbuja) -> PanelElement<'static> {
+    let color = b.color;
+    let dentro = match b.clase {
+        Clase::Player => icono_teñido(icono_propio("musica"), 13.0, color),
+        Clase::Timer => icono_teñido(icono_inline(RELOJ), 14.0, color),
+        Clase::Recorder => punto(b.activa, tema::rojo(), 8.0),
+    };
+    container(dentro)
+        .width(Length::Fixed(BURBUJA))
+        .height(Length::Fixed(BURBUJA))
+        .align_x(Horizontal::Center)
+        .align_y(Vertical::Center)
+        .style(move |_| container::Style {
+            background: Some(tema::mezclar(tema::bg(), color, 0.22).into()),
+            border: Border {
+                radius: tema::R_PILL.into(),
+                width: 1.0,
+                color: tema::alfa(color, 0.35),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
 /// El punto de la grabadora.
 fn punto(activa: bool, color: Color, lado: f32) -> PanelElement<'static> {
     let c = if activa { color } else { tema::TEXTO2 };
@@ -1259,9 +1448,11 @@ fn ondas(
     barras: usize,
     ancho: f32,
 ) -> PanelElement<'static> {
-    let fase = std::time::SystemTime::now()
+    // Segundos dentro del minuto, no desde 1970: a 1,7e9 s un `f32` solo
+    // distingue saltos de 128 s y las barras se quedaban congeladas.
+    let t = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0.0, |d| d.as_secs_f32() * 6.5);
+        .map_or(0.0, |d| (d.as_millis() % 60_000) as f32 / 1000.0);
     let mut r = row![]
         .spacing((ancho * 0.7).max(3.0))
         .align_y(Vertical::Center);
@@ -1282,7 +1473,16 @@ fn ondas(
             nivel.clamp(0.6, 1.0)
         };
         let h = if activa {
-            let onda = ((fase + i as f32 * 0.8).sin() * 0.5 + 0.5) * 0.4 + 0.6;
+            // Dos senos por barra con frecuencias propias: una onda común
+            // avanzando por la fila se lee como un acordeón, y esto como un
+            // ecualizador. Las frecuencias salen de la parte fraccionaria de
+            // múltiplos irracionales, así que no hay dos barras iguales.
+            let fi = i as f32;
+            let f1 = 5.0 + 3.0 * (fi * 1.618).fract();
+            let f2 = 9.0 + 4.0 * (fi * 2.399).fract();
+            let s1 = (t * f1 + fi * 1.3).sin() * 0.5 + 0.5;
+            let s2 = (t * f2 + fi * 2.1).sin() * 0.5 + 0.5;
+            let onda = 0.3 + 0.7 * (0.6 * s1 + 0.4 * s2);
             (alto * b * n * onda).max(ancho * 1.6)
         } else {
             ancho * 1.6
@@ -1371,6 +1571,8 @@ fn icono_teñido(ic: Option<icono::Icono>, px: f32, color: Color) -> PanelElemen
 const COLA_LISTA: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#fff"><rect x="2" y="3.4" width="12" height="1.8" rx=".9"/><rect x="2" y="7.1" width="12" height="1.8" rx=".9"/><rect x="2" y="10.8" width="12" height="1.8" rx=".9"/></svg>"##;
 const CORAZON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#fff"><path d="M8 14.1 2.9 9.2A3.4 3.4 0 0 1 8 4.7a3.4 3.4 0 0 1 5.1 4.5zm0-1.9 3.8-3.7a2 2 0 0 0-3-2.6L8 6.9 7.2 5.9a2 2 0 0 0-3 2.6z"/></svg>"##;
 const CORAZON_LLENO: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#fff"><path d="M8 14.1 2.9 9.2A3.4 3.4 0 0 1 8 4.7a3.4 3.4 0 0 1 5.1 4.5z"/></svg>"##;
+/// Esfera con agujas, para la píldora y la burbuja del temporizador.
+const RELOJ: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#fff"><path d="M8 1.5a6.5 6.5 0 1 1 0 13 6.5 6.5 0 0 1 0-13zm0 1.6a4.9 4.9 0 1 0 0 9.8 4.9 4.9 0 0 0 0-9.8zm.8 1.6v3l1.9 1.1a.8.8 0 0 1-.8 1.4L7.6 9a.8.8 0 0 1-.4-.7V4.7a.8.8 0 0 1 1.6 0z"/></svg>"##;
 const STOP: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#fff"><rect x="3.6" y="3.6" width="8.8" height="8.8" rx="2.2"/></svg>"##;
 const ALEATORIO: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#fff"><path d="M10.6 2.5a.8.8 0 0 1 1.1 0l1.8 1.8a.8.8 0 0 1 0 1.1l-1.8 1.8a.8.8 0 1 1-1.1-1.1l.4-.4h-.7c-.6 0-1 .2-1.4.7L8 7.2 7.1 6l.3-.4c.7-.9 1.6-1.4 2.7-1.4h.7l-.4-.5a.8.8 0 0 1 0-1.1zM2.3 4.2h1.9c1.1 0 2 .5 2.7 1.4l3 3.9c.4.5.8.7 1.4.7h.7l-.4-.4a.8.8 0 1 1 1.1-1.1l1.8 1.8a.8.8 0 0 1 0 1.1l-1.8 1.8a.8.8 0 1 1-1.1-1.1l.4-.4h-.7c-1.1 0-2-.5-2.7-1.4l-3-3.9c-.4-.5-.8-.7-1.4-.7H2.3a.8.8 0 0 1 0-1.6zm0 6.1h1.9c.5 0 1-.2 1.3-.6l.9 1.2c-.6.7-1.4 1-2.2 1H2.3a.8.8 0 1 1 0-1.6z"/></svg>"##;
 const REPETIR: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#fff"><path d="M4.8 2.6a.8.8 0 0 1 0 1.2l-.3.3h6a3 3 0 0 1 3 3v1a.8.8 0 1 1-1.6 0v-1c0-.8-.6-1.4-1.4-1.4h-6l.3.3a.8.8 0 1 1-1.2 1.1L1.9 5.4a.8.8 0 0 1 0-1.1l1.7-1.7a.8.8 0 0 1 1.2 0zm6.4 10.8a.8.8 0 0 1 0-1.2l.3-.3h-6a3 3 0 0 1-3-3v-1a.8.8 0 1 1 1.6 0v1c0 .8.6 1.4 1.4 1.4h6l-.3-.3a.8.8 0 1 1 1.2-1.1l1.7 1.7a.8.8 0 0 1 0 1.1l-1.7 1.7a.8.8 0 0 1-1.2 0z"/></svg>"##;
@@ -1379,20 +1581,63 @@ const AGUJAS: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16
 
 // ── Portada ──────────────────────────────────────────────────────────────
 
+/// El color de la burbuja de una actividad que no es la principal. Para la
+/// música es el de la carátula: 400 muestras, así que se puede calcular en
+/// cada sincronización sin guardar nada.
+pub fn color_burbuja(e: &Estado) -> Color {
+    match e.clase {
+        Clase::Recorder => tema::rojo(),
+        Clase::Timer => tema::acento(),
+        Clase::Player => e
+            .portada
+            .as_ref()
+            .filter(|p| p.rgba.len() >= (p.width * p.height * 4) as usize && p.width > 0)
+            .map_or_else(tema::acento, color_dominante),
+    }
+}
+
 /// Recorta las esquinas de la carátula y saca su color.
 ///
 /// El recorte se hace sobre los píxeles y no con un `border-radius` del
 /// contenedor: iced dibuja la imagen **encima** del fondo del contenedor, así
 /// que el radio del borde no la recorta y la carátula salía con las cuatro
 /// esquinas cuadradas dentro de una tarjeta redondeada.
-fn preparar_portada(portada: Option<&Portada>) -> (Option<Portada>, Option<Color>) {
-    let Some(p) = portada else {
-        return (None, None);
-    };
-    if p.width == 0 || p.height == 0 || p.rgba.len() < (p.width * p.height * 4) as usize {
-        return (None, None);
+fn preparar_portada(portada: Option<&Portada>, lado: u32) -> Option<(image::Handle, Color)> {
+    let p = portada?;
+    if p.width == 0 || p.height == 0 {
+        return None;
     }
-    (Some(redondear(p)), Some(color_dominante(p)))
+    // Se copia porque `crop_imm` exige un búfer con dueño; solo pasa al
+    // cambiar de portada, no por latido.
+    let img = ::image::RgbaImage::from_raw(p.width, p.height, p.rgba.clone())?;
+    // El cuadrado central, reducido aquí con un filtro de verdad: el pintor
+    // de CPU de iced reduce sin filtrar, y una portada de 1000 px pintada a
+    // 66 salía con dientes. Además dejaba de ser cuadrada y la imagen se
+    // encajaba con franjas vacías arriba y abajo.
+    let corte = p.width.min(p.height);
+    let cuadrada = ::image::imageops::crop_imm(
+        &img,
+        (p.width - corte) / 2,
+        (p.height - corte) / 2,
+        corte,
+        corte,
+    )
+    .to_image();
+    let lado = lado.min(corte);
+    let reducida = ::image::imageops::resize(
+        &cuadrada,
+        lado,
+        lado,
+        ::image::imageops::FilterType::Lanczos3,
+    );
+    let p = Portada {
+        rgba: reducida.into_raw(),
+        width: lado,
+        height: lado,
+    };
+    let color = color_dominante(&p);
+    let r = redondear(&p);
+    Some((image::Handle::from_rgba(r.width, r.height, r.rgba), color))
 }
 
 fn redondear(p: &Portada) -> Portada {
@@ -1414,7 +1659,7 @@ fn redondear(p: &Portada) -> Portada {
 /// dicen lo mismo que 90 000 y cuestan nada. Después se sube la saturación y se
 /// lleva a una luminosidad de trabajo, porque la media de una foto tiende al
 /// gris y un gris no sirve para teñir nada.
-fn color_dominante(p: &Portada) -> Color {
+pub(crate) fn color_dominante(p: &Portada) -> Color {
     let (w, h) = (p.width, p.height);
     let paso_x = (w / 20).max(1);
     let paso_y = (h / 20).max(1);
@@ -1508,6 +1753,7 @@ mod tests {
                 duracion_ms: 200_000,
                 favorita: false,
                 actual: i == 0,
+                portada: None,
             })
             .collect()
     }
@@ -1757,5 +2003,95 @@ mod tests {
         assert_eq!(alfa(50, 50), 255, "el centro se mantiene opaco");
         assert_eq!(alfa(0, 0), 0, "la esquina se recorta");
         assert_eq!(alfa(99, 99), 0, "y la de enfrente también");
+    }
+
+    #[test]
+    fn recoger_solo_actua_con_la_tarjeta_abierta() {
+        let mut a = Actividad::nueva(estado(Clase::Player), false);
+        assert!(!a.recoger(), "compacta no hay nada que recoger");
+        a.vista = Vista::Cola;
+        assert!(a.recoger());
+        assert_eq!(a.vista, Vista::Compacta);
+    }
+
+    #[test]
+    fn el_boton_central_cambia_el_icono_sin_esperar_a_la_app() {
+        let mut a = Actividad::nueva(estado(Clase::Player), false);
+        a.vista = Vista::Abierta;
+        let pausado = a.estado.pausado;
+        let accion = a.pulsar(
+            MARGEN_SOMBRA + ABIERTO_W / 2.0,
+            MARGEN_SOMBRA + CTRL_Y + CTRL_H / 2.0,
+        );
+        assert_eq!(accion.map(|a| a.nombre).as_deref(), Some("play-pause"));
+        assert_eq!(a.estado.pausado, !pausado);
+    }
+
+    #[test]
+    fn la_miniatura_de_la_cola_sobrevive_a_un_latido_sin_portada() {
+        let mut e = estado(Clase::Player);
+        e.cola = cola(2);
+        e.cola[1].portada = Some(Portada {
+            rgba: vec![90; 32 * 20 * 4],
+            width: 32,
+            height: 20,
+        });
+        let mut a = Actividad::nueva(e.clone(), false);
+        assert!(a.miniaturas.contains_key(&e.cola[1].id));
+        e.cola[1].portada = None;
+        a.actualizar(e.clone());
+        assert!(a.miniaturas.contains_key(&e.cola[1].id), "se conserva");
+        e.cola.truncate(1);
+        a.actualizar(e);
+        assert!(a.miniaturas.is_empty(), "y se olvida al salir de la cola");
+    }
+
+    fn burbuja(app_id: &str, clase: Clase) -> Burbuja {
+        Burbuja {
+            app_id: app_id.into(),
+            clase,
+            color: tema::acento(),
+            activa: true,
+        }
+    }
+
+    /// La píldora sigue centrada en el buffer: el hueco de la izquierda mide
+    /// lo mismo que las burbujas de la derecha, y ese hueco no es zona de clic.
+    #[test]
+    fn las_burbujas_no_descentran_la_pildora() {
+        let mut a = Actividad::nueva(estado(Clase::Player), false);
+        let (sin, _) = a.size();
+        a.poner_burbujas(vec![burbuja("com.bookos.clock", Clase::Timer)]);
+        let (con, _) = a.size();
+        assert_eq!(con - sin, (BURBUJA + BURBUJA_SEP) * 2.0);
+        let (x0, ancho) = a.zona();
+        assert_eq!(x0, BURBUJA + BURBUJA_SEP);
+        assert_eq!(ancho, PLAYER_COMPACTO_W + BURBUJA + BURBUJA_SEP);
+    }
+
+    #[test]
+    fn la_burbuja_pulsada_es_la_que_se_ve() {
+        let mut a = Actividad::nueva(estado(Clase::Player), false);
+        a.poner_burbujas(vec![
+            burbuja("com.bookos.voicerecorder", Clase::Recorder),
+            burbuja("com.bookos.clock", Clase::Timer),
+        ]);
+        let x0 = MARGEN_SOMBRA + a.zona().0 + PLAYER_COMPACTO_W + BURBUJA_SEP;
+        let y = MARGEN_SOMBRA + BURBUJA / 2.0;
+        assert_eq!(
+            a.burbuja_en(x0 + BURBUJA / 2.0, y),
+            Some("com.bookos.voicerecorder")
+        );
+        assert_eq!(
+            a.burbuja_en(x0 + BURBUJA + BURBUJA_SEP + BURBUJA / 2.0, y),
+            Some("com.bookos.clock")
+        );
+        assert_eq!(a.burbuja_en(x0 - 20.0, y), None, "la píldora no es burbuja");
+        a.vista = Vista::Abierta;
+        assert_eq!(
+            a.burbuja_en(x0 + BURBUJA / 2.0, y),
+            None,
+            "abierta no hay burbujas"
+        );
     }
 }
