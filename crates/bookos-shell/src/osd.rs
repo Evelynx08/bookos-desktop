@@ -87,14 +87,24 @@ pub const MARGEN_BUFFER_INFERIOR: f32 = MARGEN_INFERIOR + MARGEN_SOMBRA;
 
 /// El surco de la barra.
 ///
-/// Gris claro sólido y no el blanco al 14 % del resto del sistema: la cápsula
-/// del OSD es opaca, y sobre ella un surco translúcido se pierde. En el diseño
-/// se ve casi blanco.
+/// La parte vacía de la barra. Sólido y no el blanco al 14 % del resto del
+/// sistema: la cápsula del OSD es opaca, y sobre ella un surco translúcido se
+/// pierde.
 ///
-/// Es el **mismo en los dos temas** y no hace falta una versión clara: `#c7c7cc`
-/// es el gris de surco de iOS, y funciona igual sobre la cápsula negra —donde
-/// se lee como claro— que sobre la blanca, donde se lee como gris.
-const SURCO: Color = tema::hex(0xc7c7cc);
+/// En claro es el gris de surco de iOS, `#c7c7cc`. En oscuro **no** puede ser el
+/// mismo: estaba así y la parte llena no se distinguía. Contraste medido de
+/// los once acentos oscuros contra `#c7c7cc`: de 1,16 (turquesa) a 2,04
+/// (índigo), y grafito 1,53. Contra `#3a3a3c` todos pasan del 3:1 de WCAG para
+/// gráficos: el peor es el índigo, con 3,30, y el grafito sube a 4,41. El surco
+/// sigue viéndose sobre la cápsula negra (1,85). Con `control_apagado`
+/// (`#48484a`), el índigo se quedaba en 2,65.
+fn surco() -> Color {
+    if tema::es_claro() {
+        tema::hex(0xc7c7cc)
+    } else {
+        tema::hex(0x3a3a3c)
+    }
+}
 
 pub struct Osd {
     icono: Option<Icono>,
@@ -310,7 +320,7 @@ impl Osd {
             .width(Length::Fixed(ANCHO_BARRA))
             .height(Length::Fixed(BARRA))
             .style(|_theme: &iced_widget::Theme| container::Style {
-                background: Some(SURCO.into()),
+                background: Some(surco().into()),
                 border: Border {
                     radius: (BARRA / 2.0).into(),
                     ..Default::default()

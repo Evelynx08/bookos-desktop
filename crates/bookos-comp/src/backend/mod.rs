@@ -14,6 +14,7 @@ pub mod udev;
 pub mod winit;
 
 use smithay::backend::renderer::element::AsRenderElements;
+use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::utils::{
@@ -47,13 +48,24 @@ use crate::state::BookosComp;
 /// dos pantallas deslizaban desfasadas entre sí. Se llama una sola vez por
 /// vuelta, antes de componer ninguna salida.
 pub fn avanzar_animaciones(state: &mut BookosComp) {
-    if state
-        .fondo
-        .as_mut()
-        .is_some_and(crate::fondo::Fondo::avanzar)
+    // Con el fondo tapado se para aquí y no solo en el temporizador: otra cosa
+    // que se mueva —un vídeo a pantalla completa pide redibujo a 60 Hz— pasaría
+    // por esta función, y el fondo avanzaría con ella.
+    let fondo_visible = fondo_visible(state);
+    if fondo_visible
+        && state
+            .fondo
+            .as_mut()
+            .is_some_and(crate::fondo::Fondo::avanzar)
     {
         state.fondo_cristal_pendiente = true;
         state.needs_redraw = true;
+    }
+    // La reanudación. Lo que destapa el fondo —salir de pantalla completa,
+    // encender la pantalla— siempre pide un redibujo, y el redibujo pasa por
+    // aquí: no hace falta un temporizador vigilando mientras está en pausa.
+    if fondo_visible && state.tick_fondo.is_none() {
+        programar_fondo_animado(state);
     }
     if !state.brillo_poll_activo && tarjeta_brillo_abierta(state) {
         state.brillo_poll_activo = true;
@@ -200,11 +212,17 @@ fn componer(
 
     let t_cursor = _t.elapsed();
     let _t = std::time::Instant::now();
-    // Con una ventana a pantalla completa el shell no se dibuja: un vídeo con
-    // el panel encima no está a pantalla completa, está maximizado. El cursor
-    // sí sigue delante, que es lo que hace todo el mundo.
-    let completa = state.hay_pantalla_completa_en(output);
+    // Con una ventana a pantalla completa no se dibujan el panel, el dock ni la
+    // isla: un vídeo con el panel encima no está a pantalla completa, está
+    // maximizado. Lo que se abre a propósito —captura, launchpad, emergentes,
+    // OSD— sí sale encima, y el cursor también, que es lo que hace todo el
+    // mundo.
+    //
+    // Salvo con el bloqueo echado: el bloqueo es parte del shell, y las
+    // ventanas no se pintan mientras está puesto. Con un vídeo a pantalla
+    // completa no quedaba nada que dibujar y el bloqueo salía en negro.
     let bloqueado = state.shell.as_ref().is_some_and(|s| s.esta_bloqueado());
+    let completa = !bloqueado && state.hay_pantalla_completa_en(output);
     let vista_escritorios = state
         .shell
         .as_ref()
@@ -271,6 +289,43 @@ fn componer(
         .and_then(|shell| shell.conmutador_element(renderer))
     {
         elementos.push(OverlayElement::Memory(elemento));
+    }
+
+    // La capa de captura, y detrás su velo: delante del resto del shell, que
+    // queda atenuado por debajo igual que el escritorio.
+    //
+    // Y delante de la vista de escritorios: sus miniaturas y su rejilla se
+    // componen aquí debajo, por delante de todo lo del shell, y con la captura
+    // en su sitio de antes la barra de modos y el «guardar / copiar» quedaban
+    // tapados por las ventanas.
+    if let Some(shell) = state.shell.as_ref() {
+        elementos.extend(
+            shell
+                .captura_elements(renderer)
+                .into_iter()
+                .map(OverlayElement::Memory),
+        );
+        match (state.velo_captura.as_mut(), shell.datos_velo_captura()) {
+            (Some(velo), Some((pantalla, escala, marcado))) => {
+                elementos.push(OverlayElement::Velo(
+                    velo.elemento(pantalla, escala, marcado),
+                ));
+            }
+            (None, Some(_)) => {
+                elementos.extend(shell.velo_captura().into_iter().map(OverlayElement::Color));
+            }
+            (_, None) => {}
+        }
+    }
+
+    // La isla, por lo mismo: desplegada cuelga sobre las miniaturas.
+    if vista_escritorios && let Some(shell) = state.shell.as_ref() {
+        elementos.extend(
+            shell
+                .elements(renderer, false, crate::shell::CapaShell::SoloIsla)
+                .into_iter()
+                .map(OverlayElement::Memory),
+        );
     }
 
     // La vista de escritorios compone las mismas superficies Wayland, no
@@ -361,6 +416,35 @@ fn componer(
         .as_ref()
         .filter(|a| a.moviendo)
         .map(|a| a.window.clone());
+    // El ✕ de la ventana bajo el puntero, delante de todo lo de la rejilla:
+    // los elementos van de delante a atrás, así que entra el primero.
+    if vista_escritorios
+        && arrastrada_vista.is_none()
+        && let Some((_, boton)) =
+            crate::escritorios::con_cierre_visible(&expuestas, state.pointer_location)
+    {
+        let lado = (crate::escritorios::LADO_CERRAR as f64 * scale).round() as i32;
+        if state
+            .boton_cerrar_vista
+            .as_ref()
+            .is_none_or(|(l, _)| *l != lado)
+        {
+            state.boton_cerrar_vista = crate::escritorios::imagen_cerrar(lado).map(|b| (lado, b));
+        }
+        if let Some((lado, buffer)) = state.boton_cerrar_vista.as_ref()
+            && let Ok(elemento) = MemoryRenderBufferRenderElement::from_buffer(
+                renderer,
+                boton.loc.to_f64().to_physical_precise_round(scale),
+                buffer,
+                None,
+                Some(Rectangle::from_size((*lado as f64, *lado as f64).into())),
+                Some(boton.size),
+                Kind::Unspecified,
+            )
+        {
+            elementos.push(OverlayElement::Memory(elemento));
+        }
+    }
     for (window, destino) in expuestas.iter().rev() {
         if arrastrada_vista.as_ref() == Some(window) {
             continue;
@@ -404,46 +488,18 @@ fn componer(
         ));
     }
 
-    if completa
-        && !vista_escritorios
-        && let Some(elemento) = state
-            .shell
-            .as_ref()
-            .and_then(|s| s.menu_ventana_element(renderer))
-    {
-        elementos.push(OverlayElement::Memory(elemento));
-    }
-    // La capa de captura, y detrás su velo: delante del resto del shell, que
-    // queda atenuado por debajo igual que el escritorio.
-    if let Some(shell) = state
-        .shell
-        .as_ref()
-        .filter(|_| !completa || vista_escritorios)
-    {
-        elementos.extend(
-            shell
-                .captura_elements(renderer)
-                .into_iter()
-                .map(OverlayElement::Memory),
-        );
-        match (state.velo_captura.as_mut(), shell.datos_velo_captura()) {
-            (Some(velo), Some((pantalla, escala, marcado))) => {
-                elementos.push(OverlayElement::Velo(
-                    velo.elemento(pantalla, escala, marcado),
-                ));
-            }
-            (None, Some(_)) => {
-                elementos.extend(shell.velo_captura().into_iter().map(OverlayElement::Color));
-            }
-            (_, None) => {}
-        }
-    }
     elementos.extend(
         state
             .shell
             .as_ref()
-            .filter(|_| !completa || vista_escritorios)
-            .map(|shell| shell.elements(renderer))
+            .map(|shell| {
+                let capa = if vista_escritorios {
+                    crate::shell::CapaShell::SinIsla
+                } else {
+                    crate::shell::CapaShell::Todo
+                };
+                shell.elements(renderer, completa && !vista_escritorios, capa)
+            })
             .unwrap_or_default()
             .into_iter()
             .map(OverlayElement::Memory),
@@ -513,7 +569,6 @@ fn componer(
         state
             .shell
             .as_ref()
-            .filter(|_| !completa || vista_escritorios)
             .and_then(|shell| shell.velo())
             .map(OverlayElement::Color),
     );
@@ -621,6 +676,12 @@ fn componer(
             .filter_map(|w| state.space.element_location(w).map(|loc| (w.clone(), loc)))
             .collect()
     };
+    // Al desbloquear, las ventanas entran a la vez que el bloqueo se va: antes
+    // aparecían enteras en el primer fotograma y solo el reloj y el campo se
+    // desvanecían encima, así que el escritorio saltaba a la vista de golpe.
+    // Crecen un 4 % desde su centro, lo justo para que parezca que el
+    // escritorio se acerca en vez de encenderse.
+    let desbloqueo = state.shell.as_ref().and_then(|s| s.progreso_desbloqueo());
     for (window, loc) in ventanas {
         // Las que están en la rejilla de la vista general, o volviendo de
         // ella, ya se han pintado allí. Pintarlas también aquí las duplicaba;
@@ -665,6 +726,10 @@ fn componer(
             }
             None => {
                 let (alfa, zoom) = crate::ventanas::animacion(&window);
+                let (alfa, zoom) = match desbloqueo {
+                    Some(p) => (alfa * p, zoom * (0.96 + 0.04 * f64::from(p))),
+                    None => (alfa, zoom),
+                };
                 // Al maximizar o encajar, el buffer nuevo entra escalado desde
                 // el tamaño viejo: es la parte de la animación que faltaba,
                 // porque `posicion` solo movía la esquina y el tamaño cambiaba
@@ -1067,7 +1132,11 @@ pub fn servir_capturas(state: &mut BookosComp, renderer: &mut GlesRenderer, outp
         let pendiente = state.capturas_pantalla.remove(i);
         let mapeo = match renderer.copy_framebuffer(
             &framebuffer,
-            crate::captura::region_gl(pendiente.region, tamano.h),
+            crate::captura::region_gl(
+                pendiente.region,
+                tamano.h,
+                crate::captura::hay_que_voltear(&pendiente.output),
+            ),
             // **`Xrgb8888`, que es lo que se le anunció al cliente.** Los
             // nombres de fourcc describen el entero de 32 bits, así que en
             // little-endian `Xrgb8888` son los bytes B,G,R,X y `Abgr8888` son
@@ -1216,7 +1285,7 @@ pub fn servir_captura_propia(state: &mut BookosComp, renderer: &mut GlesRenderer
     let leido = renderer
         .copy_framebuffer(
             &framebuffer,
-            crate::captura::region_gl(region, tamano.h),
+            crate::captura::region_gl(region, tamano.h, crate::captura::hay_que_voltear(output)),
             // `Xrgb8888` y no `Abgr8888`, aunque el PNG quiera R,G,B,A y este
             // sea B,G,R,X: **medido**, leer en `Abgr8888` devuelve valores más
             // oscuros que los del fondo que se está enseñando —(1,31,62) donde
@@ -1315,9 +1384,22 @@ fn al_portapapeles(state: &mut BookosComp, png: Vec<u8>) {
     // `PNG` a secas lo piden algunas aplicaciones de X11 a través de XWayland, y
     // anunciarlo no cuesta nada.
     let tipos = vec!["image/png".to_string(), "PNG".to_string()];
-    let dh = state.display_handle.clone();
-    let seat = state.seat.clone();
-    set_data_device_selection(&dh, &seat, tipos, std::sync::Arc::new(png));
+    // Smithay no avisa a `SelectionHandler::new_selection` cuando la pone el
+    // propio compositor, así que a X11 se le dice aquí.
+    if let Some(xwm) = state.xwm.as_mut()
+        && let Err(err) = xwm.new_selection(
+            smithay::wayland::selection::SelectionTarget::Clipboard,
+            Some(tipos.clone()),
+        )
+    {
+        tracing::warn!("no se pudo ofrecer la captura a X11: {err}");
+    }
+    set_data_device_selection(
+        &state.display_handle,
+        &state.seat,
+        tipos,
+        crate::handlers::Seleccion::Bytes(std::sync::Arc::new(png)),
+    );
 }
 
 fn notificar_captura(state: &mut BookosComp, resumen: &str, cuerpo: &str) {
@@ -1402,6 +1484,36 @@ pub fn recargar_fondo(state: &mut BookosComp, renderer: &mut GlesRenderer) {
     state.needs_redraw = true;
 }
 
+/// ¿Se ve el fondo, o algo que sale de él, en alguna salida?
+///
+/// Si no, el fondo animado se para: un vídeo tapado seguía decodificando y
+/// subiendo dos texturas de 8 MB a 30 fps —`from_buffer` sube aunque el
+/// seguimiento de daño luego no dibuje el elemento—. Al pararse, el canal del
+/// lector se llena y ffmpeg se queda bloqueado en la tubería sin gastar CPU;
+/// al volver sigue por donde iba.
+///
+/// Solo cuenta como tapado lo que lo tapa seguro: la pantalla apagada y una
+/// ventana a pantalla completa. Con una maximizada el fondo sigue asomando por
+/// el cristal del panel y del dock, que lo desenfocan a él y no a la ventana.
+/// El bloqueo, la vista de escritorios y el deslizamiento entre escritorios lo
+/// enseñan aunque haya una ventana a pantalla completa.
+fn fondo_visible(state: &BookosComp) -> bool {
+    if !state.dpms_encendido {
+        return false;
+    }
+    if state
+        .shell
+        .as_ref()
+        .is_some_and(|s| s.esta_bloqueado() || s.vista_escritorios_abierta())
+    {
+        return true;
+    }
+    state.space.outputs().any(|output| {
+        !state.hay_pantalla_completa_en(output)
+            || state.escritorios.tira_fondo(&output.name()).is_some()
+    })
+}
+
 /// Deja un único temporizador en el instante del siguiente fotograma.
 ///
 /// Tras marcar el redibujo espera 16 ms: para entonces `avanzar_animaciones`
@@ -1417,7 +1529,12 @@ pub fn programar_fondo_animado(state: &mut BookosComp) {
     let resultado = state
         .loop_handle
         .insert_source(Timer::from_duration(espera), |_, _, state| {
-            let Some(espera) = state.fondo.as_ref().and_then(|f| f.hasta_siguiente()) else {
+            let espera = state
+                .fondo
+                .as_ref()
+                .and_then(|f| f.hasta_siguiente())
+                .filter(|_| fondo_visible(state));
+            let Some(espera) = espera else {
                 state.tick_fondo = None;
                 return TimeoutAction::Drop;
             };
@@ -1599,8 +1716,10 @@ pub fn programar_bloqueo_inactividad(state: &mut BookosComp) {
     if let Some(token) = state.tick_bloqueo.take() {
         state.loop_handle.remove(token);
     }
+    crate::atenuacion::programar(state);
     if state.bloqueo_inactividad.is_zero()
         || !state.idle_inhibidores.is_empty()
+        || bookos_shell::mantener_despierto()
         || state
             .shell
             .as_ref()
@@ -1627,7 +1746,7 @@ pub fn programar_bloqueo_inactividad(state: &mut BookosComp) {
             {
                 return TimeoutAction::Drop;
             }
-            if !state.idle_inhibidores.is_empty() {
+            if !state.idle_inhibidores.is_empty() || bookos_shell::mantener_despierto() {
                 return TimeoutAction::Drop;
             }
             let inactivo = state
@@ -1668,6 +1787,7 @@ pub fn programar_suspension_inactividad(state: &mut BookosComp) {
     cancelar_suspension_inactividad(state);
     if state.suspension_inactividad.is_zero()
         || !state.idle_inhibidores.is_empty()
+        || bookos_shell::mantener_despierto()
         || state
             .shell
             .as_ref()
@@ -1684,7 +1804,8 @@ pub fn programar_suspension_inactividad(state: &mut BookosComp) {
                 .shell
                 .as_ref()
                 .is_some_and(|shell| shell.esta_bloqueado());
-            if bloqueado && state.idle_inhibidores.is_empty() {
+            if bloqueado && state.idle_inhibidores.is_empty() && !bookos_shell::mantener_despierto()
+            {
                 tracing::info!(
                     segundos = state.suspension_inactividad.as_secs(),
                     "suspensión automática tras bloqueo"
@@ -1735,8 +1856,80 @@ pub fn programar_dpms_bloqueo(state: &mut BookosComp) {
     }
 }
 
+/// Apaga las salidas sin esperar los 10 s del bloqueo. La pantalla se queda
+/// sin ningún fotograma pendiente, y lo siguiente que pinte al encenderse es
+/// lo que haya entonces: el bloqueo, si se echó antes.
+pub fn apagar_dpms(state: &mut BookosComp) {
+    if let Some(token) = state.tick_dpms.take() {
+        state.loop_handle.remove(token);
+    }
+    cambiar_dpms(state, false);
+    // 2 s: lo que tarda de sobra logind en suspender. Si la suspensión no
+    // llega —un inhibidor—, pasado el margen basta con tocar algo.
+    state.dpms_sordo_hasta = Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+}
+
+/// Enciende las salidas al volver de la suspensión.
+///
+/// Al dormir desde el menú se apaga la pantalla antes de que logind suspenda,
+/// y la primera entrada la vuelve a encender. Pero abrir la tapa despierta el
+/// equipo sin que llegue necesariamente una tecla o un movimiento, y se
+/// quedaría en negro. `PrepareForSleep(false)` es lo que manda logind justo al
+/// reanudar.
+pub fn escuchar_reanudacion(state: &mut BookosComp) {
+    let (aviso, fuente) = smithay::reexports::calloop::channel::channel();
+    let insertado = state.loop_handle.insert_source(fuente, |evento, _, state| {
+        if let smithay::reexports::calloop::channel::Event::Msg(()) = evento {
+            tracing::info!("reanudado: se enciende la pantalla");
+            state.dpms_sordo_hasta = None;
+            despertar_dpms(state);
+        }
+    });
+    if let Err(err) = insertado {
+        tracing::error!("no se pudo escuchar la reanudación: {err}");
+        return;
+    }
+    let lanzado = std::thread::Builder::new()
+        .name("bookos-reanudar".into())
+        .spawn(move || {
+            let señales = zbus::blocking::Connection::system()
+                .and_then(|conexion| {
+                    zbus::blocking::Proxy::new(
+                        &conexion,
+                        "org.freedesktop.login1",
+                        "/org/freedesktop/login1",
+                        "org.freedesktop.login1.Manager",
+                    )
+                })
+                .and_then(|proxy| proxy.receive_signal("PrepareForSleep"));
+            let señales = match señales {
+                Ok(señales) => señales,
+                Err(err) => {
+                    tracing::warn!(
+                        "sin logind, la pantalla no se encenderá sola al despertar: {err}"
+                    );
+                    return;
+                }
+            };
+            for mensaje in señales {
+                if mensaje.body().deserialize::<bool>() == Ok(false) && aviso.send(()).is_err() {
+                    return;
+                }
+            }
+        });
+    if let Err(err) = lanzado {
+        tracing::warn!("no se pudo escuchar la reanudación: {err}");
+    }
+}
+
 /// Reactiva las salidas ante la primera entrada tras DPMS.
 pub fn despertar_dpms(state: &mut BookosComp) {
+    if state
+        .dpms_sordo_hasta
+        .is_some_and(|hasta| std::time::Instant::now() < hasta)
+    {
+        return;
+    }
     if !state.dpms_encendido {
         cambiar_dpms(state, true);
         crate::brillo_auto::evaluar(state);
@@ -1855,6 +2048,7 @@ pub fn watch_hardware(state: &mut BookosComp) {
                 tracing::debug!(cambios, "aviso de hardware, releyendo el panel");
                 refresh_panel(state);
                 crate::multimedia::cargador(state);
+                crate::atenuacion::bateria(state);
             }
             Ok(PostAction::Continue)
         });

@@ -343,6 +343,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bookos-budsd"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "libc",
+ "serde",
+ "serde_json",
+ "tokio",
+ "zbus",
+]
+
+[[package]]
 name = "bookos-comp"
 version = "0.1.0"
 dependencies = [

@@ -101,18 +101,11 @@ impl ModoTema {
             Self::Claro => Tema::Claro,
             Self::Oscuro => Tema::Oscuro,
             Self::Automatico => {
-                let m = |(h, min): HoraDelDia| h as u32 * 60 + min as u32;
-                let (a, b, x) = (m(claro_desde), m(oscuro_desde), m(ahora));
-                // Con los dos extremos iguales no hay tramo claro que valga:
-                // sería un día entero de cada cosa a la vez.
-                let claro = if a == b {
-                    false
-                } else if a < b {
-                    x >= a && x < b
+                if en_tramo(claro_desde, oscuro_desde, ahora) {
+                    Tema::Claro
                 } else {
-                    x >= a || x < b
-                };
-                if claro { Tema::Claro } else { Tema::Oscuro }
+                    Tema::Oscuro
+                }
             }
         }
     }
@@ -136,18 +129,44 @@ impl ModoTema {
         if !matches!(self, Self::Automatico) {
             return None;
         }
-        let m = |(h, min): HoraDelDia| h as u32 * 60 + min as u32;
-        let (a, b, x) = (m(claro_desde), m(oscuro_desde), m(ahora));
-        if a == b {
-            return None;
-        }
-        // El primero de los dos que caiga por delante, dando la vuelta al día.
-        let falta = |objetivo: u32| match objetivo.checked_sub(x) {
-            Some(0) | None => objetivo + 24 * 60 - x,
-            Some(d) => d,
-        };
-        Some(falta(a).min(falta(b)))
+        minutos_al_borde(claro_desde, oscuro_desde, ahora)
     }
+}
+
+/// ¿Cae `ahora` en el tramo que va de `desde` (incluida) a `hasta` (excluida)?
+///
+/// El tramo puede cruzar la medianoche —`desde` después de `hasta`—, y de ahí
+/// que la comparación no sea un simple `a <= x && x < b`. Con los dos extremos
+/// iguales no hay tramo: sería un día entero de cada cosa a la vez.
+///
+/// Lo comparten el tema automático y el horario de la luz nocturna.
+pub fn en_tramo(desde: HoraDelDia, hasta: HoraDelDia, ahora: HoraDelDia) -> bool {
+    let m = |(h, min): HoraDelDia| h as u32 * 60 + min as u32;
+    let (a, b, x) = (m(desde), m(hasta), m(ahora));
+    if a == b {
+        false
+    } else if a < b {
+        x >= a && x < b
+    } else {
+        x >= a || x < b
+    }
+}
+
+/// Minutos hasta el próximo de los dos extremos del tramo. `None` si son
+/// iguales, que es no tener tramo. Nunca cero: si ahora es uno de los bordes,
+/// el siguiente es el otro.
+pub fn minutos_al_borde(desde: HoraDelDia, hasta: HoraDelDia, ahora: HoraDelDia) -> Option<u32> {
+    let m = |(h, min): HoraDelDia| h as u32 * 60 + min as u32;
+    let (a, b, x) = (m(desde), m(hasta), m(ahora));
+    if a == b {
+        return None;
+    }
+    // El primero de los dos que caiga por delante, dando la vuelta al día.
+    let falta = |objetivo: u32| match objetivo.checked_sub(x) {
+        Some(0) | None => objetivo + 24 * 60 - x,
+        Some(d) => d,
+    };
+    Some(falta(a).min(falta(b)))
 }
 
 static ACTUAL: AtomicU8 = AtomicU8::new(0);
@@ -342,6 +361,7 @@ pub enum Acento {
     Rojo,
     Naranja,
     Amarillo,
+    Arena,
     Verde,
     Turquesa,
     Grafito,
@@ -350,7 +370,7 @@ pub enum Acento {
 impl Acento {
     /// Todos, en el orden en que se pintan en la rejilla de Apariencia: el
     /// círculo cromático, que es el orden en que se buscan con el ojo.
-    pub const TODOS: [Acento; 10] = [
+    pub const TODOS: [Acento; 11] = [
         Acento::Azul,
         Acento::Indigo,
         Acento::Morado,
@@ -358,6 +378,7 @@ impl Acento {
         Acento::Rojo,
         Acento::Naranja,
         Acento::Amarillo,
+        Acento::Arena,
         Acento::Verde,
         Acento::Turquesa,
         Acento::Grafito,
@@ -374,6 +395,7 @@ impl Acento {
             Acento::Rojo => "rojo",
             Acento::Naranja => "naranja",
             Acento::Amarillo => "amarillo",
+            Acento::Arena => "arena",
             Acento::Verde => "verde",
             Acento::Turquesa => "turquesa",
             Acento::Grafito => "grafito",
@@ -401,6 +423,11 @@ impl Acento {
             Acento::Amarillo => (0xffcc00, 0xf8db36),
             Acento::Verde => (0x34c759, 0x65ff8c),
             Acento::Turquesa => (0x009ba8, 0x40cbd4),
+            // El mismo en claro y en oscuro, elegido a mano. Es muy claro: el
+            // texto encima sale oscuro (`sobre_acento` lo decide por
+            // luminancia), pero usado como texto sobre la tarjeta blanca casi
+            // no se lee.
+            Acento::Arena => (0xffeec0, 0xffeec0),
             // El acento de quien no quiere acento. No es `TEXTO2`: ese es el
             // gris del texto secundario y usarlo aquí haría que un botón
             // primario se leyera como deshabilitado.
@@ -552,14 +579,20 @@ tokens! {
 /// Los tres perfiles de energía, con el color que les da el diseño. Se usan en
 /// el widget de la batería y en su tarjeta, y tienen que ser los mismos en los
 /// dos sitios: es lo único que dice de un vistazo en qué perfil va el equipo.
+///
+/// Son fijos, iguales en claro y en oscuro, y no salen de `amarillo()`,
+/// `verde()` ni `acento()`: esos cambian de tono con el tema —el amarillo pasa
+/// a naranja en claro— o con el acento elegido, y el perfil cambiaba de color
+/// al cambiar de tema. Aquí nunca son texto: rellenan un círculo o la pila del
+/// panel, y lo que va encima lo elige [`tinta_sobre`]. Son los del HIG.
 pub fn perfil_ahorro() -> Color {
-    amarillo()
+    hex(0xffcc00)
 }
 pub fn perfil_equilibrado() -> Color {
-    verde()
+    hex(0x34c759)
 }
 pub fn perfil_rendimiento() -> Color {
-    acento()
+    hex(0x0a84ff)
 }
 
 /// Blanco o negro, el que se lea sobre `fondo`.
@@ -773,13 +806,26 @@ pub const C_SUAVE: Curva = Curva::new(0.4, 0.0, 0.2, 1.0);
 /// Aparición de un popover. Muelle: se pasa y vuelve.
 pub const C_MUELLE_POPOVER: Curva = Curva::new(0.32, 1.3, 0.5, 1.0);
 /// Aparición de una tarjeta y transición de página. Sin rebote.
-pub const C_ENTRADA: Curva = Curva::new(0.25, 0.46, 0.45, 0.94);
+///
+/// Arranca despacio, acelera en el centro y frena con una cola larga, como un
+/// objeto con masa. La anterior, `(.25, .46, .45, .94)`, salía ya al 19 % del
+/// recorrido en el primer 10 % del tiempo: se veía como un tirón. Esta va al
+/// 3 % en el primer 10 % y al 78 % a mitad de camino. La simétrica
+/// `(.45, 0, .55, 1)` arranca todavía más suave, pero al cuarto de tiempo
+/// solo ha recorrido un 12 %, y en 220-280 ms eso se nota como retraso al
+/// pulsar.
+pub const C_ENTRADA: Curva = Curva::new(0.4, 0.0, 0.2, 1.0);
 /// Geometría de ventanas: maximizar, restaurar, encajar y resize diferido.
-/// `cubic-bezier(.22, 1, .36, 1)` sale con decisión y aterriza suavemente sin
-/// rebote; un muelle aquí haría oscilar texto y bordes ya rasterizados.
-pub const C_VENTANA: Curva = Curva::new(0.22, 1.0, 0.36, 1.0);
+/// La misma forma que [`C_ENTRADA`], sin rebote, porque un muelle aquí haría
+/// oscilar texto y bordes ya rasterizados. La anterior, `(.22, 1, .36, 1)`,
+/// recorría el 40 % en el primer 10 % del tiempo y la ventana saltaba.
+pub const C_VENTANA: Curva = Curva::new(0.4, 0.0, 0.2, 1.0);
 /// Conmutador y aparición de un modal. El muelle más marcado de los dos.
 pub const C_MUELLE: Curva = Curva::new(0.34, 1.4, 0.64, 1.0);
+/// Cambio de tema claro/oscuro. Simétrica y lenta al empezar: con
+/// [`C_SUAVE`] la foto del tema viejo perdía la mitad de su opacidad en el
+/// primer tercio y el blanco entraba como un fogonazo.
+pub const C_TEMA: Curva = Curva::new(0.45, 0.0, 0.55, 1.0);
 
 use std::time::Duration;
 
@@ -795,6 +841,14 @@ pub const D_VENTANA: Duration = Duration::from_millis(260);
 pub const D_MODAL: Duration = Duration::from_millis(250);
 /// Transición de página completa. Va con [`C_ENTRADA`].
 pub const D_PAGINA: Duration = Duration::from_millis(280);
+/// Cambio de tema. Va con [`C_TEMA`]. Más largo que una página porque cambia
+/// el brillo de **toda** la pantalla: de negro a blanco en 280 ms el ojo no
+/// llega a adaptarse y se ve un parpadeo, no un fundido.
+pub const D_TEMA: Duration = Duration::from_millis(450);
+/// Salida del bloqueo. Son dos movimientos escalonados (el bloqueo se va y
+/// luego entran las ventanas), y en 280 ms a las ventanas les quedaban menos
+/// de 200 para entrar: llegaban de golpe.
+pub const D_DESBLOQUEO: Duration = Duration::from_millis(400);
 
 /// Cuánto se lleva recorrido de una duración, entre 0 y 1.
 pub fn fraccion(pasado: Duration, total: Duration) -> f32 {
@@ -1263,6 +1317,22 @@ mod tests {
             let v = C_ENTRADA.eval(i as f32 / 50.0);
             assert!(v >= anterior, "retrocede en {i}: {v} < {anterior}");
             anterior = v;
+        }
+    }
+
+    #[test]
+    fn lo_que_se_mueve_arranca_despacio_y_frena_al_final() {
+        // Arranca más lento que la recta, la adelanta en el centro y llega
+        // frenando: lo contrario de un movimiento a velocidad constante.
+        for curva in [C_ENTRADA, C_VENTANA] {
+            assert!(
+                curva.eval(0.1) < 0.05,
+                "arranca de golpe: {}",
+                curva.eval(0.1)
+            );
+            assert!(curva.eval(0.5) > 0.5);
+            let ultimo_tramo = curva.eval(1.0) - curva.eval(0.9);
+            assert!(ultimo_tramo < 0.02, "no frena al llegar: {ultimo_tramo}");
         }
     }
 

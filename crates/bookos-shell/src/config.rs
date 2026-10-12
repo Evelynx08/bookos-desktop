@@ -21,6 +21,8 @@
 //! bloqueo_medios_y = 0.68
 //! bloqueo_reloj_tamano = 120
 //! bloqueo_avatar_tamano = 112
+//! bloqueo_reloj_fuente = moderna
+//! bloqueo_reloj_grosor = 400
 //! bloqueo_inactividad = 900
 //! suspension_inactividad = 0
 //! actividades = si
@@ -28,8 +30,17 @@
 //! alto_contraste = no
 //! brillo_automatico_pantalla = no
 //! brillo_automatico_teclado = no
+//! luz_nocturna = programada
+//! luz_nocturna_temperatura = 4000
+//! luz_nocturna_desde = 22:00
+//! luz_nocturna_hasta = 07:00
 //! temporizador_siempre_visible = no
 //! sonido_volumen = si
+//! sonidos_interfaz = si
+//! volumen_paso = 5
+//! volumen_paso_mantener = 2
+//! brillo_paso = 5
+//! brillo_paso_mantener = 2
 //! genio = si
 //! panel_esquiva = no
 //! dock_esquiva = no
@@ -86,6 +97,133 @@ pub struct BrilloAutomatico {
     pub teclado: bool,
 }
 
+/// Cuándo se tiñe la pantalla de cálido.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModoLuzNocturna {
+    #[default]
+    Apagada,
+    Encendida,
+    /// De `desde` a `hasta`, cada día.
+    Programada,
+}
+
+/// La luz nocturna: el compositor tiñe la salida bajando la curva de gamma de
+/// los canales verde y azul (ver `bookos-comp/src/luz_nocturna.rs`).
+///
+/// La temperatura va en kelvin, la unidad en que se describe el color de una
+/// luz: 6500 es el blanco del panel y no tiñe nada, por debajo es cálida y por
+/// encima fría. Se deja subir hasta [`LuzNocturna::MAXIMA`] porque el
+/// deslizador de Ajustes va de cálida a fría y alguien puede querer el blanco
+/// algo más azulado de día.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LuzNocturna {
+    pub modo: ModoLuzNocturna,
+    pub temperatura: u32,
+    pub desde: crate::tema::HoraDelDia,
+    pub hasta: crate::tema::HoraDelDia,
+}
+
+impl LuzNocturna {
+    pub const NEUTRA: u32 = 6500;
+    /// 2500 K es una vela larga: más abajo el azul desaparece del todo y los
+    /// colores de la interfaz dejan de distinguirse —acento, rojo y amarillo
+    /// salen naranjas—.
+    pub const MINIMA: u32 = 2500;
+    pub const MAXIMA: u32 = 8000;
+
+    /// ¿Toca teñir ahora, según el modo y el reloj?
+    pub fn toca(&self, ahora: crate::tema::HoraDelDia) -> bool {
+        match self.modo {
+            ModoLuzNocturna::Apagada => false,
+            ModoLuzNocturna::Encendida => true,
+            ModoLuzNocturna::Programada => crate::tema::en_tramo(self.desde, self.hasta, ahora),
+        }
+    }
+
+    /// Cuántos minutos faltan para que el horario la encienda o la apague.
+    /// `None` fuera del modo programado: no hay nada que esperar.
+    pub fn minutos_al_cambio(&self, ahora: crate::tema::HoraDelDia) -> Option<u32> {
+        match self.modo {
+            ModoLuzNocturna::Programada => {
+                crate::tema::minutos_al_borde(self.desde, self.hasta, ahora)
+            }
+            ModoLuzNocturna::Apagada | ModoLuzNocturna::Encendida => None,
+        }
+    }
+}
+
+impl Default for LuzNocturna {
+    fn default() -> Self {
+        Self {
+            modo: ModoLuzNocturna::Apagada,
+            // Lo bastante cálida para notarse sin que el blanco parezca papel
+            // viejo: es lo que dejan de serie GNOME y KDE (4000 y 4500).
+            temperatura: 4000,
+            desde: (22, 0),
+            hasta: (7, 0),
+        }
+    }
+}
+
+/// Si la luz nocturna está tiñendo **ahora**. La escribe el compositor cada vez
+/// que la aplica y la leen la baldosa y la tarjeta de brillo, que no reciben la
+/// configuración: con el modo programado y un cambio a mano, lo que dice el
+/// fichero y lo que se ve no tienen por qué coincidir.
+static LUZ_NOCTURNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn luz_nocturna_encendida() -> bool {
+    LUZ_NOCTURNA.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn marcar_luz_nocturna(encendida: bool) {
+    LUZ_NOCTURNA.store(encendida, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Cuánto mueven las teclas de volumen y brillo, en %: al pulsar y en cada
+/// repetición al mantener.
+///
+/// Al mantener va más fino que al pulsar porque se repite unas diez veces por
+/// segundo: con 5 % por repetición el volumen cruzaba de 0 a 100 en dos
+/// segundos y no daba tiempo a soltar donde se quería.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pasos {
+    pub volumen: u8,
+    pub volumen_mantener: u8,
+    pub brillo: u8,
+    pub brillo_mantener: u8,
+}
+
+impl Pasos {
+    pub const MINIMO: u8 = 1;
+    /// Al pulsar: más de 10 % por pulsación pasa de largo en dos o tres toques.
+    pub const MAXIMO_PULSAR: u8 = 10;
+    /// Al mantener. Más alto que al pulsar a propósito: es el techo que se
+    /// puede elegir, no el valor por defecto (2).
+    pub const MAXIMO_MANTENER: u8 = 30;
+
+    /// El techo de una clave de `panel.conf`; `None` si no es un paso.
+    pub fn maximo_de(clave: &str) -> Option<u8> {
+        match clave {
+            "volumen_paso" | "brillo_paso" => Some(Self::MAXIMO_PULSAR),
+            "volumen_paso_mantener" | "brillo_paso_mantener" => Some(Self::MAXIMO_MANTENER),
+            _ => None,
+        }
+    }
+}
+
+impl Default for Pasos {
+    /// 5 % al pulsar es el paso de KDE: con 10 se pasa de largo y con 2 hay
+    /// que machacar la tecla.
+    fn default() -> Self {
+        Self {
+            volumen: 5,
+            volumen_mantener: 2,
+            brillo: 5,
+            brillo_mantener: 2,
+        }
+    }
+}
+
 pub struct Config {
     pub dock_tamano: u32,
     pub bloqueo_huella: bool,
@@ -126,6 +264,13 @@ pub struct Config {
     pub fondo_oscuro: Option<String>,
     /// Distribución de teclado (`es`, `us`, `fr`…). `None` = la del sistema.
     pub teclado: Option<String>,
+    /// Milisegundos con la tecla pulsada antes de que empiece a repetirse.
+    pub teclado_retardo: u32,
+    /// Repeticiones por segundo; 0 apaga la repetición, que es lo que
+    /// significa una tasa 0 en `wl_keyboard.repeat_info`.
+    pub teclado_velocidad: u32,
+    /// Cuánto mueven las teclas de volumen y brillo, en %.
+    pub pasos: Pasos,
     /// Cuántos escritorios virtuales hay.
     ///
     /// Dos de serie y un máximo de cinco, que es lo que cabe en la vista
@@ -176,8 +321,11 @@ pub struct Config {
     /// Settings y permiten desactivar movimiento sin apagar la función.
     pub actividades: Actividades,
     pub brillo_automatico: BrilloAutomatico,
+    pub luz_nocturna: LuzNocturna,
     /// El chasquido al subir o bajar el volumen con las teclas.
     pub sonido_volumen: bool,
+    /// Los sonidos de bloquear, desbloquear, capturar e iniciar sesión.
+    pub sonidos_interfaz: bool,
     /// El «magic lamp» al minimizar. Apagado, la ventana se encoge sin deformarse.
     pub genio: bool,
     /// Si el panel y el dock se apartan de las ventanas (Meta+Alt+B y
@@ -222,6 +370,71 @@ pub struct Bloqueo {
     pub medios_y: f32,
     pub reloj_tamano: f32,
     pub avatar_tamano: f32,
+    /// La familia de la hora y de la fecha.
+    pub reloj_fuente: FuenteReloj,
+    /// El grosor de la hora, de 100 a 900 en pasos de 100: los nueve que
+    /// distingue iced (`Weight::Thin`…`Black`). La fecha no lo sigue: va en
+    /// Medium, como en macOS, para que una hora Thin no la vuelva ilegible.
+    pub reloj_grosor: u16,
+}
+
+/// Los estilos de reloj que se ofrecen, como los de la pantalla de bloqueo de
+/// macOS. Lista cerrada y no «cualquier fuente del sistema»: casi todas las
+/// instaladas traen dos o tres grosores y el control de grosor no haría nada, y
+/// `Family::Name` pide un `&'static str`. Todas son variables con eje `wght`
+/// completo, y cosmic-text aplica el grosor pedido a ese eje.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FuenteReloj {
+    /// Noto Sans: la única que la ISO instala seguro (google-noto-sans-fonts),
+    /// por eso es la de serie.
+    #[default]
+    Moderna,
+    Neutra,
+    Redondeada,
+    Clasica,
+    Display,
+    Mono,
+}
+
+impl FuenteReloj {
+    pub const TODAS: [Self; 6] = [
+        Self::Moderna,
+        Self::Neutra,
+        Self::Redondeada,
+        Self::Clasica,
+        Self::Display,
+        Self::Mono,
+    ];
+
+    /// Cómo se escribe en `panel.conf` y en `GetConfig`.
+    pub fn nombre(self) -> &'static str {
+        match self {
+            Self::Moderna => "moderna",
+            Self::Neutra => "neutra",
+            Self::Redondeada => "redondeada",
+            Self::Clasica => "clasica",
+            Self::Display => "display",
+            Self::Mono => "mono",
+        }
+    }
+
+    pub fn desde_nombre(nombre: &str) -> Option<Self> {
+        Self::TODAS.into_iter().find(|f| f.nombre() == nombre)
+    }
+
+    /// La familia tal como la conoce fontdb. Sin alias de fontconfig: fontdb
+    /// no los lee, así que tiene que ser el nombre exacto de la fuente.
+    pub fn familia(self) -> &'static str {
+        match self {
+            Self::Moderna => "Noto Sans",
+            Self::Neutra => "Adwaita Sans",
+            // La de la marca: la instala bookos-branding desde BookOS-Fonts.
+            Self::Redondeada => "Nunito",
+            Self::Clasica => "Noto Serif",
+            Self::Display => "Red Hat Display",
+            Self::Mono => "Noto Sans Mono",
+        }
+    }
 }
 
 impl Default for Bloqueo {
@@ -239,6 +452,8 @@ impl Default for Bloqueo {
             medios_y: 0.68,
             reloj_tamano: 144.0,
             avatar_tamano: 132.0,
+            reloj_fuente: FuenteReloj::Moderna,
+            reloj_grosor: 400,
         }
     }
 }
@@ -364,6 +579,10 @@ impl Default for Config {
             fondo_claro: None,
             fondo_oscuro: None,
             teclado: None,
+            // Los valores de KDE, que eran los fijos antes de poder elegirlos.
+            teclado_retardo: 600,
+            teclado_velocidad: 25,
+            pasos: Pasos::default(),
             escritorios: 2,
             nombres_escritorios: vec!["Escritorio 1".into(), "Escritorio 2".into()],
             tema: crate::tema::Tema::Oscuro,
@@ -382,7 +601,9 @@ impl Default for Config {
             suspension_inactividad: 0,
             actividades: Actividades::default(),
             brillo_automatico: BrilloAutomatico::default(),
+            luz_nocturna: LuzNocturna::default(),
             sonido_volumen: true,
+            sonidos_interfaz: true,
             genio: true,
             panel_esquiva: false,
             dock_esquiva: false,
@@ -477,6 +698,11 @@ impl Config {
                         config.sonido_volumen = v;
                     }
                 }
+                "sonidos_interfaz" => {
+                    if let Some(v) = booleano(valor, ruta, n + 1) {
+                        config.sonidos_interfaz = v;
+                    }
+                }
                 "panel_esquiva" => {
                     if let Some(v) = booleano(valor, ruta, n + 1) {
                         config.panel_esquiva = v;
@@ -537,6 +763,22 @@ impl Config {
                         config.bloqueo.avatar_tamano = v as f32;
                     }
                 }
+                "bloqueo_reloj_fuente" => match FuenteReloj::desde_nombre(valor.trim()) {
+                    Some(f) => config.bloqueo.reloj_fuente = f,
+                    None => tracing::warn!(
+                        valor = valor.trim(),
+                        "«bloqueo_reloj_fuente» no es un estilo de reloj conocido"
+                    ),
+                },
+                "bloqueo_reloj_grosor" => match valor.trim().parse::<u16>() {
+                    Ok(v) if (100..=900).contains(&v) && v % 100 == 0 => {
+                        config.bloqueo.reloj_grosor = v
+                    }
+                    _ => tracing::warn!(
+                        valor = valor.trim(),
+                        "«bloqueo_reloj_grosor» debe ser 100, 200… hasta 900"
+                    ),
+                },
                 "bloqueo_inactividad" => match valor.trim().parse::<u64>() {
                     Ok(v) if v <= 86_400 => config.bloqueo_inactividad = v,
                     _ => tracing::warn!(
@@ -583,6 +825,35 @@ impl Config {
                         config.brillo_automatico.teclado = v;
                     }
                 }
+                "luz_nocturna" => match valor.trim() {
+                    "no" => config.luz_nocturna.modo = ModoLuzNocturna::Apagada,
+                    "si" | "sí" => config.luz_nocturna.modo = ModoLuzNocturna::Encendida,
+                    "programada" => config.luz_nocturna.modo = ModoLuzNocturna::Programada,
+                    otro => {
+                        tracing::warn!(otro, "«luz_nocturna» solo entiende no, si o programada")
+                    }
+                },
+                "luz_nocturna_temperatura" => match valor.trim().parse::<u32>() {
+                    Ok(v) if (LuzNocturna::MINIMA..=LuzNocturna::MAXIMA).contains(&v) => {
+                        config.luz_nocturna.temperatura = v
+                    }
+                    _ => tracing::warn!(
+                        ?ruta,
+                        linea = n + 1,
+                        valor = valor.trim(),
+                        "temperatura fuera de [2500 - 8000] K; se ignora"
+                    ),
+                },
+                "luz_nocturna_desde" => {
+                    if let Some(h) = hora_del_dia(valor, ruta, n + 1) {
+                        config.luz_nocturna.desde = h;
+                    }
+                }
+                "luz_nocturna_hasta" => {
+                    if let Some(h) = hora_del_dia(valor, ruta, n + 1) {
+                        config.luz_nocturna.hasta = h;
+                    }
+                }
                 "acento" => match crate::tema::Acento::desde_nombre(valor) {
                     Some(a) => config.acento = a,
                     None => tracing::warn!(valor = valor.trim(), "acento desconocido"),
@@ -626,6 +897,33 @@ impl Config {
                 "fondo_claro" => config.fondo_claro = no_vacio(valor),
                 "fondo_oscuro" => config.fondo_oscuro = no_vacio(valor),
                 "teclado" => config.teclado = Some(valor.trim().to_string()),
+                "teclado_retardo" => {
+                    if let Ok(n) = valor.trim().parse::<u32>() {
+                        config.teclado_retardo = n.clamp(150, 1500);
+                    }
+                }
+                "teclado_velocidad" => {
+                    if let Ok(n) = valor.trim().parse::<u32>() {
+                        config.teclado_velocidad = n.min(60);
+                    }
+                }
+                "volumen_paso"
+                | "volumen_paso_mantener"
+                | "brillo_paso"
+                | "brillo_paso_mantener" => {
+                    if let Ok(n) = valor.trim().parse::<u8>() {
+                        let n = n.clamp(
+                            Pasos::MINIMO,
+                            Pasos::maximo_de(clave.trim()).unwrap_or(Pasos::MAXIMO_PULSAR),
+                        );
+                        match clave.trim() {
+                            "volumen_paso" => config.pasos.volumen = n,
+                            "volumen_paso_mantener" => config.pasos.volumen_mantener = n,
+                            "brillo_paso" => config.pasos.brillo = n,
+                            _ => config.pasos.brillo_mantener = n,
+                        }
+                    }
+                }
                 "velocidad_touchpad" => {
                     if let Some(v) = velocidad(valor, ruta, n + 1) {
                         config.entrada.velocidad_touchpad = v;
@@ -862,6 +1160,17 @@ pub fn guardar_brillo_automatico(elegido: BrilloAutomatico) -> std::io::Result<(
         ("brillo_automatico_pantalla", si_no(elegido.pantalla)),
         ("brillo_automatico_teclado", si_no(elegido.teclado)),
     ])
+}
+
+/// Persiste el modo de la luz nocturna, que es lo único que cambia desde la
+/// baldosa y la tarjeta de brillo: la temperatura y el horario son de Ajustes.
+pub fn guardar_luz_nocturna(modo: ModoLuzNocturna) -> std::io::Result<()> {
+    let valor = match modo {
+        ModoLuzNocturna::Apagada => "no",
+        ModoLuzNocturna::Encendida => "si",
+        ModoLuzNocturna::Programada => "programada",
+    };
+    escribir_claves(&[("luz_nocturna", valor.to_string())])
 }
 
 /// Persiste si una barra se aparta de las ventanas. `clave` es
@@ -1134,6 +1443,23 @@ mod tests {
     }
 
     #[test]
+    fn los_pasos_se_recortan_a_su_techo() {
+        let c = parsear(
+            "volumen_paso = 99\nbrillo_paso = 0\nvolumen_paso_mantener = 99\nbrillo_paso_mantener = 0",
+        );
+        assert_eq!(c.pasos.volumen, 10, "al pulsar, hasta 10");
+        assert_eq!(c.pasos.brillo, 1);
+        assert_eq!(c.pasos.volumen_mantener, 30, "al mantener, hasta 30");
+        assert_eq!(c.pasos.brillo_mantener, 1);
+        assert_eq!(parsear("volumen_paso = 7").pasos.volumen, 7);
+        assert_eq!(
+            parsear("volumen_paso = x").pasos.volumen,
+            5,
+            "ilegible: el de siempre"
+        );
+    }
+
+    #[test]
     fn las_barras_recuerdan_si_esquivan() {
         let c = parsear("");
         assert!(
@@ -1230,6 +1556,27 @@ mod tests {
 
         // Una posición fuera de pantalla no pisa el valor utilizable de serie.
         assert_eq!(parsear("bloqueo_acceso_y = 4").bloqueo.acceso_y, 0.36);
+    }
+
+    #[test]
+    fn el_estilo_del_reloj_solo_acepta_la_lista_y_grosores_de_cien_en_cien() {
+        let c = parsear("bloqueo_reloj_fuente = clasica\nbloqueo_reloj_grosor = 700\n");
+        assert_eq!(c.bloqueo.reloj_fuente, FuenteReloj::Clasica);
+        assert_eq!(c.bloqueo.reloj_grosor, 700);
+
+        // Fuera de la lista o entre medias se queda lo de serie.
+        let c = parsear("bloqueo_reloj_fuente = Comic Sans\nbloqueo_reloj_grosor = 450\n");
+        assert_eq!(c.bloqueo.reloj_fuente, FuenteReloj::Moderna);
+        assert_eq!(c.bloqueo.reloj_grosor, 400);
+        assert_eq!(
+            parsear("bloqueo_reloj_grosor = 1000").bloqueo.reloj_grosor,
+            400
+        );
+
+        // El nombre del fichero y el del enum van y vuelven.
+        for f in FuenteReloj::TODAS {
+            assert_eq!(FuenteReloj::desde_nombre(f.nombre()), Some(f));
+        }
     }
 
     #[test]

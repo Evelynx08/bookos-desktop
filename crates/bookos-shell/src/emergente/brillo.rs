@@ -99,7 +99,7 @@ pub struct Brillo {
     teclado: Option<Teclado>,
     icono_teclado: Option<Icono>,
     /// Sin sensor no hay botón «A»: uno que no puede hacer nada promete lo que
-    /// no hay, como la luz nocturna de abajo.
+    /// no hay.
     sensor: bool,
     automatico: BrilloAutomatico,
     /// El nivel que pide la luz sin el ajuste a mano, si el compositor lo sabe.
@@ -110,6 +110,9 @@ pub struct Brillo {
     icono_auto: Option<Icono>,
     /// El puntero sobre el botón «A» de cada fila: 0 pantalla, 1 teclado.
     boton: tema::Realce,
+    /// Si la luz nocturna está tiñendo, y su horario si lo tiene.
+    nocturna: bool,
+    horario: Option<(tema::HoraDelDia, tema::HoraDelDia)>,
 }
 
 #[derive(Clone, Copy)]
@@ -139,6 +142,8 @@ impl Brillo {
             transicion: None,
             icono_auto: crate::icono::propio("brillo-auto"),
             boton: tema::Realce::nuevo(),
+            nocturna: crate::luz_nocturna_encendida(),
+            horario: horario_nocturna(),
         }
     }
 
@@ -153,6 +158,7 @@ impl Brillo {
         let sensor = crate::retroiluminacion::hay_sensor_luz();
         let automatico = crate::retroiluminacion::automatico();
         let objetivo = crate::retroiluminacion::objetivo_sensor();
+        let nocturna = crate::luz_nocturna_encendida();
         if nivel != self.nivel && !tema::efectos_reducidos() {
             self.transicion = Some((self.nivel_visible(), std::time::Instant::now()));
         }
@@ -162,7 +168,9 @@ impl Brillo {
             || self.nivel != nivel
             || self.teclado != teclado
             || self.sensor != sensor
-            || self.automatico != automatico;
+            || self.automatico != automatico
+            || self.nocturna != nocturna;
+        self.nocturna = nocturna;
         self.dispositivo = dispositivo;
         self.maximo = maximo;
         self.nivel = nivel;
@@ -291,6 +299,28 @@ impl Brillo {
         Some(r)
     }
 
+    /// La fila de la luz nocturna: el grupo del pie, entero.
+    fn rect_nocturna(&self) -> iced_core::Rectangle {
+        let alto = GRUPO * 2.0 + FILA;
+        iced_core::Rectangle {
+            x: MARGEN,
+            y: self.size().1 - MARGEN - alto,
+            width: ANCHO - MARGEN * 2.0,
+            height: alto,
+        }
+    }
+
+    /// La línea de debajo de «Luz nocturna»: qué hace ahora y hasta cuándo.
+    fn estado_nocturna(&self) -> String {
+        let hora = |(h, m): tema::HoraDelDia| format!("{h:02}:{m:02}");
+        match (self.nocturna, self.horario) {
+            (true, Some((_, hasta))) => format!("Hasta las {}", hora(hasta)),
+            (true, None) => "Encendida".into(),
+            (false, Some((desde, _))) => format!("Programada desde las {}", hora(desde)),
+            (false, None) => "Apagada".into(),
+        }
+    }
+
     /// El chip «Config» de la cabecera, pegado a la derecha.
     fn rect_config(&self) -> iced_core::Rectangle {
         let ancho = control::ancho_chip("Config");
@@ -388,6 +418,11 @@ impl Brillo {
         if self.rect_config().contains(punto) {
             return Some(Accion::Lanzar("bookos-settings --page pantalla".into()));
         }
+        if self.rect_nocturna().contains(punto) {
+            // Se da por hecho sin esperar al compositor, como la baldosa.
+            self.nocturna = !self.nocturna;
+            return Some(Accion::LuzNocturna(self.nocturna));
+        }
         for fila in [Fila::Pantalla, Fila::Teclado] {
             if self.rect_boton(fila).is_some_and(|r| r.contains(punto)) {
                 match fila {
@@ -482,7 +517,10 @@ impl Brillo {
         // apartado de ello: sin ajuste coincidiría con el final del relleno.
         let pildora_pantalla: PanelElement<'_> = match self.ajuste() {
             Some((objetivo, _)) => {
-                let x = (ancho_pildora * f32::from(objetivo) / 100.0 - MARCA / 2.0)
+                // En el centro del extremo del relleno que tendría a ese nivel.
+                let x = (control::lleno(ancho_pildora, PILDORA, objetivo)
+                    - PILDORA / 2.0
+                    - MARCA / 2.0)
                     .clamp(PILDORA / 2.0, ancho_pildora - PILDORA / 2.0);
                 let marca = container(Space::new())
                     .width(Length::Fixed(MARCA))
@@ -540,18 +578,23 @@ impl Brillo {
             }
         }
 
-        // Estado informativo hasta que haya un control de luz nocturna: sin
-        // interruptor, porque uno que no hace nada promete lo que no hay.
+        // Toda la fila es el interruptor; el círculo de la luna dice si está
+        // encendida con el mismo lenguaje que el botón «A» de arriba.
+        let (fondo_luna, tinta_luna) = if self.nocturna {
+            (tema::acento(), tema::sobre_acento())
+        } else {
+            (tema::superficie(), tema::TEXTO2)
+        };
         let luna = container(match crate::icono::propio("noche") {
-            Some(ic) => crate::icono::ver_teñido_propio(&ic, 16.0, tema::TEXTO2),
+            Some(ic) => crate::icono::ver_teñido_propio(&ic, 16.0, tinta_luna),
             None => Space::new().width(Length::Fixed(16.0)).into(),
         })
         .width(Length::Fixed(control::BOTON))
         .height(Length::Fixed(control::BOTON))
         .center_x(Length::Fixed(control::BOTON))
         .center_y(Length::Fixed(control::BOTON))
-        .style(|_theme: &iced_widget::Theme| container::Style {
-            background: Some(tema::superficie().into()),
+        .style(move |_theme: &iced_widget::Theme| container::Style {
+            background: Some(fondo_luna.into()),
             border: Border {
                 radius: (control::BOTON / 2.0).into(),
                 ..Default::default()
@@ -567,7 +610,7 @@ impl Brillo {
                         .size(14.0)
                         .font(control::peso(Weight::Medium))
                         .color(tema::texto()),
-                    text("No disponible").size(11.0).color(tema::TEXTO2),
+                    text(self.estado_nocturna()).size(11.0).color(tema::TEXTO2),
                 ],
             ]
             .align_y(Vertical::Center),
@@ -594,6 +637,13 @@ impl Brillo {
         ];
         control::tarjeta(contenido.into(), ANCHO, MARGEN)
     }
+}
+
+/// El horario de la luz nocturna, si está en modo programado. Se lee al abrir
+/// la tarjeta: cambia desde Ajustes, y entonces la tarjeta no está abierta.
+fn horario_nocturna() -> Option<(tema::HoraDelDia, tema::HoraDelDia)> {
+    let luz = crate::Config::cargar().luz_nocturna;
+    (luz.modo == crate::ModoLuzNocturna::Programada).then_some((luz.desde, luz.hasta))
 }
 
 /// Ancho de la marca del sensor sobre la píldora.

@@ -20,8 +20,10 @@
 use std::process::{Command, Stdio};
 
 use iced_core::alignment::Vertical;
+use iced_core::border::Radius;
+use iced_core::font::Weight;
 use iced_core::{Border, Color, Length};
-use iced_widget::{Space, column, container, row, text};
+use iced_widget::{Space, column, container, row, stack, text};
 
 use crate::Accion;
 use crate::icono::{self, Icono};
@@ -29,38 +31,64 @@ use crate::state::Battery;
 use crate::tema;
 use crate::view::PanelElement;
 
-use super::control;
-use super::{Ancla, Tecla};
+use super::{Ancla, ES, Tecla, t};
+use super::{control, lista};
 
-// Las medidas del lienzo «Widgets de BookOS»: tarjeta de 336 con margen de 16 y
-// tres grupos grises —la cabecera, los perfiles y las preferencias— separados
-// por 12.
+// Las medidas del lienzo «Panel de batería BookOS», versión normal: tarjeta de
+// 336 con margen de 16; cabecera con el nivel, la barra y el renglón de estado;
+// los perfiles en una lista segmentada, y el pie.
 const ANCHO: f32 = 336.0;
 const MARGEN: f32 = 16.0;
-/// Alto de cada fila de perfil: una línea de texto con 13 de aire por lado.
-const FILA: f32 = 44.0;
-/// Hueco entre filas de perfil. Casi pegadas: dentro del grupo son una elección
-/// de tres, no tres tarjetas.
-const HUECO_FILA: f32 = 2.0;
-/// Diámetro del círculo de color de un perfil, con su icono blanco dentro.
-const PUNTO: f32 = 26.0;
-const ICONO_PUNTO: f32 = 15.0;
-/// Lado del icono que marca el perfil elegido.
+const INTERIOR: f32 = ANCHO - MARGEN * 2.0;
+/// Fila del título «Batería» con la pastilla de estado a la derecha.
+const TITULO: f32 = 22.0;
+const BAJO_TITULO: f32 = 4.0;
+/// El porcentaje, a 28/Bold: el «Título app» del sistema de diseño.
+const NIVEL: f32 = 34.0;
+const SOBRE_BARRA: f32 = 10.0;
+const BARRA: f32 = 8.0;
+/// La marca del tope sobresale 3 px por arriba y por abajo de la barra.
+const MARCA_TOPE: f32 = BARRA + 6.0;
+const SOBRE_ESTADO: f32 = 10.0;
+const ESTADO: f32 = 16.0;
+/// El rótulo «Modo de energía» con su aire.
+const SOBRE_SECCION: f32 = 16.0;
+const SECCION: f32 = 16.0;
+const BAJO_SECCION: f32 = 8.0;
+/// Alto de cada pieza de la lista: la fila del lateral de Ajustes, con título
+/// y subtítulo.
+const FILA: f32 = 58.0;
+/// Hueco entre piezas. Tan fino que las tres se leen como un bloque, pero cada
+/// una sigue pareciendo pulsable por separado.
+const HUECO_FILA: f32 = 3.0;
+const PUNTO: f32 = 30.0;
+const ICONO_PUNTO: f32 = 17.0;
+/// Lado de la marca del perfil elegido y de la flecha del pie.
 const MARCA: f32 = 16.0;
-/// Alto del grupo de la cabecera: título con su renglón de estado a la
-/// izquierda y el nivel a la derecha.
-const CABECERA: f32 = 68.0;
-/// Alto del grupo del pie.
+const SOBRE_PIE: f32 = 12.0;
 const PIE: f32 = 44.0;
-/// Aire entre grupos.
-const HUECO_BLOQUE: f32 = 12.0;
 
-fn media() -> iced_core::Font {
-    control::peso(iced_core::font::Weight::Medium)
+/// Un porcentaje como se escribe en cada idioma: «80 %» y «80%».
+fn por_ciento(n: u8) -> String {
+    if *ES {
+        format!("{n} %")
+    } else {
+        format!("{n}%")
+    }
 }
 
-fn gorda() -> iced_core::Font {
-    control::peso(iced_core::font::Weight::Bold)
+/// Una duración legible: «4 h 12 min», «45 min». No «4:12», que se confunde
+/// con una hora.
+fn duracion(min: u32) -> String {
+    match (min / 60, min % 60) {
+        (0, m) => format!("{m} min"),
+        (h, 0) => format!("{h} h"),
+        (h, m) => format!("{h} h {m} min"),
+    }
+}
+
+fn peso(w: Weight) -> iced_core::Font {
+    control::peso(w)
 }
 
 /// El icono teñido, o un hueco de su tamaño si falta.
@@ -75,15 +103,16 @@ fn icono_o_hueco(icono: Option<&Icono>, px: f32, color: Color) -> PanelElement<'
 struct Perfil {
     /// La clave que entiende el daemon: `power-saver`, `balanced`…
     clave: String,
-    /// Cómo se enseña, en castellano.
     etiqueta: &'static str,
+    /// Lo que hace, en el subtítulo de la fila.
+    detalle: &'static str,
     /// El color que lo identifica: el mismo que lleva el pictograma del panel
     /// cuando ese perfil está puesto. Es lo que ata las dos cosas. No va solo:
     /// el rótulo al lado es lo que lo distingue para quien no separa el
     /// amarillo del verde.
     color: Color,
-    /// El pictograma blanco que va dentro del círculo de color: el segundo
-    /// canal, además del rótulo, para quien no distingue los colores.
+    /// El pictograma que va dentro del círculo de color: el segundo canal,
+    /// además del rótulo, para quien no distingue los colores.
     icono: Option<Icono>,
 }
 
@@ -109,19 +138,43 @@ fn icono_perfil(clave: &str) -> Option<Icono> {
     )))
 }
 
-/// El rayo de AC de la cabecera: el mismo `bolt` que el panel, macizo.
-const RAYO: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#fff"><path fill-rule="evenodd" clip-rule="evenodd" d="M14.615 1.595a.75.75 0 0 1 .359.852L12.982 9.75h7.268a.75.75 0 0 1 .548 1.262l-10.5 11.25a.75.75 0 0 1-1.272-.71l1.992-7.302H3.75a.75.75 0 0 1-.548-1.262l10.5-11.25a.75.75 0 0 1 .913-.143Z"/></svg>"##;
+/// El rayo y el aviso de la pastilla de estado: `bolt` y
+/// `exclamation-triangle` de Heroicons Outline, con el trazo a 2,5 como pide el
+/// HIG para iconos de 14 px.
+const RAYO: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m3.75 13.5 10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75Z"/></svg>"##;
+const AVISO: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z"/></svg>"##;
 
-/// Traduce la clave del daemon: etiqueta y color. Los rótulos son los del
-/// diseño.
-fn nombrar(clave: &str) -> (&'static str, Color) {
+/// Traduce la clave del daemon: rótulo, qué hace y color.
+fn nombrar(clave: &str) -> (&'static str, &'static str, Color) {
     match clave {
-        "power-saver" => ("Ahorro de energía", tema::perfil_ahorro()),
-        "balanced" => ("Equilibrado", tema::perfil_equilibrado()),
-        "performance" => ("Alto rendimiento", tema::perfil_rendimiento()),
+        "power-saver" => (
+            t("Ahorro de energía", "Power saver"),
+            t(
+                "Más autonomía, menos potencia",
+                "Longer battery life, less power",
+            ),
+            tema::perfil_ahorro(),
+        ),
+        "balanced" => (
+            t("Equilibrado", "Balanced"),
+            t("Potencia según lo que hagas", "Power adapts to what you do"),
+            tema::perfil_equilibrado(),
+        ),
+        "performance" => (
+            t("Alto rendimiento", "Performance"),
+            t(
+                "Máxima potencia, más consumo",
+                "Maximum power, higher usage",
+            ),
+            tema::perfil_rendimiento(),
+        ),
         // Los hay con un cuarto perfil propio del fabricante; se enseña en gris
         // en vez de esconderlo.
-        _ => ("Otro perfil", tema::TEXTO2),
+        _ => (
+            t("Otro perfil", "Other profile"),
+            t("Definido por el fabricante", "Defined by the manufacturer"),
+            tema::TEXTO2,
+        ),
     }
 }
 
@@ -161,11 +214,12 @@ fn perfiles() -> Vec<Perfil> {
     claves
         .into_iter()
         .map(|clave| {
-            let (etiqueta, color) = nombrar(&clave);
+            let (etiqueta, detalle, color) = nombrar(&clave);
             Perfil {
                 icono: icono_perfil(&clave),
                 clave,
                 etiqueta,
+                detalle,
                 color,
             }
         })
@@ -173,7 +227,7 @@ fn perfiles() -> Vec<Perfil> {
 }
 
 /// Qué perfil está puesto ahora.
-fn perfil_activo() -> Option<String> {
+pub(super) fn perfil_activo() -> Option<String> {
     let salida = Command::new("busctl")
         .args([
             "--system",
@@ -191,47 +245,45 @@ fn perfil_activo() -> Option<String> {
     texto.split('"').nth(1).map(str::to_string)
 }
 
-/// El tope de carga, si el portátil tiene uno puesto. Es la explicación de por
-/// qué una batería enchufada se queda parada en el 80 % y no llega al 100.
-fn umbral() -> Option<u8> {
-    let ruta = ruta_bateria()?;
-    std::fs::read_to_string(ruta.join("charge_control_end_threshold"))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
-        .filter(|u| *u > 0 && *u < 100)
+/// En qué está la batería, que es lo que decide la pastilla, el color de la
+/// barra y el renglón de estado.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fase {
+    /// Un sobremesa: no hay batería.
+    SinBateria,
+    /// Bajo mínimos y sin enchufe.
+    Baja,
+    Descargando,
+    Cargando,
+    /// Enchufado y sin cargar: llena, o parada en el tope.
+    Enchufado,
 }
 
-/// La primera batería de sysfs. Se busca aquí y no se reutiliza la de
-/// `state.rs` porque allí es privada y solo devuelve el dato ya interpretado.
-fn ruta_bateria() -> Option<std::path::PathBuf> {
-    let dir = std::fs::read_dir("/sys/class/power_supply").ok()?;
-    let mut rutas: Vec<_> = dir
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| std::fs::read_to_string(p.join("type")).is_ok_and(|t| t.trim() == "Battery"))
-        .collect();
-    // Ordenadas para que BAT0 gane a BAT1 y la elección no dependa del orden
-    // del directorio, que no está garantizado.
-    rutas.sort();
-    rutas.into_iter().next()
+impl Fase {
+    fn de(bateria: Option<Battery>) -> Self {
+        match bateria {
+            None => Fase::SinBateria,
+            Some(b) if b.charging => Fase::Cargando,
+            Some(b) if b.plugged => Fase::Enchufado,
+            Some(b) if b.percent <= 15 => Fase::Baja,
+            Some(_) => Fase::Descargando,
+        }
+    }
 }
 
 pub struct Energia {
     bateria: Option<Battery>,
-    /// Consumo ahora mismo y ciclos de carga, para la cabecera.
     /// El tope de carga del portátil, si lo hay.
     umbral: Option<u8>,
     perfiles: Vec<Perfil>,
     activo: Option<String>,
     /// Sobre qué fila está el ratón, para el realce.
     señalado: tema::Realce,
-    /// La marca del perfil elegido y la flecha del pie. Se cargan una vez: son
-    /// los mismos en cada repintado.
+    /// Se cargan una vez: son los mismos en cada repintado.
     marca: Option<Icono>,
     flecha: Option<Icono>,
     rayo: Icono,
+    aviso: Icono,
 }
 
 impl Energia {
@@ -240,13 +292,14 @@ impl Energia {
             // Con tiempo restante: es la tarjeta que lo enseña, y solo se lee
             // mientras está abierta.
             bateria: Battery::read(true),
-            umbral: umbral(),
+            umbral: crate::state::charge_limit(),
             perfiles: perfiles(),
             activo: perfil_activo(),
             señalado: tema::Realce::nuevo(),
             marca: icono::propio("comprobado"),
             flecha: icono::propio("chevron-derecha"),
             rayo: icono::desde_svg(RAYO),
+            aviso: icono::desde_svg(AVISO),
         }
     }
 
@@ -254,15 +307,25 @@ impl Energia {
         let perfiles = if self.perfiles.is_empty() {
             0.0
         } else {
-            self.alto_lista() + control::GRUPO * 2.0 + HUECO_BLOQUE
+            SOBRE_SECCION + SECCION + BAJO_SECCION + self.alto_lista()
         };
         (
             ANCHO,
-            MARGEN * 2.0 + CABECERA + HUECO_BLOQUE + perfiles + PIE,
+            MARGEN * 2.0 + self.alto_cabecera() + perfiles + SOBRE_PIE + PIE,
         )
     }
 
-    /// Lo que ocupan las filas de perfil, sin el relleno del grupo.
+    /// La cabecera entera: título, nivel, barra si hay batería y estado.
+    fn alto_cabecera(&self) -> f32 {
+        let barra = if self.bateria.is_some() {
+            SOBRE_BARRA + BARRA
+        } else {
+            0.0
+        };
+        TITULO + BAJO_TITULO + NIVEL + barra + SOBRE_ESTADO + ESTADO
+    }
+
+    /// Lo que ocupan las piezas de la lista.
     fn alto_lista(&self) -> f32 {
         let filas = self.perfiles.len() as f32;
         if filas == 0.0 {
@@ -277,12 +340,12 @@ impl Energia {
 
     /// La `y` donde empieza la lista de perfiles, relativa a la emergente.
     fn y_lista(&self) -> f32 {
-        MARGEN + CABECERA + HUECO_BLOQUE + control::GRUPO
+        MARGEN + self.alto_cabecera() + SOBRE_SECCION + SECCION + BAJO_SECCION
     }
 
-    /// Qué fila de perfil cae en esa `y`.
+    /// Qué fila de perfil cae en ese punto.
     fn fila_en(&self, x: f32, y: f32) -> Option<usize> {
-        if x < MARGEN + control::GRUPO || x > ANCHO - MARGEN - control::GRUPO {
+        if !(MARGEN..=ANCHO - MARGEN).contains(&x) {
             return None;
         }
         let rel = y - self.y_lista();
@@ -290,12 +353,19 @@ impl Energia {
             return None;
         }
         let i = (rel / (FILA + HUECO_FILA)) as usize;
-        // El hueco entre filas no es de nadie: pulsarlo no debe cambiar el
+        // El hueco entre piezas no es de nadie: pulsarlo no debe cambiar el
         // perfil por accidente.
         if rel - i as f32 * (FILA + HUECO_FILA) > FILA {
             return None;
         }
         (i < self.perfiles.len()).then_some(i)
+    }
+
+    /// ¿Cae el punto en el pie? Incluye el margen de debajo: es el borde de la
+    /// tarjeta y apuntar al botón desde abajo no debe fallar por 16 px.
+    fn en_pie(&self, x: f32, y: f32) -> bool {
+        let alto = self.size().1;
+        y >= alto - MARGEN - PIE && (MARGEN..=ANCHO - MARGEN).contains(&x)
     }
 
     pub fn puntero(&mut self, punto: Option<(f32, f32)>) -> bool {
@@ -309,9 +379,11 @@ impl Energia {
     }
 
     pub fn pulsar(&mut self, x: f32, y: f32) -> Option<Accion> {
-        // El pie va al final de la tarjeta: el último grupo, de `PIE` px.
-        let alto = self.size().1;
-        if y > alto - PIE - MARGEN && x > MARGEN && x < ANCHO - MARGEN {
+        if self.en_pie(x, y) {
+            // `bateria` es el id de la página en BookOS Settings (`pages` en su
+            // main.js). Con Ajustes ya abierto, la segunda instancia lo manda
+            // por su socket y la ventana viva navega a esa página; sin abrir,
+            // lo lee `get_startup_page` al arrancar.
             return Some(Accion::Lanzar("bookos-settings --page bateria".into()));
         }
         let i = self.fila_en(x, y)?;
@@ -340,6 +412,21 @@ impl Energia {
         None
     }
 
+    /// Relee la batería y el tope mientras la tarjeta está abierta, que es
+    /// cuando se mira el tiempo: sin esto se quedaba con la foto del instante
+    /// en que se abrió y el panel, debajo, seguía contando. El tope también,
+    /// porque se cambia en Ajustes con la tarjeta a la vista.
+    pub fn refrescar(&mut self) -> bool {
+        let fresca = Battery::read(true);
+        let umbral = crate::state::charge_limit();
+        if fresca == self.bateria && umbral == self.umbral {
+            return false;
+        }
+        self.bateria = fresca;
+        self.umbral = umbral;
+        true
+    }
+
     pub fn tecla(&mut self, tecla: crate::TeclaPulsada) -> Tecla {
         match tecla {
             crate::TeclaPulsada::Escape => Tecla::Cerrar,
@@ -347,184 +434,271 @@ impl Energia {
         }
     }
 
-    /// El color del perfil que está puesto, que es con el que se rellena el
-    /// pictograma de la cabecera: el mismo que lleva el del panel, para que las
-    /// dos cosas se lean como una.
+    /// El color del perfil que está puesto, con el que se rellena la barra
+    /// mientras descarga: el mismo que lleva el pictograma del panel, para que
+    /// las dos cosas se lean como una.
     fn color_activo(&self) -> Color {
         self.activo
             .as_deref()
             .and_then(|a| self.perfiles.iter().find(|p| p.clave == a))
-            .map_or(tema::texto(), |p| p.color)
+            .map_or(tema::TEXTO2, |p| p.color)
     }
 
-    /// La pila de la cabecera: carcasa de 30×14 con el relleno proporcional.
-    ///
-    /// Bajo mínimos y sin enchufe el relleno pasa a rojo, que es lo único que
-    /// se tiene que ver de un vistazo; el resto del tiempo lleva el color del
-    /// perfil.
-    fn pila(&self) -> PanelElement<'_> {
-        const ANCHO_PILA: f32 = 30.0;
-        // Con AC, el rayo verde en el hueco de la pila, igual que en el panel.
-        if self.bateria.is_some_and(|b| b.plugged) {
-            return container(icono::ver_teñido(&self.rayo, 20.0, Some(tema::verde())))
-                .width(Length::Fixed(ANCHO_PILA + 3.0))
-                .center_x(Length::Fixed(ANCHO_PILA + 3.0))
-                .into();
+    /// El tope solo cuenta enchufado: descargando no frena nada y dibujarlo
+    /// sería ruido.
+    fn tope_visible(&self) -> Option<u8> {
+        self.umbral
+            .filter(|_| self.bateria.is_some_and(|b| b.plugged))
+    }
+
+    /// La pastilla de la derecha del título: rótulo, icono y su color.
+    fn pastilla(&self) -> Option<(&'static str, &Icono, Color)> {
+        match Fase::de(self.bateria) {
+            Fase::Descargando => None,
+            Fase::Baja => Some((t("Batería baja", "Low battery"), &self.aviso, tema::rojo())),
+            Fase::Cargando => Some((t("Cargando", "Charging"), &self.rayo, tema::verde())),
+            Fase::Enchufado => Some((t("Enchufado", "Plugged in"), &self.rayo, tema::verde())),
+            Fase::SinBateria => Some((t("Corriente", "AC power"), &self.rayo, tema::verde())),
         }
-        const ALTO_PILA: f32 = 14.0;
-        const BORDE: f32 = 1.5;
-        let (porciento, color) = match self.bateria {
-            Some(b) if b.percent <= 15 && !b.plugged => (b.percent, tema::rojo()),
-            Some(b) => (b.percent, self.color_activo()),
-            None => (0, self.color_activo()),
+    }
+
+    /// El renglón de debajo de la barra.
+    fn estado(&self) -> String {
+        let Some(bat) = self.bateria else {
+            return t(
+                "Este equipo funciona solo con corriente",
+                "This computer runs on AC power only",
+            )
+            .into();
         };
-        let interior = ANCHO_PILA - BORDE * 2.0 - 3.0;
-        let relleno = container(Space::new())
-            .width(Length::Fixed(
-                (interior * porciento.min(100) as f32 / 100.0).max(2.0),
-            ))
-            .height(Length::Fill)
-            .style(move |_theme: &iced_widget::Theme| container::Style {
-                background: Some(color.into()),
-                border: Border {
-                    radius: 2.0.into(),
+        match (Fase::de(self.bateria), bat.minutes) {
+            (Fase::Descargando | Fase::Baja, Some(m)) => {
+                if *ES {
+                    format!("{} restantes", duracion(m))
+                } else {
+                    format!("{} left", duracion(m))
+                }
+            }
+            (Fase::Descargando | Fase::Baja, None) => t("Usando la batería", "On battery").into(),
+            // Con tope, la meta es el tope: «llena en» prometería un 100 % al
+            // que la batería no va a llegar.
+            (Fase::Cargando, Some(m)) => match (self.umbral, *ES) {
+                (Some(u), true) => format!("Al {} en {}", por_ciento(u), duracion(m)),
+                (Some(u), false) => format!("{} in {}", por_ciento(u), duracion(m)),
+                (None, true) => format!("Llena en {}", duracion(m)),
+                (None, false) => format!("Full in {}", duracion(m)),
+            },
+            (Fase::Cargando, None) => t("Cargando la batería", "Charging the battery").into(),
+            // Parada en el tope: se dice por qué no sube, que si no parece un
+            // fallo del cargador.
+            (Fase::Enchufado, _) if self.umbral.is_some_and(|u| bat.percent + 1 >= u) => t(
+                "En pausa para cuidar la batería",
+                "Paused to protect the battery",
+            )
+            .into(),
+            (Fase::Enchufado, _) if bat.percent >= 99 => {
+                t("Batería cargada", "Fully charged").into()
+            }
+            (Fase::Enchufado, _) => t("Enchufado, sin cargar", "Plugged in, not charging").into(),
+            (Fase::SinBateria, _) => unreachable!("con batería leída la fase no es SinBateria"),
+        }
+    }
+
+    /// Título y pastilla, el porcentaje grande, la barra y el renglón.
+    fn cabecera(&self) -> PanelElement<'_> {
+        let mut titulo = row![
+            text(t("Batería", "Battery"))
+                .size(12.0)
+                .font(peso(Weight::Medium))
+                .color(tema::TEXTO2),
+            Space::new().width(Length::Fill),
+        ]
+        .height(Length::Fixed(TITULO))
+        .align_y(Vertical::Center);
+        if let Some((rotulo, icono, color)) = self.pastilla() {
+            titulo = titulo.push(
+                container(
+                    row![
+                        icono::ver_teñido(icono, 14.0, Some(color)),
+                        text(rotulo)
+                            .size(12.0)
+                            .font(peso(Weight::Medium))
+                            .color(tema::texto()),
+                    ]
+                    .spacing(4)
+                    .align_y(Vertical::Center),
+                )
+                .height(Length::Fixed(TITULO))
+                .center_y(Length::Fixed(TITULO))
+                .padding([0, 8])
+                .style(|_theme: &iced_widget::Theme| container::Style {
+                    background: Some(tema::superficie_en_tarjeta().into()),
+                    border: Border {
+                        radius: tema::R_CHIP.into(),
+                        ..Default::default()
+                    },
                     ..Default::default()
-                },
-                ..Default::default()
-            });
-        let carcasa = container(relleno)
-            .width(Length::Fixed(ANCHO_PILA))
-            .height(Length::Fixed(ALTO_PILA))
-            .padding(BORDE + 1.5)
-            .style(|_theme: &iced_widget::Theme| container::Style {
-                border: Border {
-                    radius: 4.0.into(),
-                    width: BORDE,
-                    color: tema::TEXTO2,
-                },
-                ..Default::default()
-            });
-        let borne = container(Space::new())
-            .width(Length::Fixed(2.0))
-            .height(Length::Fixed(5.0))
-            .style(|_theme: &iced_widget::Theme| container::Style {
-                background: Some(tema::TEXTO2.into()),
-                border: Border {
-                    radius: 1.0.into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            });
-        row![carcasa, Space::new().width(Length::Fixed(1.0)), borne]
-            .align_y(Vertical::Center)
+                }),
+            );
+        }
+
+        let fase = Fase::de(self.bateria);
+        let nivel = match self.bateria {
+            Some(b) => por_ciento(b.percent),
+            None => t("Sin batería", "No battery").into(),
+        };
+        // Bajo mínimos el número también se pone rojo: a 28 px el rojo pasa el
+        // 3:1 que pide el texto grande, y es lo que tiene que verse de lejos.
+        let color_nivel = if fase == Fase::Baja {
+            tema::rojo()
+        } else {
+            tema::texto()
+        };
+        let mut cabecera = column![
+            titulo,
+            Space::new().height(Length::Fixed(BAJO_TITULO)),
+            container(
+                text(nivel)
+                    .size(28.0)
+                    .font(peso(Weight::Bold))
+                    .color(color_nivel)
+            )
+            .height(Length::Fixed(NIVEL))
+            .center_y(Length::Fixed(NIVEL)),
+        ];
+        if let Some(bat) = self.bateria {
+            cabecera = cabecera
+                .push(Space::new().height(Length::Fixed(SOBRE_BARRA)))
+                .push(self.barra(bat, fase));
+        }
+
+        let mut renglon = row![
+            text(lista::recortar(&self.estado(), INTERIOR - 70.0, 13.0))
+                .size(13.0)
+                .color(tema::TEXTO2),
+            Space::new().width(Length::Fill),
+        ]
+        .height(Length::Fixed(ESTADO))
+        .align_y(Vertical::Center);
+        if let Some(u) = self.tope_visible() {
+            let tope = if *ES {
+                format!("Tope {}", por_ciento(u))
+            } else {
+                format!("Limit {}", por_ciento(u))
+            };
+            renglon = renglon.push(text(tope).size(13.0).color(tema::TEXTO2));
+        }
+        cabecera
+            .push(Space::new().height(Length::Fixed(SOBRE_ESTADO)))
+            .push(renglon)
             .into()
     }
 
-    /// La cabecera: «Batería» con la fuente debajo, y el nivel con su pila a
-    /// la derecha.
-    fn cabecera(&self) -> PanelElement<'_> {
-        let nivel = match self.bateria {
-            // Un sobremesa no tiene batería y la tarjeta sigue teniendo
-            // sentido: los perfiles son suyos igual.
-            Some(b) => format!("{} %", b.percent),
-            None => "—".to_string(),
+    /// La barra de nivel con la marca del tope encima, si toca.
+    ///
+    /// Va en un `stack` de la altura de la marca, con la barra centrada, y no
+    /// en la altura de la barra: así la marca sobresale 3 px por cada lado sin
+    /// que la cabecera tenga que reservar ese aire en otro sitio.
+    fn barra(&self, bat: Battery, fase: Fase) -> PanelElement<'_> {
+        let color = match fase {
+            Fase::Baja => tema::rojo(),
+            Fase::Cargando | Fase::Enchufado => tema::verde(),
+            _ => self.color_activo(),
         };
-        let detalle = self.estado();
-        let dentro = row![
-            column![
-                control::titulo("Batería"),
-                text(detalle).size(11.0).color(tema::TEXTO2),
-            ]
-            .spacing(2),
-            Space::new().width(Length::Fill),
-            text(nivel).size(22.0).font(gorda()).color(tema::texto()),
-            Space::new().width(Length::Fixed(8.0)),
-            self.pila(),
-        ]
-        .align_y(Vertical::Center);
-        control::grupo(
-            container(dentro)
-                .height(Length::Fill)
-                .center_y(Length::Fill)
-                .padding([0, 8])
-                .into(),
-            ANCHO - MARGEN * 2.0,
-            8.0,
+        // Nunca más estrecho que alto: con menos, iced recorta el radio y
+        // asoma una barrita recta por las curvas (ver `control::pildora`).
+        let lleno = (INTERIOR * bat.percent.min(100) as f32 / 100.0).max(BARRA);
+        let pista = container(
+            container(Space::new())
+                .width(Length::Fixed(lleno))
+                .height(Length::Fixed(BARRA))
+                .style(move |_theme: &iced_widget::Theme| container::Style {
+                    background: Some(color.into()),
+                    border: Border {
+                        radius: tema::R_PILL.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
         )
-    }
-
-    /// El renglón de estado: fuente, tiempo restante y tope de carga, los que
-    /// haya de los tres.
-    fn estado(&self) -> String {
-        let Some(bat) = self.bateria else {
-            return "Sin batería".into();
-        };
-        let mut partes = Vec::new();
-        // De dónde come el equipo, como lo dice el diseño: «Batería» o «AC».
-        // Que esté cargando ya lo cuenta el tiempo que falta para llenarse.
-        partes.push(if bat.plugged { "AC" } else { "Batería" }.to_string());
-        match bat.minutes {
-            Some(m) if bat.charging => partes.push(format!("llena en {}:{:02}", m / 60, m % 60)),
-            Some(m) if !bat.plugged => partes.push(format!("{}:{:02} restantes", m / 60, m % 60)),
-            _ => {}
+        .width(Length::Fixed(INTERIOR))
+        .height(Length::Fixed(BARRA))
+        .style(|_theme: &iced_widget::Theme| container::Style {
+            background: Some(tema::control_apagado().into()),
+            border: Border {
+                radius: tema::R_PILL.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let aire = (MARCA_TOPE - BARRA) / 2.0;
+        let mut capas = stack![
+            container(pista)
+                .height(Length::Fixed(MARCA_TOPE))
+                .padding([aire, 0.0])
+        ];
+        if let Some(u) = self.tope_visible() {
+            let x = INTERIOR * u as f32 / 100.0 - 1.0;
+            capas = capas.push(row![
+                Space::new().width(Length::Fixed(x)),
+                container(Space::new())
+                    .width(Length::Fixed(2.0))
+                    .height(Length::Fixed(MARCA_TOPE))
+                    .style(|_theme: &iced_widget::Theme| container::Style {
+                        background: Some(tema::texto().into()),
+                        border: Border {
+                            radius: 1.0.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+            ]);
         }
-        // El tope solo cuando ya está frenando la carga: dicho siempre sería
-        // ruido, y dicho justo ahí explica el 80 % que no sube.
-        if let Some(u) = self.umbral.filter(|u| bat.plugged && bat.percent >= *u) {
-            partes.push(format!("tope {u} %"));
-        }
-        partes.join(" · ")
+        container(capas).height(Length::Fixed(MARCA_TOPE)).into()
     }
 
-    /// El pie: «Preferencias de batería» con su flecha, que lleva a la página
-    /// de batería de los ajustes.
-    fn pie(&self) -> PanelElement<'_> {
-        control::grupo(
-            container(
-                row![
-                    text("Preferencias de batería")
-                        .size(14.0)
-                        .font(media())
-                        .color(tema::TEXTO2),
-                    Space::new().width(Length::Fill),
-                    icono_o_hueco(self.flecha.as_ref(), MARCA, tema::TEXTO2),
-                ]
-                .align_y(Vertical::Center),
-            )
-            .height(Length::Fill)
-            .center_y(Length::Fill)
-            .padding([0, 8])
-            .into(),
-            ANCHO - MARGEN * 2.0,
-            2.0,
-        )
-    }
-
+    /// Una pieza de la lista segmentada.
     fn fila(&self, i: usize) -> PanelElement<'_> {
         let perfil = &self.perfiles[i];
         let activo = self.activo.as_deref() == Some(perfil.clave.as_str());
         let señalado = self.señalado.intensidad(i);
+        let base = tema::superficie_en_tarjeta();
 
-        // El elegido va con el acento al 10 % y su filo, como lo seleccionado
-        // en cualquier lista del sistema; el color del perfil se queda en el
-        // punto. Rellenar la fila del color del perfil dejaba el texto sin
-        // contraste en amarillo y hacía que las otras dos no parecieran
-        // pulsables.
-        let (fondo, borde, color, peso) = if activo {
+        // El elegido, con el acento al 10 % como lo seleccionado en cualquier
+        // lista del sistema; el color del perfil se queda en el círculo.
+        let (fondo, color) = if activo {
             (
-                control::seleccionada(señalado),
-                tema::alfa(tema::acento(), 0.45),
+                tema::mezclar(base, tema::acento(), 0.10 + 0.06 * señalado),
                 tema::acento(),
-                control::peso(iced_core::font::Weight::Semibold),
             )
         } else {
             (
-                tema::mezclar(Color::TRANSPARENT, tema::card(), señalado),
-                Color::TRANSPARENT,
+                tema::mezclar(base, tema::tinta(), 0.05 * señalado),
                 tema::texto(),
-                media(),
             )
         };
+        // Esquinas de control por fuera del bloque y de chip donde se tocan
+        // dos piezas: las tres forman una sola figura.
+        let ultima = i + 1 == self.perfiles.len();
+        let (arriba, abajo) = (
+            if i == 0 {
+                tema::R_CONTROL
+            } else {
+                tema::R_CHIP
+            },
+            if ultima {
+                tema::R_CONTROL
+            } else {
+                tema::R_CHIP
+            },
+        );
+        let radio = Radius {
+            top_left: arriba,
+            top_right: arriba,
+            bottom_right: abajo,
+            bottom_left: abajo,
+        };
+
         let color_punto = perfil.color;
         let punto = container(icono_o_hueco(
             perfil.icono.as_ref(),
@@ -543,10 +717,23 @@ impl Energia {
             },
             ..Default::default()
         });
+        // Lo que queda para el texto: la pieza menos el relleno, el círculo,
+        // su hueco y la marca con el suyo.
+        let ancho_texto = INTERIOR - 28.0 - PUNTO - 14.0 - MARCA - 14.0;
+        let textos = column![
+            text(lista::recortar(perfil.etiqueta, ancho_texto, 14.0))
+                .size(14.0)
+                .font(peso(Weight::Medium))
+                .color(color),
+            text(lista::recortar(perfil.detalle, ancho_texto, 11.0))
+                .size(11.0)
+                .color(tema::TEXTO2),
+        ]
+        .spacing(2);
         let mut contenido = row![
             punto,
-            Space::new().width(Length::Fixed(12.0)),
-            text(perfil.etiqueta).size(14.5).font(peso).color(color),
+            Space::new().width(Length::Fixed(14.0)),
+            textos,
             Space::new().width(Length::Fill),
         ]
         .align_y(Vertical::Center);
@@ -554,40 +741,70 @@ impl Energia {
             contenido = contenido.push(icono_o_hueco(self.marca.as_ref(), MARCA, tema::acento()));
         }
         container(contenido)
-            .width(Length::Fill)
+            .width(Length::Fixed(INTERIOR))
             .height(Length::Fixed(FILA))
             .center_y(Length::Fixed(FILA))
-            .padding([0, 12])
+            .padding([0, 14])
             .style(move |_theme: &iced_widget::Theme| container::Style {
                 background: Some(fondo.into()),
                 border: Border {
-                    radius: tema::R_BOTON_PEQUENO.into(),
-                    width: 1.0,
-                    color: borde,
+                    radius: radio,
+                    ..Default::default()
                 },
                 ..Default::default()
             })
             .into()
     }
 
+    /// El pie: «Preferencias de batería», que abre su página en Ajustes. En el
+    /// color del texto y no en gris: es un botón, y en gris parecía apagado.
+    fn pie(&self) -> PanelElement<'_> {
+        control::grupo(
+            container(
+                row![
+                    text(t("Preferencias de batería", "Battery settings"))
+                        .size(14.0)
+                        .font(peso(Weight::Medium))
+                        .color(tema::texto()),
+                    Space::new().width(Length::Fill),
+                    icono_o_hueco(self.flecha.as_ref(), MARCA, tema::TEXTO2),
+                ]
+                .align_y(Vertical::Center),
+            )
+            .height(Length::Fixed(PIE))
+            .center_y(Length::Fixed(PIE))
+            .padding([0, 14])
+            .into(),
+            INTERIOR,
+            0.0,
+        )
+    }
+
     pub fn view(&self) -> PanelElement<'_> {
-        let mut contenido = column![container(self.cabecera()).height(Length::Fixed(CABECERA))];
+        let mut contenido = column![self.cabecera()];
         if !self.perfiles.is_empty() {
             let mut filas = column![].spacing(HUECO_FILA);
             for i in 0..self.perfiles.len() {
                 filas = filas.push(self.fila(i));
             }
             contenido = contenido
-                .push(Space::new().height(Length::Fixed(HUECO_BLOQUE)))
-                .push(control::grupo(
-                    filas.into(),
-                    ANCHO - MARGEN * 2.0,
-                    control::GRUPO,
-                ));
+                .push(Space::new().height(Length::Fixed(SOBRE_SECCION)))
+                .push(
+                    container(
+                        text(t("Modo de energía", "Power mode"))
+                            .size(12.0)
+                            .font(peso(Weight::Medium))
+                            .color(tema::TEXTO2),
+                    )
+                    .height(Length::Fixed(SECCION))
+                    .center_y(Length::Fixed(SECCION)),
+                )
+                .push(Space::new().height(Length::Fixed(BAJO_SECCION)))
+                .push(filas);
         }
         contenido = contenido
-            .push(Space::new().height(Length::Fixed(HUECO_BLOQUE)))
-            .push(container(self.pie()).height(Length::Fixed(PIE)));
+            .push(Space::new().height(Length::Fixed(SOBRE_PIE)))
+            .push(self.pie());
         control::tarjeta(contenido.into(), ANCHO, MARGEN)
     }
 }
@@ -596,20 +813,26 @@ impl Energia {
 mod tests {
     use super::*;
 
-    /// El hueco entre filas no pertenece a ninguna: pulsarlo no debe cambiar el
-    /// perfil.
-    #[test]
-    fn el_hueco_entre_filas_no_es_de_nadie() {
+    fn con_perfiles(claves: &[&str]) -> Energia {
         let mut e = Energia::new();
-        e.perfiles = ["a", "b"]
-            .into_iter()
+        e.perfiles = claves
+            .iter()
             .map(|c| Perfil {
-                clave: c.into(),
+                clave: (*c).into(),
                 etiqueta: "X",
+                detalle: "Y",
                 color: tema::TEXTO2,
                 icono: None,
             })
             .collect();
+        e
+    }
+
+    /// El hueco entre piezas no pertenece a ninguna: pulsarlo no debe cambiar
+    /// el perfil.
+    #[test]
+    fn el_hueco_entre_filas_no_es_de_nadie() {
+        let e = con_perfiles(&["a", "b"]);
         let y0 = e.y_lista();
         assert_eq!(e.fila_en(50.0, y0 + 1.0), Some(0));
         assert_eq!(e.fila_en(50.0, y0 + FILA + HUECO_FILA / 2.0), None);
@@ -621,13 +844,7 @@ mod tests {
     /// en vez de dejar un hueco vacío debajo.
     #[test]
     fn sin_perfiles_la_tarjeta_encoge() {
-        let mut e = Energia::new();
-        e.perfiles = vec![Perfil {
-            clave: "a".into(),
-            etiqueta: "X",
-            color: tema::TEXTO2,
-            icono: None,
-        }];
+        let mut e = con_perfiles(&["a"]);
         let con = e.size().1;
         e.perfiles.clear();
         assert!(
@@ -635,5 +852,57 @@ mod tests {
             "{} debería ser menor que {con}",
             e.size().1
         );
+    }
+
+    /// El pie abre la página de batería de Ajustes, con perfiles y sin ellos,
+    /// y también pulsando en el margen de debajo.
+    #[test]
+    fn el_pie_abre_la_pagina_de_bateria() {
+        for claves in [&["a", "b", "c"][..], &[]] {
+            let mut e = con_perfiles(claves);
+            let alto = e.size().1;
+            for y in [alto - MARGEN - PIE / 2.0, alto - 2.0] {
+                let accion = e.pulsar(ANCHO / 2.0, y);
+                assert!(
+                    matches!(&accion, Some(Accion::Lanzar(cmd)) if cmd == "bookos-settings --page bateria"),
+                    "y={y} con {} perfiles: {accion:?}",
+                    claves.len()
+                );
+            }
+        }
+    }
+
+    /// El pie y la última fila no se pisan: pulsar la última fila cambia el
+    /// perfil y no abre Ajustes.
+    #[test]
+    fn la_ultima_fila_no_es_el_pie() {
+        let mut e = con_perfiles(&["a", "b", "c"]);
+        e.activo = Some("a".into());
+        let y = e.y_lista() + 2.0 * (FILA + HUECO_FILA) + FILA - 1.0;
+        assert_eq!(e.fila_en(ANCHO / 2.0, y), Some(2));
+        assert!(!e.en_pie(ANCHO / 2.0, y));
+    }
+
+    #[test]
+    fn duraciones_legibles() {
+        assert_eq!(duracion(45), "45 min");
+        assert_eq!(duracion(60), "1 h");
+        assert_eq!(duracion(252), "4 h 12 min");
+    }
+
+    /// Con un sobremesa no hay barra y la cabecera es más baja.
+    #[test]
+    fn sin_bateria_no_hay_barra() {
+        let mut e = con_perfiles(&["a"]);
+        e.bateria = Some(Battery {
+            percent: 50,
+            charging: false,
+            plugged: false,
+            minutes: None,
+        });
+        let con = e.alto_cabecera();
+        e.bateria = None;
+        assert_eq!(e.alto_cabecera(), con - SOBRE_BARRA - BARRA);
+        assert_eq!(Fase::de(None), Fase::SinBateria);
     }
 }

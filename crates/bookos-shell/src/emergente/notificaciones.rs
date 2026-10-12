@@ -9,7 +9,7 @@
 
 use std::time::{Duration, Instant};
 
-use iced_core::alignment::Vertical;
+use iced_core::alignment::{Horizontal, Vertical};
 use iced_core::font::Weight;
 use iced_core::{Border, Length};
 use iced_widget::{Space, column, container, row, text};
@@ -49,6 +49,9 @@ const CIERRE: f32 = 30.0;
 const DURACION: f32 = 34.0;
 /// Hueco entre las piezas del grupo: filas, botones y bloques.
 const HUECO: f32 = 6.0;
+/// El hueco de la hora —o de la ✕ que la sustituye—: «hace 44 min» a 11 px cabe
+/// con holgura, y a ancho fijo la cabecera no se descuadra con el texto.
+const HORA_ANCHO: f32 = 64.0;
 /// Hueco entre los dos chips de la cabecera.
 const ENTRE_CHIPS: f32 = 8.0;
 /// La etiqueta del botón que vacía la lista. «Borrar» y no «Borrar todo»: con
@@ -562,6 +565,7 @@ impl Notificaciones {
             (acciones, _, true) if acciones > 0 => format!("{} · …", acciones),
             (0, Some(porcentaje), _) => format!("{}%", porcentaje),
             (0, _, true) => "…".to_string(),
+            (1, _, _) => "1 acción".to_string(),
             (acciones, _, _) if acciones > 0 => format!("{} acciones", acciones),
             _ => String::new(),
         };
@@ -580,12 +584,26 @@ impl Notificaciones {
             text(notif.hace()).size(11.0).color(tema::TEXTO2).into()
         };
 
+        // Anchos fijos en toda la cabecera: sin ellos iced reparte lo que sobra
+        // entre los tres textos y un nombre de aplicación largo aplastaba la
+        // hora hasta partirla en tres líneas («hace / 44 / min»), con lo que la
+        // cabecera crecía y empujaba el resumen fuera de la fila. El nombre se
+        // recorta a lo que quede libre.
+        let ancho_indicador = indicador.chars().count() as f32 * 5.5;
+        let ancho_app = (ANCHO_TEXTO - HORA_ANCHO - 6.0 - ancho_indicador - HUECO).max(40.0);
         let cabecera = row![
-            text(app).size(11.0).color(color_app),
+            container(
+                text(lista::recortar(&app, ancho_app, 11.0))
+                    .size(11.0)
+                    .color(color_app)
+            )
+            .width(Length::Fixed(ancho_app)),
             Space::new().width(Length::Fill),
             text(indicador).size(10.0).color(tema::TEXTO2),
             Space::new().width(Length::Fixed(6.0)),
-            derecha,
+            container(derecha)
+                .width(Length::Fixed(HORA_ANCHO))
+                .align_x(Horizontal::Right),
         ]
         .align_y(Vertical::Center);
 

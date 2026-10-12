@@ -6,11 +6,12 @@
 //!
 //! ## Cómo está construida la cara
 //!
-//! - **Negro, no gris.** La isla usa el fondo de pantalla completa
-//!   ([`tema::bg`]) y no el de tarjeta: colgando del borde superior tiene que
-//!   leerse como una prolongación del marco de la pantalla, no como una
-//!   ventanita. El temporizador es la excepción y va **relleno de color**,
-//!   porque es el único que reclama atención por sí mismo.
+//! - **Superficie de tarjeta, lisa.** Blanca en claro y carbón en oscuro
+//!   ([`tema::card`]), como cualquier tarjeta del sistema de diseño. Ninguna
+//!   actividad va rellena de color: el temporizador y el calendario lo iban, y
+//!   una tarjeta entera de acento decía «esto se toca» por toda su superficie.
+//!   El color se queda en lo que se pulsa (acento) y en lo que informa de un
+//!   estado (rojo de grabar, ámbar del temporizador, verde de la transferencia).
 //! - **La geometría vive en constantes, no en el árbol de widgets.** Las zonas
 //!   sensibles al clic se calculan a mano en [`Actividad::pulsar`] —aquí no hay
 //!   eventos de iced, el compositor entrega un punto— así que un `padding` que
@@ -20,17 +21,16 @@
 //!   («‹‹», «Ⅱ», «♥»), y eso depende de que la fuente del sistema los tenga:
 //!   medido, el corazón de «favorita» no se dibujaba **nada** en esta máquina y
 //!   la fila de la cola salía vacía en ese hueco.
-//! - **La portada manda en el color.** De ella sale el color de los controles,
-//!   así que la isla de cada disco se ve distinta sin que la aplicación mande
-//!   ningún color. Se calcula una vez al recibir el estado, no por fotograma.
+//! - **El acento manda en los controles, no la portada.** Teñirlos con el
+//!   color del disco hacía que el botón de reproducir cambiase de color con
+//!   cada canción y dejase de leerse como el control del sistema.
 
 use std::collections::HashMap;
 use std::time::Instant;
 
 use iced_core::alignment::{Horizontal, Vertical};
 use iced_core::font::{Font, Weight};
-use iced_core::gradient::Linear;
-use iced_core::{Background, Border, Color, Gradient, Length, Radians, Shadow, Vector};
+use iced_core::{Border, Color, Length, Shadow, Vector};
 use iced_widget::{Space, column, container, image, row, stack, text};
 
 use crate::icono;
@@ -58,6 +58,13 @@ const TIMER_COMPACTO_W: f32 = 132.0;
 const RECORDER_COMPACTO_W: f32 = 172.0;
 /// Las otras actividades vivas, como círculos a la derecha de la píldora.
 const BURBUJA: f32 = PLAYER_COMPACTO_H;
+/// Transferencia, calendario y monitor: mismas píldoras bajas que la música,
+/// con el ancho justo para «nombre + dato».
+const TRANSFER_COMPACTO_W: f32 = 236.0;
+const CALENDARIO_COMPACTO_W: f32 = 290.0;
+const MONITOR_COMPACTO_W: f32 = 276.0;
+/// Auriculares: icono, nombre y la batería más baja, como la transferencia.
+const AURICULARES_COMPACTO_W: f32 = TRANSFER_COMPACTO_W;
 const BURBUJA_SEP: f32 = 6.0;
 /// La música cerrada es una píldora baja: una canción de fondo no merece la
 /// tarjeta de 380×72 del temporizador, que tapaba las pestañas de la ventana
@@ -66,28 +73,51 @@ const BURBUJA_SEP: f32 = 6.0;
 const PLAYER_COMPACTO_W: f32 = 280.0;
 /// Lo que cabe en la barra superior dejando `ARRIBA` por encima y por debajo.
 const PLAYER_COMPACTO_H: f32 = crate::PANEL_HEIGHT as f32 - ARRIBA * 2.0;
+/// La isla cerrada es un squircle, no una píldora: con la mitad del alto de
+/// radio se leía como un botón de cápsula. 10 es el radio de «botón pequeño» de
+/// la tabla del HIG, y a estos 26 px de alto deja esquinas claramente cuadradas.
+const RADIO_COMPACTO: f32 = 10.0;
 const ABIERTO_W: f32 = 440.0;
 /// Margen interior de las vistas abiertas.
 const PAD: f32 = 22.0;
 
+/// Rótulo de sección («Temporizador», «Rendimiento»): el section header del
+/// sistema de diseño, 12/Medium en texto secundario.
+const ROTULO_H: f32 = 16.0;
+/// Botón ancho de la tarjeta: el botón de diálogo del sistema de diseño.
+const BOTON_H: f32 = 48.0;
+const BOTON_SEP: f32 = 12.0;
+/// Barras de progreso de todas las tarjetas.
+const BARRA_GRUESO: f32 = 6.0;
+
 /// Reproductor abierto, de arriba abajo.
 const ARTE: f32 = 66.0;
 const CAB_H: f32 = ARTE;
-const CTRL_Y: f32 = PAD + CAB_H + 26.0;
+const CTRL_Y: f32 = PAD + CAB_H + 18.0;
 const CTRL_H: f32 = 56.0;
 /// Los cinco controles: aleatorio, anterior, reproducir, siguiente, repetir.
 const CTRL_PLAY: f32 = 56.0;
 const CTRL_LADO: f32 = 44.0;
 const CTRL_PLANO: f32 = 26.0;
 const CTRL_SEP: f32 = 12.0;
-/// Fila del progreso: tiempo, barra, tiempo, cola y volumen.
-const BARRA_Y: f32 = CTRL_Y + CTRL_H + 22.0;
-const BARRA_H: f32 = 26.0;
-const BARRA_GRUESO: f32 = 8.0;
-/// Ancho reservado a cada rótulo de tiempo dentro de esa fila.
+/// Fila del progreso: tiempo, barra, tiempo.
+const BARRA_Y: f32 = CTRL_Y + CTRL_H + 16.0;
+const BARRA_H: f32 = 20.0;
+/// Ancho reservado a cada rótulo de tiempo dentro de esa fila. Fijo para que
+/// la barra no cambie de largo al pasar de «9:59» a «10:00».
 const TIEMPO_W: f32 = 42.0;
-const ICONO_FILA: f32 = 24.0;
-const PLAYER_H: f32 = BARRA_Y + BARRA_H + PAD;
+/// Fila secundaria, bajo un divisor: la cola en la mitad izquierda y el
+/// volumen en la derecha.
+const SEC_Y: f32 = BARRA_Y + BARRA_H + 12.0 + 1.0 + 10.0;
+const SEC_H: f32 = 28.0;
+const ICONO_FILA: f32 = 20.0;
+/// La pista del volumen: empieza tras su icono y acaba en el margen. El
+/// pulgar entra entero en los dos extremos, así que el recorrido útil es el
+/// ancho menos el pulgar.
+const VOL_X0: f32 = ABIERTO_W / 2.0 + 16.0 + ICONO_FILA + 10.0;
+const VOL_X1: f32 = ABIERTO_W - PAD;
+const VOL_PULGAR: f32 = 20.0;
+const PLAYER_H: f32 = SEC_Y + SEC_H + PAD;
 
 /// La cola cuelga por debajo del reproductor, dentro de la misma tarjeta.
 const COLA_SEP: f32 = 10.0;
@@ -96,19 +126,45 @@ const COLA_FILA_H: f32 = 60.0;
 const COLA_PAD: f32 = 14.0;
 const COLA_MAX: usize = 4;
 
-/// Temporizador abierto.
-const TIMER_CAB_H: f32 = 52.0;
-const TIMER_AVISO_H: f32 = 20.0;
-const TIMER_BOTON_Y: f32 = PAD + TIMER_CAB_H + 10.0 + TIMER_AVISO_H + 16.0;
-const BOTON_H: f32 = 48.0;
+/// Temporizador abierto: rótulo, cifra, estado, barra y botones.
+const CIFRA_H: f32 = 54.0;
+const ESTADO_H: f32 = 18.0;
+const TIMER_BOTON_Y: f32 =
+    PAD + ROTULO_H + 6.0 + CIFRA_H + 2.0 + ESTADO_H + 14.0 + BARRA_GRUESO + 18.0;
 const TIMER_H: f32 = TIMER_BOTON_Y + BOTON_H + PAD;
 
-/// Grabadora abierta.
-const REC_CAB_H: f32 = 28.0;
+/// Grabadora abierta: estado, tiempo, ondas y los dos botones redondos.
+const REC_CAB_H: f32 = 20.0;
+const REC_TIEMPO_H: f32 = 40.0;
 const REC_ONDAS_H: f32 = 46.0;
-const REC_BOTON_Y: f32 = PAD + REC_CAB_H + 16.0 + REC_ONDAS_H + 20.0;
+const REC_BOTON_Y: f32 = PAD + REC_CAB_H + 6.0 + REC_TIEMPO_H + 12.0 + REC_ONDAS_H + 18.0;
 const REC_BOTON: f32 = 56.0;
 const RECORDER_H: f32 = REC_BOTON_Y + REC_BOTON + PAD;
+
+/// Transferencia abierta: archivo, barra, «42 % … Quedan 1:12» y cancelar.
+const TRANSFER_CAB_H: f32 = 44.0;
+const TRANSFER_INFO_H: f32 = 16.0;
+const TRANSFER_BOTON_Y: f32 =
+    PAD + TRANSFER_CAB_H + 18.0 + BARRA_GRUESO + 10.0 + TRANSFER_INFO_H + 18.0;
+const TRANSFER_H: f32 = TRANSFER_BOTON_Y + BOTON_H + PAD;
+
+/// Calendario abierto: rótulo, evento, horario, cuenta atrás y un botón.
+const CAL_TITULO_H: f32 = 28.0;
+const CAL_SUB_H: f32 = 18.0;
+const CAL_CUANDO_H: f32 = 20.0;
+const CAL_BOTON_Y: f32 =
+    PAD + ROTULO_H + 6.0 + CAL_TITULO_H + 2.0 + CAL_SUB_H + 12.0 + CAL_CUANDO_H + 18.0;
+const CAL_H: f32 = CAL_BOTON_Y + BOTON_H + PAD;
+
+/// Monitor abierto: una fila «nombre … cifra» por métrica, sin barras ni
+/// botones; pulsar cierra.
+const MON_FILA_H: f32 = 36.0;
+
+/// Auriculares abiertos: el aparato, las filas del monitor (izquierdo,
+/// derecho, estuche) y debajo un botón para Ajustes.
+const AUR_CAB_H: f32 = 32.0;
+const AUR_BOTON_Y: f32 = PAD + AUR_CAB_H + 8.0 + MON_FILA_H * 3.0 + 16.0;
+const AUR_H: f32 = AUR_BOTON_Y + BOTON_H + PAD;
 
 /// Lado en píxeles de la carátula ya preparada: tres por punto del mayor
 /// tamaño al que se pinta (66), nítida hasta escala 3.
@@ -133,6 +189,27 @@ pub enum Clase {
     Player,
     Timer,
     Recorder,
+    /// Un archivo que se está enviando o recibiendo. `nivel` es el progreso
+    /// (0..1) y `restante_ms` lo que falta, −1 si no se sabe.
+    Transfer,
+    /// Un aviso de clase o evento. `restante_ms` es lo que falta para que
+    /// empiece; negativo, ya ha empezado.
+    Calendar,
+    /// Rendimiento rápido: CPU, GPU, RAM, temperatura y batería en `metricas`.
+    Monitor,
+    /// La batería de unos auriculares al sacarlos: una métrica por auricular
+    /// y otra para el estuche si informa. `titulo` es el nombre del aparato.
+    Auriculares,
+}
+
+/// Una fila del monitor. `critica` la decide quien publica: una batería al 10 %
+/// es grave y una CPU al 10 % no, y de eso la isla no sabe nada.
+#[derive(Debug, Clone)]
+pub struct Metrica {
+    pub etiqueta: String,
+    pub valor: f32,
+    pub texto: String,
+    pub critica: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -176,6 +253,7 @@ pub struct Estado {
     pub repetir: bool,
     pub portada: Option<Portada>,
     pub cola: Vec<ItemCola>,
+    pub metricas: Vec<Metrica>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,17 +283,15 @@ enum Vista {
 pub struct Actividad {
     estado: Estado,
     vista: Vista,
-    volumen_visible: bool,
     animaciones: bool,
     desde: Instant,
     ultimo_frame_ondas: Instant,
-    /// La portada con las esquinas ya recortadas y el color que la resume.
+    /// La portada con las esquinas ya recortadas.
     ///
-    /// Las dos cosas se calculan al recibir el estado y no al dibujar: recortar
-    /// son 90 000 píxeles por portada, y hacerlo en cada fotograma de una
-    /// animación de 220 ms es pagarlo trece veces para ver lo mismo.
+    /// Se prepara al recibir el estado y no al dibujar: recortar son 90 000
+    /// píxeles por portada, y hacerlo en cada fotograma de una animación de
+    /// 220 ms es pagarlo trece veces para ver lo mismo.
     arte: Option<image::Handle>,
-    tinte: Option<Color>,
     /// Miniaturas de la cola por id de pista, ya recortadas y reducidas.
     miniaturas: HashMap<String, image::Handle>,
     burbujas: Vec<Burbuja>,
@@ -223,16 +299,14 @@ pub struct Actividad {
 
 impl Actividad {
     pub fn nueva(estado: Estado, animaciones: bool) -> Self {
-        let (arte, tinte) = preparar_portada(estado.portada.as_ref(), ARTE_PX).unzip();
+        let arte = preparar_portada(estado.portada.as_ref(), ARTE_PX);
         let mut a = Self {
             estado,
             vista: Vista::Compacta,
-            volumen_visible: false,
             animaciones,
             desde: Instant::now(),
             ultimo_frame_ondas: Instant::now() - FRAME_ONDAS,
             arte,
-            tinte,
             miniaturas: HashMap::new(),
             burbujas: Vec::new(),
         };
@@ -252,9 +326,13 @@ impl Actividad {
             // guardarlos multiplicaría la memoria por pista. Solo se preparan
             // las filas que se pintan; reducir veinte portadas en el hilo del
             // compositor al cambiar de canción es trabajo que nadie ve.
+            //
+            // Ni las que ya tienen miniatura: el estado guardado las hereda de
+            // una publicación a otra y llegan aquí en cada latido.
             if let Some(p) = item.portada.take()
                 && i < COLA_MAX
-                && let Some((h, _)) = preparar_portada(Some(&p), MINIATURA_PX)
+                && !self.miniaturas.contains_key(&item.id)
+                && let Some(h) = preparar_portada(Some(&p), MINIATURA_PX)
             {
                 self.miniaturas.insert(item.id.clone(), h);
             }
@@ -271,9 +349,7 @@ impl Actividad {
             _ => true,
         };
         if cambio {
-            let (arte, tinte) = preparar_portada(estado.portada.as_ref(), ARTE_PX).unzip();
-            self.arte = arte;
-            self.tinte = tinte;
+            self.arte = preparar_portada(estado.portada.as_ref(), ARTE_PX);
         }
         self.estado = estado;
         self.guardar_miniaturas();
@@ -286,6 +362,10 @@ impl Actividad {
         }
         self.colapsar();
         true
+    }
+
+    pub fn desplegada(&self) -> bool {
+        self.vista != Vista::Compacta
     }
 
     pub fn app_id(&self) -> &str {
@@ -332,7 +412,9 @@ impl Actividad {
         if n == 0 {
             return 0.0;
         }
-        COLA_SEP + COLA_PAD * 2.0 + COLA_CAB_H + COLA_FILA_H * n as f32
+        // El último PAD es el margen inferior de la tarjeta: la cola va
+        // metida dentro, no pegada a su borde.
+        COLA_SEP + COLA_PAD * 2.0 + COLA_CAB_H + COLA_FILA_H * n as f32 + PAD
     }
 
     pub fn poner_burbujas(&mut self, burbujas: Vec<Burbuja>) {
@@ -344,6 +426,10 @@ impl Actividad {
             Clase::Player => PLAYER_COMPACTO_W,
             Clase::Timer => TIMER_COMPACTO_W,
             Clase::Recorder => RECORDER_COMPACTO_W,
+            Clase::Transfer => TRANSFER_COMPACTO_W,
+            Clase::Calendar => CALENDARIO_COMPACTO_W,
+            Clase::Monitor => MONITOR_COMPACTO_W,
+            Clase::Auriculares => AURICULARES_COMPACTO_W,
         }
     }
 
@@ -392,6 +478,15 @@ impl Actividad {
                     Clase::Player => PLAYER_H,
                     Clase::Timer => TIMER_H,
                     Clase::Recorder => RECORDER_H,
+                    Clase::Transfer => TRANSFER_H,
+                    Clase::Calendar => CAL_H,
+                    Clase::Auriculares => AUR_H,
+                    Clase::Monitor => {
+                        PAD * 2.0
+                            + ROTULO_H
+                            + 8.0
+                            + MON_FILA_H * self.estado.metricas.len().max(1) as f32
+                    }
                 },
             ),
         };
@@ -435,32 +530,6 @@ impl Actividad {
         (alfa, zoom, -(h / 2.0 - MARGEN_SOMBRA) * (1.0 - zoom))
     }
 
-    /// La columna del volumen se despliega al pasar por encima de su botón, en
-    /// la esquina inferior derecha.
-    pub fn puntero(&mut self, punto: Option<(f32, f32)>) -> bool {
-        let antes = self.volumen_visible;
-        self.volumen_visible = self.vista != Vista::Compacta
-            && self.estado.clase == Clase::Player
-            && punto.is_some_and(|(x, y)| {
-                let (x, y) = (x - MARGEN_SOMBRA, y - MARGEN_SOMBRA);
-                let x_min = ABIERTO_W - PAD - ICONO_FILA - 10.0;
-                if antes {
-                    // Una vez abierto admite algo de desviación lateral y por
-                    // encima. Sin esta histéresis, alcanzar el 100 % exigía
-                    // no sobrepasar ni una fracción de píxel el extremo.
-                    x > x_min - VOL_TOLERANCIA_X
-                        && x < ABIERTO_W - PAD + VOL_TOLERANCIA_X
-                        && y > VOL_BASE_Y - VOL_ALTO - VOL_TOLERANCIA_Y
-                        && y < BARRA_Y + BARRA_H + VOL_TOLERANCIA_Y
-                } else {
-                    // Cerrado solo responde al icono; así pasar por la zona
-                    // vacía de encima no hace aparecer controles por sorpresa.
-                    x > x_min && y > BARRA_Y - 4.0 && y < BARRA_Y + BARRA_H + 4.0
-                }
-            });
-        antes != self.volumen_visible
-    }
-
     pub fn pulsar(&mut self, x: f32, y: f32) -> Option<Accion> {
         let x = x - MARGEN_SOMBRA;
         let y = y - MARGEN_SOMBRA;
@@ -494,19 +563,46 @@ impl Actividad {
                 };
                 Some(self.accion(nombre, String::new()))
             }
+            Clase::Transfer => {
+                if y < TRANSFER_BOTON_Y {
+                    self.colapsar();
+                    return None;
+                }
+                Some(self.accion("cancel", String::new()))
+            }
+            Clase::Calendar => {
+                if y < CAL_BOTON_Y {
+                    self.colapsar();
+                    return None;
+                }
+                Some(self.accion("dismiss", String::new()))
+            }
+            Clase::Auriculares => {
+                if y < AUR_BOTON_Y {
+                    self.colapsar();
+                    return None;
+                }
+                Some(self.accion("open", String::new()))
+            }
+            // Solo informa: cualquier clic lo vuelve a la píldora.
+            Clase::Monitor => {
+                self.colapsar();
+                None
+            }
             Clase::Recorder => {
                 if y < REC_BOTON_Y {
                     self.colapsar();
                     return None;
                 }
-                let nombre = if x < ABIERTO_W / 2.0 {
+                // Pausa a la izquierda y detener a la derecha, en las dos
+                // mitades de la tarjeta: los botones van centrados a cada lado
+                // del eje, así que cada mitad contiene el suyo entero.
+                let nombre = if x >= ABIERTO_W / 2.0 {
                     "stop"
+                } else if self.estado.pausado {
+                    "resume"
                 } else {
-                    if self.estado.pausado {
-                        "resume"
-                    } else {
-                        "pause"
-                    }
+                    "pause"
                 };
                 Some(self.accion(nombre, String::new()))
             }
@@ -515,23 +611,10 @@ impl Actividad {
 
     fn colapsar(&mut self) {
         self.vista = Vista::Compacta;
-        self.volumen_visible = false;
         self.desde = Instant::now();
     }
 
     fn pulsar_player(&mut self, x: f32, y: f32) -> Option<Accion> {
-        // Volumen desplegado: la columna se lee de abajo arriba y se queda con
-        // el clic antes que nada de lo que tenga debajo.
-        if self.volumen_visible
-            && x > ABIERTO_W - PAD - ICONO_FILA - 10.0 - VOL_TOLERANCIA_X
-            && y > VOL_BASE_Y - VOL_ALTO - VOL_TOLERANCIA_Y
-            && y < VOL_BASE_Y
-        {
-            let value = (((VOL_BASE_Y - y) / VOL_ALTO) * 100.0)
-                .round()
-                .clamp(0.0, 100.0);
-            return Some(self.accion("volume", format!("{value:.0}")));
-        }
         if y < CTRL_Y {
             self.colapsar();
             return None;
@@ -563,12 +646,18 @@ impl Actividad {
             }
             return Some(self.accion(nombre, String::new()));
         }
-        if y < BARRA_Y + BARRA_H {
-            let cola_x = ABIERTO_W - PAD - ICONO_FILA * 2.0 - 12.0;
-            if x >= ABIERTO_W - PAD - ICONO_FILA - 10.0 {
-                return None;
-            }
-            if x >= cola_x {
+        // La frontera con la fila de abajo va en el divisor, a mitad del hueco.
+        if y < SEC_Y - 11.0 {
+            let ini = PAD + TIEMPO_W + 10.0;
+            let fin = ABIERTO_W - PAD - TIEMPO_W - 10.0;
+            let value = ((x - ini) / (fin - ini)).clamp(0.0, 1.0);
+            return Some(self.accion("seek", format!("{value:.4}")));
+        }
+        if y < PLAYER_H - PAD / 2.0 {
+            if x < ABIERTO_W / 2.0 {
+                if self.filas_cola() == 0 {
+                    return None;
+                }
                 self.vista = if self.vista == Vista::Cola {
                     Vista::Abierta
                 } else {
@@ -577,10 +666,18 @@ impl Actividad {
                 self.desde = Instant::now();
                 return None;
             }
-            let ini = PAD + TIEMPO_W + 10.0;
-            let fin = cola_x - TIEMPO_W - 14.0;
-            let value = ((x - ini) / (fin - ini)).clamp(0.0, 1.0);
-            return Some(self.accion("seek", format!("{value:.4}")));
+            // El icono del altavoz no es parte de la pista: un clic en él
+            // que bajase el volumen a 0 sería una sorpresa.
+            if x < VOL_X0 - 6.0 {
+                return None;
+            }
+            let recorrido = VOL_X1 - VOL_X0 - VOL_PULGAR;
+            let f = ((x - VOL_X0 - VOL_PULGAR / 2.0) / recorrido).clamp(0.0, 1.0);
+            let value = (f * 100.0).round() as u8;
+            // Igual que reproducir: el pulgar va ya donde se pulsó y el
+            // siguiente latido del reproductor confirma el valor real.
+            self.estado.volumen = value;
+            return Some(self.accion("volume", value.to_string()));
         }
         // Por debajo del reproductor está el panel de la cola.
         let y = y - (PLAYER_H + COLA_SEP + COLA_PAD + COLA_CAB_H);
@@ -625,13 +722,14 @@ impl Actividad {
             .into()
     }
 
-    /// El color de los controles. La portada manda; sin portada, el acento del
-    /// sistema. La grabadora es siempre roja: es lo que significa grabar.
+    /// El color de lo que se pulsa: el acento del sistema, también en la
+    /// música. La grabadora pinta su rojo aparte, que es estado y no acción.
     fn color(&self) -> Color {
         match self.estado.clase {
-            Clase::Recorder => tema::acento(),
-            Clase::Timer => tema::acento(),
-            Clase::Player => self.tinte.unwrap_or_else(tema::acento),
+            // Informativo: el acento (HIG: «azul = interactivo o activo») no
+            // se gasta en decorar una lectura de reojo.
+            Clase::Monitor | Clase::Auriculares => tema::TEXTO2,
+            _ => tema::acento(),
         }
     }
 
@@ -655,12 +753,15 @@ impl Actividad {
         fila.into()
     }
 
+    /// Las píldoras van todas igual: icono o portada, una identificación breve
+    /// y el dato principal a la derecha, en un ancho fijo por clase para que
+    /// cambiar una cifra no mueva nada.
     fn pildora(&self) -> PanelElement<'_> {
         let color = self.color();
-        match self.estado.clase {
-            Clase::Player => tarjeta(
+        let (contenido, ancho, lados): (PanelElement<'_>, f32, u16) = match self.estado.clase {
+            Clase::Player => (
                 row![
-                    caratula(self.arte.as_ref(), 18.0, color),
+                    caratula(self.arte.as_ref(), 18.0),
                     text(crate::emergente::recortar_texto(
                         &self.estado.titulo,
                         PLAYER_COMPACTO_W - 18.0 - 22.0 - 8.0 * 3.0 - 16.0,
@@ -676,30 +777,95 @@ impl Actividad {
                 .align_y(Vertical::Center)
                 .into(),
                 PLAYER_COMPACTO_W,
-                PLAYER_COMPACTO_H,
-                PLAYER_COMPACTO_H / 2.0,
-                Relleno::Tinte(color),
-                [4, 8],
+                8,
             ),
-            // Las tres píldoras van igual: el tinte de su color sobre el negro de
-            // la isla y lo único que importa de cada una.
-            Clase::Timer => tarjeta(
+            Clase::Timer => (
                 row![
                     icono_teñido(icono_inline(RELOJ), 16.0, color),
                     text(formato_tiempo(self.estado.restante_ms))
                         .size(13)
-                        .font(negrita()),
+                        .font(negrita())
+                        .color(if self.estado.restante_ms < 0 {
+                            tema::rojo()
+                        } else {
+                            tema::texto()
+                        }),
                 ]
-                .spacing(6)
+                .spacing(8)
                 .align_y(Vertical::Center)
                 .into(),
                 TIMER_COMPACTO_W,
-                PLAYER_COMPACTO_H,
-                PLAYER_COMPACTO_H / 2.0,
-                Relleno::Tinte(color),
-                [4, 12],
+                12,
             ),
-            Clase::Recorder => tarjeta(
+            Clase::Transfer => (
+                fila_compacta(
+                    icono_teñido(icono_inline(DOCUMENTO), 16.0, tema::texto()),
+                    &self.estado.titulo,
+                    TRANSFER_COMPACTO_W - 40.0,
+                    format!("{:.0} %", self.estado.nivel.clamp(0.0, 1.0) * 100.0),
+                    tema::TEXTO2,
+                ),
+                TRANSFER_COMPACTO_W,
+                12,
+            ),
+            Clase::Calendar => (
+                fila_compacta(
+                    icono_teñido(icono_inline(CALENDARIO), 16.0, tema::texto()),
+                    &self.estado.titulo,
+                    CALENDARIO_COMPACTO_W - 64.0,
+                    cuenta_atras(self.estado.restante_ms),
+                    tema::TEXTO2,
+                ),
+                CALENDARIO_COMPACTO_W,
+                12,
+            ),
+            Clase::Monitor => (
+                row![
+                    icono_teñido(icono_inline(CHIP), 16.0, color),
+                    text(crate::emergente::recortar_texto(
+                        &resumen_metricas(&self.estado.metricas),
+                        MONITOR_COMPACTO_W - 16.0 - 8.0 - 24.0,
+                        11.0
+                    ))
+                    .size(11)
+                    .font(negrita())
+                    .wrapping(iced_core::text::Wrapping::None)
+                    .width(Length::Fill),
+                ]
+                .spacing(8)
+                .align_y(Vertical::Center)
+                .into(),
+                MONITOR_COMPACTO_W,
+                12,
+            ),
+            Clase::Auriculares => {
+                // La más baja de las de los auriculares: es la que decide
+                // cuánto queda de escucha. El estuche no cuenta, y un auricular
+                // sin lectura tampoco: su 0 es «no lo sé», no «descargado».
+                let peor = self
+                    .estado
+                    .metricas
+                    .iter()
+                    .take(2)
+                    .filter(|m| !desconocida(m))
+                    .min_by(|a, b| a.valor.total_cmp(&b.valor));
+                (
+                    fila_compacta(
+                        image(FOTOS_BUDS[4].clone()).width(18.0).height(18.0).into(),
+                        &self.estado.titulo,
+                        AURICULARES_COMPACTO_W - 40.0,
+                        peor.map_or_else(|| "—".to_string(), |m| m.texto.clone()),
+                        if peor.is_some_and(|m| m.critica) {
+                            tema::rojo()
+                        } else {
+                            tema::TEXTO2
+                        },
+                    ),
+                    AURICULARES_COMPACTO_W,
+                    12,
+                )
+            }
+            Clase::Recorder => (
                 row![
                     punto(self.sonando(), tema::rojo(), 8.0),
                     text(if self.estado.pausado {
@@ -712,218 +878,351 @@ impl Actividad {
                     .width(Length::Fill),
                     text(formato_tiempo(self.estado.posicion_ms))
                         .size(12)
-                        .color(tema::TEXTO2),
+                        .font(negrita()),
                 ]
                 .spacing(8)
                 .align_y(Vertical::Center)
                 .into(),
                 RECORDER_COMPACTO_W,
-                PLAYER_COMPACTO_H,
-                PLAYER_COMPACTO_H / 2.0,
-                Relleno::Tinte(tema::rojo()),
-                [4, 12],
+                12,
             ),
-        }
+        };
+        tarjeta(
+            contenido,
+            ancho,
+            PLAYER_COMPACTO_H,
+            RADIO_COMPACTO,
+            [4, lados],
+        )
     }
 
     fn abierta(&self) -> PanelElement<'_> {
         let color = self.color();
         let (w, h) = self.size();
         let (w, h) = (w - MARGEN_SOMBRA * 2.0, h - MARGEN_SOMBRA * 2.0);
-        match self.estado.clase {
+        let ancho_util = ABIERTO_W - PAD * 2.0;
+        let cuerpo: PanelElement<'_> = match self.estado.clase {
             Clase::Player => {
+                let con_cola = self.vista == Vista::Cola && self.filas_cola() > 0;
                 let mut cuerpo = column![
-                    container(self.cabecera_player(ARTE)).height(Length::Fixed(CAB_H)),
+                    container(self.cabecera_player()).height(Length::Fixed(CAB_H)),
                     Space::new().height(Length::Fixed(CTRL_Y - PAD - CAB_H)),
                     self.controles(color),
                     Space::new().height(Length::Fixed(BARRA_Y - CTRL_Y - CTRL_H)),
                     self.fila_progreso(color),
+                    Space::new().height(Length::Fixed(12.0)),
+                    divisor(),
+                    Space::new().height(Length::Fixed(SEC_Y - BARRA_Y - BARRA_H - 13.0)),
+                    self.fila_secundaria(color),
                 ];
-                if self.vista == Vista::Cola && self.filas_cola() > 0 {
+                if con_cola {
                     cuerpo = cuerpo
                         .push(Space::new().height(Length::Fixed(COLA_SEP + PAD)))
                         .push(self.panel_cola(color));
                 }
-                // El panel de la cola llega hasta los bordes de la tarjeta, así
-                // que el margen inferior lo pone él y no el contenedor.
-                let abajo = if self.vista == Vista::Cola && self.filas_cola() > 0 {
-                    0.0
-                } else {
-                    PAD
-                };
-                // El volumen es una capa flotante. Dentro de `fila_progreso`
-                // quedaba limitado a los 26 px de alto de la fila y el stack
-                // lo recortaba, aunque el estado de hover sí cambiase.
-                let cuerpo = stack![
-                    cuerpo,
-                    container(self.volumen_vertical(color))
-                        .width(Length::Fill)
-                        // Acaba al comenzar la fila: queda encima del icono,
-                        // no montado sobre él.
-                        .height(Length::Fixed(BARRA_Y - PAD))
-                        .align_x(Horizontal::Right)
-                        .align_y(Vertical::Bottom),
-                ];
-                tarjeta_v(
-                    cuerpo.into(),
-                    w,
-                    h,
-                    RADIO,
-                    Relleno::Tinte(color),
-                    [PAD, PAD, abajo, PAD],
-                )
+                return tarjeta(cuerpo.into(), w, h, RADIO, [PAD as u16, PAD as u16]);
             }
             Clase::Timer => {
                 let vencido = self.estado.restante_ms < 0;
-                let fondo = color;
-                let cuerpo = column![
+                let (estado, principal) = if vencido {
+                    ("Tiempo acabado", "Aplazar")
+                } else if self.estado.pausado {
+                    ("En pausa", "Reanudar")
+                } else {
+                    ("En marcha", "Pausar")
+                };
+                // Lo transcurrido, que es lo que crece. Vencido, llena y roja.
+                let hecho = if vencido {
+                    1.0
+                } else if self.estado.duracion_ms > 0 {
+                    1.0 - self.estado.restante_ms as f32 / self.estado.duracion_ms as f32
+                } else {
+                    0.0
+                };
+                column![
+                    rotulo("Temporizador"),
+                    Space::new().height(Length::Fixed(6.0)),
+                    // Open Sans trae las cifras tabulares por defecto: centrada,
+                    // la cuenta atrás no baila al cambiar de dígito.
+                    container(
+                        text(formato_tiempo(self.estado.restante_ms))
+                            .size(44)
+                            .font(gorda())
+                            .color(if vencido { tema::rojo() } else { tema::texto() })
+                    )
+                    .width(Length::Fill)
+                    .height(Length::Fixed(CIFRA_H))
+                    .align_x(Horizontal::Center)
+                    .align_y(Vertical::Center),
+                    Space::new().height(Length::Fixed(2.0)),
+                    container(text(estado).size(13).color(tema::TEXTO2))
+                        .width(Length::Fill)
+                        .height(Length::Fixed(ESTADO_H))
+                        .align_x(Horizontal::Center),
+                    Space::new().height(Length::Fixed(14.0)),
+                    // Sin duración publicada no hay progreso que enseñar: el
+                    // hueco se queda para que los botones no se muevan.
+                    if self.estado.duracion_ms > 0 || vencido {
+                        barra(
+                            hecho,
+                            if vencido {
+                                tema::rojo()
+                            } else {
+                                tema::amarillo()
+                            },
+                        )
+                    } else {
+                        Space::new().height(Length::Fixed(BARRA_GRUESO)).into()
+                    },
+                    Space::new().height(Length::Fixed(18.0)),
+                    row![
+                        boton(principal, Boton::Principal),
+                        boton("Parar", Boton::Secundario)
+                    ]
+                    .spacing(BOTON_SEP),
+                ]
+                .into()
+            }
+            Clase::Transfer => {
+                let f = self.estado.nivel.clamp(0.0, 1.0);
+                let ancho_texto = ancho_util - 44.0 - 14.0;
+                column![
                     container(
                         row![
-                            reloj_blanco(48.0, fondo),
-                            text(formato_tiempo(self.estado.restante_ms))
-                                .size(40)
-                                .font(gorda())
-                                .color(Color::WHITE),
-                            Space::new().width(Length::Fill),
+                            ficha(DOCUMENTO),
+                            column![
+                                text(crate::emergente::recortar_texto(
+                                    &self.estado.titulo,
+                                    ancho_texto,
+                                    15.0
+                                ))
+                                .size(15)
+                                .font(negrita())
+                                .wrapping(iced_core::text::Wrapping::None),
+                                text(crate::emergente::recortar_texto(
+                                    &self.estado.subtitulo,
+                                    ancho_texto,
+                                    12.0
+                                ))
+                                .size(12)
+                                .color(tema::TEXTO2)
+                                .wrapping(iced_core::text::Wrapping::None),
+                            ]
+                            .spacing(3),
                         ]
-                        .spacing(16)
+                        .spacing(14)
                         .align_y(Vertical::Center)
                     )
-                    .height(Length::Fixed(TIMER_CAB_H)),
+                    .height(Length::Fixed(TRANSFER_CAB_H)),
+                    Space::new().height(Length::Fixed(18.0)),
+                    // Verde y no acento: la barra informa, no se toca.
+                    barra(f, tema::verde()),
                     Space::new().height(Length::Fixed(10.0)),
                     container(
-                        text(if vencido {
-                            "¡El tiempo se ha acabado!"
-                        } else if self.estado.pausado {
-                            "Temporizador en pausa"
-                        } else {
-                            "Temporizador en marcha"
-                        })
-                        .size(13)
-                        .color(Color {
-                            a: 0.85,
-                            ..Color::WHITE
-                        }),
-                    )
-                    .width(Length::Fill)
-                    .height(Length::Fixed(TIMER_AVISO_H))
-                    .align_x(Horizontal::Center),
-                    Space::new().height(Length::Fixed(16.0)),
-                    row![
-                        boton_sobre_color(
-                            if vencido {
-                                "Aplazar"
-                            } else if self.estado.pausado {
-                                "Reanudar"
-                            } else {
-                                "Pausar"
-                            },
-                            fondo,
-                            false,
-                        ),
-                        boton_sobre_color("Parar", fondo, true),
-                    ]
-                    .spacing(12),
-                ];
-                tarjeta(
-                    cuerpo.into(),
-                    w,
-                    h,
-                    RADIO,
-                    Relleno::Color(fondo),
-                    [PAD as u16, PAD as u16],
-                )
-            }
-            Clase::Recorder => {
-                let cuerpo = column![
-                    container(
                         row![
-                            punto(self.sonando(), tema::rojo(), 14.0),
-                            text(if self.estado.pausado {
-                                "En pausa"
-                            } else {
-                                "Grabando"
-                            })
-                            .size(17)
-                            .font(negrita()),
+                            text(format!("{:.0} %", f * 100.0)).size(12).font(negrita()),
                             Space::new().width(Length::Fill),
-                            text(formato_tiempo(self.estado.posicion_ms))
-                                .size(17)
-                                .font(negrita()),
+                            text(if self.estado.restante_ms >= 0 {
+                                format!("Quedan {}", formato_corto(self.estado.restante_ms))
+                            } else {
+                                String::new()
+                            })
+                            .size(12)
+                            .color(tema::TEXTO2),
                         ]
-                        .spacing(13)
                         .align_y(Vertical::Center)
                     )
-                    .height(Length::Fixed(REC_CAB_H)),
-                    Space::new().height(Length::Fixed(16.0)),
-                    container(ondas(
-                        self.estado.nivel,
-                        self.sonando(),
-                        tema::rojo(),
-                        REC_ONDAS_H,
-                        29,
-                        5.0
-                    ))
-                    .width(Length::Fill)
-                    .height(Length::Fixed(REC_ONDAS_H))
-                    .align_x(Horizontal::Center),
-                    Space::new().height(Length::Fixed(20.0)),
+                    .height(Length::Fixed(TRANSFER_INFO_H)),
+                    Space::new().height(Length::Fixed(18.0)),
+                    boton("Cancelar", Boton::Secundario),
+                ]
+                .into()
+            }
+            Clase::Calendar => {
+                let en_curso = self.estado.restante_ms < 0;
+                column![
+                    rotulo(if en_curso {
+                        "En curso"
+                    } else {
+                        "Próximo evento"
+                    }),
+                    Space::new().height(Length::Fixed(6.0)),
+                    container(
+                        text(crate::emergente::recortar_texto(
+                            &self.estado.titulo,
+                            ancho_util,
+                            20.0
+                        ))
+                        .size(20)
+                        .font(gorda())
+                        .wrapping(iced_core::text::Wrapping::None)
+                    )
+                    .height(Length::Fixed(CAL_TITULO_H))
+                    .align_y(Vertical::Center),
+                    Space::new().height(Length::Fixed(2.0)),
+                    // El horario lo compone la app («10:00–11:30 · Aula 3»):
+                    // aquí no se deduce ninguna hora de fin ni lugar.
+                    container(
+                        text(crate::emergente::recortar_texto(
+                            &self.estado.subtitulo,
+                            ancho_util,
+                            14.0
+                        ))
+                        .size(14)
+                        .color(tema::TEXTO2)
+                        .wrapping(iced_core::text::Wrapping::None)
+                    )
+                    .height(Length::Fixed(CAL_SUB_H)),
+                    Space::new().height(Length::Fixed(12.0)),
                     container(
                         row![
-                            redondo(icono_inline(STOP), REC_BOTON, Fondo::Solido, color),
-                            redondo(
-                                icono_propio(if self.estado.pausado {
-                                    "reproducir"
-                                } else {
-                                    "pausa"
-                                }),
-                                REC_BOTON,
-                                Fondo::Solido,
-                                color,
-                            ),
+                            icono_teñido(icono_inline(RELOJ), 16.0, tema::TEXTO2),
+                            text(if en_curso {
+                                "Ya ha empezado".to_string()
+                            } else {
+                                format!("Empieza {}", cuenta_atras(self.estado.restante_ms))
+                            })
+                            .size(13)
+                            .color(tema::TEXTO2),
                         ]
-                        .spacing(18)
+                        .spacing(8)
+                        .align_y(Vertical::Center)
                     )
-                    .width(Length::Fill)
-                    .align_x(Horizontal::Center),
-                ];
-                tarjeta(
-                    cuerpo.into(),
-                    w,
-                    h,
-                    RADIO,
-                    Relleno::Negro,
-                    [PAD as u16, PAD as u16],
-                )
+                    .height(Length::Fixed(CAL_CUANDO_H)),
+                    Space::new().height(Length::Fixed(18.0)),
+                    // La única orden que el calendario atiende es «dismiss»
+                    // (calendar/src-tauri/src/avisos.rs); un «Abrir
+                    // calendario» no tendría quien lo escuchase.
+                    boton("Descartar", Boton::Principal),
+                ]
+                .into()
             }
-        }
+            Clase::Auriculares => {
+                let n = self.estado.metricas.len().min(3);
+                column![
+                    container(
+                        row![
+                            image(FOTOS_BUDS[3].clone())
+                                .width(AUR_CAB_H)
+                                .height(AUR_CAB_H),
+                            text(crate::emergente::recortar_texto(
+                                &self.estado.titulo,
+                                ancho_util - AUR_CAB_H - 12.0,
+                                17.0
+                            ))
+                            .size(17)
+                            .font(gorda())
+                            .wrapping(iced_core::text::Wrapping::None),
+                        ]
+                        .spacing(12)
+                        .align_y(Vertical::Center)
+                    )
+                    .height(Length::Fixed(AUR_CAB_H)),
+                    Space::new().height(Length::Fixed(8.0)),
+                    filas_metricas(
+                        &self.estado.metricas,
+                        // El orden lo fija bookos-budsd: izquierdo, derecho y,
+                        // si informa, el estuche.
+                        &FOTOS_BUDS[..3],
+                        true
+                    ),
+                    // Sin estuche quedan dos filas: el botón no se mueve,
+                    // que es donde `pulsar` lo busca.
+                    Space::new().height(Length::Fixed(MON_FILA_H * (3 - n) as f32 + 16.0)),
+                    boton("Abrir en Ajustes", Boton::Principal),
+                ]
+                .into()
+            }
+            Clase::Monitor => column![
+                rotulo("Rendimiento"),
+                Space::new().height(Length::Fixed(8.0)),
+                filas_metricas(&self.estado.metricas, &[], false),
+            ]
+            .into(),
+            Clase::Recorder => column![
+                container(
+                    row![
+                        punto(self.sonando(), tema::rojo(), 10.0),
+                        text(if self.estado.pausado {
+                            "En pausa"
+                        } else {
+                            "Grabando"
+                        })
+                        .size(13)
+                        .font(negrita()),
+                    ]
+                    .spacing(8)
+                    .align_y(Vertical::Center)
+                )
+                .height(Length::Fixed(REC_CAB_H)),
+                Space::new().height(Length::Fixed(6.0)),
+                container(
+                    text(formato_tiempo(self.estado.posicion_ms))
+                        .size(34)
+                        .font(gorda())
+                )
+                .width(Length::Fill)
+                .height(Length::Fixed(REC_TIEMPO_H))
+                .align_x(Horizontal::Center)
+                .align_y(Vertical::Center),
+                Space::new().height(Length::Fixed(12.0)),
+                container(ondas(
+                    self.estado.nivel,
+                    self.sonando(),
+                    tema::rojo(),
+                    REC_ONDAS_H,
+                    29,
+                    5.0
+                ))
+                .width(Length::Fill)
+                .height(Length::Fixed(REC_ONDAS_H))
+                .align_x(Horizontal::Center),
+                Space::new().height(Length::Fixed(18.0)),
+                // Pausa con el peso de un control secundario; detener, en
+                // rojo, porque cierra la grabación.
+                container(
+                    row![
+                        redondo(
+                            icono_inline(if self.estado.pausado { PLAY } else { PAUSA }),
+                            REC_BOTON,
+                            Fondo::Tenue,
+                        ),
+                        redondo(icono_inline(STOP), REC_BOTON, Fondo::Solido(tema::rojo())),
+                    ]
+                    .spacing(28)
+                )
+                .width(Length::Fill)
+                .align_x(Horizontal::Center),
+            ]
+            .into(),
+        };
+        tarjeta(cuerpo, w, h, RADIO, [PAD as u16, PAD as u16])
     }
 
-    fn cabecera_player(&self, lado: f32) -> PanelElement<'_> {
-        let color = self.color();
-        let grande = lado > 50.0;
+    fn cabecera_player(&self) -> PanelElement<'_> {
+        let ancho = ABIERTO_W - PAD * 2.0 - ARTE - 16.0;
         row![
-            caratula(self.arte.as_ref(), lado, color),
+            caratula(self.arte.as_ref(), ARTE),
             column![
-                text(self.estado.titulo.clone())
-                    .size(if grande { 17 } else { 15 })
-                    .font(negrita()),
-                text(self.estado.subtitulo.clone())
-                    .size(if grande { 14 } else { 13 })
-                    .color(tema::TEXTO2),
+                text(crate::emergente::recortar_texto(
+                    &self.estado.titulo,
+                    ancho,
+                    17.0
+                ))
+                .size(17)
+                .font(negrita())
+                .wrapping(iced_core::text::Wrapping::None),
+                text(crate::emergente::recortar_texto(
+                    &self.estado.subtitulo,
+                    ancho,
+                    14.0
+                ))
+                .size(14)
+                .color(tema::TEXTO2)
+                .wrapping(iced_core::text::Wrapping::None),
             ]
             .spacing(4)
             .width(Length::Fill),
-            // El ecualizador: cinco barras gruesas, no un vúmetro fino. Es el
-            // adorno que dice «esto está sonando» sin ocupar sitio.
-            ondas(
-                self.estado.nivel,
-                self.sonando(),
-                color,
-                if grande { 30.0 } else { 26.0 },
-                5,
-                6.0
-            ),
         ]
         .spacing(16)
         .align_y(Vertical::Center)
@@ -931,19 +1230,15 @@ impl Actividad {
     }
 
     fn controles(&self, color: Color) -> PanelElement<'_> {
-        let central = if self.estado.pausado {
-            "reproducir"
-        } else {
-            "pausa"
-        };
-        let plano = |activo: bool| if activo { color } else { apagado(0.8) };
+        let central = if self.estado.pausado { PLAY } else { PAUSA };
+        let plano = |activo: bool| if activo { color } else { tema::TEXTO2 };
         container(
             row![
-                icono_teñido(icono_inline(ALEATORIO), 21.0, plano(self.estado.aleatorio)),
-                redondo(icono_propio("anterior"), CTRL_LADO, Fondo::Tenue, color),
-                redondo(icono_propio(central), CTRL_PLAY, Fondo::Solido, color),
-                redondo(icono_propio("siguiente"), CTRL_LADO, Fondo::Tenue, color),
-                icono_teñido(icono_inline(REPETIR), 21.0, plano(self.estado.repetir)),
+                icono_teñido(icono_inline(ALEATORIO), 20.0, plano(self.estado.aleatorio)),
+                redondo(icono_inline(ANTERIOR), CTRL_LADO, Fondo::Tenue),
+                redondo(icono_inline(central), CTRL_PLAY, Fondo::Solido(color)),
+                redondo(icono_inline(SIGUIENTE), CTRL_LADO, Fondo::Tenue),
+                icono_teñido(icono_inline(REPETIR), 20.0, plano(self.estado.repetir)),
             ]
             .spacing(CTRL_SEP)
             .align_y(Vertical::Center),
@@ -954,8 +1249,6 @@ impl Actividad {
         .into()
     }
 
-    /// Tiempo, barra, tiempo, cola y volumen: todo en una línea, como el
-    /// reproductor de la referencia.
     fn fila_progreso(&self, color: Color) -> PanelElement<'_> {
         let (pos, total) = (self.estado.posicion_ms, self.estado.duracion_ms);
         let f = if total > 0 {
@@ -963,58 +1256,66 @@ impl Actividad {
         } else {
             0.0
         };
-        let lleno = (f * 1000.0) as u16;
-        let vacio = 1000 - lleno.min(1000);
-        // El resto de la barra va en el mismo color rebajado y no en gris: es
-        // lo que hace que se lea como «cuánto queda de esto» y no como un
-        // carril vacío.
-        let barra = stack![
-            container(Space::new())
-                .width(Length::Fill)
-                .height(Length::Fixed(BARRA_GRUESO))
-                .style(move |_| pill(tema::mezclar(color, Color::WHITE, 0.45))),
+        let tiempo = |ms: i64| text(formato_corto(ms)).size(12).color(tema::TEXTO2);
+        container(
             row![
-                container(Space::new())
-                    .width(Length::FillPortion(lleno.max(1)))
-                    .height(Length::Fixed(BARRA_GRUESO))
-                    .style(move |_| pill(color)),
-                Space::new().width(Length::FillPortion(vacio.max(1))),
-            ],
-        ];
-        let fila = row![
-            container(text(formato_corto(pos)).size(12).font(negrita()))
-                .width(Length::Fixed(TIEMPO_W)),
-            container(barra)
-                .width(Length::Fill)
-                .height(Length::Fixed(BARRA_GRUESO)),
-            container(text(formato_corto(total)).size(12).font(negrita()))
-                .width(Length::Fixed(TIEMPO_W))
-                .align_x(Horizontal::Right),
-            icono_teñido(
-                icono_propio("cola-lista"),
-                18.0,
-                if self.vista == Vista::Cola {
-                    color
-                } else {
-                    apagado(0.82)
-                },
-            ),
-            icono_teñido(icono_propio("volumen-alto"), 20.0, apagado(0.82)),
-        ]
-        .spacing(10)
-        .align_y(Vertical::Center);
-        container(fila)
-            .height(Length::Fixed(BARRA_H))
-            .align_y(Vertical::Center)
-            .into()
+                container(tiempo(pos)).width(Length::Fixed(TIEMPO_W)),
+                barra(f, color),
+                container(tiempo(total))
+                    .width(Length::Fixed(TIEMPO_W))
+                    .align_x(Horizontal::Right),
+            ]
+            .spacing(10)
+            .align_y(Vertical::Center),
+        )
+        .height(Length::Fixed(BARRA_H))
+        .align_y(Vertical::Center)
+        .into()
+    }
+
+    /// Cola y volumen, cada uno en su mitad. Pesan menos que el progreso:
+    /// texto secundario, iconos grises, y el acento solo en lo que está
+    /// encendido o se arrastra.
+    fn fila_secundaria(&self, color: Color) -> PanelElement<'_> {
+        let tinta_cola = if self.filas_cola() == 0 {
+            apagado(0.3)
+        } else if self.vista == Vista::Cola {
+            color
+        } else {
+            tema::TEXTO2
+        };
+        container(
+            row![
+                container(
+                    row![
+                        icono_teñido(icono_propio("cola-lista"), 18.0, tinta_cola),
+                        text("A continuación")
+                            .size(13)
+                            .font(medio())
+                            .color(tinta_cola),
+                    ]
+                    .spacing(10)
+                    .align_y(Vertical::Center)
+                )
+                .width(Length::Fixed(ABIERTO_W / 2.0 - PAD)),
+                Space::new().width(Length::Fixed(16.0)),
+                icono_teñido(icono_inline(VOLUMEN), ICONO_FILA, tema::TEXTO2),
+                Space::new().width(Length::Fixed(10.0)),
+                deslizador(self.estado.volumen, color),
+            ]
+            .align_y(Vertical::Center),
+        )
+        .height(Length::Fixed(SEC_H))
+        .align_y(Vertical::Center)
+        .into()
     }
 
     fn panel_cola(&self, color: Color) -> PanelElement<'_> {
         let mut filas = column![
             container(
-                text("A CONTINUACIÓN")
-                    .size(11)
-                    .font(gorda())
+                text("A continuación")
+                    .size(12)
+                    .font(medio())
                     .color(tema::TEXTO2)
             )
             .height(Length::Fixed(COLA_CAB_H))
@@ -1029,9 +1330,11 @@ impl Actividad {
                         // cuadrado gris en cada fila se ve como un hueco sin
                         // cargar.
                         match self.miniaturas.get(&item.id) {
-                            Some(m) => caratula(Some(m), 42.0, color),
-                            None if actual => caratula(self.arte.as_ref(), 42.0, color),
-                            None => caratula_pequena(color),
+                            Some(m) => caratula(Some(m), 42.0),
+                            None if actual => caratula(self.arte.as_ref(), 42.0),
+                            // Sobre el gris de la cola, el hueco va del color
+                            // de la tarjeta: con el mismo gris desaparecía.
+                            None => caratula_vacia(42.0, tema::card()),
                         },
                         column![
                             text(item.titulo.clone())
@@ -1073,129 +1376,48 @@ impl Actividad {
                 bottom: COLA_PAD,
                 left: COLA_PAD,
             })
+            // Opaca y compuesta sobre la tarjeta: un velo translúcido de este
+            // tamaño cuesta 17 veces más en tiny-skia (ver `superficie_en_tarjeta`).
             .style(|_| container::Style {
-                background: Some(tema::alfa(tema::texto(), 0.07).into()),
+                background: Some(tema::superficie_en_tarjeta().into()),
                 border: Border {
-                    radius: RADIO.into(),
+                    // Más cerrado que la tarjeta que lo contiene, para que se
+                    // lea como un contenedor dentro de otro.
+                    radius: tema::R_POPOVER.into(),
                     ..Default::default()
                 },
                 ..Default::default()
             })
             .into()
     }
-
-    fn volumen_vertical(&self, color: Color) -> PanelElement<'_> {
-        if !self.volumen_visible {
-            return Space::new().into();
-        }
-        let lleno = VOL_ALTO * self.estado.volumen.min(100) as f32 / 100.0;
-        let pista = container(Space::new())
-            .width(Length::Fixed(7.0))
-            .height(Length::Fixed(VOL_ALTO))
-            .style(move |_| pill(tema::mezclar(color, Color::WHITE, 0.45)));
-        let progreso = container(
-            container(Space::new())
-                .width(Length::Fixed(7.0))
-                .height(Length::Fixed(lleno.max(3.0)))
-                .style(move |_| pill(color)),
-        )
-        .width(Length::Fixed(7.0))
-        .height(Length::Fixed(VOL_ALTO))
-        .align_y(Vertical::Bottom);
-        container(stack![pista, progreso])
-            // Veinte píxeles centran la pista con el pictograma inferior. El
-            // contenedor anterior medía 28 y, al alinearse a la derecha, dejaba
-            // la pista cuatro píxeles desplazada hacia la izquierda.
-            .width(Length::Fixed(20.0))
-            .height(Length::Fixed(VOL_ALTO))
-            .align_x(Horizontal::Center)
-            .into()
-    }
 }
-
-/// Alto útil de la columna de volumen.
-const VOL_ALTO: f32 = 64.0;
-/// Base de la parte rellenable. Se deja un pequeño hueco sobre el icono para
-/// que ambos controles se lean como piezas distintas.
-const VOL_BASE_Y: f32 = BARRA_Y;
-const VOL_TOLERANCIA_X: f32 = 14.0;
-const VOL_TOLERANCIA_Y: f32 = 14.0;
 
 // ── Piezas ───────────────────────────────────────────────────────────────
-
-enum Relleno {
-    /// El fondo de pantalla completa: negro en oscuro, blanco en claro.
-    Negro,
-    /// El negro del reproductor con el color de la carátula entrando desde
-    /// arriba: así cada canción tiñe la isla entera, no solo sus botones.
-    Tinte(Color),
-    /// Relleno del color, para el temporizador.
-    Color(Color),
-}
 
 fn tarjeta<'a>(
     contenido: PanelElement<'a>,
     w: f32,
     h: f32,
     radio: f32,
-    relleno: Relleno,
     padding: [u16; 2],
 ) -> PanelElement<'a> {
     let (v, hh) = (padding[0] as f32, padding[1] as f32);
-    tarjeta_v(contenido, w, h, radio, relleno, [v, hh, v, hh])
+    tarjeta_v(contenido, w, h, radio, [v, hh, v, hh])
 }
 
 /// La tarjeta, con el padding por lados.
 ///
-/// El fondo es un degradado de muy poco recorrido —un 4 % de luminosidad entre
-/// arriba y abajo— para que el canto superior se lea como iluminado y la isla
-/// no parezca un rectángulo recortado. La sombra va **también en oscuro**: la
-/// isla cuelga sobre el escritorio, y sin ella se confunde con una ventana
-/// negra pegada al borde.
+/// El fondo es liso, como el del resto del escritorio (panel, dock, lanzador,
+/// avisos): un degradado hacía de la isla la única superficie que brillaba. La
+/// sombra va **también en oscuro**: la isla cuelga sobre el escritorio, y sin
+/// ella se confunde con una ventana pegada al borde.
 fn tarjeta_v<'a>(
     contenido: PanelElement<'a>,
     w: f32,
     h: f32,
     radio: f32,
-    relleno: Relleno,
     padding: [f32; 4],
 ) -> PanelElement<'a> {
-    let (arriba, abajo, borde) = match relleno {
-        Relleno::Negro => {
-            let base = tema::bg();
-            let claro = tema::es_claro();
-            (
-                if claro {
-                    Color::WHITE
-                } else {
-                    tema::mezclar(base, Color::WHITE, 0.06)
-                },
-                if claro {
-                    tema::mezclar(base, Color::WHITE, 0.6)
-                } else {
-                    base
-                },
-                tema::alfa(tema::texto(), if claro { 0.10 } else { 0.12 }),
-            )
-        }
-        Relleno::Tinte(c) => {
-            let base = tema::bg();
-            let claro = tema::es_claro();
-            // Más tinte en oscuro: sobre blanco un 30 % ya se lee como otra
-            // superficie y el texto negro pierde contraste.
-            let f = if claro { 0.16 } else { 0.30 };
-            (
-                tema::mezclar(base, c, f),
-                tema::mezclar(base, c, f * 0.25),
-                tema::alfa(c, if claro { 0.25 } else { 0.35 }),
-            )
-        }
-        Relleno::Color(c) => (
-            tema::mezclar(c, Color::WHITE, 0.10),
-            tema::mezclar(c, Color::BLACK, 0.12),
-            tema::alfa(Color::WHITE, 0.16),
-        ),
-    };
     container(contenido)
         .width(Length::Fixed(w))
         .height(Length::Fixed(h))
@@ -1208,15 +1430,10 @@ fn tarjeta_v<'a>(
             left: padding[3],
         })
         .style(move |_| container::Style {
-            background: Some(Background::Gradient(Gradient::Linear(
-                Linear::new(Radians(std::f32::consts::PI))
-                    .add_stop(0.0, arriba)
-                    .add_stop(1.0, abajo),
-            ))),
+            background: Some(tema::card().into()),
             border: Border {
                 radius: radio.into(),
-                width: 1.0,
-                color: borde,
+                ..Default::default()
             },
             shadow: tema::sombra_popover(),
             ..Default::default()
@@ -1224,69 +1441,29 @@ fn tarjeta_v<'a>(
         .into()
 }
 
-/// La carátula, o un cuadrado del color con una nota cuando no hay ninguna.
-fn caratula(arte: Option<&image::Handle>, lado: f32, color: Color) -> PanelElement<'static> {
+/// La carátula, o un cuadrado de superficie con una nota cuando no hay
+/// ninguna. Sin sombra de color: era un halo que cambiaba con cada disco.
+fn caratula(arte: Option<&image::Handle>, lado: f32) -> PanelElement<'static> {
     match arte {
-        // Tamaño fijo y el mismo radio que la imagen: la sombra de iced sigue
-        // la caja del contenedor, y sin esto salía un rectángulo borroso más
-        // ancho que la carátula.
-        Some(h) => container(image(h.clone()).width(lado).height(lado))
-            .width(Length::Fixed(lado))
-            .height(Length::Fixed(lado))
-            .style(move |_| container::Style {
-                border: Border {
-                    radius: (lado * 0.22).into(),
-                    ..Default::default()
-                },
-                shadow: Shadow {
-                    color: tema::alfa(color, 0.45),
-                    offset: Vector::new(0.0, 3.0),
-                    blur_radius: lado * 0.2,
-                },
-                ..Default::default()
-            })
-            .into(),
-        None => container(icono_teñido(
-            icono_propio("musica"),
-            lado * 0.46,
-            tema::tinta_sobre(color),
-        ))
-        .width(Length::Fixed(lado))
-        .height(Length::Fixed(lado))
-        .align_x(Horizontal::Center)
-        .align_y(Vertical::Center)
-        .style(move |_| container::Style {
-            background: Some(degradado(color, 1.0, 0.68)),
-            border: Border {
-                radius: (lado * 0.22).into(),
-                ..Default::default()
-            },
-            shadow: Shadow {
-                color: tema::alfa(color, 0.45),
-                offset: Vector::new(0.0, 4.0),
-                blur_radius: 14.0,
-            },
-            ..Default::default()
-        })
-        .into(),
+        Some(h) => image(h.clone()).width(lado).height(lado).into(),
+        None => caratula_vacia(lado, tema::superficie_en_tarjeta()),
     }
 }
 
-fn caratula_pequena(color: Color) -> PanelElement<'static> {
-    let c = tema::mezclar(color, tema::bg(), 0.45);
+fn caratula_vacia(lado: f32, fondo: Color) -> PanelElement<'static> {
     container(icono_teñido(
         icono_propio("musica"),
-        18.0,
-        tema::tinta_sobre(color),
+        lado * 0.46,
+        tema::TEXTO2,
     ))
-    .width(Length::Fixed(42.0))
-    .height(Length::Fixed(42.0))
+    .width(Length::Fixed(lado))
+    .height(Length::Fixed(lado))
     .align_x(Horizontal::Center)
     .align_y(Vertical::Center)
     .style(move |_| container::Style {
-        background: Some(degradado(c, 1.0, 0.68)),
+        background: Some(fondo.into()),
         border: Border {
-            radius: 11.0.into(),
+            radius: (lado * 0.22).into(),
             ..Default::default()
         },
         ..Default::default()
@@ -1294,18 +1471,17 @@ fn caratula_pequena(color: Color) -> PanelElement<'static> {
     .into()
 }
 
-/// El reloj del temporizador: círculo blanco con las agujas en el color de la
-/// tarjeta, que es como se lee sobre un fondo lleno de color.
-fn reloj_blanco(lado: f32, color: Color) -> PanelElement<'static> {
-    container(icono_teñido(icono_inline(AGUJAS), lado * 0.62, color))
-        .width(Length::Fixed(lado))
-        .height(Length::Fixed(lado))
+/// El icono de un archivo en su ficha, como los iconos de fila de Ajustes.
+fn ficha(svg: &str) -> PanelElement<'static> {
+    container(icono_teñido(icono_inline(svg), 22.0, tema::texto()))
+        .width(Length::Fixed(44.0))
+        .height(Length::Fixed(44.0))
         .align_x(Horizontal::Center)
         .align_y(Vertical::Center)
         .style(|_| container::Style {
-            background: Some(Color::WHITE.into()),
+            background: Some(tema::superficie_en_tarjeta().into()),
             border: Border {
-                radius: tema::R_PILL.into(),
+                radius: tema::R_BOTON.into(),
                 ..Default::default()
             },
             ..Default::default()
@@ -1313,70 +1489,78 @@ fn reloj_blanco(lado: f32, color: Color) -> PanelElement<'static> {
         .into()
 }
 
+/// Icono, nombre recortado y el dato a la derecha: la píldora de las
+/// actividades que identifican algo con un nombre.
+fn fila_compacta(
+    icono: PanelElement<'static>,
+    titulo: &str,
+    ancho_texto: f32,
+    dato: String,
+    color_dato: Color,
+) -> PanelElement<'static> {
+    row![
+        icono,
+        text(crate::emergente::recortar_texto(
+            titulo,
+            ancho_texto - 16.0 - 16.0 - 24.0,
+            12.0
+        ))
+        .size(12)
+        .font(negrita())
+        .wrapping(iced_core::text::Wrapping::None)
+        .width(Length::Fill),
+        text(dato).size(12).color(color_dato),
+    ]
+    .spacing(8)
+    .align_y(Vertical::Center)
+    .into()
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Fondo {
-    /// Relleno con el color de la isla: el control principal.
-    Solido,
-    /// El mismo color muy rebajado: los de alrededor.
+    /// Relleno de color: el control principal (acento) o detener (rojo).
+    Solido(Color),
+    /// Superficie neutra con el icono en el color del texto: los de alrededor.
     Tenue,
 }
 
-fn redondo(
-    ic: Option<icono::Icono>,
-    lado: f32,
-    fondo: Fondo,
-    color: Color,
-) -> PanelElement<'static> {
-    let solido = fondo == Fondo::Solido;
-    let px = lado * 0.44;
-    let tinta = if solido {
-        tema::tinta_sobre(color)
-    } else {
-        Color::WHITE
+fn redondo(ic: Option<icono::Icono>, lado: f32, fondo: Fondo) -> PanelElement<'static> {
+    let (relleno, tinta) = match fondo {
+        Fondo::Solido(c) => (c, tema::tinta_sobre(c)),
+        Fondo::Tenue => (tema::superficie_en_tarjeta(), tema::texto()),
     };
-    let tinta = if solido || !tema::es_claro() {
-        tinta
-    } else {
-        tema::texto()
-    };
-    container(icono_teñido(ic, px, tinta))
+    container(icono_teñido(ic, lado * 0.4, tinta))
         .width(Length::Fixed(lado))
         .height(Length::Fixed(lado))
         .align_x(Horizontal::Center)
         .align_y(Vertical::Center)
         .style(move |_| container::Style {
-            background: Some(if solido {
-                degradado(color, 1.0, 0.8)
-            } else {
-                Background::Color(tema::alfa(color, 0.5))
-            }),
+            background: Some(relleno.into()),
             border: Border {
                 radius: (lado / 2.0).into(),
                 ..Default::default()
-            },
-            shadow: if solido {
-                Shadow {
-                    color: tema::alfa(color, 0.45),
-                    offset: Vector::new(0.0, 4.0),
-                    blur_radius: 12.0,
-                }
-            } else {
-                Shadow::default()
             },
             ..Default::default()
         })
         .into()
 }
 
-/// Botón ancho sobre una tarjeta llena de color: el fondo no puede ser un gris
-/// del tema, tiene que salir del propio color o desaparece.
-fn boton_sobre_color(rotulo: &'static str, fondo: Color, principal: bool) -> PanelElement<'static> {
-    let relleno = if principal {
-        tema::mezclar(fondo, Color::WHITE, 0.22)
-    } else {
-        tema::mezclar(fondo, Color::BLACK, 0.35)
+#[derive(Clone, Copy)]
+enum Boton {
+    /// Acento con su tinta: la acción de la tarjeta.
+    Principal,
+    /// Superficie neutra: la alternativa.
+    Secundario,
+}
+
+/// Botón de diálogo del sistema de diseño: 48 de alto, radio de control,
+/// 15/Semibold, repartido a partes iguales con su pareja.
+fn boton(rotulo: &'static str, tipo: Boton) -> PanelElement<'static> {
+    let (relleno, tinta) = match tipo {
+        Boton::Principal => (tema::acento(), tema::sobre_acento()),
+        Boton::Secundario => (tema::superficie_en_tarjeta(), tema::texto()),
     };
-    container(text(rotulo).size(14).font(negrita()).color(Color::WHITE))
+    container(text(rotulo).size(15).font(negrita()).color(tinta))
         .width(Length::Fill)
         .height(Length::Fixed(BOTON_H))
         .align_x(Horizontal::Center)
@@ -1384,12 +1568,129 @@ fn boton_sobre_color(rotulo: &'static str, fondo: Color, principal: bool) -> Pan
         .style(move |_| container::Style {
             background: Some(relleno.into()),
             border: Border {
-                radius: 16.0.into(),
+                radius: tema::R_CONTROL.into(),
                 ..Default::default()
             },
             ..Default::default()
         })
         .into()
+}
+
+fn rotulo(t: &'static str) -> PanelElement<'static> {
+    container(text(t).size(12).font(medio()).color(tema::TEXTO2))
+        .height(Length::Fixed(ROTULO_H))
+        .align_y(Vertical::Center)
+        .into()
+}
+
+fn divisor() -> PanelElement<'static> {
+    container(Space::new())
+        .width(Length::Fill)
+        .height(Length::Fixed(1.0))
+        .style(|_| container::Style {
+            background: Some(tema::divisor().into()),
+            ..Default::default()
+        })
+        .into()
+}
+
+/// Un auricular sin lectura. bookos-budsd manda 0 cuando el aparato no
+/// informa (lo dice al omitir el estuche a 0) y nunca marca crítico un 0:
+/// enseñarlo como «0 %» se leería como descargado.
+fn desconocida(m: &Metrica) -> bool {
+    m.valor <= 0.0 && !m.critica
+}
+
+/// Una fila «nombre … cifra» por métrica, separadas por divisores. Solo
+/// cifras: una barra por fila no aportaba nada a una lectura de reojo. Rojo si
+/// quien publica la marca crítica.
+/// `fotos` pone una delante de cada etiqueta, por posición; sin foto, la fila
+/// empieza por el texto.
+fn filas_metricas(
+    metricas: &[Metrica],
+    fotos: &[image::Handle],
+    cero_desconocido: bool,
+) -> PanelElement<'static> {
+    let mut filas = column![];
+    for (i, m) in metricas.iter().enumerate() {
+        if i > 0 {
+            filas = filas.push(divisor());
+        }
+        let (valor, c) = if cero_desconocido && desconocida(m) {
+            ("—".to_string(), tema::TEXTO2)
+        } else if m.critica {
+            (m.texto.clone(), tema::rojo())
+        } else {
+            (m.texto.clone(), tema::texto())
+        };
+        filas = filas.push(
+            container(
+                row![
+                    match fotos.get(i) {
+                        Some(foto) => row![
+                            image(foto.clone()).width(FOTO_FILA).height(FOTO_FILA),
+                            Space::new().width(Length::Fixed(12.0)),
+                        ]
+                        .into(),
+                        None => PanelElement::from(Space::new()),
+                    },
+                    text(m.etiqueta.clone()).size(14),
+                    Space::new().width(Length::Fill),
+                    text(valor).size(14).font(negrita()).color(c),
+                ]
+                .align_y(Vertical::Center),
+            )
+            // El divisor se come un píxel de la fila: el alto total sigue
+            // siendo `MON_FILA_H` por métrica, que es lo que reserva `size`.
+            .height(Length::Fixed(MON_FILA_H - if i > 0 { 1.0 } else { 0.0 }))
+            .align_y(Vertical::Center),
+        );
+    }
+    filas.into()
+}
+
+/// El volumen como el deslizador del sistema de diseño: pista fina, relleno
+/// de acento y pulgar blanco. El pulgar recorre el ancho menos su lado, y
+/// `pulsar_player` hace la misma cuenta.
+fn deslizador(volumen: u8, color: Color) -> PanelElement<'static> {
+    let ancho = VOL_X1 - VOL_X0;
+    let x = (ancho - VOL_PULGAR) * f32::from(volumen.min(100)) / 100.0;
+    let pista = container(stack![
+        container(Space::new())
+            .width(Length::Fill)
+            .height(Length::Fixed(4.0))
+            .style(|_| pill(tema::control_apagado())),
+        container(Space::new())
+            .width(Length::Fixed(x + VOL_PULGAR / 2.0))
+            .height(Length::Fixed(4.0))
+            .style(move |_| pill(color)),
+    ])
+    .width(Length::Fill)
+    .height(Length::Fixed(VOL_PULGAR))
+    .align_y(Vertical::Center);
+    let pulgar = container(Space::new())
+        .width(Length::Fixed(VOL_PULGAR))
+        .height(Length::Fixed(VOL_PULGAR))
+        .style(|_| container::Style {
+            background: Some(Color::WHITE.into()),
+            border: Border {
+                radius: tema::R_PILL.into(),
+                ..Default::default()
+            },
+            shadow: Shadow {
+                color: tema::alfa(Color::BLACK, 0.2),
+                offset: Vector::new(0.0, 1.0),
+                blur_radius: 3.0,
+            },
+            ..Default::default()
+        });
+    container(stack![
+        pista,
+        row![Space::new().width(Length::Fixed(x)), pulgar],
+    ])
+    .width(Length::Fixed(ancho))
+    .height(Length::Fixed(VOL_PULGAR))
+    .into()
 }
 
 fn ver_burbuja(b: &Burbuja) -> PanelElement<'static> {
@@ -1398,6 +1699,10 @@ fn ver_burbuja(b: &Burbuja) -> PanelElement<'static> {
         Clase::Player => icono_teñido(icono_propio("musica"), 13.0, color),
         Clase::Timer => icono_teñido(icono_inline(RELOJ), 14.0, color),
         Clase::Recorder => punto(b.activa, tema::rojo(), 8.0),
+        Clase::Transfer => icono_teñido(icono_inline(DOCUMENTO), 14.0, color),
+        Clase::Calendar => icono_teñido(icono_inline(CALENDARIO), 14.0, color),
+        Clase::Monitor => icono_teñido(icono_inline(CHIP), 14.0, color),
+        Clase::Auriculares => image(FOTOS_BUDS[4].clone()).width(18.0).height(18.0).into(),
     };
     container(dentro)
         .width(Length::Fixed(BURBUJA))
@@ -1405,36 +1710,24 @@ fn ver_burbuja(b: &Burbuja) -> PanelElement<'static> {
         .align_x(Horizontal::Center)
         .align_y(Vertical::Center)
         .style(move |_| container::Style {
-            background: Some(tema::mezclar(tema::bg(), color, 0.22).into()),
+            background: Some(tema::card().into()),
             border: Border {
-                radius: tema::R_PILL.into(),
-                width: 1.0,
-                color: tema::alfa(color, 0.35),
+                radius: RADIO_COMPACTO.into(),
+                ..Default::default()
             },
+            shadow: tema::sombra_popover(),
             ..Default::default()
         })
         .into()
 }
 
-/// El punto de la grabadora.
+/// El punto de la grabadora, liso: el rojo ya basta para llamar la atención.
 fn punto(activa: bool, color: Color, lado: f32) -> PanelElement<'static> {
     let c = if activa { color } else { tema::TEXTO2 };
     container(Space::new())
         .width(Length::Fixed(lado))
         .height(Length::Fixed(lado))
-        .style(move |_| container::Style {
-            background: Some(c.into()),
-            border: Border {
-                radius: tema::R_PILL.into(),
-                ..Default::default()
-            },
-            shadow: Shadow {
-                color: tema::alfa(c, 0.6),
-                offset: Vector::new(0.0, 0.0),
-                blur_radius: 10.0,
-            },
-            ..Default::default()
-        })
+        .style(move |_| pill(c))
         .into()
 }
 
@@ -1504,7 +1797,7 @@ fn ondas(
 /// el canal alfa: el teñido de un SVG **descarta el alfa**, así que un icono
 /// «al 35 %» se dibujaba blanco puro.
 fn apagado(f: f32) -> Color {
-    tema::mezclar(tema::bg(), tema::texto(), f)
+    tema::mezclar(tema::card(), tema::texto(), f)
 }
 
 fn pill(color: Color) -> container::Style {
@@ -1518,19 +1811,15 @@ fn pill(color: Color) -> container::Style {
     }
 }
 
-/// Un relleno con el color en dos intensidades. Un botón de un solo color plano
-/// se ve pegado al fondo; con medio punto de degradado parece una superficie.
-fn degradado(color: Color, arriba: f32, abajo: f32) -> Background {
-    Background::Gradient(Gradient::Linear(
-        Linear::new(Radians(std::f32::consts::PI))
-            .add_stop(0.0, tema::mezclar(Color::BLACK, color, arriba))
-            .add_stop(1.0, tema::mezclar(Color::BLACK, color, abajo)),
-    ))
-}
-
 fn negrita() -> Font {
     Font {
         weight: Weight::Semibold,
+        ..Font::DEFAULT
+    }
+}
+fn medio() -> Font {
+    Font {
+        weight: Weight::Medium,
         ..Font::DEFAULT
     }
 }
@@ -1565,44 +1854,78 @@ fn icono_teñido(ic: Option<icono::Icono>, px: f32, color: Color) -> PanelElemen
     }
 }
 
+// Heroicons 2.1.5 `16/solid` (BookOS-HIG) donde existe equivalente. Se quedan
+// propios ALEATORIO (Heroicons no tiene «shuffle»), CORAZON (el contorno solo
+// existe en 20/24).
 // Pictogramas que no están en la biblioteca del panel. Trazos sólidos y no
 // `stroke`: el teñido de iced sustituye el color de relleno, y un icono
 // perfilado saldría hueco.
-const COLA_LISTA: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#fff"><rect x="2" y="3.4" width="12" height="1.8" rx=".9"/><rect x="2" y="7.1" width="12" height="1.8" rx=".9"/><rect x="2" y="10.8" width="12" height="1.8" rx=".9"/></svg>"##;
+const COLA_LISTA: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#fff"><path d="M3 4.75a1 1 0 1 0 0-2 1 1 0 0 0 0 2ZM6.25 3a.75.75 0 0 0 0 1.5h7a.75.75 0 0 0 0-1.5h-7ZM6.25 7.25a.75.75 0 0 0 0 1.5h7a.75.75 0 0 0 0-1.5h-7ZM6.25 11.5a.75.75 0 0 0 0 1.5h7a.75.75 0 0 0 0-1.5h-7ZM4 12.25a1 1 0 1 1-2 0 1 1 0 0 1 2 0ZM3 9a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z"/></svg>"##;
 const CORAZON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#fff"><path d="M8 14.1 2.9 9.2A3.4 3.4 0 0 1 8 4.7a3.4 3.4 0 0 1 5.1 4.5zm0-1.9 3.8-3.7a2 2 0 0 0-3-2.6L8 6.9 7.2 5.9a2 2 0 0 0-3 2.6z"/></svg>"##;
-const CORAZON_LLENO: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#fff"><path d="M8 14.1 2.9 9.2A3.4 3.4 0 0 1 8 4.7a3.4 3.4 0 0 1 5.1 4.5z"/></svg>"##;
+const CORAZON_LLENO: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#fff"><path d="M2 6.342a3.375 3.375 0 0 1 6-2.088 3.375 3.375 0 0 1 5.997 2.26c-.063 2.134-1.618 3.76-2.955 4.784a14.437 14.437 0 0 1-2.676 1.61c-.02.01-.038.017-.05.022l-.014.006-.004.002h-.002a.75.75 0 0 1-.592.001h-.002l-.004-.003-.015-.006a5.528 5.528 0 0 1-.232-.107 14.395 14.395 0 0 1-2.535-1.557C3.564 10.22 1.999 8.558 1.999 6.38L2 6.342Z"/></svg>"##;
 /// Esfera con agujas, para la píldora y la burbuja del temporizador.
-const RELOJ: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#fff"><path d="M8 1.5a6.5 6.5 0 1 1 0 13 6.5 6.5 0 0 1 0-13zm0 1.6a4.9 4.9 0 1 0 0 9.8 4.9 4.9 0 0 0 0-9.8zm.8 1.6v3l1.9 1.1a.8.8 0 0 1-.8 1.4L7.6 9a.8.8 0 0 1-.4-.7V4.7a.8.8 0 0 1 1.6 0z"/></svg>"##;
-const STOP: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#fff"><rect x="3.6" y="3.6" width="8.8" height="8.8" rx="2.2"/></svg>"##;
+const RELOJ: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#fff"><path fill-rule="evenodd" d="M1 8a7 7 0 1 1 14 0A7 7 0 0 1 1 8Zm7.75-4.25a.75.75 0 0 0-1.5 0V8c0 .414.336.75.75.75h3.25a.75.75 0 0 0 0-1.5h-2.5v-3.5Z" clip-rule="evenodd"/></svg>"##;
+/// Heroicons 2.1.5 `16/solid/document` (BookOS-HIG), sin dibujo propio.
+const DOCUMENTO: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#fff"><path d="M2.5 3.5A1.5 1.5 0 0 1 4 2h4.879a1.5 1.5 0 0 1 1.06.44l3.122 3.12a1.5 1.5 0 0 1 .439 1.061V12.5A1.5 1.5 0 0 1 12 14H4a1.5 1.5 0 0 1-1.5-1.5v-9Z"/></svg>"##;
+/// Heroicons 2.1.5 `16/solid/calendar` (BookOS-HIG), sin dibujo propio.
+const CALENDARIO: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#fff"><path fill-rule="evenodd" d="M4 1.75a.75.75 0 0 1 1.5 0V3h5V1.75a.75.75 0 0 1 1.5 0V3a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2V1.75ZM4.5 6a1 1 0 0 0-1 1v4.5a1 1 0 0 0 1 1h7a1 1 0 0 0 1-1V7a1 1 0 0 0-1-1h-7Z" clip-rule="evenodd"/></svg>"##;
+/// Heroicons 2.1.5 `16/solid/cpu-chip` (BookOS-HIG), sin dibujo propio.
+/// Las fotos de los Buds3 Pro que enseña Ajustes en la página de los
+/// auriculares (BookOS-Settings/src/assets), recortadas y reducidas a 84 px
+/// —28 puntos a escala 3— con Lanczos: el pintor de CPU de iced reduce sin
+/// filtrar y la de 512 salía con dientes a este tamaño. Son las del 3 Pro para
+/// cualquier modelo, que es también lo que hace Ajustes cuando no reconoce el
+/// aparato: el contrato de la isla no dice el modelo más que en el nombre.
+///
+/// Un `Handle` por foto para todo el proceso: `from_bytes` le da un id nuevo
+/// en cada llamada, y crearlo en la vista volvía a decodificar el PNG en cada
+/// repintado.
+static FOTOS_BUDS: std::sync::LazyLock<[image::Handle; 5]> = std::sync::LazyLock::new(|| {
+    [
+        include_bytes!("../assets/buds/izquierdo.png").as_slice(),
+        include_bytes!("../assets/buds/derecho.png").as_slice(),
+        include_bytes!("../assets/buds/estuche.png").as_slice(),
+        // Los dos juntos, para la cabecera: 96 px, 32 puntos a escala 3.
+        include_bytes!("../assets/buds/pareja.png").as_slice(),
+        // Y otra vez a 54 px para la píldora y la burbuja: reducir la de 96 a
+        // 18 puntos sin filtro la dejaba en una mancha.
+        include_bytes!("../assets/buds/pareja-pequena.png").as_slice(),
+    ]
+    .map(image::Handle::from_bytes)
+});
+const FOTO_FILA: f32 = 28.0;
+/// Heroicons 2.1.5 `16/solid/speaker-wave` (BookOS-HIG).
+const VOLUMEN: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#fff"><path d="M7.557 2.066A.75.75 0 0 1 8 2.75v10.5a.75.75 0 0 1-1.248.56L3.59 11H2a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h1.59l3.162-2.81a.75.75 0 0 1 .805-.124ZM12.95 3.05a.75.75 0 1 0-1.06 1.06 5.5 5.5 0 0 1 0 7.78.75.75 0 1 0 1.06 1.06 7 7 0 0 0 0-9.9Z"/><path d="M10.828 5.172a.75.75 0 1 0-1.06 1.06 2.5 2.5 0 0 1 0 3.536.75.75 0 1 0 1.06 1.06 4 4 0 0 0 0-5.656Z"/></svg>"##;
+/// Heroicons 2.1.5 `16/solid` play, pause, backward y forward: los controles
+/// del reproductor rellenos, como el resto de botones redondos de la isla.
+pub(crate) const PLAY: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#fff"><path d="M3 3.732a1.5 1.5 0 0 1 2.305-1.265l6.706 4.267a1.5 1.5 0 0 1 0 2.531l-6.706 4.268A1.5 1.5 0 0 1 3 12.267V3.732Z"/></svg>"##;
+pub(crate) const PAUSA: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#fff"><path d="M4.5 2a.5.5 0 0 0-.5.5v11a.5.5 0 0 0 .5.5h1a.5.5 0 0 0 .5-.5v-11a.5.5 0 0 0-.5-.5h-1ZM10.5 2a.5.5 0 0 0-.5.5v11a.5.5 0 0 0 .5.5h1a.5.5 0 0 0 .5-.5v-11a.5.5 0 0 0-.5-.5h-1Z"/></svg>"##;
+pub(crate) const ANTERIOR: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#fff"><path d="M8.5 4.75a.75.75 0 0 0-1.107-.66l-6 3.25a.75.75 0 0 0 0 1.32l6 3.25a.75.75 0 0 0 1.107-.66V8.988l5.393 2.921A.75.75 0 0 0 15 11.25v-6.5a.75.75 0 0 0-1.107-.66L8.5 7.013V4.75Z"/></svg>"##;
+pub(crate) const SIGUIENTE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#fff"><path d="M2.53 3.956A1 1 0 0 0 1 4.804v6.392a1 1 0 0 0 1.53.848l5.113-3.196c.16-.1.279-.233.357-.383v2.73a1 1 0 0 0 1.53.849l5.113-3.196a1 1 0 0 0 0-1.696L9.53 3.956A1 1 0 0 0 8 4.804v2.731a.992.992 0 0 0-.357-.383L2.53 3.956Z"/></svg>"##;
+const CHIP: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#fff"><path d="M6 6v4h4V6H6Z"/><path fill-rule="evenodd" d="M5.75 1a.75.75 0 0 0-.75.75V3a2 2 0 0 0-2 2H1.75a.75.75 0 0 0 0 1.5H3v.75H1.75a.75.75 0 0 0 0 1.5H3v.75H1.75a.75.75 0 0 0 0 1.5H3a2 2 0 0 0 2 2v1.25a.75.75 0 0 0 1.5 0V13h.75v1.25a.75.75 0 0 0 1.5 0V13h.75v1.25a.75.75 0 0 0 1.5 0V13a2 2 0 0 0 2-2h1.25a.75.75 0 0 0 0-1.5H13v-.75h1.25a.75.75 0 0 0 0-1.5H13V6.5h1.25a.75.75 0 0 0 0-1.5H13a2 2 0 0 0-2-2V1.75a.75.75 0 0 0-1.5 0V3h-.75V1.75a.75.75 0 0 0-1.5 0V3H6.5V1.75A.75.75 0 0 0 5.75 1ZM11 4.5a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-.5.5H5a.5.5 0 0 1-.5-.5V5a.5.5 0 0 1 .5-.5h6Z" clip-rule="evenodd"/></svg>"##;
+const STOP: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#fff"><rect width="10" height="10" x="3" y="3" rx="1.5"/></svg>"##;
 const ALEATORIO: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#fff"><path d="M10.6 2.5a.8.8 0 0 1 1.1 0l1.8 1.8a.8.8 0 0 1 0 1.1l-1.8 1.8a.8.8 0 1 1-1.1-1.1l.4-.4h-.7c-.6 0-1 .2-1.4.7L8 7.2 7.1 6l.3-.4c.7-.9 1.6-1.4 2.7-1.4h.7l-.4-.5a.8.8 0 0 1 0-1.1zM2.3 4.2h1.9c1.1 0 2 .5 2.7 1.4l3 3.9c.4.5.8.7 1.4.7h.7l-.4-.4a.8.8 0 1 1 1.1-1.1l1.8 1.8a.8.8 0 0 1 0 1.1l-1.8 1.8a.8.8 0 1 1-1.1-1.1l.4-.4h-.7c-1.1 0-2-.5-2.7-1.4l-3-3.9c-.4-.5-.8-.7-1.4-.7H2.3a.8.8 0 0 1 0-1.6zm0 6.1h1.9c.5 0 1-.2 1.3-.6l.9 1.2c-.6.7-1.4 1-2.2 1H2.3a.8.8 0 1 1 0-1.6z"/></svg>"##;
 const REPETIR: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#fff"><path d="M4.8 2.6a.8.8 0 0 1 0 1.2l-.3.3h6a3 3 0 0 1 3 3v1a.8.8 0 1 1-1.6 0v-1c0-.8-.6-1.4-1.4-1.4h-6l.3.3a.8.8 0 1 1-1.2 1.1L1.9 5.4a.8.8 0 0 1 0-1.1l1.7-1.7a.8.8 0 0 1 1.2 0zm6.4 10.8a.8.8 0 0 1 0-1.2l.3-.3h-6a3 3 0 0 1-3-3v-1a.8.8 0 1 1 1.6 0v1c0 .8.6 1.4 1.4 1.4h6l-.3-.3a.8.8 0 1 1 1.2-1.1l1.7 1.7a.8.8 0 0 1 0 1.1l-1.7 1.7a.8.8 0 0 1-1.2 0z"/></svg>"##;
-/// Solo las agujas: van sobre el disco blanco que dibuja `reloj_blanco`.
-const AGUJAS: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#fff"><path d="M8.95 3.7v3.75l2.4 1.45a.95.95 0 0 1-.98 1.63L7.5 8.85a.95.95 0 0 1-.46-.82V3.7a.95.95 0 0 1 1.9 0"/></svg>"##;
 
 // ── Portada ──────────────────────────────────────────────────────────────
 
-/// El color de la burbuja de una actividad que no es la principal. Para la
-/// música es el de la carátula: 400 muestras, así que se puede calcular en
-/// cada sincronización sin guardar nada.
+/// El color de la burbuja de una actividad que no es la principal: el mismo
+/// que lleva su píldora.
 pub fn color_burbuja(e: &Estado) -> Color {
     match e.clase {
         Clase::Recorder => tema::rojo(),
-        Clase::Timer => tema::acento(),
-        Clase::Player => e
-            .portada
-            .as_ref()
-            .filter(|p| p.rgba.len() >= (p.width * p.height * 4) as usize && p.width > 0)
-            .map_or_else(tema::acento, color_dominante),
+        Clase::Monitor | Clase::Auriculares => tema::TEXTO2,
+        Clase::Player | Clase::Timer | Clase::Transfer | Clase::Calendar => tema::acento(),
     }
 }
 
-/// Recorta las esquinas de la carátula y saca su color.
+/// Recorta las esquinas de la carátula.
 ///
 /// El recorte se hace sobre los píxeles y no con un `border-radius` del
 /// contenedor: iced dibuja la imagen **encima** del fondo del contenedor, así
 /// que el radio del borde no la recorta y la carátula salía con las cuatro
 /// esquinas cuadradas dentro de una tarjeta redondeada.
-fn preparar_portada(portada: Option<&Portada>, lado: u32) -> Option<(image::Handle, Color)> {
+fn preparar_portada(portada: Option<&Portada>, lado: u32) -> Option<image::Handle> {
     let p = portada?;
     if p.width == 0 || p.height == 0 {
         return None;
@@ -1635,9 +1958,8 @@ fn preparar_portada(portada: Option<&Portada>, lado: u32) -> Option<(image::Hand
         width: lado,
         height: lado,
     };
-    let color = color_dominante(&p);
     let r = redondear(&p);
-    Some((image::Handle::from_rgba(r.width, r.height, r.rgba), color))
+    Some(image::Handle::from_rgba(r.width, r.height, r.rgba))
 }
 
 fn redondear(p: &Portada) -> Portada {
@@ -1697,6 +2019,54 @@ pub(crate) fn color_dominante(p: &Portada) -> Color {
     }
 }
 
+/// La barra de progreso de las tarjetas abiertas, sobre el surco neutro del
+/// sistema de diseño (`--toff`). El resto iba en el mismo color rebajado, y con
+/// el acento claro del tema oscuro las dos mitades apenas se distinguían.
+fn barra(f: f32, color: Color) -> PanelElement<'static> {
+    let lleno = (f.clamp(0.0, 1.0) * 1000.0) as u16;
+    let vacio = 1000 - lleno.min(1000);
+    container(stack![
+        container(Space::new())
+            .width(Length::Fill)
+            .height(Length::Fixed(BARRA_GRUESO))
+            .style(|_| pill(tema::control_apagado())),
+        row![
+            container(Space::new())
+                .width(Length::FillPortion(lleno.max(1)))
+                .height(Length::Fixed(BARRA_GRUESO))
+                .style(move |_| pill(color)),
+            Space::new().width(Length::FillPortion(vacio.max(1))),
+        ],
+    ])
+    .width(Length::Fill)
+    .height(Length::Fixed(BARRA_GRUESO))
+    .into()
+}
+
+/// «en 10 min», «en 1 h 05», «ahora». Un aviso no necesita segundos: llegan
+/// cada minuto y una cuenta atrás por segundos pediría repintar sin parar.
+fn cuenta_atras(ms: i64) -> String {
+    if ms < 60_000 {
+        return "ahora".into();
+    }
+    let min = ms / 60_000;
+    if min < 60 {
+        format!("en {min} min")
+    } else {
+        format!("en {} h {:02}", min / 60, min % 60)
+    }
+}
+
+/// «CPU 23 %  ·  RAM 41 %  ·  62°», las tres primeras: es lo que cabe en la
+/// píldora, y el resto está a un clic.
+fn resumen_metricas(m: &[Metrica]) -> String {
+    m.iter()
+        .take(3)
+        .map(|x| format!("{} {}", x.etiqueta, x.texto))
+        .collect::<Vec<_>>()
+        .join("  ·  ")
+}
+
 /// `01:18`, y con horas cuando las hay.
 fn formato_tiempo(ms: i64) -> String {
     let signo = if ms < 0 { "−" } else { "" };
@@ -1741,6 +2111,7 @@ mod tests {
             repetir: false,
             portada: None,
             cola: Vec::new(),
+            metricas: Vec::new(),
         }
     }
 
@@ -1807,23 +2178,25 @@ mod tests {
         assert!(!a.ondas_pendientes());
     }
 
+    /// El volumen va en la fila secundaria: los extremos de la pista dan 0 y
+    /// 100, el centro la mitad, y el altavoz no cuenta como pista.
     #[test]
-    fn hover_sobre_volumen_despliega_el_slider() {
+    fn el_volumen_manda_lo_pulsado_y_mueve_el_pulgar() {
         let mut a = Actividad::nueva(estado(Clase::Player), false);
         a.vista = Vista::Abierta;
-        let x = MARGEN_SOMBRA + ABIERTO_W - PAD - ICONO_FILA / 2.0;
-        let y = MARGEN_SOMBRA + BARRA_Y + BARRA_H / 2.0;
-        assert!(a.puntero(Some((x, y))), "el estado de hover no cambió");
-        assert!(a.volumen_visible);
-        // Se puede alcanzar el extremo superior y desviarse un poco hacia la
-        // izquierda sin que el control desaparezca bajo el cursor.
-        assert!(!a.puntero(Some((
-            x - VOL_TOLERANCIA_X,
-            MARGEN_SOMBRA + VOL_BASE_Y - VOL_ALTO - VOL_TOLERANCIA_Y / 2.0,
-        ))));
-        assert!(a.volumen_visible);
-        assert!(a.puntero(None), "salir del icono no ocultó el slider");
-        assert!(!a.volumen_visible);
+        let y = MARGEN_SOMBRA + SEC_Y + SEC_H / 2.0;
+        let mut en = |x: f32| {
+            a.pulsar(MARGEN_SOMBRA + x, y)
+                .map(|ac| (ac.nombre, ac.valor))
+        };
+        assert_eq!(en(VOL_X1 - 1.0), Some(("volume".into(), "100".into())));
+        assert_eq!(en(VOL_X0 + 1.0), Some(("volume".into(), "0".into())));
+        assert_eq!(
+            en((VOL_X0 + VOL_X1) / 2.0),
+            Some(("volume".into(), "50".into()))
+        );
+        assert_eq!(en(VOL_X0 - ICONO_FILA), None, "el altavoz no es pista");
+        assert_eq!(a.estado.volumen, 50, "el pulgar no espera a la app");
     }
 
     /// Los cinco controles caen donde se dibujan. Es la prueba que faltaba: las
@@ -1863,7 +2236,7 @@ mod tests {
         a.vista = Vista::Abierta;
         let y = MARGEN_SOMBRA + BARRA_Y + BARRA_H / 2.0;
         let ini = PAD + TIEMPO_W + 10.0;
-        let fin = ABIERTO_W - PAD - ICONO_FILA * 2.0 - 12.0 - TIEMPO_W - 14.0;
+        let fin = ABIERTO_W - PAD - TIEMPO_W - 10.0;
         let medio = a.pulsar(MARGEN_SOMBRA + (ini + fin) / 2.0, y).unwrap();
         assert_eq!(medio.nombre, "seek");
         let f: f32 = medio.valor.parse().unwrap();
@@ -1887,8 +2260,8 @@ mod tests {
         let mut a = Actividad::nueva(e, false);
         a.vista = Vista::Abierta;
         let alto_sin = a.size().1;
-        let x = MARGEN_SOMBRA + ABIERTO_W - PAD - ICONO_FILA * 2.0 - 6.0;
-        let y = MARGEN_SOMBRA + BARRA_Y + BARRA_H / 2.0;
+        let x = MARGEN_SOMBRA + PAD + 40.0;
+        let y = MARGEN_SOMBRA + SEC_Y + SEC_H / 2.0;
         assert!(a.pulsar(x, y).is_none());
         assert_eq!(a.vista, Vista::Cola);
         assert!(a.size().1 > alto_sin, "la tarjeta crece con la cola");
@@ -1949,7 +2322,15 @@ mod tests {
     /// cuando no hay ningún botón de cerrar dibujado.
     #[test]
     fn la_cabecera_colapsa_la_tarjeta() {
-        for clase in [Clase::Player, Clase::Timer, Clase::Recorder] {
+        for clase in [
+            Clase::Player,
+            Clase::Timer,
+            Clase::Recorder,
+            Clase::Transfer,
+            Clase::Calendar,
+            Clase::Monitor,
+            Clase::Auriculares,
+        ] {
             let mut a = Actividad::nueva(estado(clase), false);
             a.vista = Vista::Abierta;
             assert!(
@@ -1958,6 +2339,70 @@ mod tests {
             );
             assert_eq!(a.vista, Vista::Compacta, "{clase:?}");
         }
+    }
+
+    #[test]
+    fn la_grabadora_pausa_a_la_izquierda_y_detiene_a_la_derecha() {
+        let mut a = Actividad::nueva(estado(Clase::Recorder), false);
+        a.vista = Vista::Abierta;
+        let y = MARGEN_SOMBRA + REC_BOTON_Y + REC_BOTON / 2.0;
+        let centro = MARGEN_SOMBRA + ABIERTO_W / 2.0;
+        // Los centros de los dos botones, con la separación con que se dibujan.
+        let izq = a.pulsar(centro - 14.0 - REC_BOTON / 2.0, y).unwrap();
+        let der = a.pulsar(centro + 14.0 + REC_BOTON / 2.0, y).unwrap();
+        assert_eq!(
+            (izq.nombre.as_str(), der.nombre.as_str()),
+            ("pause", "stop")
+        );
+        a.estado.pausado = true;
+        let izq = a.pulsar(centro - 14.0 - REC_BOTON / 2.0, y).unwrap();
+        assert_eq!(izq.nombre, "resume");
+    }
+
+    #[test]
+    fn el_temporizador_en_marcha_pausa_y_el_pausado_reanuda() {
+        let mut a = Actividad::nueva(estado(Clase::Timer), false);
+        a.vista = Vista::Abierta;
+        let y = MARGEN_SOMBRA + TIMER_BOTON_Y + BOTON_H / 2.0;
+        let x = MARGEN_SOMBRA + PAD + 40.0;
+        assert_eq!(a.pulsar(x, y).unwrap().nombre, "pause");
+        a.estado.pausado = true;
+        assert_eq!(a.pulsar(x, y).unwrap().nombre, "resume");
+    }
+
+    /// Los botones de una sola acción ocupan todo el ancho y responden en
+    /// toda su fila; por encima, la tarjeta se recoge.
+    #[test]
+    fn los_botones_anchos_mandan_su_orden() {
+        for (clase, y, nombre) in [
+            (Clase::Transfer, TRANSFER_BOTON_Y, "cancel"),
+            (Clase::Calendar, CAL_BOTON_Y, "dismiss"),
+            (Clase::Auriculares, AUR_BOTON_Y, "open"),
+        ] {
+            let mut a = Actividad::nueva(estado(clase), false);
+            a.vista = Vista::Abierta;
+            let accion = a.pulsar(
+                MARGEN_SOMBRA + ABIERTO_W - PAD - 5.0,
+                MARGEN_SOMBRA + y + BOTON_H / 2.0,
+            );
+            assert_eq!(accion.map(|a| a.nombre).as_deref(), Some(nombre));
+            // Y el botón acaba dentro de la tarjeta.
+            assert!(y + BOTON_H + PAD <= a.size().1 - MARGEN_SOMBRA * 2.0);
+        }
+    }
+
+    /// Un auricular que no informa no puede salir como el más descargado.
+    #[test]
+    fn un_auricular_sin_lectura_es_desconocido_y_no_cero() {
+        let m = |v: f32, critica| Metrica {
+            etiqueta: "x".into(),
+            valor: v,
+            texto: format!("{:.0} %", v * 100.0),
+            critica,
+        };
+        assert!(desconocida(&m(0.0, false)));
+        assert!(!desconocida(&m(0.1, true)));
+        assert!(!desconocida(&m(0.5, false)));
     }
 
     /// Una hora larga de grabación no puede leerse como «01:05».

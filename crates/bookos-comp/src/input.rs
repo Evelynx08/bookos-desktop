@@ -68,6 +68,10 @@ pub fn tecla(state: &mut BookosComp, codigo: Keycode, estado: KeyState, time: u3
     if let Some(token) = state.repeticion_retroceso.take() {
         state.loop_handle.remove(token);
     }
+    if let Some(token) = state.repeticion_multimedia.take() {
+        state.loop_handle.remove(token);
+    }
+    crate::multimedia::soltar_chasquido(state);
     let mut repetir = false;
     // Hay un menú abierto que aún no tiene el teclado: se le da ahora, antes
     // de que la tecla salga hacia el cliente. El grab de popups ignora los
@@ -187,7 +191,21 @@ pub fn tecla(state: &mut BookosComp, codigo: Keycode, estado: KeyState, time: u3
             {
                 return FilterResult::Intercept(Some(crate::keybinds::Accion::ConmutarCancelar));
             }
+            let buscador = state
+                .shell
+                .as_ref()
+                .is_some_and(|s| s.emergente_nombre() == Some("buscador"));
             if let Some(accion) = crate::keybinds::resolver(modifiers, &handle, codigo.raw()) {
+                // Con el buscador abierto, un atajo que mueve ventanas o
+                // cambia de escritorio actuaría sobre algo que no se ve y
+                // dejaría la paleta flotando encima del resultado. Solo
+                // pasan Meta+Espacio, que la cierra, y las de emergencia.
+                if buscador
+                    && !matches!(accion, crate::keybinds::Accion::Buscador)
+                    && !accion.es_emergencia()
+                {
+                    return FilterResult::Intercept(None);
+                }
                 // Con el bloqueo echado solo valen las salidas de
                 // emergencia. Que el cambio de TTY siga funcionando no
                 // es un descuido: es la puerta trasera con la que se
@@ -270,6 +288,11 @@ pub fn tecla(state: &mut BookosComp, codigo: Keycode, estado: KeyState, time: u3
                     return FilterResult::Intercept(accion.map(crate::keybinds::Accion::DelShell));
                 }
             }
+            // Ctrl+C, Ctrl+V y compañía no se traducen; con el buscador
+            // abierto tampoco deben llegar a la ventana que hay debajo.
+            if buscador {
+                return FilterResult::Intercept(None);
+            }
             FilterResult::Forward
         },
     );
@@ -305,23 +328,27 @@ pub fn tecla(state: &mut BookosComp, codigo: Keycode, estado: KeyState, time: u3
 /// así que en el launchpad mantener Retroceso borraba un solo carácter.
 fn repetir_retroceso(state: &mut BookosComp) {
     use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
-    // Mismos valores que `add_keyboard` en state.rs: 600 ms y 25/s.
-    const ESPERA: std::time::Duration = std::time::Duration::from_millis(600);
-    const CADA: std::time::Duration = std::time::Duration::from_millis(40);
-    let token = state
-        .loop_handle
-        .insert_source(Timer::from_duration(ESPERA), |_, _, state| {
-            let seguir = state
-                .shell
-                .as_mut()
-                .is_some_and(|s| s.tecla(TeclaPulsada::Retroceso).0);
-            if !seguir {
-                state.repeticion_retroceso = None;
-                return TimeoutAction::Drop;
-            }
-            state.needs_redraw = true;
-            TimeoutAction::ToDuration(CADA)
-        });
+    let (retardo, velocidad) = state.teclado_repeticion;
+    if velocidad == 0 {
+        return;
+    }
+    let espera = std::time::Duration::from_millis(retardo.into());
+    let cada = std::time::Duration::from_millis((1000 / velocidad).into());
+    let token =
+        state
+            .loop_handle
+            .insert_source(Timer::from_duration(espera), move |_, _, state| {
+                let seguir = state
+                    .shell
+                    .as_mut()
+                    .is_some_and(|s| s.tecla(TeclaPulsada::Retroceso).0);
+                if !seguir {
+                    state.repeticion_retroceso = None;
+                    return TimeoutAction::Drop;
+                }
+                state.needs_redraw = true;
+                TimeoutAction::ToDuration(cada)
+            });
     match token {
         Ok(token) => state.repeticion_retroceso = Some(token),
         Err(err) => tracing::warn!("sin repetición de Retroceso: {err}"),
@@ -363,6 +390,7 @@ fn capturar(state: &mut BookosComp, evdev: u32) -> bool {
 
 pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
     state.last_input = Some(std::time::Instant::now());
+    crate::atenuacion::actividad(state);
     state.idle_notifier_state.notify_activity(&state.seat);
     crate::backend::despertar_dpms(state);
     if state
@@ -371,6 +399,24 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
         .is_some_and(|shell| shell.esta_bloqueado())
     {
         crate::backend::programar_suspension_inactividad(state);
+    }
+
+    // Los gestos del touchpad abren el conmutador, la vista de escritorios y
+    // el launchpad, y cambian de escritorio: con el bloqueo echado, lo que
+    // abrían enseñaba ventanas vivas por encima del candado.
+    let es_gesto = matches!(
+        event,
+        InputEvent::GestureSwipeBegin { .. }
+            | InputEvent::GestureSwipeUpdate { .. }
+            | InputEvent::GestureSwipeEnd { .. }
+            | InputEvent::GesturePinchBegin { .. }
+            | InputEvent::GesturePinchUpdate { .. }
+            | InputEvent::GesturePinchEnd { .. }
+            | InputEvent::GestureHoldBegin { .. }
+            | InputEvent::GestureHoldEnd { .. }
+    );
+    if es_gesto && state.shell.as_ref().is_some_and(|s| s.esta_bloqueado()) {
+        return;
     }
 
     match event {
@@ -494,6 +540,18 @@ pub fn handle<B: InputBackend>(state: &mut BookosComp, event: InputEvent<B>) {
                             state.escritorios.cuantos(),
                         );
                         crate::escritorios::cambiar_aqui(state, destino);
+                    }
+                    // Con la vista abierta, bajar es deshacer el subir que la
+                    // abrió. Antes despejaba por debajo de la vista: las
+                    // ventanas quedaban escondidas sin que se viera, y ni el
+                    // gesto de enseñarlas las traía hasta cambiar de escritorio.
+                    Gesto::DespejarEscritorio
+                        if state
+                            .shell
+                            .as_ref()
+                            .is_some_and(|s| s.vista_escritorios_abierta()) =>
+                    {
+                        crate::keybinds::ejecutar(state, crate::keybinds::Accion::VistaEscritorios);
                     }
                     Gesto::DespejarEscritorio => crate::escritorios::despejar(state),
                     // Subir con el escritorio despejado devuelve las ventanas;
@@ -644,6 +702,9 @@ fn traducir_tecla(
         keysyms::KEY_Next | keysyms::KEY_KP_Next => TeclaPulsada::PaginaAbajo,
         keysyms::KEY_Tab | keysyms::KEY_ISO_Left_Tab => TeclaPulsada::Tabulador,
         keysyms::KEY_BackSpace if ctrl => TeclaPulsada::BorrarTodo,
+        // Con Ctrl, `key_char` da el carácter de control (0x01) y caería en
+        // el descarte de abajo: por eso se mira el keysym.
+        keysyms::KEY_a | keysyms::KEY_A if ctrl => TeclaPulsada::SeleccionarTodo,
         keysyms::KEY_BackSpace => TeclaPulsada::Retroceso,
         // Lo demás solo interesa si escribe algo: es lo que alimentará la
         // búsqueda del launchpad. Los controles se descartan para que un
@@ -775,7 +836,13 @@ pub fn boton(state: &mut BookosComp, button: u32, pulsado: ButtonState, time: u3
     // borde. Es el gesto de KWin y de casi todos los gestores de
     // ventanas de Wayland, y aquí es además la **única** forma de mover
     // una ventana que se dibuje sin decoración cliente.
-    if pulsado == ButtonState::Pressed && modificadores(state).logo {
+    // Sobre el shell no: con el launchpad, un menú o la vista de escritorios
+    // abiertos, la ventana de debajo está tapada o se dibuja en otro sitio, y
+    // se movía o redimensionaba una ventana que no se veía.
+    if pulsado == ButtonState::Pressed
+        && modificadores(state).logo
+        && !state.shell_contiene(state.pointer_location)
+    {
         let modo = match button {
             BTN_LEFT => Some(crate::ventanas::Modo::Mover),
             BTN_RIGHT => Some(crate::ventanas::Modo::Redimensionar {
@@ -831,11 +898,7 @@ pub fn boton(state: &mut BookosComp, button: u32, pulsado: ButtonState, time: u3
     {
         state.needs_redraw = true;
     }
-    if state
-        .shell
-        .as_ref()
-        .is_some_and(|s| s.contiene(punto.x, punto.y))
-    {
+    if state.shell_contiene(punto) {
         // Ni la pulsación ni el soltar llegan al cliente: para él este
         // clic no ha existido. Reenviar solo el soltar le dejaría un
         // botón que se levanta sin haberse pulsado nunca.
@@ -1055,7 +1118,13 @@ pub fn set_pointer(state: &mut BookosComp, destino: Point<f64, Logical>, time: u
         state.needs_redraw = true;
         return;
     }
-    if crate::escritorios::mover_en_vista(state) {
+    // Con la vista abierta el ✕ sigue al puntero de ventana en ventana.
+    if crate::escritorios::mover_en_vista(state)
+        || state
+            .shell
+            .as_ref()
+            .is_some_and(|s| s.vista_escritorios_abierta())
+    {
         state.needs_redraw = true;
     }
     if let Some(shell) = state.shell.as_mut() {
@@ -1439,7 +1508,7 @@ fn seguir_arrastre_escritorio(state: &mut BookosComp, location: Point<f64, Logic
 }
 
 /// Cierra el gesto del escritorio: quita la banda o deja los iconos en su celda.
-fn soltar_escritorio(state: &mut BookosComp) -> bool {
+pub(crate) fn soltar_escritorio(state: &mut BookosComp) -> bool {
     let Some(arrastre) = state.arrastre_escritorio.take() else {
         return false;
     };
@@ -1459,10 +1528,7 @@ fn soltar_escritorio(state: &mut BookosComp) -> bool {
 
 /// Da el foco de teclado a la ventana bajo el cursor y la sube del todo.
 fn focus_under_pointer(state: &mut BookosComp) {
-    let bajo = state
-        .space
-        .element_under(state.pointer_location)
-        .map(|(w, _)| w.clone());
+    let bajo = state.ventana_bajo(state.pointer_location).map(|(w, _)| w);
     if let Some(window) = bajo {
         state.enfocar(&window);
     }
@@ -1519,6 +1585,9 @@ pub fn exponer(state: &mut BookosComp) {
     if state.shell.as_ref().is_some_and(|s| s.hay_conmutador()) {
         return;
     }
+    // Con el escritorio despejado no hay ventanas mapeadas que exponer: se
+    // devuelven primero, que es lo que pide quien quiere verlas.
+    crate::escritorios::recuperar(state);
     crate::keybinds::ejecutar(
         state,
         crate::keybinds::Accion::Conmutar(bookos_shell::conmutador::Modo::Ventanas, 0),

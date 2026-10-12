@@ -20,10 +20,9 @@
 //! **Todo lo que se dibuja hace algo.** Los estados que se pueden leer se leen
 //! desde la caché compartida para red, Bluetooth y audio; los que no tienen
 //! forma de consultarse son acciones, no interruptores. Mantener la pantalla
-//! encendida es la excepción: su estado **es** un proceso hijo vivo, y por eso
-//! lo guarda el shell.
+//! encendida lo guarda el shell para que dure aunque se cierre la tarjeta.
 
-use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use iced_core::alignment::{Horizontal, Vertical};
@@ -38,7 +37,10 @@ use crate::medios::{self, Sonando};
 use crate::tema;
 use crate::view::PanelElement;
 
+use super::bluetooth::Bluetooth;
 use super::control;
+use super::lista;
+use super::red::Red;
 use super::{Ancla, Tecla};
 
 const ANCHO: f32 = 352.0;
@@ -119,7 +121,7 @@ struct Baldosa {
     icono: &'static str,
     /// El rótulo de debajo. Es lo que hace, no cómo se llama el icono.
     nombre: &'static str,
-    /// Encendida: círculo en acento sólido. Apagada: el acento aclarado.
+    /// Encendida: círculo en acento sólido. Apagada: color de la tarjeta.
     activa: bool,
     /// Qué ejecuta. `None` = lo resuelve el propio shell.
     accion: Option<Accion>,
@@ -132,6 +134,64 @@ struct Baldosa {
 enum Interna {
     /// Mantener la pantalla encendida.
     Mantener,
+}
+
+/// La lista de Wi-Fi o de Bluetooth abierta **dentro** de la estación.
+///
+/// Es lo que hace la bandeja del sistema de Plasma: pulsar una entrada cambia
+/// el contenido del mismo desplegable por la vista completa del applet, con
+/// una flecha para volver. Antes se cerraba la estación y se abría la tarjeta
+/// suelta colgando de su icono del panel, que está en otro sitio: la mano y la
+/// vista tenían que ir a buscarla.
+///
+/// Son las mismas tarjetas que abre el panel, con su contenido sin la caja. Se
+/// dibujan con su ancho (336) centradas en el de la estación (352), así que lo
+/// que entra del puntero se corre [`DESVIO`] para que sus zonas coincidan.
+enum Detalle {
+    Red(Red),
+    Bluetooth(Bluetooth),
+}
+
+const DESVIO: f32 = (ANCHO - lista::ANCHO) / 2.0;
+
+impl Detalle {
+    fn alto(&self) -> f32 {
+        match self {
+            Self::Red(r) => r.size().1,
+            Self::Bluetooth(b) => b.size().1,
+        }
+    }
+    fn contenido(&self) -> PanelElement<'_> {
+        match self {
+            Self::Red(r) => r.contenido(true),
+            Self::Bluetooth(b) => b.contenido(true),
+        }
+    }
+    fn pulsar(&mut self, x: f32, y: f32) -> Option<Accion> {
+        match self {
+            Self::Red(r) => r.pulsar(x - DESVIO, y),
+            Self::Bluetooth(b) => b.pulsar(x - DESVIO, y),
+        }
+    }
+    fn puntero(&mut self, punto: Option<(f32, f32)>) -> bool {
+        let punto = punto.map(|(x, y)| (x - DESVIO, y));
+        match self {
+            Self::Red(r) => r.puntero(punto),
+            Self::Bluetooth(b) => b.puntero(punto),
+        }
+    }
+    fn animando(&self) -> bool {
+        match self {
+            Self::Red(r) => r.animando(),
+            Self::Bluetooth(b) => b.animando(),
+        }
+    }
+    fn refrescar(&mut self) -> bool {
+        match self {
+            Self::Red(r) => r.refrescar(),
+            Self::Bluetooth(b) => b.refrescar(),
+        }
+    }
 }
 
 /// Qué está agarrado con el ratón.
@@ -177,19 +237,27 @@ pub struct Centro {
     caratula: Option<iced_widget::image::Handle>,
     /// Donde deja su última lectura el hilo que vigila lo que suena.
     lectura: Arc<Mutex<Option<Lectura>>>,
+    /// La lista de Wi-Fi o Bluetooth abierta en el sitio, si la hay. En caja:
+    /// una tarjeta de red entera dentro hacía de la estación la variante más
+    /// grande de `Emergente`, y todas pagaban ese tamaño.
+    detalle: Option<Box<Detalle>>,
+    transicion: Option<super::Transicion>,
+    origen_detalle: iced_core::Rectangle,
 }
 
-/// El `systemd-inhibit` que impide que la pantalla se apague mientras esté
-/// puesto. Matarlo es apagar el conmutador.
-///
-/// Vive aquí y no en `Centro` porque la tarjeta se destruye al cerrarla: el
-/// proceso seguía vivo, la baldosa volvía a nacer apagada y pulsarla lanzaba
-/// un segundo inhibidor, dejando el primero sin forma de quitarlo y el equipo
-/// sin suspenderse. El shell vive lo que la sesión, así que esto también.
-static INHIBIDOR: Mutex<Option<Child>> = Mutex::new(None);
+// El compositor decide el bloqueo y la atenuación sin consultar logind.
+// Este estado dura toda la sesión, aunque se destruya la tarjeta.
+static MANTENER_DESPIERTO: AtomicBool = AtomicBool::new(false);
+
+pub fn mantener_despierto() -> bool {
+    MANTENER_DESPIERTO.load(Ordering::Relaxed)
+}
 
 impl Centro {
     pub fn refrescar(&mut self) -> bool {
+        if let Some(d) = self.detalle.as_mut() {
+            return d.refrescar();
+        }
         let state = bookos_system::snapshot();
         let wifi_disponible = !state.network.is_null();
         let bluetooth_disponible = !state.bluetooth.is_null();
@@ -299,6 +367,9 @@ impl Centro {
             sonando: None,
             caratula: None,
             lectura: Arc::default(),
+            detalle: None,
+            transicion: None,
+            origen_detalle: iced_core::Rectangle::default(),
         };
         // La primera lectura en el sitio: si fuera por el hilo, la tarjeta
         // abriría sin la parte de la música y crecería un segundo después.
@@ -316,6 +387,9 @@ impl Centro {
     }
 
     pub fn size(&self) -> (f32, f32) {
+        if let Some(d) = &self.detalle {
+            return (ANCHO, d.alto());
+        }
         let mut alto = MARGEN * 2.0
             + CABECERA
             + HUECO
@@ -457,6 +531,9 @@ impl Centro {
     }
 
     pub fn puntero(&mut self, punto: Option<(f32, f32)>) -> bool {
+        if let Some(d) = self.detalle.as_mut() {
+            return d.puntero(punto);
+        }
         if let Some((x, _)) = punto {
             let r = self.rect_pildora(Agarre::Volumen);
             let nivel = control::nivel_en(x, r.x, r.width);
@@ -472,7 +549,7 @@ impl Centro {
 
     /// ¿Se mueve algo dentro de la tarjeta?
     pub fn animando(&self) -> bool {
-        self.señalada.animando()
+        self.señalada.animando() || self.detalle.as_ref().is_some_and(|d| d.animando())
     }
 
     pub fn agarrado(&self) -> bool {
@@ -491,6 +568,13 @@ impl Centro {
     }
 
     pub fn pulsar(&mut self, x: f32, y: f32) -> Option<Accion> {
+        if let Some(d) = self.detalle.as_mut() {
+            if lista::volver_en(x - DESVIO, y) {
+                self.volver();
+                return None;
+            }
+            return d.pulsar(x, y);
+        }
         let punto = iced_core::Point::new(x, y);
         let holgada = |mut r: iced_core::Rectangle| {
             r.y -= control::MARGEN_AGARRE;
@@ -511,8 +595,8 @@ impl Centro {
         }
         // El botón del brillo pone o quita el automático, igual que el del
         // volumen silencia: los dos actúan en el sitio, sin abrir nada más. El
-        // teclado y la luz nocturna se quedan sin sitio aquí, pero siguen a un
-        // clic del icono del panel, que abre la tarjeta entera.
+        // teclado se queda sin sitio aquí, pero sigue a un clic del icono del
+        // panel, que abre la tarjeta entera; la luz nocturna tiene su baldosa.
         if self.sensor && self.rect_boton(Agarre::Brillo).contains(punto) {
             self.automatico = !self.automatico;
             let mut elegido = crate::retroiluminacion::automatico();
@@ -578,21 +662,38 @@ impl Centro {
                 });
                 return None;
             }
-            return Some(Accion::Emergente(if bluetooth {
-                "bluetooth"
-            } else {
-                "red"
-            }));
+            // Sin servicio no hay lista que enseñar: la tarjeta diría
+            // «Cargando…» para siempre.
+            if disponible {
+                self.detalle = Some(Box::new(if bluetooth {
+                    Detalle::Bluetooth(Bluetooth::new())
+                } else {
+                    Detalle::Red(Red::new())
+                }));
+                self.señalada.señalar(None);
+                self.origen_detalle = iced_core::Rectangle {
+                    x: inicio,
+                    y: self.y_conexiones(),
+                    width: (ANCHO - MARGEN * 2.0 - 8.0) / 2.0,
+                    height: CONEXION,
+                };
+                self.animar(super::Transicion::AbrirDetalle(self.origen_detalle));
+            }
+            return None;
         }
         let i = self.baldosa_en(x, y)?;
         if let Some(interna) = self.baldosas[i].interna {
-            self.alternar(interna, i);
-            return None;
+            return Some(self.alternar(interna, i));
         }
         if self.baldosas[i].icono == "notificaciones" {
             // «No molestar» vive en su propia tarjeta, que es donde están las
             // duraciones; desde aquí solo se abre.
             return Some(Accion::Emergente("notificaciones"));
+        }
+        if self.baldosas[i].icono == "noche" {
+            let encender = !self.baldosas[i].activa;
+            self.baldosas[i].activa = encender;
+            return Some(Accion::LuzNocturna(encender));
         }
         if self.baldosas[i].icono == "avion" {
             bookos_system::request(bookos_system::Operation::Airplane {
@@ -600,10 +701,14 @@ impl Centro {
             });
             return None;
         }
-        // El estado se da por cambiado sin releerlo: `rfkill` y compañía tardan
-        // en aplicarlo y la baldosa se quedaría como estaba hasta la siguiente
-        // apertura.
-        self.baldosas[i].activa = !self.baldosas[i].activa;
+        if self.baldosas[i].icono == "ahorro" {
+            self.baldosas[i].activa = !self.baldosas[i].activa;
+            return Some(Accion::PerfilEnergia(if self.baldosas[i].activa {
+                "power-saver"
+            } else {
+                "balanced"
+            }));
+        }
         self.baldosas[i].accion.clone()
     }
 
@@ -619,33 +724,13 @@ impl Centro {
         }
     }
 
-    /// Enciende o apaga un conmutador cuyo estado vive en el shell.
-    fn alternar(&mut self, cual: Interna, i: usize) {
+    fn alternar(&mut self, cual: Interna, i: usize) -> Accion {
         match cual {
             Interna::Mantener => {
-                let mut inhibidor = INHIBIDOR.lock().expect("nadie suelta el cerrojo a medias");
-                if let Some(mut hijo) = inhibidor.take() {
-                    // Matar el `systemd-inhibit` suelta el bloqueo: es lo que
-                    // hace el plasmoide, y garantiza que no quede un inhibidor
-                    // colgado si el shell se cae.
-                    let _ = hijo.kill();
-                    let _ = hijo.wait();
-                    self.baldosas[i].activa = false;
-                    return;
-                }
-                *inhibidor = Command::new("systemd-inhibit")
-                    .args([
-                        "--what=idle:sleep",
-                        "--who=BookOS",
-                        "--why=Mantener la pantalla encendida",
-                        "sleep",
-                        "infinity",
-                    ])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .ok();
-                self.baldosas[i].activa = inhibidor.is_some();
+                let activo = !mantener_despierto();
+                MANTENER_DESPIERTO.store(activo, Ordering::Relaxed);
+                self.baldosas[i].activa = activo;
+                Accion::MantenerDespierto
             }
         }
     }
@@ -682,9 +767,34 @@ impl Centro {
 
     pub fn tecla(&mut self, tecla: crate::TeclaPulsada) -> Tecla {
         match tecla {
+            // Dentro de una lista, Esc vuelve a la estación, como la flecha.
+            crate::TeclaPulsada::Escape if self.detalle.is_some() => {
+                self.volver();
+                Tecla::Consumida
+            }
             crate::TeclaPulsada::Escape => Tecla::Cerrar,
             _ => Tecla::Ignorada,
         }
+    }
+
+    fn animar(&mut self, transicion: super::Transicion) {
+        if !tema::efectos_reducidos() {
+            self.transicion = Some(transicion);
+        }
+    }
+
+    pub fn tomar_transicion(&mut self) -> Option<super::Transicion> {
+        self.transicion.take()
+    }
+
+    /// De la lista a la estación. Se relee al volver: mientras estaba en la
+    /// lista no se refrescaba, y la píldora diría la red de antes.
+    fn volver(&mut self) {
+        self.detalle = None;
+        self.animar(super::Transicion::CerrarDetalle(self.origen_detalle));
+        self.red = self.wifi_disponible.then(conectado_a).flatten();
+        self.dispositivo = self.bluetooth_disponible.then(emparejado_con).flatten();
+        self.refrescar();
     }
 
     // --- Dibujo ------------------------------------------------------------
@@ -1108,6 +1218,14 @@ impl Centro {
     }
 
     pub fn view(&self) -> PanelElement<'_> {
+        if let Some(d) = &self.detalle {
+            // El margen de la estación más el desvío: la lista queda centrada.
+            return control::tarjeta(
+                container(d.contenido()).padding([0.0, DESVIO]).into(),
+                ANCHO,
+                MARGEN,
+            );
+        }
         let mut rejilla = column![].spacing(ENTRE_FILAS);
         for fila in 0..self.baldosas.len().div_ceil(COLUMNAS) {
             let mut linea = row![];
@@ -1160,9 +1278,7 @@ fn baldosas() -> Vec<Baldosa> {
         && !state.bluetooth.is_null()
         && state.network["enabled"] == false
         && state.bluetooth["enabled"] == false;
-    let ahorro = std::fs::read_to_string("/sys/firmware/acpi/platform_profile")
-        .unwrap_or_default()
-        .contains("low-power");
+    let ahorro = super::energia::perfil_activo().as_deref() == Some("power-saver");
     vec![
         Baldosa {
             icono: "avion",
@@ -1182,31 +1298,23 @@ fn baldosas() -> Vec<Baldosa> {
             icono: "ahorro",
             nombre: "Ahorro",
             activa: ahorro,
-            accion: Some(Accion::Lanzar(format!(
-                "busctl --system set-property net.hadess.PowerProfiles \
-                 /net/hadess/PowerProfiles net.hadess.PowerProfiles ActiveProfile s {}",
-                if ahorro { "balanced" } else { "power-saver" }
-            ))),
+            accion: None,
             interna: None,
         },
         Baldosa {
             icono: "mantener",
             nombre: "Despierta",
-            activa: INHIBIDOR
-                .lock()
-                .expect("nadie suelta el cerrojo a medias")
-                .is_some(),
+            activa: mantener_despierto(),
             accion: None,
             interna: Some(Interna::Mantener),
         },
         Baldosa {
             icono: "noche",
             nombre: "Noche",
-            activa: false,
-            // La luz nocturna la aplica el compositor cambiando la curva de
-            // color de la salida, y eso todavía no existe: de momento abre
-            // donde se configurará.
-            accion: Some(Accion::Lanzar("bookos-settings --page pantalla".into())),
+            activa: crate::luz_nocturna_encendida(),
+            // La acción se arma al pulsar: lleva el estado al que se va, y
+            // uno calculado aquí se quedaría viejo al segundo toque.
+            accion: None,
             interna: None,
         },
         Baldosa {
@@ -1220,17 +1328,14 @@ fn baldosas() -> Vec<Baldosa> {
             icono: "captura",
             nombre: "Captura",
             activa: false,
-            accion: Some(Accion::Lanzar("bookos-captura || spectacle".into())),
+            accion: Some(Accion::AbrirCaptura),
             interna: None,
         },
         Baldosa {
             icono: "bloquear",
             nombre: "Bloquear",
             activa: false,
-            accion: Some(Accion::Lanzar(
-                "loginctl lock-session || qdbus6 org.freedesktop.ScreenSaver /ScreenSaver Lock"
-                    .into(),
-            )),
+            accion: Some(Accion::Bloquear),
             interna: None,
         },
     ]
@@ -1323,7 +1428,14 @@ fn vigilar_medios(
                 if destino.strong_count() == 0 {
                     return;
                 }
-                let l = Lectura::nueva(Sonando::leer(), previa.take());
+                let sonando = match Sonando::consultar() {
+                    Ok(sonando) => sonando,
+                    Err(error) => {
+                        tracing::debug!("se conserva la tarjeta multimedia: {error}");
+                        continue;
+                    }
+                };
+                let l = Lectura::nueva(sonando, previa.take());
                 previa = l
                     .sonando
                     .as_ref()
@@ -1428,17 +1540,24 @@ mod tests {
         assert!(!c.automatico, "sin sensor no debería haber cambiado nada");
     }
 
-    /// Las dos tarjetas de conectividad abren su lista, cada una la suya.
+    /// Las dos tarjetas de conectividad abren su lista, cada una la suya, en
+    /// el sitio: sin acción, que cerraría la estación.
     #[test]
     fn las_tarjetas_de_conexion_abren_su_lista() {
         let mut c = Centro::new();
+        c.wifi_disponible = true;
+        c.bluetooth_disponible = true;
         let y = c.y_conexiones() + CONEXION / 2.0;
         // Fuera del círculo: la mitad derecha de cada tarjeta.
-        assert_eq!(c.pulsar(140.0, y), Some(Accion::Emergente("red")));
-        assert_eq!(
-            c.pulsar(ANCHO - 40.0, y),
-            Some(Accion::Emergente("bluetooth"))
-        );
+        assert_eq!(c.pulsar(140.0, y), None);
+        assert!(matches!(c.detalle.as_deref(), Some(Detalle::Red(_))));
+        c.tecla(crate::TeclaPulsada::Escape);
+        assert!(c.detalle.is_none(), "Esc vuelve a la estación");
+        // Volver relee el estado real, y en una máquina sin Bluetooth eso
+        // deshace lo forzado arriba.
+        c.bluetooth_disponible = true;
+        assert_eq!(c.pulsar(ANCHO - 40.0, y), None);
+        assert!(matches!(c.detalle.as_deref(), Some(Detalle::Bluetooth(_))));
     }
 
     /// Y el círculo de esas tarjetas enciende y apaga la radio, sin abrir nada.
@@ -1455,32 +1574,76 @@ mod tests {
         assert_eq!(accion, None);
     }
 
-    /// «Mantener la pantalla encendida» es un proceso vivo: encenderlo lo
-    /// arranca y apagarlo lo mata.
     #[test]
-    fn mantener_la_pantalla_es_un_proceso() {
+    fn mantener_despierto_persiste_al_cerrar_la_tarjeta() {
         let mut c = Centro::new();
-        let Some(i) = c
+        let i = c
             .baldosas
             .iter()
             .position(|b| b.interna == Some(Interna::Mantener))
-        else {
-            panic!("no está la baldosa de mantener la pantalla");
-        };
-        c.alternar(Interna::Mantener, i);
-        // Sin `systemd-inhibit` en el sistema no hay nada más que comprobar.
-        if !c.baldosas[i].activa {
-            return;
-        }
-        // Cerrar la tarjeta y abrir otra: el conmutador sigue encendido.
+            .expect("la rejilla contiene mantener despierto");
+        assert_eq!(c.alternar(Interna::Mantener, i), Accion::MantenerDespierto);
+        assert!(mantener_despierto());
         drop(c);
         let mut c = Centro::new();
-        assert!(c.baldosas[i].activa, "la tarjeta nueva olvidó el inhibidor");
+        assert!(c.baldosas[i].activa);
         c.alternar(Interna::Mantener, i);
-        assert!(
-            INHIBIDOR.lock().expect("cerrojo").is_none(),
-            "el inhibidor sigue vivo"
-        );
+        assert!(!mantener_despierto());
         assert!(!c.baldosas[i].activa);
+    }
+    #[test]
+    fn ahorro_alterna_el_perfil_en_cada_pulsacion() {
+        let mut c = Centro::new();
+        let i = c
+            .baldosas
+            .iter()
+            .position(|b| b.icono == "ahorro")
+            .expect("la rejilla contiene ahorro");
+        c.baldosas[i].activa = false;
+        let x = MARGEN
+            + REJILLA_MARGEN
+            + 2.5 * (ANCHO - 2.0 * (MARGEN + REJILLA_MARGEN)) / COLUMNAS as f32;
+        let y = c.y_rejilla() + REJILLA_MARGEN + BOTON / 2.0;
+        for perfil in ["power-saver", "balanced", "power-saver"] {
+            assert_eq!(c.pulsar(x, y), Some(Accion::PerfilEnergia(perfil)));
+        }
+    }
+
+    #[test]
+    fn las_acciones_no_se_quedan_encendidas() {
+        let mut c = Centro::new();
+        let ancho = (ANCHO - 2.0 * (MARGEN + REJILLA_MARGEN)) / COLUMNAS as f32;
+        for (columna, accion) in [
+            (1, Accion::Lanzar("bookos-share || kdeconnect-app".into())),
+            (2, Accion::AbrirCaptura),
+            (3, Accion::Bloquear),
+        ] {
+            let x = MARGEN + REJILLA_MARGEN + (columna as f32 + 0.5) * ancho;
+            let y = c.y_rejilla() + REJILLA_MARGEN + CELDA + ENTRE_FILAS + BOTON / 2.0;
+            assert_eq!(c.pulsar(x, y), Some(accion));
+            assert!(!c.baldosas[COLUMNAS + columna].activa);
+        }
+    }
+
+    #[test]
+    fn las_listas_nacen_de_su_tarjeta_y_vuelven_a_ella() {
+        let mut c = Centro::new();
+        for (x, inicio) in [(140.0, MARGEN), (ANCHO - 40.0, ANCHO / 2.0 + 4.0)] {
+            c.wifi_disponible = true;
+            c.bluetooth_disponible = true;
+            c.pulsar(x, c.y_conexiones() + CONEXION / 2.0);
+            let Some(super::super::Transicion::AbrirDetalle(origen)) = c.tomar_transicion() else {
+                panic!("la lista no pidió la animación desde su tarjeta");
+            };
+            assert_eq!(origen.x, inicio);
+            assert_eq!(origen.y, c.y_conexiones());
+            assert!(origen.contains(iced_core::Point::new(x, origen.center_y())));
+            c.tecla(crate::TeclaPulsada::Escape);
+            assert_eq!(
+                c.tomar_transicion(),
+                Some(super::super::Transicion::CerrarDetalle(origen))
+            );
+            assert!(c.tomar_transicion().is_none());
+        }
     }
 }

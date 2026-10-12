@@ -51,8 +51,9 @@ const AIRE_NOMBRE: f32 = 6.0;
 const NOMBRE_H: f32 = 22.0;
 /// Diámetro del botón de añadir, que es un círculo en el extremo derecho.
 const MAS: f32 = 44.0;
-/// Lado del botón de cerrar de cada previa.
-const CERRAR: f32 = 24.0;
+/// Lado del botón de cerrar de cada previa: el alto de la línea del nombre,
+/// donde vive.
+const CERRAR: f32 = NOMBRE_H;
 const DOBLE_CLIC: std::time::Duration = std::time::Duration::from_millis(450);
 
 pub struct Escritorios {
@@ -141,11 +142,14 @@ impl Escritorios {
         }
     }
 
+    /// Va **debajo** de la miniatura, en la línea del nombre. Dentro de ella no
+    /// se veía nunca: el compositor monta el fondo y las ventanas por delante de
+    /// esta franja, así que todo lo que se dibuje en el hueco queda tapado.
     fn cerrar_rect(&self, i: usize) -> Rectangle {
-        let p = self.previa(i);
+        let n = self.nombre_rect(i);
         Rectangle {
-            x: p.x + p.width - CERRAR - 6.0,
-            y: p.y + 6.0,
+            x: n.x + n.width - CERRAR,
+            y: n.y,
             width: CERRAR,
             height: CERRAR,
         }
@@ -198,7 +202,12 @@ impl Escritorios {
 
     pub fn puntero(&mut self, punto: Option<(f32, f32)>) -> bool {
         let nuevo = punto.and_then(|(x, y)| {
-            (0..self.nombres.len()).find(|i| Self::contiene(self.previa(*i), x, y))
+            // La línea del nombre cuenta como parte de la miniatura: la ✕ está
+            // ahí, y si al llegar a ella se apagase el hover desaparecería
+            // antes de poder pulsarla.
+            (0..self.nombres.len()).find(|i| {
+                Self::contiene(self.previa(*i), x, y) || Self::contiene(self.nombre_rect(*i), x, y)
+            })
         });
         self.hover.señalar(nuevo)
     }
@@ -314,41 +323,35 @@ impl Escritorios {
                     .into()
             };
 
-            let previa = container(
-                container(cierre)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .align_x(Horizontal::Right)
-                    .padding(6),
-            )
-            .width(Length::Fixed(ancho))
-            .height(Length::Fixed(alto))
-            .style(move |_| container::Style {
-                // Solo se ve en el marco de 2 px que queda alrededor de lo que
-                // compone el compositor —el fondo de pantalla y las ventanas—,
-                // y entero mientras el fondo no haya podido cargarse.
-                background: Some(
-                    Color {
-                        a: 0.92,
-                        ..tema::bg()
-                    }
-                    .into(),
-                ),
-                border: Border {
-                    color: if activo {
-                        tema::acento()
-                    } else {
-                        tema::mezclar(
-                            tema::alfa(tema::tinta(), 0.18),
-                            tema::alfa(tema::tinta(), 0.45),
-                            hover,
-                        )
+            let previa = container(Space::new())
+                .width(Length::Fixed(ancho))
+                .height(Length::Fixed(alto))
+                .style(move |_| container::Style {
+                    // Solo se ve en el marco de 2 px que queda alrededor de lo que
+                    // compone el compositor —el fondo de pantalla y las ventanas—,
+                    // y entero mientras el fondo no haya podido cargarse.
+                    background: Some(
+                        Color {
+                            a: 0.92,
+                            ..tema::bg()
+                        }
+                        .into(),
+                    ),
+                    border: Border {
+                        color: if activo {
+                            tema::acento()
+                        } else {
+                            tema::mezclar(
+                                tema::alfa(tema::tinta(), 0.18),
+                                tema::alfa(tema::tinta(), 0.45),
+                                hover,
+                            )
+                        },
+                        width: if activo { 2.0 } else { 1.0 },
+                        radius: tema::R_BOTON_PEQUENO.into(),
                     },
-                    width: if activo { 2.0 } else { 1.0 },
-                    radius: tema::R_BOTON_PEQUENO.into(),
-                },
-                ..Default::default()
-            });
+                    ..Default::default()
+                });
 
             let texto_etiqueta = self
                 .editando
@@ -356,29 +359,36 @@ impl Escritorios {
                 .filter(|(j, _)| *j == i)
                 .map(|(_, s)| format!("{s}│"))
                 .unwrap_or_else(|| nombre.clone());
-            let etiqueta = container(
-                text(texto_etiqueta)
-                    .size(tema::T_CUERPO)
-                    // El activo es el único que va en blanco: el nombre es lo
-                    // que dice dónde estás cuando las cinco miniaturas se
-                    // parecen entre sí.
-                    // Todos en blanco: sobre la franja translúcida el gris
-                    // secundario se pierde contra el escritorio que se ve
-                    // debajo. Lo que separa al activo es el peso, no el color.
-                    .color(tema::texto())
-                    .font(iced_core::Font {
-                        weight: if activo {
-                            iced_core::font::Weight::Semibold
-                        } else {
-                            iced_core::font::Weight::Normal
-                        },
-                        ..iced_core::Font::DEFAULT
-                    })
-                    .align_x(Horizontal::Center),
-            )
+            // El hueco de la izquierda mide lo que la ✕: así el nombre sigue
+            // centrado en la miniatura aunque la ✕ ocupe el otro extremo.
+            let etiqueta = container(row![
+                Space::new().width(Length::Fixed(CERRAR)),
+                container(
+                    text(texto_etiqueta)
+                        .size(tema::T_CUERPO)
+                        // El activo es el único que va en blanco: el nombre es lo
+                        // que dice dónde estás cuando las cinco miniaturas se
+                        // parecen entre sí.
+                        // Todos en blanco: sobre la franja translúcida el gris
+                        // secundario se pierde contra el escritorio que se ve
+                        // debajo. Lo que separa al activo es el peso, no el color.
+                        .color(tema::texto())
+                        .font(iced_core::Font {
+                            weight: if activo {
+                                iced_core::font::Weight::Semibold
+                            } else {
+                                iced_core::font::Weight::Normal
+                            },
+                            ..iced_core::Font::DEFAULT
+                        })
+                        .align_x(Horizontal::Center)
+                )
+                .width(Length::Fill)
+                .align_x(Horizontal::Center),
+                cierre
+            ])
             .width(Length::Fixed(ancho))
             .height(Length::Fixed(NOMBRE_H))
-            .align_x(Horizontal::Center)
             .align_y(Vertical::Center)
             .style(move |_| container::Style {
                 background: editando.then_some(tema::hover().into()),

@@ -244,6 +244,7 @@ const PROPIOS: &[(&str, &[u8])] = &[
     ),
     ("tienda", include_bytes!("../assets/iconos/tienda.svg")),
     ("dormir", include_bytes!("../assets/iconos/dormir.svg")),
+    ("hibernar", include_bytes!("../assets/iconos/hibernar.svg")),
     (
         "reiniciar",
         include_bytes!("../assets/iconos/reiniciar.svg"),
@@ -257,6 +258,11 @@ const PROPIOS: &[(&str, &[u8])] = &[
     ),
     ("fijar", include_bytes!("../assets/iconos/fijar.svg")),
     ("cerrar", include_bytes!("../assets/iconos/cerrar.svg")),
+    ("ojo", include_bytes!("../assets/iconos/ojo.svg")),
+    (
+        "ojo-tachado",
+        include_bytes!("../assets/iconos/ojo-tachado.svg"),
+    ),
     // --- Los del centro de control ---------------------------------------
     ("avion", include_bytes!("../assets/iconos/avion.svg")),
     // --- Los perfiles de energía -----------------------------------------
@@ -506,6 +512,25 @@ const TEMAS: &[&str] = &[
     "hicolor",
     "Adwaita",
 ];
+/// El tema de iconos que el usuario eligió en Ajustes → Apariencia → Iconos
+/// (Claro, Oscuro o Tintados), que Ajustes deja en `icon-theme` de GSettings.
+///
+/// `TEMAS` no basta: solo conoce `BookOS-Light` y `BookOS`, así que el pack
+/// oscuro y `BookOS-Tinted`/`BookOS-Tinted-B` (Ajustes alterna los dos nombres
+/// para que GTK vea cada cambio de paleta) se aplicaban en las apps y no en el
+/// dock. Se lee por `gsettings` porque es donde Ajustes lo escribe; el nombre
+/// se descarta si no es un directorio simple, ya que acaba en una ruta.
+pub fn tema_elegido() -> Option<String> {
+    let salida = std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.interface", "icon-theme"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let texto = String::from_utf8(salida.stdout).ok()?;
+    let nombre = texto.trim().trim_matches('\'');
+    (!nombre.is_empty() && !nombre.contains(['/', '.'])).then(|| nombre.to_string())
+}
+
 /// Las categorías de freedesktop que usa el escritorio. `status` y
 /// `preferences` hacen falta para el panel: los iconos de aplicación viven en
 /// `apps`, pero los de batería y red están en `status`.
@@ -550,9 +575,9 @@ fn tamano_de(nombre: &str) -> Option<u32> {
 /// cada búsqueda posterior en un puñado de comprobaciones.
 ///
 /// Medido en esta máquina: buscar treinta iconos pasó de 31 ms a menos de 2.
-fn directorios() -> &'static [PathBuf] {
-    static DIRS: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
-    DIRS.get_or_init(|| {
+fn directorios() -> std::sync::Arc<Vec<PathBuf>> {
+    con_directorios(|| {
+        let elegido = tema_elegido();
         let mut dirs = Vec::new();
         for base in icon_dirs() {
             if !base.is_dir() {
@@ -560,7 +585,11 @@ fn directorios() -> &'static [PathBuf] {
             }
             // Los planos como /usr/share/pixmaps van tal cual, sin tema.
             dirs.push(base.clone());
-            for tema in TEMAS {
+            for tema in elegido
+                .iter()
+                .map(String::as_str)
+                .chain(TEMAS.iter().copied())
+            {
                 let raiz = base.join(tema);
                 let Ok(nivel1) = std::fs::read_dir(&raiz) else {
                     continue;
@@ -615,13 +644,35 @@ fn directorios() -> &'static [PathBuf] {
     })
 }
 
+fn con_directorios(construir: impl FnOnce() -> Vec<PathBuf>) -> std::sync::Arc<Vec<PathBuf>> {
+    let mut guardado = DIRS.lock().unwrap_or_else(|e| e.into_inner());
+    guardado
+        .get_or_insert_with(|| std::sync::Arc::new(construir()))
+        .clone()
+}
+
+/// Los directorios del tema elegido, que dependen de `icon-theme` y por eso
+/// se pueden tirar: Ajustes cambia el tema sin reiniciar la sesión.
+static DIRS: std::sync::Mutex<Option<std::sync::Arc<Vec<PathBuf>>>> = std::sync::Mutex::new(None);
+
+/// Olvida el tema de iconos leído y todos los iconos ya cargados, para que la
+/// próxima búsqueda mire el `icon-theme` de ahora. Sin esto el dock se quedaba
+/// con los iconos del arranque: `directorios()` y `CACHE` valen para toda la
+/// sesión y Ajustes alterna `BookOS-Tinted`/`-B` justo para que se note el cambio.
+pub fn recargar_tema() {
+    *DIRS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    if let Some(cache) = CACHE.get() {
+        cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+}
+
 pub fn resolve_icon(name: &str) -> Option<PathBuf> {
     // Un nombre puede venir ya como ruta absoluta desde un `.desktop`.
     if name.starts_with('/') {
         let p = PathBuf::from(name);
         return p.is_file().then_some(p);
     }
-    for dir in directorios() {
+    for dir in directorios().iter() {
         for ext in ["svg", "png", "xpm"] {
             let p = dir.join(format!("{name}.{ext}"));
             if p.is_file() {

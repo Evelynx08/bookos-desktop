@@ -1,0 +1,29 @@
+#!/bin/sh
+# Lunar Lake (Core Ultra 7 258V) sale de un s2idle largo con la CPU clavada a
+# 400 MHz: el firmware cuenta la energía del reposo dentro de la media de PL1
+# y cree que el paquete se ha pasado del límite. La media es de 48 s en esta
+# máquina, así que la limitación dura hasta que esa ventana se vacía, y con el
+# perfil de ahorro en batería (PL1 = 7 W) no llega a vaciarse nunca mientras se
+# usa el equipo.
+#
+# Acortar la ventana a 125 ms justo al reanudar tira esa media vieja; pasados
+# unos segundos se devuelve la original para no cambiar el comportamiento
+# normal de turbo. Descrito en linux-pm (sept. 2026), sin parche en el kernel.
+#
+# Instalar: sudo install -m755 data/system-sleep/bookos-rapl-tau /usr/lib/systemd/system-sleep/
+
+[ "$1" = post ] || exit 0
+
+tau=/sys/class/powercap/intel-rapl-mmio:0/constraint_0_time_window_us
+[ -w "$tau" ] || exit 0
+
+original=$(cat "$tau")
+# Otro despertar dentro de los 8 s: la restauración anterior sigue pendiente y
+# trae el valor bueno; leerlo ahora guardaría el corto como «original». Se
+# compara por debajo de 1 s porque el hardware redondea lo que se escribe.
+[ "$original" -lt 1000000 ] && exit 0
+echo 125000 > "$tau"
+# systemd-sleep espera a sus hooks con las sesiones congeladas: un `sleep`
+# aquí congelaría el escritorio esos segundos. La restauración va aparte.
+systemd-run --quiet --on-active=8s \
+    sh -c "echo $original > $tau"

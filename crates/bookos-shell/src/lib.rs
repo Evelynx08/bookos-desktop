@@ -44,7 +44,7 @@ mod emergente;
 /// fondo, por debajo de las ventanas, y le da los clics que no son de nadie.
 pub mod escritorio;
 pub mod fondos;
-mod icono;
+pub mod icono;
 /// El logo, incrustado en el binario. Público porque el "Acerca de" del menú
 /// lo pinta grande.
 pub mod marca;
@@ -79,12 +79,13 @@ pub enum PiezaCaptura {
 pub use emergente::RADIO_MINIATURA_ESCRITORIO;
 /// Un cambio de vista del launchpad que anima el compositor. Público porque es
 /// él quien tiene las dos superficies que hay que cruzar.
-pub use emergente::launchpad::Transicion as TransicionLaunchpad;
+pub use emergente::Transicion as TransicionLaunchpad;
 /// Cuánto hay que mover el ratón para que un clic pase a ser un arrastre. Lo
 /// comparten el launchpad y el dock: el gesto es el mismo y con dos umbrales
 /// distintos sacar un icono del dock respondería antes o después que moverlo
 /// por la rejilla.
 pub use emergente::launchpad::UMBRAL_ARRASTRE;
+pub use emergente::mantener_despierto;
 pub use emergente::{Ancla, Emergente, ModoProyeccion, PantallaCompartible};
 /// El icono ya cargado de una aplicación. Sale al exterior porque el conmutador
 /// lo arma el compositor, que conoce las ventanas pero no el tema de iconos.
@@ -122,9 +123,10 @@ pub fn entrada_de_ventana(app_id: &str, titulo: &str) -> conmutador::Entrada {
 
 pub use config::{
     Actividades as ConfigActividades, Bloqueo as ConfigBloqueo, BrilloAutomatico, Config, Efectos,
-    Entrada, MAXIMO_ESCRITORIOS, guardar_apariencia, guardar_brillo_automatico,
-    guardar_configuracion, guardar_dock, guardar_efectos, guardar_escritorios, guardar_esquiva,
-    guardar_fondo, olvidar_fondo,
+    Entrada, FuenteReloj, LuzNocturna, MAXIMO_ESCRITORIOS, ModoLuzNocturna, Pasos,
+    guardar_apariencia, guardar_brillo_automatico, guardar_configuracion, guardar_dock,
+    guardar_efectos, guardar_escritorios, guardar_esquiva, guardar_fondo, guardar_luz_nocturna,
+    luz_nocturna_encendida, marcar_luz_nocturna, olvidar_fondo,
 };
 pub use dock::{
     Dock, DockItem, ICON as DOCK_ICON, MARGIN as DOCK_MARGIN, PAD as DOCK_PAD,
@@ -237,6 +239,12 @@ pub enum Accion {
         id: u32,
         clave: String,
     },
+    /// La respuesta escrita en la caja de «Responder» de una notificación. El
+    /// compositor la entrega a la aplicación por `NotificationReplied`.
+    NotificacionRespuesta {
+        id: u32,
+        texto: String,
+    },
     /// Vaciar la cola entera.
     BorrarNotificaciones,
     /// Echar la pantalla de bloqueo. La del propio compositor, no la de KDE.
@@ -267,6 +275,13 @@ pub enum Accion {
     AlternarEfectos,
     /// Qué luces siguen al sensor, con el estado entero como `Apariencia`.
     BrilloAutomatico(config::BrilloAutomatico),
+    /// Encender (`true`) o apagar la luz nocturna. Con horario vale hasta el
+    /// próximo borde; ver `bookos-comp/src/luz_nocturna.rs`.
+    LuzNocturna(bool),
+    /// Reprogramar las alarmas de inactividad al cambiar el inhibidor del shell.
+    MantenerDespierto,
+    PerfilEnergia(&'static str),
+    AbrirCaptura,
     /// Crear una carpeta en el escritorio, del menú de clic derecho.
     EscritorioNuevaCarpeta,
     /// Mandar lo seleccionado del escritorio a la papelera, del mismo menú.
@@ -294,6 +309,10 @@ impl Accion {
                 // El botón «A» se pulsa para ver cómo queda: cerrar la tarjeta
                 // escondería justo el nivel que acaba de cambiar.
                 | Self::BrilloAutomatico(_)
+                // Lo mismo: se enciende para ver cómo queda.
+                | Self::LuzNocturna(_)
+                | Self::MantenerDespierto
+                | Self::PerfilEnergia(_)
                 | Self::Actividad(_)
                 // Anclar arrastrando **no** cierra el launchpad: la mano está
                 // ahí para poner varias, y cerrarse tras la primera obligaría a
@@ -322,6 +341,8 @@ fn emergente_de(nombre: &str) -> Option<fn() -> Emergente> {
         // esa otra tarjeta del shell» y no hacía falta un segundo.
         "apariencia" => Some(Emergente::apariencia),
         "apagar" => Some(Emergente::apagar),
+        // El logo del panel lo abre por su zona fija; esto es para el atajo.
+        "menu" => Some(Emergente::menu),
         _ => None,
     }
 }
@@ -470,6 +491,24 @@ pub fn mismo_programa(lanzador: &str, ventana: &str) -> bool {
             .is_some_and(|ultimo| ultimo.eq_ignore_ascii_case(lanzador))
 }
 
+/// ¿La actividad publicada con ese `app_id` es de la app que tiene esa ventana?
+///
+/// Las apps publican con el identificador de Tauri (`com.bookos.calendar`) y su
+/// ventana sale con el nombre del binario (`bookos-calendar`), o con el mismo
+/// identificador según cómo la abra GTK. Se comparan por lo que queda al quitar
+/// `com.bookos.` / `bookos-` y los guiones, que también junta
+/// `systemmonitor` con `bookos-system-monitor`.
+fn es_de_la_app(actividad: &str, ventana: &str) -> bool {
+    let nombre = |id: &str| {
+        id.strip_prefix("com.bookos.")
+            .or_else(|| id.strip_prefix("bookos-"))
+            .unwrap_or(id)
+            .replace('-', "")
+            .to_ascii_lowercase()
+    };
+    mismo_programa(actividad, ventana) || nombre(actividad) == nombre(ventana)
+}
+
 /// Las teclas que le importan al shell.
 ///
 /// Es un enum propio y diminuto en vez del keysym de xkb porque el shell no
@@ -496,8 +535,11 @@ pub enum TeclaPulsada {
     /// las flechas recorren la rejilla.
     Tabulador,
     Retroceso,
-    /// Ctrl+Retroceso: vaciar el campo de texto de una vez.
+    /// Ctrl+Retroceso. El launchpad vacía con ella el campo entero; el
+    /// buscador borra la última palabra.
     BorrarTodo,
+    /// Ctrl+A. Solo la entiende el buscador; el resto la ignora.
+    SeleccionarTodo,
     Caracter(char),
 }
 
@@ -678,6 +720,9 @@ pub struct Shell {
     /// La actividad que el usuario pasó a la píldora pulsando su burbuja. Sin
     /// elección, o si la elegida terminó, manda la prioridad.
     actividad_principal: Option<String>,
+    /// El `app_id` de la ventana con el foco, que pone el compositor: el shell
+    /// no ve el foco. Sirve para no enseñar en la isla lo que ya se está viendo.
+    app_enfocada: Option<String>,
 
     /// Las notificaciones que han llegado. Las recibe el compositor por D-Bus
     /// y las deja aquí; el panel y su tarjeta las leen de un solo sitio.
@@ -708,6 +753,9 @@ pub struct Shell {
 
 impl Shell {
     pub fn new(width: u32, scale: f32) -> Self {
+        // Aquí y no en `con_config`: el canal sale de ficheros de la máquina,
+        // igual que `panel.conf`, y los tests no deben depender de ellos.
+        marca::aplicar_canal(marca::Canal::leer());
         Self::con_config(width, scale, Config::cargar())
     }
 
@@ -786,6 +834,7 @@ impl Shell {
             actividad: None,
             actividades: std::collections::HashMap::new(),
             actividad_principal: None,
+            app_enfocada: None,
             barras: std::collections::HashMap::new(),
             // Sin alto todavía: lo sabe el compositor y llega por
             // `escritorio_pantalla` antes del primer frame.
@@ -961,13 +1010,36 @@ impl Shell {
         }
         // La portada pesa cientos de KB. El Player solo la reenvía al cambiar
         // de canción y las actualizaciones de posición llegan vacías.
-        if estado.portada.is_none() {
-            estado.portada = self
-                .actividades
-                .get(&estado.app_id)
-                .and_then(|anterior| anterior.portada.clone());
+        //
+        // Las de la cola se heredan igual. Sin eso solo vivían en la tarjeta ya
+        // construida, y cada vez que la isla se rehace —la app recupera el foco
+        // y lo suelta, otra actividad le quita la píldora— la cola salía sin
+        // carátulas hasta el siguiente reenvío del Player, hasta 30 s después.
+        //
+        // Se mueven en vez de clonarse: el estado anterior se va a sustituir.
+        if let Some(mut anterior) = self.actividades.remove(&estado.app_id) {
+            if estado.portada.is_none() {
+                estado.portada = anterior.portada.take();
+            }
+            for item in estado.cola.iter_mut().filter(|i| i.portada.is_none()) {
+                item.portada = anterior
+                    .cola
+                    .iter_mut()
+                    .find(|a| a.id == item.id)
+                    .and_then(|a| a.portada.take());
+            }
         }
         self.actividades.insert(estado.app_id.clone(), estado);
+        self.sincronizar_actividad();
+    }
+
+    /// Dice qué aplicación tiene el foco. Su actividad se esconde de la isla
+    /// mientras esté delante y vuelve al salir de ella.
+    pub fn poner_app_enfocada(&mut self, app_id: Option<String>) {
+        if self.app_enfocada == app_id {
+            return;
+        }
+        self.app_enfocada = app_id;
         self.sincronizar_actividad();
     }
 
@@ -975,12 +1047,27 @@ impl Shell {
         let prioridad = |e: &actividad::Estado| match e.clase {
             actividad::Clase::Recorder => 40,
             actividad::Clase::Timer if e.restante_ms < 0 => 30,
+            // Un aviso de clase pide atención como un temporizador vencido, pero
+            // la grabadora en marcha manda más: no se puede perder un audio.
+            actividad::Clase::Calendar => 35,
             actividad::Clase::Timer => 20,
+            actividad::Clase::Transfer => 15,
+            // Dura unos segundos al sacarlos: por encima de la música, que
+            // sigue ahí cuando se cierre.
+            actividad::Clase::Auriculares => 12,
             actividad::Clase::Player => 10,
+            // Ambiental: nunca le quita la píldora a algo que esté pasando.
+            actividad::Clase::Monitor => 5,
         };
         let mut vivas: Vec<&actividad::Estado> = self
             .actividades
             .values()
+            .filter(|e| {
+                !self
+                    .app_enfocada
+                    .as_deref()
+                    .is_some_and(|ventana| es_de_la_app(&e.app_id, ventana))
+            })
             .filter(|e| {
                 e.clase != actividad::Clase::Timer
                     || self.actividades_config.temporizador_siempre
@@ -1091,17 +1178,6 @@ impl Shell {
             .map_or((0.0, 1.0, 0.0), |(a, _)| a.entrada())
     }
 
-    pub fn actividad_puntero(&mut self, punto: Option<(f32, f32)>) -> bool {
-        let cambio = self
-            .actividad
-            .as_mut()
-            .is_some_and(|(a, _)| a.puntero(punto));
-        if cambio && let Some((_, c)) = self.actividad.as_mut() {
-            c.painted_once = false;
-        }
-        cambio
-    }
-
     /// La parte visible de la isla como `(x, ancho)` dentro de la tarjeta.
     pub fn actividad_zona(&self) -> Option<(f32, f32)> {
         self.actividad.as_ref().map(|(a, _)| a.zona())
@@ -1145,6 +1221,10 @@ impl Shell {
         let (w, h) = actividad.size();
         *canvas = Canvas::new(Size::new(w, h), self.panel.scale);
         true
+    }
+
+    pub fn actividad_abierta(&self) -> bool {
+        self.actividad.as_ref().is_some_and(|(a, _)| a.desplegada())
     }
 
     pub fn recoger_actividad(&mut self) -> bool {
@@ -1232,6 +1312,7 @@ impl Shell {
             {
                 sobra.descartar();
             }
+            self.ordenar_pila();
         }
         self.notificaciones.añadir(notificacion);
         self.sincronizar_notificaciones();
@@ -1244,6 +1325,7 @@ impl Shell {
     /// alguno.
     pub fn toasts_vivos(&mut self) -> bool {
         self.toasts.retain(|(t, _)| t.queda().is_some());
+        self.ordenar_pila();
         !self.toasts.is_empty()
     }
 
@@ -1263,10 +1345,30 @@ impl Shell {
         self.toasts.iter().find(|(t, _)| t.id() == id)
     }
 
-    /// Alfa, escala, peso en la pila y alto de la tarjeta del aviso `id`.
-    pub fn toast_estado(&self, id: u32) -> Option<(f32, f32, f32, f32)> {
+    /// Alfa, escala y cuánto baja el aviso `id`, en lógicos, por su sitio en la
+    /// pila.
+    pub fn toast_estado(&self, id: u32) -> Option<(f32, f32, f32)> {
         self.toast(id)
-            .map(|(t, _)| (t.alfa(), t.escala(), t.peso(), t.alto_tarjeta()))
+            .map(|(t, _)| (t.alfa(), t.escala(), t.desplazamiento()))
+    }
+
+    /// Los avisos en el orden en que hay que componerlos: el de delante
+    /// primero, porque en la lista de elementos de Smithay el primero queda
+    /// encima. Los que se están yendo van antes que los demás de su nivel: se
+    /// desvanecen por encima del que sube a ocupar su sitio.
+    pub fn toasts_para_componer(&self) -> Vec<u32> {
+        let mut orden: Vec<_> = self.toasts.iter().map(|(t, _)| t).collect();
+        orden.sort_by_key(|t| (t.profundidad(), !t.saliendo()));
+        orden.into_iter().map(|t| t.id()).collect()
+    }
+
+    /// El aviso de delante, el único que se pulsa.
+    pub fn toast_de_delante(&self) -> Option<u32> {
+        self.toasts
+            .iter()
+            .map(|(t, _)| t)
+            .find(|t| t.profundidad() == 0 && !t.saliendo())
+            .map(|t| t.id())
     }
 
     pub fn toasts_animando(&self) -> bool {
@@ -1277,7 +1379,7 @@ impl Shell {
         self.toast(id).is_some_and(|(_, c)| !c.painted_once)
     }
 
-    pub fn toast_accion_relativa(&self, id: u32, x: f32, y: f32) -> Option<String> {
+    pub fn toast_accion_relativa(&self, id: u32, x: f32, y: f32) -> Option<toast::Pulsado> {
         self.toast(id).and_then(|(t, _)| t.accion_en(x, y))
     }
 
@@ -1300,9 +1402,40 @@ impl Shell {
         match self.toasts.iter_mut().find(|(t, _)| t.id() == id) {
             Some((t, _)) => {
                 t.descartar();
+                self.ordenar_pila();
                 true
             }
             None => false,
+        }
+    }
+
+    /// Reparte los niveles de la pila: el primero que no se está yendo va
+    /// delante y cada uno de los siguientes un nivel más al fondo. Los de atrás
+    /// toman el alto del de delante, y un aviso que cambia de nivel o de alto
+    /// se repinta —y se recrea su lienzo si el tamaño ya no es el mismo—.
+    fn ordenar_pila(&mut self) {
+        let alto_cabeza = self
+            .toasts
+            .iter()
+            .find(|(t, _)| !t.saliendo())
+            .map(|(t, _)| t.alto_propio());
+        let mut nivel = 0;
+        for (t, canvas) in &mut self.toasts {
+            let (profundidad, fijo) = if t.saliendo() {
+                (0, None)
+            } else {
+                nivel += 1;
+                (nivel - 1, alto_cabeza.filter(|_| nivel > 1))
+            };
+            if !t.colocar(profundidad, fijo) {
+                continue;
+            }
+            let (w, h) = t.size();
+            let objetivo = Size::new(w, h);
+            if canvas.size != objetivo {
+                *canvas = Canvas::new(objetivo, self.panel.scale);
+            }
+            canvas.painted_once = false;
         }
     }
 
@@ -1402,6 +1535,17 @@ impl Shell {
         true
     }
 
+    /// Abre la caja de respuesta de la notificación `id`. `false` si ya no está
+    /// en la lista: la pudo cerrar su aplicación mientras se pulsaba el botón.
+    pub fn abrir_respuesta(&mut self, id: u32) -> bool {
+        let Some(n) = self.notificaciones.lista().iter().find(|n| n.id == id) else {
+            return false;
+        };
+        let emergente = Emergente::respuesta(id, &n.app, &n.resumen);
+        self.abrir(emergente);
+        true
+    }
+
     pub fn notificaciones(&self) -> &[notificaciones::Notificacion] {
         self.notificaciones.lista()
     }
@@ -1455,6 +1599,9 @@ impl Shell {
         tema::aplicar(tema_nuevo);
         tema::aplicar_acento(acento);
         self.theme = view::theme();
+        // Ajustes avisa con esta misma sección al cambiar el estilo de iconos.
+        icono::recargar_tema();
+        self.dock_items.recargar_iconos();
         for canvas in [
             Some(&mut self.panel),
             Some(&mut self.dock),
@@ -1472,6 +1619,16 @@ impl Shell {
             // construidos, con el color de antes dentro.
             canvas.cache = None;
         }
+    }
+
+    /// Cambia el color del logo del panel al del canal de actualizaciones.
+    pub fn aplicar_canal(&mut self, canal: marca::Canal) {
+        if canal == marca::canal_actual() {
+            return;
+        }
+        marca::aplicar_canal(canal);
+        self.panel.painted_once = false;
+        self.panel.cache = None;
     }
 
     /// Cuánto falta para que algún widget tenga algo nuevo que enseñar.
@@ -1778,17 +1935,9 @@ impl Shell {
         cambio
     }
 
-    /// El cambio de vista del launchpad que el compositor todavía no ha
-    /// animado, si lo hay. Se lo lleva quien pregunta.
-    ///
-    /// El launchpad no anima nada por su cuenta —rasterizar la rejilla cuesta
-    /// 11 ms— y esto es cómo lo pide: el compositor guarda la superficie de
-    /// antes, deja que se pinte la de después y cruza las dos en la GPU.
-    pub fn launchpad_transicion(&mut self) -> Option<emergente::launchpad::Transicion> {
-        match self.emergente.as_mut() {
-            Some((Emergente::Launchpad(l), _)) => l.tomar_transicion(),
-            _ => None,
-        }
+    /// El compositor conserva la superficie anterior para animar el cambio.
+    pub fn launchpad_transicion(&mut self) -> Option<emergente::Transicion> {
+        self.emergente.as_mut()?.0.tomar_transicion()
     }
 
     /// ¿El realce tiene que ir **por delante** del buffer de la emergente?
@@ -2316,15 +2465,16 @@ impl Shell {
     /// Abre el conmutador con las celdas por orden de uso reciente.
     ///
     /// La lista la arma el compositor: el shell no ve el foco ni las ventanas.
-    /// Con menos de dos **celdas** no se abre —no hay nada que conmutar— y el
-    /// compositor lo sabe porque esto devuelve `false`.
+    /// Sin **celdas** no se abre y el compositor lo sabe porque esto devuelve
+    /// `false`. Con una sola sí: sirve para ver qué hay abierto, aunque no haya
+    /// a dónde ir.
     pub fn abrir_conmutador(
         &mut self,
         modo: conmutador::Modo,
         apps: Vec<conmutador::Entrada>,
         pantalla: (f32, f32),
     ) -> bool {
-        if apps.len() < 2 {
+        if apps.is_empty() {
             return false;
         }
         let c = conmutador::Conmutador::new(modo, apps, pantalla);
@@ -3005,5 +3155,69 @@ mod pruebas_esquinas {
         redondear_esquinas(&mut rgba, 4, 4, 2.0, Alfa::Recto);
         assert_eq!(&rgba[..3], [200, 200, 200]);
         assert!(rgba[3] < 200);
+    }
+
+    /// La isla enseña lo de las demás apps, no lo de la que tienes delante.
+    #[test]
+    fn la_actividad_se_empareja_con_la_ventana_de_su_app() {
+        assert!(es_de_la_app("com.bookos.calendar", "bookos-calendar"));
+        assert!(es_de_la_app("com.bookos.calendar", "com.bookos.calendar"));
+        assert!(es_de_la_app(
+            "com.bookos.systemmonitor",
+            "bookos-system-monitor"
+        ));
+        assert!(!es_de_la_app("com.bookos.calendar", "bookos-clock"));
+        assert!(!es_de_la_app("com.bookos.calendar", "konsole"));
+    }
+}
+
+#[cfg(test)]
+mod pruebas_actividades {
+    use super::*;
+    use actividad::{Clase, Estado, ItemCola, Portada};
+
+    fn estado(portada_cola: Option<Portada>) -> Estado {
+        Estado {
+            app_id: "com.bookos.player".into(),
+            clase: Clase::Player,
+            activo: true,
+            pausado: false,
+            titulo: "Pista".into(),
+            subtitulo: "Artista".into(),
+            posicion_ms: 0,
+            duracion_ms: 60_000,
+            restante_ms: 0,
+            volumen: 50,
+            nivel: 0.0,
+            aleatorio: false,
+            repetir: false,
+            portada: None,
+            cola: vec![ItemCola {
+                id: "/pista.flac".into(),
+                titulo: "Pista".into(),
+                artista: "Artista".into(),
+                duracion_ms: 0,
+                favorita: false,
+                actual: true,
+                portada: portada_cola,
+            }],
+            metricas: Vec::new(),
+        }
+    }
+
+    /// La isla se rehace desde el estado guardado cada vez que la app suelta
+    /// el foco: si el latido sin carátulas las borrara de ahí, la cola saldría
+    /// vacía hasta el siguiente reenvío del reproductor.
+    #[test]
+    fn un_latido_sin_caratulas_no_borra_las_de_la_cola() {
+        let mut shell = Shell::con_config(1280, 1.0, Config::default());
+        shell.publicar_actividad(estado(Some(Portada {
+            rgba: vec![90; 32 * 32 * 4],
+            width: 32,
+            height: 32,
+        })));
+        shell.publicar_actividad(estado(None));
+        let guardado = &shell.actividades["com.bookos.player"];
+        assert!(guardado.cola[0].portada.is_some());
     }
 }

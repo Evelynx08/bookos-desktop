@@ -89,12 +89,12 @@ impl Fundido {
     }
 
     pub fn terminado(&self) -> bool {
-        self.inicio.elapsed() >= tema::D_PAGINA
+        self.inicio.elapsed() >= tema::D_TEMA
     }
 
     /// La foto de este fotograma, encima de todo y cada vez más transparente.
     pub fn elemento(&self, contexto: &ContextId<GlesTexture>) -> TextureRenderElement<GlesTexture> {
-        let t = tema::C_SUAVE.eval(tema::avance(self.inicio.elapsed(), tema::D_PAGINA));
+        let t = tema::C_TEMA.eval(tema::avance(self.inicio.elapsed(), tema::D_TEMA));
         TextureRenderElement::from_static_texture(
             self.id.clone(),
             contexto.clone(),

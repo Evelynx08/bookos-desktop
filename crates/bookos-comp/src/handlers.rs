@@ -139,6 +139,7 @@ impl CompositorHandler for BookosComp {
         self.send_initial_configure(&window, &root);
         self.colocar_si_es_nueva(&window);
         if crate::ventanas::tamano_nuevo(&window) {
+            self.recolocar_si_creció(&window);
             self.revisar_barras();
         }
         self.needs_redraw = true;
@@ -711,6 +712,13 @@ impl SeatHandler for BookosComp {
         let cliente = focused.and_then(|s| self.display_handle.get_client(s.id()).ok());
         set_data_device_focus(&self.display_handle, seat, cliente.clone());
         set_primary_focus(&self.display_handle, seat, cliente);
+        let app = focused
+            .and_then(|s| self.window_for_surface(s))
+            .and_then(|w| app_id(&w));
+        if let Some(shell) = self.shell.as_mut() {
+            shell.poner_app_enfocada(app);
+        }
+        self.needs_redraw = true;
     }
 
     fn cursor_image(
@@ -801,44 +809,95 @@ impl smithay::wayland::dmabuf::DmabufHandler for BookosComp {
     }
 }
 
-impl SelectionHandler for BookosComp {
-    /// Lo que el compositor pone en el portapapeles cuando el dueño es él.
-    ///
-    /// Hoy solo lo usa la captura de pantalla, y por eso son bytes a secas: el
-    /// tipo de contenido va aparte, en la lista de tipos MIME que se anuncia al
-    /// poner la selección. Es un `Arc` porque el mismo contenido lo puede pedir
-    /// más de un cliente y no tiene sentido copiarlo por cada pegado.
-    type SelectionUserData = std::sync::Arc<Vec<u8>>;
+/// Una selección cuyo dueño, a ojos de los clientes Wayland, es el compositor.
+#[derive(Clone)]
+pub enum Seleccion {
+    /// Bytes propios: hoy, la captura de pantalla.
+    Bytes(std::sync::Arc<Vec<u8>>),
+    /// La puso un programa X11. XWayland entero es un solo cliente y no tiene
+    /// `wl_data_device` propio: el puente es el gestor de ventanas, y cuando
+    /// alguien pega hay que pedírsela a él.
+    X11,
+}
 
-    /// Un cliente pega: le escribimos el contenido por el descriptor que trae.
-    ///
-    /// **En un hilo aparte, y no aquí.** Un pipe tiene 64 KB de buffer y una
-    /// captura son varios megas: escribirla desde el bucle dejaría el
-    /// compositor bloqueado hasta que el otro extremo terminara de leer, o sea
-    /// el escritorio congelado mientras pegas. El hilo se muere solo al acabar.
+/// Escribe `datos` por el descriptor de quien pega.
+///
+/// **En un hilo aparte, y no aquí.** Un pipe tiene 64 KB de buffer y una
+/// captura son varios megas: escribirla desde el bucle dejaría el compositor
+/// bloqueado hasta que el otro extremo terminara de leer, o sea el escritorio
+/// congelado mientras pegas. El hilo se muere solo al acabar.
+pub fn escribir_seleccion(
+    datos: std::sync::Arc<Vec<u8>>,
+    mime_type: String,
+    fd: std::os::fd::OwnedFd,
+) {
+    let hilo = std::thread::Builder::new()
+        .name("portapapeles".into())
+        .spawn(move || {
+            use smithay::reexports::rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+            use std::io::Write;
+            // El pipe que abre el gestor X11 viene con `O_NONBLOCK` y el hilo
+            // está para bloquearse: sin quitarlo, `write_all` se topa con
+            // `EAGAIN` al llenar el buffer y a X11 llegaban 65 536 bytes de una
+            // captura de 434 478.
+            if let Ok(flags) = fcntl_getfl(&fd) {
+                let _ = fcntl_setfl(&fd, flags - OFlags::NONBLOCK);
+            }
+            let mut destino = std::fs::File::from(fd);
+            if let Err(err) = destino.write_all(&datos).and_then(|()| destino.flush()) {
+                // Que el otro lado cierre antes de leerlo todo es normal
+                // —hay clientes que solo miran la cabecera—, así que esto
+                // se cuenta y no se grita.
+                tracing::debug!(%mime_type, "el pegado se cortó: {err}");
+            }
+        });
+    if let Err(err) = hilo {
+        tracing::error!("no se pudo lanzar el hilo del portapapeles: {err}");
+    }
+}
+
+impl SelectionHandler for BookosComp {
+    /// Es un `Arc` dentro porque el mismo contenido lo puede pedir más de un
+    /// cliente y no tiene sentido copiarlo por cada pegado.
+    type SelectionUserData = Seleccion;
+
+    /// Un cliente Wayland cambia la selección: X11 tiene que enterarse, o lo
+    /// copiado en Firefox no llega nunca a VirtualBox ni a nada que vaya por
+    /// XWayland. Con `None` el gestor suelta la selección X11 si era suya.
+    fn new_selection(
+        &mut self,
+        ty: smithay::wayland::selection::SelectionTarget,
+        source: Option<smithay::wayland::selection::SelectionSource>,
+        _seat: Seat<Self>,
+    ) {
+        if let Some(xwm) = self.xwm.as_mut()
+            && let Err(err) = xwm.new_selection(ty, source.map(|s| s.mime_types()))
+        {
+            tracing::warn!(?ty, "no se pudo pasar la selección a X11: {err}");
+        }
+    }
+
+    /// Un cliente Wayland pega algo cuyo dueño somos nosotros.
     fn send_selection(
         &mut self,
-        _ty: smithay::wayland::selection::SelectionTarget,
+        ty: smithay::wayland::selection::SelectionTarget,
         mime_type: String,
         fd: std::os::fd::OwnedFd,
         _seat: Seat<Self>,
         datos: &Self::SelectionUserData,
     ) {
-        let datos = datos.clone();
-        let hilo = std::thread::Builder::new()
-            .name("portapapeles".into())
-            .spawn(move || {
-                use std::io::Write;
-                let mut destino = std::fs::File::from(fd);
-                if let Err(err) = destino.write_all(&datos).and_then(|()| destino.flush()) {
-                    // Que el otro lado cierre antes de leerlo todo es normal
-                    // —hay clientes que solo miran la cabecera—, así que esto
-                    // se cuenta y no se grita.
-                    tracing::debug!(%mime_type, "el pegado se cortó: {err}");
+        match datos {
+            Seleccion::Bytes(datos) => escribir_seleccion(datos.clone(), mime_type, fd),
+            Seleccion::X11 => {
+                let Some(xwm) = self.xwm.as_mut() else {
+                    // XWayland murió con la selección puesta: el `fd` se cierra
+                    // al soltarlo y quien pega recibe vacío.
+                    return;
+                };
+                if let Err(err) = xwm.send_selection(ty, mime_type, fd, self.loop_handle.clone()) {
+                    tracing::warn!(?ty, "no se pudo leer la selección de X11: {err}");
                 }
-            });
-        if let Err(err) = hilo {
-            tracing::error!("no se pudo lanzar el hilo del portapapeles: {err}");
+            }
         }
     }
 }
@@ -937,8 +996,9 @@ impl IdleInhibitHandler for BookosComp {
 
     fn uninhibit(&mut self, surface: WlSurface) {
         self.idle_inhibidores.retain(|actual| actual != &surface);
-        self.idle_notifier_state
-            .set_is_inhibited(!self.idle_inhibidores.is_empty());
+        self.idle_notifier_state.set_is_inhibited(
+            !self.idle_inhibidores.is_empty() || bookos_shell::mantener_despierto(),
+        );
         if self.idle_inhibidores.is_empty() {
             self.last_input = Some(std::time::Instant::now());
         }

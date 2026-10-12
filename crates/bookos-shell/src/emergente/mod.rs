@@ -38,10 +38,22 @@ mod menu_dock;
 mod notificaciones;
 mod proyeccion;
 mod red;
+mod respuesta;
 mod sonido;
+
+use std::sync::LazyLock;
 
 use crate::Accion;
 use crate::view::PanelElement;
+
+/// Español si la sesión va en español, inglés en cualquier otro idioma: la
+/// misma regla que `apps.rs` con el `Name[es]` de los `.desktop`.
+static ES: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("LANG").is_ok_and(|l| l.starts_with("es")));
+
+fn t(es: &'static str, en: &'static str) -> &'static str {
+    if *ES { es } else { en }
+}
 
 /// Dónde se coloca una superficie emergente.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -99,6 +111,22 @@ pub(crate) fn notificaciones_con(
     notificaciones::Notificaciones::con_silencio(silencio)
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Transicion {
+    /// Se ha entrado en una carpeta: el panel crece y la rejilla se aparta.
+    AbrirCarpeta,
+    /// Se ha salido: al revés y sin muelle, que rebotar al salir se lee como
+    /// que la carpeta no quería cerrarse.
+    CerrarCarpeta,
+    /// Lo de dentro ha cambiado sin cambiar de vista —el color de la carpeta,
+    /// una aplicación que se quita, el modo edición—: fundido y nada más.
+    Fundido,
+    AbrirDetalle(iced_core::Rectangle),
+    CerrarDetalle(iced_core::Rectangle),
+}
+
+pub use centro::mantener_despierto;
+
 pub enum Emergente {
     Menu(menu::Menu),
     Apariencia(apariencia::Apariencia),
@@ -115,6 +143,7 @@ pub enum Emergente {
     Bluetooth(bluetooth::Bluetooth),
     Launchpad(launchpad::Launchpad),
     Buscador(buscador::Buscador),
+    Respuesta(respuesta::Respuesta),
     Escritorios(escritorios::Escritorios),
     Proyeccion(proyeccion::Proyeccion),
     Compartir(compartir::Compartir),
@@ -206,6 +235,11 @@ impl Emergente {
         Self::Buscador(buscador::Buscador::new(pantalla))
     }
 
+    /// La caja para responder a la notificación `id` sin abrir su aplicación.
+    pub fn respuesta(id: u32, app: &str, resumen: &str) -> Self {
+        Self::Respuesta(respuesta::Respuesta::new(id, app, resumen))
+    }
+
     pub fn escritorios(pantalla: (f32, f32), activo: usize, nombres: Vec<String>) -> Self {
         Self::Escritorios(escritorios::Escritorios::new(pantalla, activo, nombres))
     }
@@ -243,6 +277,7 @@ impl Emergente {
             Self::Bluetooth(_) => "bluetooth",
             Self::Launchpad(_) => "launchpad",
             Self::Buscador(_) => "buscador",
+            Self::Respuesta(_) => "respuesta",
             Self::Escritorios(_) => "escritorios",
             Self::Proyeccion(_) => "proyeccion",
             Self::Compartir(_) => "compartir",
@@ -267,6 +302,7 @@ impl Emergente {
             Self::Bluetooth(b) => b.size(),
             Self::Launchpad(l) => l.size(),
             Self::Buscador(b) => b.size(),
+            Self::Respuesta(r) => r.size(),
             Self::Escritorios(e) => e.size(),
             Self::Proyeccion(p) => p.size(),
             Self::Compartir(c) => c.size(),
@@ -305,6 +341,7 @@ impl Emergente {
             Self::Bluetooth(b) => b.ancla(),
             Self::Launchpad(l) => l.ancla(),
             Self::Buscador(b) => b.ancla(),
+            Self::Respuesta(r) => r.ancla(),
             Self::Escritorios(e) => e.ancla(),
             Self::Proyeccion(p) => p.ancla(),
             Self::Compartir(c) => c.ancla(),
@@ -323,6 +360,7 @@ impl Emergente {
             Self::Sonido(s) => s.refrescar(),
             Self::Centro(c) => c.refrescar(),
             Self::Brillo(b) => b.refrescar(),
+            Self::Energia(e) => e.refrescar(),
             _ => false,
         }
     }
@@ -336,6 +374,7 @@ impl Emergente {
         match self {
             Self::Launchpad(l) => l.animando(),
             Self::Buscador(b) => b.animando(),
+            Self::Respuesta(r) => r.animando(),
             Self::Apariencia(a) => a.animando(),
             Self::Apagar(a) => a.animando(),
             Self::Menu(m) => m.animando(),
@@ -355,8 +394,15 @@ impl Emergente {
         }
     }
 
-    /// ¿Ocupa la pantalla entera?
-    ///
+    /// El compositor anima el cambio conservando la superficie de antes.
+    pub fn tomar_transicion(&mut self) -> Option<Transicion> {
+        match self {
+            Self::Centro(c) => c.tomar_transicion(),
+            Self::Launchpad(l) => l.tomar_transicion(),
+            _ => None,
+        }
+    }
+
     /// El launchpad y la vista general. El panel no se dibuja por encima: son
     /// modos temporales que gobiernan toda la pantalla aunque su chrome ocupe
     /// solo la zona con contenido.
@@ -383,6 +429,7 @@ impl Emergente {
             // asoma sobre el escritorio, no algo que haya que atender, y apagar
             // lo de debajo la convertiría en un diálogo.
             Self::Buscador(b) => Some(b.velo()),
+            Self::Respuesta(r) => Some(r.velo()),
             Self::Acerca(a) => Some(a.velo()),
             // Es un diálogo: hay que contestarle antes de seguir, y el velo es
             // lo que lo dice sin escribirlo.
@@ -430,6 +477,7 @@ impl Emergente {
             Self::Bluetooth(b) => b.view(),
             Self::Launchpad(l) => l.view(),
             Self::Buscador(b) => b.view(),
+            Self::Respuesta(r) => r.view(),
             Self::Escritorios(e) => e.view(),
             Self::Proyeccion(p) => p.view(),
             Self::Compartir(c) => c.view(),
@@ -463,6 +511,8 @@ impl Emergente {
             Self::Bluetooth(b) => b.puntero(punto),
             Self::Launchpad(l) => l.puntero(punto),
             Self::Buscador(b) => b.puntero(punto),
+            // Un campo de texto: no hay nada que señalar con el ratón.
+            Self::Respuesta(_) => false,
             Self::Escritorios(e) => e.puntero(punto),
             Self::Proyeccion(p) => p.puntero(punto),
             Self::Compartir(c) => c.puntero(punto),
@@ -488,6 +538,7 @@ impl Emergente {
             Self::Bluetooth(b) => b.pulsar(x, y),
             Self::Launchpad(l) => l.pulsar(x, y),
             Self::Buscador(b) => b.pulsar(x, y),
+            Self::Respuesta(_) => None,
             Self::Escritorios(e) => e.pulsar(x, y),
             Self::Proyeccion(p) => p.pulsar(x, y),
             Self::Compartir(c) => c.pulsar(x, y),
@@ -553,6 +604,7 @@ impl Emergente {
             Self::Bluetooth(b) => b.tecla(tecla),
             Self::Launchpad(l) => l.tecla(tecla),
             Self::Buscador(b) => b.tecla(tecla),
+            Self::Respuesta(r) => r.tecla(tecla),
             Self::Escritorios(e) => e.tecla(tecla),
             Self::Proyeccion(p) => p.tecla(tecla),
             Self::Compartir(c) => c.tecla(tecla),

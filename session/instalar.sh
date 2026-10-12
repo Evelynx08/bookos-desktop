@@ -44,10 +44,20 @@ if [ -z "$system_bin" ]; then
     echo "Compila primero: cargo build --release -p bookos-system" >&2
     exit 1
 fi
+budsd_bin=""
+for candidate in "$aqui/../target/release/bookos-budsd" "$aqui/../target/debug/bookos-budsd"; do
+    [ -x "$candidate" ] || continue
+    if [ -z "$budsd_bin" ] || [ "$candidate" -nt "$budsd_bin" ]; then budsd_bin="$candidate"; fi
+done
+if [ -z "$budsd_bin" ]; then
+    echo "Compila primero: cargo build --release -p bookos-budsd" >&2
+    exit 1
+fi
 # Las unidades vienen con la ruta del RPM (/usr/libexec); en desarrollo el
 # binario va a /usr/local/libexec, así que aquí se reescribe al vuelo. Antes
 # era al revés y el paquete instalado quedaba apuntando a /usr/local.
 install -Dm755 "$system_bin" /usr/local/libexec/bookos-system
+install -Dm755 "$budsd_bin" /usr/local/libexec/bookos-budsd
 install -Dm755 "$comp_bin" /usr/local/bin/bookos-comp
 # Por `mktemp` y no por una ruta fija de /tmp: esto corre como root, y un
 # `> /tmp/nombre-que-se-sabe` lo puede haber dejado preparado cualquiera como
@@ -60,6 +70,12 @@ install -Dm644 "$temporal_unidad" /usr/local/share/dbus-1/services/org.bookos.Sy
 sed 's|/usr/libexec/bookos-system|/usr/local/libexec/bookos-system|' \
     "$aqui/bookos-system.service" > "$temporal_unidad"
 install -Dm644 "$temporal_unidad" /usr/local/lib/systemd/user/bookos-system.service
+sed 's|/usr/libexec/bookos-budsd|/usr/local/libexec/bookos-budsd|' \
+    "$aqui/org.bookos.Buds.service" > "$temporal_unidad"
+install -Dm644 "$temporal_unidad" /usr/local/share/dbus-1/services/org.bookos.Buds.service
+sed 's|/usr/libexec/bookos-budsd|/usr/local/libexec/bookos-budsd|' \
+    "$aqui/bookos-budsd.service" > "$temporal_unidad"
+install -Dm644 "$temporal_unidad" /usr/local/lib/systemd/user/bookos-budsd.service
 rm -f -- "$temporal_unidad"
 # El target que declara la sesión gráfica. Sin él no arranca el portal: ver el
 # comentario de bookos-session.target.
@@ -92,9 +108,16 @@ fi
 # El backend de portales. El compositor implementa ScreenCast y Screenshot
 # dentro de su propio proceso, así que aquí solo se declara quién los atiende:
 # el .portal dice qué interfaces hay detrás del nombre de bus, y el
-# BookOS-portals.conf dice que en esta sesión mandan esas y no las de GTK.
+# bookos-portals.conf dice que en esta sesión mandan esas y no las de GTK.
+#
+# En minúsculas: xdg-desktop-portal pasa `XDG_CURRENT_DESKTOP` a minúsculas
+# antes de buscar `<escritorio>-portals.conf` (portals.conf(5)). Con el nombre
+# `BookOS-portals.conf` no lo encontraba y el selector de archivos y el resto
+# de portales caían en xdg-desktop-portal-gtk. Se borra el viejo para que no
+# quede un fichero muerto que parezca el bueno.
 install -Dm644 "$aqui/bookos.portal" /usr/share/xdg-desktop-portal/portals/bookos.portal
-install -Dm644 "$aqui/bookos-portals.conf" /usr/share/xdg-desktop-portal/BookOS-portals.conf
+install -Dm644 "$aqui/bookos-portals.conf" /usr/share/xdg-desktop-portal/bookos-portals.conf
+rm -f /usr/share/xdg-desktop-portal/BookOS-portals.conf
 
 # La tapa de la cámara del Galaxy Book: el compositor la lee directamente para
 # el aviso de «Cámara desactivada». Va en /etc y no en /usr/local, que udev no
@@ -102,6 +125,11 @@ install -Dm644 "$aqui/bookos-portals.conf" /usr/share/xdg-desktop-portal/BookOS-
 install -Dm644 "$aqui/70-bookos-camara.rules" /etc/udev/rules.d/70-bookos-camara.rules
 udevadm control --reload-rules || true
 udevadm trigger --subsystem-match=input --action=change || true
+
+# El número de serie de «Acerca de este PC», legible para `wheel`.
+install -Dm644 "$aqui/71-bookos-serie.rules" /etc/udev/rules.d/71-bookos-serie.rules
+udevadm control --reload-rules || true
+udevadm trigger --subsystem-match=dmi --action=change || true
 
 echo "Instalado. En la pantalla de login ya sale 'BookOS' en la lista de sesiones."
 echo "El registro de cada arranque queda en \$XDG_RUNTIME_DIR/bookos-session.log"

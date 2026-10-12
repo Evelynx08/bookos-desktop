@@ -139,8 +139,32 @@ pub fn interruptor_en(x: f32, y: f32) -> bool {
     (izquierda - 8.0..=derecha + 8.0).contains(&x) && (MARGEN..=MARGEN + CABECERA).contains(&y)
 }
 
-pub fn cabecera<'a>(titulo: &'a str, encendido: Option<f32>) -> PanelElement<'a> {
-    let mut fila = row![control::titulo(titulo)].align_y(Vertical::Center);
+/// Lado de la flecha de volver de la cabecera, y lo que se aparta el título.
+const VOLVER: f32 = 18.0;
+const TRAS_VOLVER: f32 = 6.0;
+
+/// ¿Cae el punto en la flecha de volver? Toda la altura de la cabecera y hasta
+/// el principio del título, más algo de aire: es un blanco de 18 px.
+pub fn volver_en(x: f32, y: f32) -> bool {
+    (MARGEN - 4.0..=MARGEN + 4.0 + VOLVER + TRAS_VOLVER + 8.0).contains(&x)
+        && (MARGEN..=MARGEN + CABECERA).contains(&y)
+}
+
+/// El título de la tarjeta y su interruptor. Con `volver`, una flecha delante
+/// del título: la tarjeta está dentro de la Estación de Control y se vuelve a
+/// ella, como el applet de Plasma dentro de la bandeja del sistema.
+pub fn cabecera<'a>(titulo: &'a str, encendido: Option<f32>, volver: bool) -> PanelElement<'a> {
+    let mut fila = row![].align_y(Vertical::Center);
+    if volver {
+        let flecha: PanelElement<'a> = match icono::propio("chevron-izquierda") {
+            Some(ic) => icono::ver_teñido_propio(&ic, VOLVER, tema::texto()),
+            None => Space::new().width(Length::Fixed(VOLVER)).into(),
+        };
+        fila = fila
+            .push(flecha)
+            .push(Space::new().width(Length::Fixed(TRAS_VOLVER)));
+    }
+    fila = fila.push(control::titulo(titulo));
     if let Some(encendido) = encendido {
         fila = fila
             .push(Space::new().width(Length::Fill))

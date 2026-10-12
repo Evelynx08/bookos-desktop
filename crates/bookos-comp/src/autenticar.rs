@@ -13,6 +13,8 @@ const PAM_PROMPT_ECHO_ON: c_int = 2;
 const PAM_ERROR_MSG: c_int = 3;
 const PAM_TEXT_INFO: c_int = 4;
 const PAM_CONV_ERR: c_int = 19;
+/// `pam_set_item` con esto fija la función de espera tras un fallo.
+const PAM_FAIL_DELAY: c_int = 10;
 /// «No puedo recoger la información de autenticación». Es lo que contesta
 /// `pam_fprintd` en una máquina **sin lector de huellas**, y no es lo mismo que
 /// un rechazo: no hay nada que rechazar. Distinguirlo importa porque tratarlo
@@ -249,6 +251,7 @@ fn autenticar_servicio(
         type Authenticate = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
         type Account = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
         type End = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
+        type SetItem = unsafe extern "C" fn(*mut c_void, c_int, *const c_void) -> c_int;
         type StrError = unsafe extern "C" fn(*mut c_void, c_int) -> *const c_char;
         let Ok(start) = pam.get::<Start>(b"pam_start\0") else {
             return Veredicto::NoDisponible;
@@ -300,6 +303,19 @@ fn autenticar_servicio(
             );
             return Veredicto::NoDisponible;
         }
+        // Medido con contraseña errónea en este portátil: 1,7-2,2 s por
+        // intento, de los que la comprobación real (unix_chkpwd + yescrypt)
+        // son 41-55 ms. El resto es la espera que pide `pam_unix` antes de
+        // contestar un fallo. Con PAM_FAIL_DELAY la espera la gestiona la
+        // aplicación, que es para lo que existe: el bloqueo ya tiene su propia
+        // demora creciente (`demora_reintento`), así que esta sobraba y solo
+        // hacía lento equivocarse una vez al teclear.
+        if let Ok(poner) = pam.get::<SetItem>(b"pam_set_item\0") {
+            poner(handle, PAM_FAIL_DELAY, sin_demora as *const c_void);
+        }
+        // Con la duración en la traza: tras dormir el procesador puede volver
+        // a 400 MHz (PL1 de RAPL) y el yescrypt de 50 ms pasa a notarse.
+        let desde = std::time::Instant::now();
         let autenticacion = authenticate(handle, 0);
         let resultado = if autenticacion == PAM_SUCCESS {
             account(handle, 0)
@@ -311,7 +327,11 @@ fn autenticar_servicio(
         // el fallo es «no era la contraseña» o «esto ni siquiera pudo
         // preguntar».
         if resultado == PAM_SUCCESS {
-            tracing::info!(servicio = nombre, "PAM autenticó");
+            tracing::info!(
+                servicio = nombre,
+                ms = desde.elapsed().as_millis() as u64,
+                "PAM autenticó"
+            );
         } else if autenticacion == PAM_AUTHINFO_UNAVAIL {
             tracing::info!(
                 servicio = nombre,
@@ -346,6 +366,15 @@ fn autenticar_servicio(
             _ => Veredicto::Rechazado,
         }
     }
+}
+
+/// La función que PAM llama en vez de dormir tras un fallo. No hace nada:
+/// la demora la pone el bloqueo.
+unsafe extern "C" fn sin_demora(
+    _estado: c_int,
+    _microsegundos: std::ffi::c_uint,
+    _datos: *mut c_void,
+) {
 }
 
 unsafe extern "C" fn conversar(

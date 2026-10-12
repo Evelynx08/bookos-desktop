@@ -53,7 +53,7 @@ enum Entrada {
 /// El menú, en el mismo orden que el plasmoide.
 fn entradas() -> Vec<Entrada> {
     use Entrada::{Divisor, Item};
-    vec![
+    let mut entradas = vec![
         Item {
             etiqueta: "Acerca de este PC",
             icono: "acerca",
@@ -123,7 +123,33 @@ fn entradas() -> Vec<Entrada> {
             atajo: Some("Ctrl+Alt+Supr"),
             accion: || Accion::CerrarSesion,
         },
-    ]
+    ];
+    // Debajo de Dormir, y solo si logind dice que se puede: sin swap en disco
+    // el botón fallaría sin más.
+    if crate::confirmacion::hibernar_disponible() {
+        let tras_dormir = entradas
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    Item {
+                        icono: "dormir",
+                        ..
+                    }
+                )
+            })
+            .map_or(0, |i| i + 1);
+        entradas.insert(
+            tras_dormir,
+            Item {
+                etiqueta: "Hibernar",
+                icono: "hibernar",
+                atajo: None,
+                accion: || Accion::Lanzar("systemctl hibernate".into()),
+            },
+        );
+    }
+    entradas
 }
 
 pub struct Menu {

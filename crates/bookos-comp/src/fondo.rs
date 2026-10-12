@@ -11,9 +11,21 @@
 //! Los fondos estáticos conservan el mismo buffer durante toda la sesión. En
 //! un WebP animado solo se conserva y sube el fotograma visible; el temporizador
 //! despierta al llegar su duración para no mantener la animación entera en RAM.
+//!
+//! ## Vídeo
+//!
+//! Un vídeo no se convierte a WebP: el decodificador WebP de `image` tarda
+//! 67-80 ms por fotograma a 1920×1200 (medido con `image` 0.25.10), y aquí corre
+//! en el hilo del compositor, así que a 24 fps el escritorio entero bajaba a
+//! unos 12. El vídeo lo decodifica un `ffmpeg` aparte y un hilo lector deja
+//! cada fotograma ya en buffer y con su miniatura; al compositor solo le toca
+//! cambiar de buffer y subirlo. Lo que no sea AV1 ni VP9 se convierte una vez a
+//! AV1 en segundo plano; el porqué, en [`convertir`].
 
-use std::io::BufReader;
+use std::io::{BufReader, Read as _};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use image::AnimationDecoder as _;
@@ -32,6 +44,20 @@ use smithay::utils::Transform;
 /// La previa más grande mide 250 px lógicos, que a escala 2 son 500 físicos:
 /// 640 llega de sobra y cuesta 1 MB por copia, frente a los 20 MB del original.
 const MINIATURA_ANCHO: i32 = 640;
+
+/// Ancho máximo al que se decodifica un vídeo.
+///
+/// Cada fotograma se sube entero a la GPU dos veces —el fondo y el cristal con
+/// mipmaps—, así que el coste va con los píxeles: un 4K serían 33 MB por
+/// fotograma. A 1920 son 9 MB, y en un fondo con ventanas encima no se nota.
+const VIDEO_ANCHO: u32 = 1920;
+
+/// Fotogramas por segundo a los que se limita un vídeo. Por lo mismo que el
+/// ancho: un vídeo de 60 fps son el doble de subidas para un fondo.
+const VIDEO_FPS: f64 = 30.0;
+
+/// Extensiones que se abren como vídeo. Coinciden con las que acepta Ajustes.
+pub const EXTENSIONES_VIDEO: [&str; 5] = ["mp4", "webm", "mkv", "mov", "m4v"];
 
 /// Qué fondo ha pedido el usuario, antes de decidir cuál toca.
 ///
@@ -124,48 +150,537 @@ pub struct Fondo {
     animacion: Option<Animacion>,
 }
 
-struct Animacion {
-    ruta: PathBuf,
-    frames: image::Frames<'static>,
-    siguiente: Instant,
+/// Un fotograma listo para poner: los píxeles y su miniatura.
+struct Fotograma {
+    rgba: MemoryBuffer,
+    pixeles: (i32, i32),
+    mini_rgba: Vec<u8>,
+    mini_pixeles: (i32, i32),
+}
+
+impl Fotograma {
+    fn de_rgba(rgba: &[u8], pixeles: (i32, i32)) -> Self {
+        // Abgr8888: en little-endian son los bytes R,G,B,A, que es justo lo que
+        // devuelve el decodificador. Con Argb8888 —el del shell— saldría con el
+        // rojo y el azul cambiados; ya pasó una vez con el panel.
+        let (mini_rgba, mini_pixeles) = reducir(rgba, pixeles, MINIATURA_ANCHO);
+        Self {
+            rgba: MemoryBuffer::from_slice(rgba, Fourcc::Abgr8888, pixeles),
+            pixeles,
+            mini_rgba,
+            mini_pixeles,
+        }
+    }
+}
+
+enum Animacion {
+    Webp {
+        ruta: PathBuf,
+        frames: image::Frames<'static>,
+        siguiente: Instant,
+    },
+    Video(Video),
+}
+
+/// Lo que deja un paso de la animación.
+enum Paso {
+    Nuevo(Fotograma),
+    /// El vídeo no tenía listo el siguiente: se queda el que hay.
+    Mismo,
+    /// La animación se acabó por un error; el último fotograma se queda fijo.
+    Fin,
 }
 
 impl Animacion {
-    fn abrir(ruta: &Path) -> Option<(Self, Vec<u8>, u32, u32)> {
+    fn abrir(ruta: &Path) -> Option<(Self, Fotograma)> {
+        if es_video(ruta) {
+            let (video, primero) = Video::abrir(ruta)?;
+            return Some((Self::Video(video), primero));
+        }
         let mut frames = frames_webp(ruta)?;
         let frame = frames.next()?.ok()?;
         let retraso = retraso(frame.delay());
         let rgba = frame.into_buffer();
         let (w, h) = rgba.dimensions();
         Some((
-            Self {
+            Self::Webp {
                 ruta: ruta.to_path_buf(),
                 frames,
                 siguiente: Instant::now() + retraso,
             },
-            rgba.into_raw(),
-            w,
-            h,
+            Fotograma::de_rgba(&rgba, (w as i32, h as i32)),
         ))
     }
 
-    fn avanzar(&mut self) -> Option<(Vec<u8>, u32, u32)> {
-        let frame = match self.frames.next() {
+    fn siguiente(&self) -> Instant {
+        match self {
+            Self::Webp { siguiente, .. } => *siguiente,
+            Self::Video(video) => video.siguiente,
+        }
+    }
+
+    fn avanzar(&mut self) -> Paso {
+        let (ruta, frames, siguiente) = match self {
+            Self::Video(video) => return video.avanzar(),
+            Self::Webp {
+                ruta,
+                frames,
+                siguiente,
+            } => (ruta, frames, siguiente),
+        };
+        let frame = match frames.next() {
             Some(Ok(frame)) => frame,
             Some(Err(err)) => {
-                tracing::warn!(ruta = ?self.ruta, %err, "fotograma WebP inválido");
-                return None;
+                tracing::warn!(?ruta, %err, "fotograma WebP inválido");
+                return Paso::Fin;
             }
             None => {
-                self.frames = frames_webp(&self.ruta)?;
-                self.frames.next()?.ok()?
+                let Some(frame) = frames_webp(ruta).and_then(|nuevos| {
+                    *frames = nuevos;
+                    frames.next()?.ok()
+                }) else {
+                    return Paso::Fin;
+                };
+                frame
             }
         };
-        self.siguiente = Instant::now() + retraso(frame.delay());
+        *siguiente = Instant::now() + retraso(frame.delay());
         let rgba = frame.into_buffer();
         let (w, h) = rgba.dimensions();
-        Some((rgba.into_raw(), w, h))
+        Paso::Nuevo(Fotograma::de_rgba(&rgba, (w as i32, h as i32)))
     }
+}
+
+fn es_video(ruta: &Path) -> bool {
+    ruta.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| EXTENSIONES_VIDEO.contains(&e.to_ascii_lowercase().as_str()))
+}
+
+/// Códecs que se reproducen tal cual. El resto se convierte a AV1 la primera
+/// vez que se elige el vídeo; ver [`convertir`].
+///
+/// Son los dos que el ffmpeg de Fedora (`ffmpeg-free`) decodifica con su propio
+/// decodificador —y por VAAPI—, y los dos que siguen bien al dar la vuelta.
+const DIRECTOS: [&str; 2] = ["av1", "vp9"];
+
+/// Un vídeo en bucle decodificado por `ffmpeg`.
+struct Video {
+    proceso: Child,
+    fotogramas: Receiver<Fotograma>,
+    periodo: Duration,
+    siguiente: Instant,
+    /// La conversión a AV1, mientras dura. Entretanto se reproduce el original.
+    conversion: Option<Conversion>,
+}
+
+enum Conversion {
+    /// ffmpeg convirtiendo. El sondeo es el del original: el convertido sale
+    /// ya con ese tamaño y ese ritmo, y así no hace falta otro ffprobe.
+    Convirtiendo {
+        proceso: Child,
+        destino: PathBuf,
+        sondeo: Sondeo,
+    },
+    /// Ya convertido, y un hilo abriendo el resultado. Va en un hilo porque
+    /// ffprobe y el primer fotograma de ffmpeg tardan entre los dos un segundo
+    /// (medido: 0,3-0,4 s y 0,6-0,8 s), y en el del compositor eso es un
+    /// segundo con la pantalla y la entrada paradas.
+    Abriendo(Receiver<Option<(Video, Fotograma)>>),
+}
+
+impl Video {
+    fn abrir(ruta: &Path) -> Option<(Self, Fotograma)> {
+        let sondeo = sondear(ruta)?;
+        let directo = DIRECTOS.contains(&sondeo.codec.as_str());
+        let (w, h, _) = sondeo.salida();
+        // Con algunos tamaños diminutos SVT-AV1 se queda colgado, sin gastar
+        // CPU y sin atender SIGTERM: 8×4 y 16×64 sí, 64×16 y 32×32 no. Con los
+        // dos lados de 64 o más no se colgó ninguno de los probados. Ningún
+        // fondo es así de pequeño, pero un proceso colgado para siempre es peor
+        // que reproducir el original.
+        let destino = ruta_convertida(ruta).filter(|_| !directo && w.min(h) >= 64);
+        let Some(destino) = destino else {
+            return Self::reproducir(ruta, &sondeo, directo);
+        };
+        if destino.is_file()
+            && let Some(abierto) = Self::reproducir(&destino, &sondeo, true)
+        {
+            return Some(abierto);
+        }
+        // La conversión se lanza **después** de comprobar que el original se
+        // puede reproducir: si este ffmpeg no lo decodifica (HEVC en
+        // ffmpeg-free) tampoco lo podría convertir.
+        let (mut video, primero) = Self::reproducir(ruta, &sondeo, false)?;
+        video.conversion =
+            convertir(ruta, &sondeo, &destino).map(|proceso| Conversion::Convirtiendo {
+                proceso,
+                destino,
+                sondeo,
+            });
+        Some((video, primero))
+    }
+
+    /// Con `vaapi`, primero por la GPU y, si no arranca, por software. No hay
+    /// forma barata de preguntar antes si la GPU decodifica este códec: ffmpeg
+    /// falla al abrir y eso se ve aquí como un vídeo sin primer fotograma. Sin
+    /// `vaapi` ni se intenta: con el H.264 de ffmpeg-free fallaría siempre, y
+    /// el intento cuesta lo que tarda ffmpeg en arrancar.
+    fn reproducir(ruta: &Path, sondeo: &Sondeo, vaapi: bool) -> Option<(Self, Fotograma)> {
+        let (w, h, fps) = sondeo.salida();
+        let (proceso, fotogramas, primero) = vaapi
+            .then(|| lanzar(ruta, (w, h), fps, true))
+            .flatten()
+            .or_else(|| lanzar(ruta, (w, h), fps, false))?;
+        let periodo = Duration::from_secs_f64(1.0 / fps);
+        let video = Self {
+            proceso,
+            fotogramas,
+            periodo,
+            siguiente: Instant::now() + periodo,
+            conversion: None,
+        };
+        Some((video, primero))
+    }
+
+    fn avanzar(&mut self) -> Paso {
+        // El convertido entra en cuanto tiene su primer fotograma, sin fundido:
+        // es un corte del punto por el que iba el original al principio del
+        // vídeo, y pasa una vez en la vida de cada fondo.
+        if let Some((convertido, primero)) = self.relevo() {
+            *self = convertido;
+            return Paso::Nuevo(primero);
+        }
+        // Sin acumular retraso: si el temporizador llega tarde se sigue desde
+        // ahora, no se intenta recuperar fotogramas que ya no se van a ver.
+        self.siguiente = (self.siguiente + self.periodo).max(Instant::now());
+        match self.fotogramas.try_recv() {
+            Ok(fotograma) => Paso::Nuevo(fotograma),
+            Err(TryRecvError::Empty) => Paso::Mismo,
+            Err(TryRecvError::Disconnected) => Paso::Fin,
+        }
+    }
+
+    /// Sigue la conversión un paso. Devuelve el vídeo convertido cuando ya se
+    /// puede poner en lugar de este.
+    fn relevo(&mut self) -> Option<(Video, Fotograma)> {
+        match self.conversion.as_mut()? {
+            Conversion::Convirtiendo { proceso, .. } => {
+                let bien = match proceso.try_wait() {
+                    Ok(None) => return None,
+                    Ok(Some(estado)) => estado.success(),
+                    Err(err) => {
+                        tracing::warn!(%err, "no se pudo consultar la conversión del fondo");
+                        false
+                    }
+                };
+                let Some(Conversion::Convirtiendo {
+                    destino, sondeo, ..
+                }) = self.conversion.take()
+                else {
+                    unreachable!("comprobada arriba");
+                };
+                let parcial = parcial(&destino);
+                if !bien
+                    || std::fs::rename(&parcial, &destino)
+                        .inspect_err(|err| {
+                            tracing::warn!(?destino, %err, "no se pudo guardar el vídeo convertido");
+                        })
+                        .is_err()
+                {
+                    tracing::warn!(
+                        ?destino,
+                        "la conversión del vídeo del fondo falló: se sigue con el original"
+                    );
+                    // Puede no existir si ffmpeg falló antes de escribir nada.
+                    let _ = std::fs::remove_file(&parcial);
+                    return None;
+                }
+                tracing::info!(?destino, "vídeo del fondo convertido");
+                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                // Si el fondo se suelta antes de que acabe, `send` falla y el
+                // vídeo abierto se suelta aquí, con su ffmpeg.
+                std::thread::Builder::new()
+                    .name("fondo-relevo".into())
+                    .spawn(move || {
+                        let _ = tx.send(Self::reproducir(&destino, &sondeo, true));
+                    })
+                    .inspect_err(|err| tracing::warn!(%err, "no se pudo abrir el convertido"))
+                    .ok()?;
+                self.conversion = Some(Conversion::Abriendo(rx));
+                None
+            }
+            Conversion::Abriendo(rx) => match rx.try_recv() {
+                Err(TryRecvError::Empty) => None,
+                Ok(abierto) => {
+                    self.conversion = None;
+                    abierto
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.conversion = None;
+                    None
+                }
+            },
+        }
+    }
+}
+
+impl Drop for Video {
+    fn drop(&mut self) {
+        // Al morir ffmpeg el lector ve fin de tubería y termina solo. `wait`
+        // es para no dejar un zombi por cada cambio de fondo. La conversión
+        // también muere: si se cambia de fondo a medias, el `.parcial` se
+        // sobrescribe la próxima vez que se elija este vídeo.
+        let _ = self.proceso.kill();
+        let _ = self.proceso.wait();
+        if let Some(Conversion::Convirtiendo { proceso, .. }) = self.conversion.as_mut() {
+            let _ = proceso.kill();
+            let _ = proceso.wait();
+        }
+    }
+}
+
+/// Arranca ffmpeg y espera el primer fotograma. `vaapi` decodifica en la GPU.
+///
+/// Por VAAPI los fotogramas se bajan como NV12 y se pasan a I420 **antes** de
+/// RGBA: el escalador de ffmpeg tiene camino rápido de I420 a RGBA y no de NV12.
+/// Medido con el fondo de 1920×1080 en AV1, 10 s a 30 fps: 4,6 s de CPU de NV12
+/// directo a RGBA, 2,3 s pasando por I420. Por software, el mismo vídeo en
+/// H.264 por openh264 eran 11 s: un núcleo entero solo para el fondo.
+fn lanzar(
+    ruta: &Path,
+    (w, h): (u32, u32),
+    fps: f64,
+    vaapi: bool,
+) -> Option<(Child, Receiver<Fotograma>, Fotograma)> {
+    let mut ffmpeg = Command::new("ffmpeg");
+    ffmpeg.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
+    if vaapi {
+        ffmpeg.args(["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"]);
+    }
+    ffmpeg
+        .args(["-stream_loop", "-1", "-i"])
+        .arg(ruta)
+        .args(["-an", "-vf"]);
+    let bajada = if vaapi {
+        "hwdownload,format=nv12,format=yuv420p,"
+    } else {
+        ""
+    };
+    let mut proceso = ffmpeg
+        .arg(format!("{bajada}fps={fps},scale={w}:{h}:flags=bilinear"))
+        .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+        .inspect_err(|err| tracing::warn!(?ruta, %err, "no se pudo lanzar ffmpeg"))
+        .ok()?;
+    let mut salida = proceso.stdout.take().expect("stdout pedido como tubería");
+    // Capacidad uno: si el compositor no recoge —movimiento reducido, o el
+    // fondo saliente de un fundido—, el hilo se bloquea al mandar, ffmpeg al
+    // escribir en la tubería, y ninguno de los dos gasta CPU.
+    let (tx, fotogramas) = std::sync::mpsc::sync_channel(1);
+    let pixeles = (w as i32, h as i32);
+    let lector = std::thread::Builder::new()
+        .name("fondo-video".into())
+        .spawn(move || {
+            let mut crudo = vec![0u8; w as usize * h as usize * 4];
+            while salida.read_exact(&mut crudo).is_ok() {
+                if tx.send(Fotograma::de_rgba(&crudo, pixeles)).is_err() {
+                    break;
+                }
+            }
+        });
+    // Arrancar ffmpeg y sacar el primero tarda unos cientos de ms; un códec
+    // que este ffmpeg no tiene (HEVC en ffmpeg-free), o una GPU que no lo
+    // decodifica, cierra la tubería y aquí se ve como desconexión.
+    let primero = match lector {
+        Ok(_) => fotogramas.recv_timeout(Duration::from_secs(5)),
+        Err(err) => {
+            tracing::warn!(?ruta, %err, "no se pudo crear el hilo del vídeo");
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        }
+    };
+    match primero {
+        Ok(primero) => Some((proceso, fotogramas, primero)),
+        Err(err) => {
+            if vaapi {
+                tracing::debug!(
+                    ?ruta,
+                    "VAAPI no decodifica este vídeo: se prueba por software"
+                );
+            } else {
+                tracing::warn!(?ruta, %err, "el vídeo no dio ningún fotograma");
+            }
+            let _ = proceso.kill();
+            let _ = proceso.wait();
+            None
+        }
+    }
+}
+
+/// Convierte el vídeo a AV1, en segundo plano y con la prioridad más baja.
+///
+/// Es por el ffmpeg de Fedora: `ffmpeg-free` no trae decodificador de H.264
+/// propio, solo openh264, y openh264 no aguanta el salto de `-stream_loop`.
+/// Con el fondo de 10 s a 60 fps, en cada vuelta fallaban 247 paquetes y el
+/// vídeo saltaba de 10 s a 14,17 s; el filtro `fps` rellena ese hueco
+/// repitiendo el último fotograma, así que el fondo se quedaba **congelado
+/// cuatro segundos** de cada diez. Tampoco hay VAAPI para H.264 sin el
+/// decodificador propio. El AV1 resultante da la vuelta sin un error y se
+/// decodifica en la GPU.
+///
+/// Se aprovecha la pasada única para lo que sería caro en cada fotograma:
+/// `deband` alisa los escalones de los degradados oscuros —el H.264 de 4,5
+/// Mbit/s del fondo los trae de serie, y a 2880 px de panel se ven—, y el
+/// escalado va con lanczos. Con `preset 10` el fondo de 10 s tarda 11 s.
+fn convertir(ruta: &Path, sondeo: &Sondeo, destino: &Path) -> Option<Child> {
+    let carpeta = destino.parent().expect("la ruta convertida tiene carpeta");
+    std::fs::create_dir_all(carpeta)
+        .inspect_err(|err| tracing::warn!(?carpeta, %err, "no se pudo crear la caché de fondos"))
+        .ok()?;
+    let (w, h, fps) = sondeo.salida();
+    let mut ffmpeg = Command::new("nice");
+    ffmpeg
+        .args([
+            "-n",
+            "19",
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+        ])
+        .arg("-i")
+        .arg(ruta)
+        .args(["-an", "-vf"])
+        .arg(format!(
+            "deband=1thr=0.02:2thr=0.02:3thr=0.02:range=16:blur=1,\
+             fps={fps},scale={w}:{h}:flags=lanczos"
+        ))
+        .args([
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libsvtav1",
+            "-preset",
+            "10",
+            "-crf",
+            "20",
+        ]);
+    // Sin etiqueta de color, el escalador de ffmpeg convierte con BT.601, que es
+    // el de la definición estándar; los reproductores dan por hecho BT.709 en
+    // HD, y con 601 el morado del fondo salía azulado.
+    if sondeo.sin_color && h >= 720 {
+        ffmpeg.args([
+            "-colorspace",
+            "bt709",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+        ]);
+    }
+    let proceso = ffmpeg
+        .arg(parcial(destino))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .inspect_err(|err| tracing::warn!(?ruta, %err, "no se pudo lanzar la conversión del fondo"))
+        .ok()?;
+    tracing::info!(?ruta, ?destino, "convirtiendo el vídeo del fondo");
+    Some(proceso)
+}
+
+/// Dónde va la conversión de `ruta`. El tamaño y la fecha van en el nombre para
+/// que un vídeo sobrescrito con otro del mismo nombre no reutilice la vieja.
+fn ruta_convertida(ruta: &Path) -> Option<PathBuf> {
+    let meta = std::fs::metadata(ruta).ok()?;
+    let fecha = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    let cache = match std::env::var_os("XDG_CACHE_HOME") {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(std::env::var_os("HOME")?).join(".cache"),
+    };
+    let nombre = ruta.file_stem()?.to_string_lossy();
+    Some(cache.join("bookos/fondos").join(format!(
+        "{nombre}-{}-{}.mkv",
+        meta.len(),
+        fecha.as_secs()
+    )))
+}
+
+/// Mientras se escribe va con otro nombre: si el compositor muere a medias, el
+/// fichero a medio hacer no se toma por bueno la próxima vez.
+fn parcial(destino: &Path) -> PathBuf {
+    destino.with_extension("parcial.mkv")
+}
+
+/// Lo que se sabe del vídeo antes de abrirlo.
+struct Sondeo {
+    /// Ancho y alto ya girados.
+    ancho: u32,
+    alto: u32,
+    fps: f64,
+    codec: String,
+    /// El vídeo no dice con qué matriz se pasa de YUV a RGB.
+    sin_color: bool,
+}
+
+impl Sondeo {
+    /// Tamaño y ritmo a los que se decodifica, con los topes aplicados.
+    fn salida(&self) -> (u32, u32, f64) {
+        // Pares: con rgba no hace falta, pero el escalador de ffmpeg redondea
+        // las impares a su manera y el tamaño leído dejaría de cuadrar.
+        let w = self.ancho.min(VIDEO_ANCHO) & !1;
+        let h = ((self.alto as f64 * w as f64 / self.ancho as f64).round() as u32).max(2) & !1;
+        (w, h, self.fps.min(VIDEO_FPS))
+    }
+}
+
+fn sondear(ruta: &Path) -> Option<Sondeo> {
+    let salida = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries"])
+        .args([
+            "stream=codec_name,width,height,avg_frame_rate,color_space:stream_side_data=rotation",
+        ])
+        .args(["-of", "default=nw=1"])
+        .arg(ruta)
+        .stdin(Stdio::null())
+        .output()
+        .inspect_err(|err| tracing::warn!(?ruta, %err, "no se pudo lanzar ffprobe"))
+        .ok()?;
+    let texto = String::from_utf8_lossy(&salida.stdout);
+    let campo = |nombre: &str| {
+        texto
+            .lines()
+            .find_map(|l| l.strip_prefix(nombre)?.strip_prefix('='))
+    };
+    let ancho: u32 = campo("width")?.parse().ok()?;
+    let alto: u32 = campo("height")?.parse().ok()?;
+    // `30/1`, `30000/1001`. Sin dato fiable (`0/0` en algunos webm) se toma el
+    // tope: duplicar algún fotograma es mejor que no animar.
+    let fps = campo("avg_frame_rate")
+        .and_then(|f| f.split_once('/'))
+        .and_then(|(n, d)| Some(n.parse::<f64>().ok()? / d.parse::<f64>().ok()?))
+        .filter(|f| f.is_finite() && *f > 0.0)
+        .unwrap_or(VIDEO_FPS);
+    // ffmpeg gira solo los vídeos de móvil; ffprobe da el tamaño sin girar.
+    let girado = campo("rotation")
+        .and_then(|r| r.parse::<i32>().ok())
+        .is_some_and(|r| r.rem_euclid(180) == 90);
+    let (ancho, alto) = if girado { (alto, ancho) } else { (ancho, alto) };
+    (ancho > 0 && alto > 0).then(|| Sondeo {
+        ancho,
+        alto,
+        fps,
+        codec: campo("codec_name").unwrap_or_default().to_owned(),
+        sin_color: campo("color_space").is_none_or(|c| c == "unknown"),
+    })
 }
 
 fn retraso(delay: image::Delay) -> Duration {
@@ -193,33 +708,28 @@ impl Fondo {
             Some(r) => PathBuf::from(r),
             None => buscar()?,
         };
-        let (animacion, pixeles, w, h) = match Animacion::abrir(&ruta) {
-            Some((animacion, pixeles, w, h)) => (Some(animacion), pixeles, w, h),
+        let (animacion, primero) = match Animacion::abrir(&ruta) {
+            Some((animacion, primero)) => (Some(animacion), primero),
+            None if es_video(&ruta) => return None,
             None => {
                 let (pixeles, w, h) = decodificar_estatico(&ruta)?;
-                (None, pixeles, w, h)
+                (None, Fotograma::de_rgba(&pixeles, (w as i32, h as i32)))
             }
         };
         tracing::info!(
             ?ruta,
-            w,
-            h,
+            w = primero.pixeles.0,
+            h = primero.pixeles.1,
             animado = animacion.is_some(),
             "fondo del escritorio"
         );
-        // Abgr8888: en little-endian son los bytes R,G,B,A, que es justo lo que
-        // devuelve el decodificador. Con Argb8888 —el del shell— saldría con el
-        // rojo y el azul cambiados; ya pasó una vez con el panel.
-        let (mini_rgba, mini_pixeles) = reducir(&pixeles, (w as i32, h as i32), MINIATURA_ANCHO);
-        let rgba = MemoryBuffer::from_slice(&pixeles, Fourcc::Abgr8888, (w as i32, h as i32));
-        drop(pixeles);
         Some(Self {
             ruta,
-            buffer: compartido(&rgba),
-            pixeles: (w as i32, h as i32),
-            rgba,
-            mini_rgba,
-            mini_pixeles,
+            buffer: compartido(&primero.rgba),
+            pixeles: primero.pixeles,
+            rgba: primero.rgba,
+            mini_rgba: primero.mini_rgba,
+            mini_pixeles: primero.mini_pixeles,
             mini: std::cell::RefCell::new(Vec::new()),
             gemelo: std::cell::RefCell::new(None),
             animacion,
@@ -235,7 +745,7 @@ impl Fondo {
         Some(
             self.animacion
                 .as_ref()?
-                .siguiente
+                .siguiente()
                 .saturating_duration_since(Instant::now()),
         )
     }
@@ -248,15 +758,22 @@ impl Fondo {
         {
             return false;
         }
-        let siguiente = self.animacion.as_mut().and_then(Animacion::avanzar);
-        let Some((rgba, w, h)) = siguiente else {
-            self.animacion = None;
+        let Some(animacion) = self.animacion.as_mut() else {
             return false;
         };
-        self.rgba = MemoryBuffer::from_slice(&rgba, Fourcc::Abgr8888, (w as i32, h as i32));
-        self.buffer = compartido(&self.rgba);
-        self.pixeles = (w as i32, h as i32);
-        (self.mini_rgba, self.mini_pixeles) = reducir(&self.rgba, self.pixeles, MINIATURA_ANCHO);
+        let fotograma = match animacion.avanzar() {
+            Paso::Nuevo(fotograma) => fotograma,
+            Paso::Mismo => return false,
+            Paso::Fin => {
+                self.animacion = None;
+                return false;
+            }
+        };
+        self.buffer = compartido(&fotograma.rgba);
+        self.rgba = fotograma.rgba;
+        self.pixeles = fotograma.pixeles;
+        self.mini_rgba = fotograma.mini_rgba;
+        self.mini_pixeles = fotograma.mini_pixeles;
         self.mini.get_mut().clear();
         *self.gemelo.get_mut() = None;
         true
@@ -563,13 +1080,143 @@ mod tests {
             .expect("fixture WebP en base64");
         std::fs::write(&ruta, datos).expect("se puede crear el WebP temporal");
 
-        let (mut animacion, primero, w, h) = Animacion::abrir(&ruta).expect("WebP animado");
-        assert_eq!((w, h), (2, 2));
-        let segundo = animacion.avanzar().expect("segundo fotograma").0;
-        let vuelta = animacion.avanzar().expect("vuelta al primero").0;
+        let (mut animacion, primero) = Animacion::abrir(&ruta).expect("WebP animado");
+        assert_eq!(primero.pixeles, (2, 2));
+        let segundo = nuevo(animacion.avanzar());
+        let vuelta = nuevo(animacion.avanzar());
         std::fs::remove_file(&ruta).expect("se puede retirar el WebP temporal");
-        assert_ne!(primero, segundo);
-        assert_eq!(primero, vuelta);
+        assert_ne!(&primero.rgba[..], &segundo.rgba[..]);
+        assert_eq!(&primero.rgba[..], &vuelta.rgba[..]);
+    }
+
+    fn nuevo(paso: Paso) -> Fotograma {
+        match paso {
+            Paso::Nuevo(fotograma) => fotograma,
+            Paso::Mismo | Paso::Fin => panic!("se esperaba un fotograma nuevo"),
+        }
+    }
+
+    /// Un vídeo girado sale con el ancho y el alto cambiados, sigue en bucle al
+    /// acabarse, y al soltarlo no deja ffmpeg vivo. Necesita `ffmpeg` y
+    /// `ffprobe` instalados, que es lo mismo que necesita el escritorio.
+    #[test]
+    fn un_video_girado_se_reproduce_en_bucle() {
+        let ruta = temporal("mkv");
+        let plano = temporal("plano.mkv");
+        let ffmpeg = |args: &[&str], salida: &Path| {
+            let ok = Command::new("ffmpeg")
+                .args(["-hide_banner", "-loglevel", "error", "-y"])
+                .args(args)
+                .arg(salida)
+                .status()
+                .expect("ffmpeg instalado");
+            assert!(ok.success(), "ffmpeg no pudo crear {salida:?}");
+        };
+        // Rojo y luego azul, medio segundo cada uno a 4 fps. La fuente `color`
+        // de lavfi pasa por YUV y el rojo llega como 253: se compara el canal
+        // que domina, no el valor exacto.
+        ffmpeg(
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                "color=red:s=8x4:r=4:d=0.5",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=blue:s=8x4:r=4:d=0.5",
+                "-filter_complex",
+                "[0][1]concat",
+                "-c:v",
+                "ffv1",
+                "-pix_fmt",
+                "bgr0",
+            ],
+            &plano,
+        );
+        // El giro va como opción de **entrada** de la copia: es como lo
+        // guardan los móviles, en metadatos y no en los píxeles.
+        let plano_str = plano.to_str().expect("ruta temporal en UTF-8");
+        ffmpeg(
+            &["-display_rotation", "90", "-i", plano_str, "-c", "copy"],
+            &ruta,
+        );
+        std::fs::remove_file(&plano).expect("se puede retirar el vídeo plano");
+
+        let (mut animacion, primero) = Animacion::abrir(&ruta).expect("vídeo legible");
+        std::fs::remove_file(&ruta).expect("se puede retirar el vídeo temporal");
+        assert_eq!(primero.pixeles, (4, 8));
+        let es_rojo = |rgba: &[u8]| rgba[0] > 200 && rgba[2] < 50;
+        assert!(es_rojo(&primero.rgba));
+        let Animacion::Video(video) = &mut animacion else {
+            panic!("un .mkv se abre como vídeo");
+        };
+        let pid = video.proceso.id();
+        // Tras el primer rojo: rojo, azul, azul y vuelta al rojo.
+        let rojos: Vec<bool> = (0..4)
+            .map(|_| {
+                let f = video
+                    .fotogramas
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("el vídeo sigue dando fotogramas");
+                es_rojo(&f.rgba)
+            })
+            .collect();
+        assert_eq!(rojos, [true, false, false, true]);
+        drop(animacion);
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "ffmpeg sigue vivo tras soltar el fondo"
+        );
+    }
+
+    /// Un vídeo que no es AV1 se convierte en segundo plano, el resultado se
+    /// queda con su nombre definitivo solo al acabar bien, y se reproduce.
+    #[test]
+    fn un_video_mpeg4_se_convierte_a_av1() {
+        let ruta = temporal("avi");
+        let destino = temporal("convertido.mkv");
+        let ok = Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi"])
+            .args(["-i", "color=red:s=64x64:r=4:d=1", "-c:v", "mpeg4"])
+            .arg(&ruta)
+            .status()
+            .expect("ffmpeg instalado");
+        assert!(ok.success(), "ffmpeg no pudo crear {ruta:?}");
+
+        let sondeo = sondear(&ruta).expect("vídeo legible");
+        assert_eq!(sondeo.codec, "mpeg4");
+        let (mut video, _) =
+            Video::reproducir(&ruta, &sondeo, false).expect("el original se reproduce");
+        video.conversion =
+            convertir(&ruta, &sondeo, &destino).map(|proceso| Conversion::Convirtiendo {
+                proceso,
+                destino: destino.clone(),
+                sondeo,
+            });
+        assert!(video.conversion.is_some(), "la conversión arranca");
+        let limite = Instant::now() + Duration::from_secs(60);
+        let (convertido, primero) = loop {
+            if let Some(relevo) = video.relevo() {
+                break relevo;
+            }
+            assert!(video.conversion.is_some(), "la conversión falló");
+            assert!(Instant::now() < limite, "la conversión no acaba");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(video.conversion.is_none(), "el relevo cierra la conversión");
+        drop((video, convertido));
+        std::fs::remove_file(&ruta).expect("se puede retirar el original");
+
+        assert!(!parcial(&destino).exists(), "el parcial se renombra");
+        let codec = sondear(&destino).expect("el convertido se lee").codec;
+        std::fs::remove_file(&destino).expect("se puede retirar el convertido");
+        assert_eq!(codec, "av1");
+        assert_eq!(primero.pixeles, (64, 64));
+        assert!(
+            primero.rgba[0] > 200 && primero.rgba[2] < 50,
+            "sigue siendo rojo"
+        );
     }
 
     /// La pareja manda sobre el fondo común, y cambiar de tema cambia la

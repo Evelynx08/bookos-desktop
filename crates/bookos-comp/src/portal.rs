@@ -634,7 +634,11 @@ pub fn tema_gtk() {
         _ => "Blue",
     };
     let tema = format!("BookOS-{}-{color}", if claro { "Light" } else { "Dark" });
-    let iconos = tema_iconos(claro);
+    // Los tintados los elige el usuario en Ajustes y no dependen de claro u
+    // oscuro: sin esto, cada cambio de tema o de acento los pisaba con el pack
+    // claro u oscuro.
+    let tintado = bookos_shell::icono::tema_elegido().filter(|t| t.starts_with("BookOS-Tinted"));
+    let iconos = tintado.as_deref().unwrap_or_else(|| tema_iconos(claro));
     for (clave, valor) in [
         ("gtk-theme", tema.as_str()),
         ("icon-theme", iconos),
@@ -651,6 +655,16 @@ pub fn tema_gtk() {
             .stderr(std::process::Stdio::null())
             .spawn();
     }
+    let sonido = tema_sonido();
+    if let Some(sonido) = sonido {
+        // El OSD suena con `canberra-gtk-play`, que sigue este ajuste; las apps
+        // GTK que avisan con sonido, también.
+        let _ = std::process::Command::new("gsettings")
+            .args(["set", "org.gnome.desktop.sound", "theme-name", sonido])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
     let Some(config) =
         std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
     else {
@@ -659,19 +673,36 @@ pub fn tema_gtk() {
     let oscuro = if claro { "false" } else { "true" };
     for version in ["gtk-3.0", "gtk-4.0"] {
         let ruta = config.join(version).join("settings.ini");
-        if let Err(err) = reescribir_ini(
-            &ruta,
-            &[
-                ("gtk-theme-name", &tema),
-                ("gtk-icon-theme-name", iconos),
-                // Si se quedara en `true`, GTK cargaría `gtk-dark.css` del
-                // tema claro y seguiría saliendo oscuro.
-                ("gtk-application-prefer-dark-theme", oscuro),
-            ],
-        ) {
+        let mut valores = vec![
+            ("gtk-theme-name", tema.as_str()),
+            ("gtk-icon-theme-name", iconos),
+            // Si se quedara en `true`, GTK cargaría `gtk-dark.css` del tema
+            // claro y seguiría saliendo oscuro.
+            ("gtk-application-prefer-dark-theme", oscuro),
+        ];
+        if let Some(sonido) = sonido {
+            valores.push(("gtk-sound-theme-name", sonido));
+        }
+        if let Err(err) = reescribir_ini(&ruta, &valores) {
             tracing::warn!(?ruta, "no se pudo escribir el tema GTK: {err}");
         }
     }
+}
+
+/// El tema de sonido de BookOS, si está instalado.
+///
+/// Si no, `None` y no se toca nada: nombrar un tema que no existe dejaría a
+/// libcanberra cayendo a freedesktop, pero también pisaría el que el usuario
+/// tuviera puesto (en esta máquina, `ocean` de KDE).
+fn tema_sonido() -> Option<&'static str> {
+    let mut bases = vec![std::path::PathBuf::from("/usr/share/sounds")];
+    if let Some(home) = std::env::var_os("HOME") {
+        bases.push(std::path::PathBuf::from(home).join(".local/share/sounds"));
+    }
+    bases
+        .iter()
+        .any(|b| b.join("bookos/index.theme").is_file())
+        .then_some("bookos")
 }
 
 /// El pack de iconos de BookOS si está instalado; si no, Breeze.
@@ -689,10 +720,16 @@ fn tema_iconos(claro: bool) -> &'static str {
     if let Some(home) = std::env::var_os("HOME") {
         bases.push(std::path::PathBuf::from(home).join(".local/share/icons"));
     }
-    if bases
-        .iter()
-        .any(|b| b.join(bookos).join("index.theme").is_file())
-    {
+    // Con `Directories=`: el tema de cursores del compositor (`cursor.rs`)
+    // vive en `~/.local/share/icons/BookOS-Dark` con su propio `index.theme`,
+    // sin iconos, y bastaba para nombrarlo. GTK avisaba en cada app («Theme
+    // file for BookOS-Dark has no directories») y se quedaba sin Breeze.
+    if bases.iter().any(|b| {
+        std::fs::read_to_string(b.join(bookos).join("index.theme")).is_ok_and(|t| {
+            t.lines()
+                .any(|l| l.trim_start().starts_with("Directories="))
+        })
+    }) {
         bookos
     } else {
         breeze

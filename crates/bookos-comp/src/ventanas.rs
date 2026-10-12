@@ -1117,12 +1117,7 @@ impl BookosComp {
         if tam.w <= 0 || tam.h <= 0 {
             return;
         }
-        let ocupadas: Vec<_> = self
-            .space
-            .elements()
-            .filter(|w| *w != window && colocada(w))
-            .filter_map(|w| self.space.element_location(w))
-            .collect();
+        let ocupadas = self.esquinas_ocupadas(window);
         let sitio = hueco(tam, crate::decoracion::area_util(self, window), &ocupadas);
         tracing::debug!(?sitio, ?tam, otras = ocupadas.len(), "ventana colocada");
         // Un cliente X11 tiene que enterarse de dónde lo hemos puesto: sus
@@ -1149,6 +1144,45 @@ impl BookosComp {
         // Una ventana que aparece se lleva el foco: es lo que espera cualquiera
         // al abrir un programa, y sin esto habría que pulsarla para escribir.
         self.enfocar(window);
+    }
+
+    fn esquinas_ocupadas(&self, window: &Window) -> Vec<Point<i32, Logical>> {
+        self.space
+            .elements()
+            .filter(|w| *w != window && colocada(w))
+            .filter_map(|w| self.space.element_location(w))
+            .collect()
+    }
+
+    /// Vuelve a colocar una ventana que crece justo después de abrirse y ya no
+    /// cabe donde se puso.
+    ///
+    /// Algunos clientes (LibreOffice con gtk3) mapean con un tamaño provisional
+    /// y a los pocos commits pasan al definitivo. `colocar_si_es_nueva` centró
+    /// el provisional, así que la esquina se quedaba donde estaba y el resto se
+    /// salía por la derecha y por abajo. Los dos primeros segundos son la ventana de
+    /// tiempo: pasados, un cambio de tamaño es del usuario o de la propia aplicación y se
+    /// respeta donde esté.
+    pub fn recolocar_si_creció(&mut self, window: &Window) {
+        const VENTANA_DE_CRECIMIENTO: Duration = Duration::from_secs(2);
+        let Some(nacida) = estado(window).nacida.get() else {
+            return;
+        };
+        if nacida.elapsed() > VENTANA_DE_CRECIMIENTO || maximizada(window) || completa(window) {
+            return;
+        }
+        let Some(loc) = self.space.element_location(window) else {
+            return;
+        };
+        let tam = window.geometry().size;
+        let area = crate::decoracion::area_util(self, window);
+        if area.contains_rect(Rectangle::new(loc, tam)) {
+            return;
+        }
+        let sitio = hueco(tam, area, &self.esquinas_ocupadas(window));
+        if sitio != loc {
+            self.space.map_element(window.clone(), sitio, false);
+        }
     }
 
     /// Da el foco de teclado a una ventana, la eleva y actualiza el estado
@@ -1273,11 +1307,7 @@ impl BookosComp {
     /// normal del clic.
     pub fn empezar_arrastre(&mut self, modo: Modo) -> bool {
         let punto = self.pointer_location;
-        let Some((window, loc)) = self
-            .space
-            .element_under(punto)
-            .map(|(w, loc)| (w.clone(), loc))
-        else {
+        let Some((window, loc)) = self.ventana_bajo(punto) else {
             return false;
         };
         // Redimensionar una ventana maximizada no tiene sentido: el cliente ya

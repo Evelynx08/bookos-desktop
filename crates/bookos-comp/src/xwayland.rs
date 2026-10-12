@@ -17,18 +17,24 @@
 //! instalado se avisa y la sesión sigue: perder los programas X11 es malo,
 //! pero mucho menos que no tener escritorio.
 //!
-//! La escala se deja fuera a propósito. X11 no sabe de escalas fraccionarias
-//! —el protocolo es de 1987— y lo que hacen KWin y Mutter es enseñarle a
-//! XWayland una pantalla en píxeles físicos y dejar que las aplicaciones se
-//! vean pequeñas, o mentirle con `Xft.dpi`. Aquí las ventanas X11 se tratan en
-//! lógicos como las demás, que en un panel de 242 DPI significa que se ven al
-//! tamaño correcto aunque un poco borrosas al ampliarlas.
+//! **Escala.** X11 no sabe de escalas. Antes las ventanas X11 iban en lógicos
+//! y el compositor ampliaba su imagen al factor del panel: tamaño correcto,
+//! pero borrosas (VirtualBox, Electron sin Wayland). Ahora XWayland ve la
+//! pantalla en píxeles físicos (`set_client_scale`, lo mismo que hace KWin con
+//! «dejar que las aplicaciones escalen solas») y a las aplicaciones se les
+//! dice el factor con `Xft.dpi`. Qt 6, Electron/Chromium y los textos de GTK
+//! lo leen y se dibujan grandes y nítidas; una aplicación que lo ignore se ve
+//! pequeña, que es el precio que pagan todos los escritorios que hacen esto.
+
+use std::os::fd::OwnedFd;
 
 use smithay::utils::{Logical, Rectangle};
+use smithay::wayland::selection::SelectionTarget;
 use smithay::wayland::xwayland_shell::XWaylandShellState;
 use smithay::xwayland::xwm::{Reorder, ResizeEdge, XwmId};
 use smithay::xwayland::{X11Surface, X11Wm, XWayland, XWaylandEvent};
 
+use crate::handlers::Seleccion;
 use crate::state::BookosComp;
 
 /// Lanza XWayland y deja programado el arranque de su gestor de ventanas.
@@ -55,6 +61,7 @@ pub fn arrancar(state: &mut BookosComp) {
         }
     };
 
+    state.cliente_x11 = Some(cliente.clone());
     let resultado =
         state
             .loop_handle
@@ -73,6 +80,7 @@ pub fn arrancar(state: &mut BookosComp) {
                             // dibuja sin decoración ni foco.
                             state.xwm = Some(wm);
                             state.display_x11 = Some(display_number);
+                            actualizar_escala(state);
                             tracing::info!(
                                 display = format!(":{display_number}"),
                                 "XWayland listo"
@@ -87,6 +95,50 @@ pub fn arrancar(state: &mut BookosComp) {
             });
     if let Err(err) = resultado {
         tracing::error!("no se pudo escuchar a XWayland: {err}");
+    }
+}
+
+/// Pone a XWayland en la escala del monitor más denso y se lo dice a las
+/// aplicaciones con `Xft.dpi`. Se llama al arrancar y cada vez que cambian las
+/// pantallas.
+///
+/// Con varios monitores manda el más denso: en el otro las ventanas X11 se
+/// verán grandes, pero nítidas; al revés se verían borrosas en el panel, que
+/// es donde se trabaja. Las ventanas X11 ya abiertas no se redibujan con el
+/// DPI nuevo hasta que se reinician: `Xft.dpi` se lee al arrancar.
+pub fn actualizar_escala(state: &mut BookosComp) {
+    let Some(cliente) = state.cliente_x11.as_ref() else {
+        return;
+    };
+    let escala = state
+        .space
+        .outputs()
+        .map(|o| o.current_scale().fractional_scale())
+        .max_by(f64::total_cmp)
+        .unwrap_or(1.0);
+    let datos = cliente
+        .get_data::<smithay::xwayland::XWaylandClientData>()
+        .expect("el cliente de XWayland lleva sus datos desde el spawn");
+    if datos.compositor_state.client_scale() == escala {
+        return;
+    }
+    datos.compositor_state.set_client_scale(escala);
+    tracing::info!(escala, "escala de XWayland");
+    let Some(n) = state.display_x11 else {
+        return;
+    };
+    // 96 es el DPI de referencia de X11: 192 equivale a escala 2.
+    let dpi = (96.0 * escala).round() as u32;
+    match std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("echo 'Xft.dpi: {dpi}' | xrdb -merge"))
+        .env("DISPLAY", format!(":{n}"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(hijo) => state.hijos.push(hijo),
+        Err(err) => tracing::warn!("no se pudo fijar Xft.dpi: {err}"),
     }
 }
 
@@ -302,6 +354,115 @@ impl smithay::xwayland::XwmHandler for BookosComp {
     fn move_request(&mut self, _xwm: XwmId, window: X11Surface, _button: u32) {
         if let Some(elemento) = self.window_de_x11(&window) {
             self.arrastrar_ventana(&elemento, crate::ventanas::Modo::Mover, true);
+        }
+    }
+
+    /// Un programa X11 pide leer una selección que tiene un cliente Wayland.
+    ///
+    /// Siempre que sí, sin mirar el foco. VirtualBox pregunta los tipos
+    /// (`TARGETS`) en cuanto cambia el dueño, para anunciárselos al invitado,
+    /// y en ese momento quien tiene el foco es la ventana donde se copió, no
+    /// la máquina virtual: atado al foco, el invitado no se entera nunca. Entre
+    /// programas X11 tampoco hay más barrera que esta.
+    fn allow_selection_access(&mut self, _xwm: XwmId, _selection: SelectionTarget) -> bool {
+        true
+    }
+
+    fn send_selection(
+        &mut self,
+        _xwm: XwmId,
+        selection: SelectionTarget,
+        mime_type: String,
+        fd: OwnedFd,
+    ) {
+        use smithay::wayland::selection::data_device::{
+            current_data_device_selection_userdata, request_data_device_client_selection,
+        };
+        use smithay::wayland::selection::primary_selection::{
+            current_primary_selection_userdata, request_primary_client_selection,
+        };
+        // Si el dueño es el compositor —la captura—, Smithay no la sirve:
+        // `request_*_client_selection` es solo para leer la de un cliente.
+        let propia = match selection {
+            SelectionTarget::Clipboard => {
+                current_data_device_selection_userdata(&self.seat).map(|d| d.clone())
+            }
+            SelectionTarget::Primary => {
+                current_primary_selection_userdata(&self.seat).map(|d| d.clone())
+            }
+        };
+        // Los dos `request_*` tienen tipos de error distintos: de ahí el texto.
+        let resultado = match propia {
+            Some(Seleccion::Bytes(datos)) => {
+                crate::handlers::escribir_seleccion(datos, mime_type, fd);
+                return;
+            }
+            // Que pida la suya propia no debería pasar: el gestor no reenvía
+            // peticiones cuando el dueño X11 es otro programa X11.
+            Some(Seleccion::X11) => return,
+            None => match selection {
+                SelectionTarget::Clipboard => {
+                    request_data_device_client_selection(&self.seat, mime_type, fd)
+                        .map_err(|e| e.to_string())
+                }
+                SelectionTarget::Primary => {
+                    request_primary_client_selection(&self.seat, mime_type, fd)
+                        .map_err(|e| e.to_string())
+                }
+            },
+        };
+        if let Err(err) = resultado {
+            tracing::warn!(
+                ?selection,
+                "X11 no pudo leer la selección de Wayland: {err}"
+            );
+        }
+    }
+
+    /// Un programa X11 copia: los clientes Wayland lo ven como selección del
+    /// compositor, y al pegar se le pide a XWayland (`Seleccion::X11`).
+    fn new_selection(&mut self, _xwm: XwmId, selection: SelectionTarget, mime_types: Vec<String>) {
+        use smithay::wayland::selection::data_device::set_data_device_selection;
+        use smithay::wayland::selection::primary_selection::set_primary_selection;
+        match selection {
+            SelectionTarget::Clipboard => set_data_device_selection(
+                &self.display_handle,
+                &self.seat,
+                mime_types,
+                Seleccion::X11,
+            ),
+            SelectionTarget::Primary => {
+                set_primary_selection(&self.display_handle, &self.seat, mime_types, Seleccion::X11)
+            }
+        }
+    }
+
+    /// El programa X11 soltó su selección. Solo se borra la de Wayland si
+    /// seguía siendo la suya: si entretanto copió un cliente Wayland, esa manda.
+    fn cleared_selection(&mut self, _xwm: XwmId, selection: SelectionTarget) {
+        use smithay::wayland::selection::data_device::{
+            clear_data_device_selection, current_data_device_selection_userdata,
+        };
+        use smithay::wayland::selection::primary_selection::{
+            clear_primary_selection, current_primary_selection_userdata,
+        };
+        match selection {
+            SelectionTarget::Clipboard => {
+                if matches!(
+                    current_data_device_selection_userdata(&self.seat).as_deref(),
+                    Some(Seleccion::X11)
+                ) {
+                    clear_data_device_selection(&self.display_handle, &self.seat);
+                }
+            }
+            SelectionTarget::Primary => {
+                if matches!(
+                    current_primary_selection_userdata(&self.seat).as_deref(),
+                    Some(Seleccion::X11)
+                ) {
+                    clear_primary_selection(&self.display_handle, &self.seat);
+                }
+            }
         }
     }
 

@@ -64,6 +64,15 @@ fn describir(ruta: &Path) -> anyhow::Result<()> {
         recursos.connectors().len(),
         card.plane_handles().map(|p| p.len()).unwrap_or(0)
     );
+    // Cero entradas es que no hay curva de gamma y la luz nocturna no puede
+    // teñir esa pantalla.
+    let gamma: Vec<String> = recursos
+        .crtcs()
+        .iter()
+        .filter_map(|c| card.get_crtc(*c).ok())
+        .map(|c| c.gamma_length().to_string())
+        .collect();
+    println!("  tabla de gamma por crtc: {}", gamma.join(", "));
 
     for handle in recursos.connectors() {
         let Ok(con) = card.get_connector(*handle, false) else {

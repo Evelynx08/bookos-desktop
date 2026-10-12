@@ -31,8 +31,8 @@ pub struct Battery {
     /// Enchufado a la corriente. No es lo mismo que `charging`: con el umbral
     /// de carga alcanzado el portátil está enchufado y **no** carga.
     pub plugged: bool,
-    /// Minutos que quedan — de autonomía si descarga, para llenarse si carga.
-    /// `None` cuando el driver no da corriente instantánea o vale cero.
+    /// Minutos que quedan — de autonomía si descarga, para llegar al tope de
+    /// carga si carga. `None` cuando el driver no da corriente o vale cero.
     pub minutes: Option<u32>,
 }
 
@@ -70,36 +70,47 @@ impl Battery {
         let percent = read_num(path.join("capacity"))?.min(100) as u8;
         let status = fs::read_to_string(path.join("status")).ok()?;
         let status = status.trim();
+        // Manda el adaptador, y la batería solo si no hay ninguno. Su `status`
+        // llega tarde: el driver lo sirve de una caché de 1 s
+        // (`battery.cache_time`) y el aviso de udev del adaptador llega antes
+        // de que cambie. Leyéndolo de ahí, al desenchufar seguía diciendo
+        // «Charging» y no sonaba nada; al volver a enchufar decía por fin
+        // «Discharging» y sonaba la desconexión, y 0,77 s después la conexión
+        // (visto en el registro de la sesión). Leer `online` cuesta 0,035 ms.
+        //
         // "Not charging" es lo que dice el driver cuando está enchufado pero
         // parado en el umbral de carga: no está cargando, pero tampoco
         // gastando batería.
-        let charging = status == "Charging";
+        let plugged = ac_online().unwrap_or(matches!(status, "Charging" | "Not charging" | "Full"));
+        // Sin corriente no se carga, diga lo que diga un `status` atrasado.
+        let charging = plugged && status == "Charging";
         Some(Self {
             percent,
             charging,
-            // El estado de la batería ya distingue los tres casos, así que no
-            // hace falta ir a mirar el adaptador: solo se le pregunta a ADP*
-            // cuando la batería dice algo que no sabemos interpretar.
-            plugged: match status {
-                "Charging" | "Not charging" | "Full" => true,
-                "Discharging" => false,
-                _ => ac_online().unwrap_or(false),
-            },
+            plugged,
             minutes: con_minutos
-                .then(|| remaining_minutes(&path, charging))
+                .then(|| {
+                    // Envenenado solo si otro hilo reventó a mitad de una
+                    // suma: la media que dejó sigue siendo un número válido.
+                    let mut media = FLUJO.lock().unwrap_or_else(|e| e.into_inner());
+                    remaining_minutes(&path, charging, &mut media)
+                })
                 .flatten(),
         })
     }
 }
 
-/// Minutos restantes a partir de la carga y la corriente instantáneas.
+/// Minutos restantes: lo que falta por gastar o por cargar, entre la
+/// corriente **media** de los últimos minutos.
 ///
 /// El kernel expone la batería en carga (`charge_*`, µAh) o en energía
 /// (`energy_*`, µWh) según el driver; las dos parejas dividen igual, así que
-/// basta con encontrar la que exista. La cuenta es la ingenua —carga entre
-/// corriente— y por tanto salta al vuelo con cada pico de consumo: sirve para
-/// "me queda tarde o me queda un rato", no como promesa.
-fn remaining_minutes(path: &Path, charging: bool) -> Option<u32> {
+/// basta con encontrar la que exista.
+///
+/// Cargando, la meta es el tope de carga y no `charge_full`: con el umbral al
+/// 80 % la cuenta hasta el lleno daba 0:52 donde faltaban 0:30 (medido aquí al
+/// 53 %, 2,2 A).
+fn remaining_minutes(path: &Path, charging: bool, media: &mut Flujo) -> Option<u32> {
     // El `exists()` se repite en cada lectura a propósito: recordarlo en un
     // global ataría la respuesta a la primera batería que se mirase, y lo que
     // cuesta aquí es `current_now` —0,53 ms medidos, una consulta al
@@ -110,17 +121,79 @@ fn remaining_minutes(path: &Path, charging: bool) -> Option<u32> {
         ("energy_now", "energy_full", "power_now")
     };
 
-    let ahora = read_num(path.join(ahora))? as u64;
-    let flujo = read_num(path.join(flujo))? as u64;
-    if flujo == 0 {
-        return None;
-    }
+    let ahora = read_num(path.join(ahora))? as f32;
+    let flujo = media.poner(
+        read_num(path.join(flujo))? as f32,
+        charging,
+        std::time::Instant::now(),
+    )?;
     let restante = if charging {
-        (read_num(path.join(tope))? as u64).saturating_sub(ahora)
+        let lleno = read_num(path.join(tope))? as f32;
+        let meta = charge_limit_en(path).map_or(lleno, |u| lleno * f32::from(u) / 100.0);
+        meta - ahora
     } else {
         ahora
     };
-    Some((restante * 60 / flujo) as u32)
+    let minutos = restante * 60.0 / flujo;
+    // Con la carga frenando justo antes del tope la corriente cae a unos pocos
+    // mA y la cuenta da días: eso no es una estimación, es ruido.
+    (restante > 0.0 && minutos < 24.0 * 60.0).then_some(minutos as u32)
+}
+
+/// La corriente media.
+///
+/// Se promedia el **flujo** y no los minutos, como se hacía antes: los minutos
+/// son su inverso y su media no es la de nada, y sobre todo un valor de minutos
+/// promediado no avanza solo. Con la corriente media y la carga leída en cada
+/// momento, la cuenta baja minuto a minuto aunque el consumo no cambie.
+///
+/// Hay una sola para todo el proceso (ver [`FLUJO`]): el panel, el emergente de
+/// energía y el buscador leen la misma batería y tienen que decir el mismo
+/// tiempo. Con una media por cada uno, el emergente recién abierto enseñaba la
+/// lectura cruda y el panel su media, y no coincidían nunca.
+///
+/// La media es exponencial en el **tiempo** —constante de [`Flujo::TAU`]—, no
+/// en el número de lecturas: quien más lee no pesa más. La corriente
+/// instantánea en este portátil va de 1:28 de autonomía compilando a 8:18 en
+/// reposo treinta segundos después; con dos minutos, un pico de medio minuto
+/// mueve la media un 22 % y no la triplica.
+#[derive(Default)]
+struct Flujo(Option<(bool, f32, std::time::Instant)>);
+
+static FLUJO: std::sync::Mutex<Flujo> = std::sync::Mutex::new(Flujo(None));
+
+impl Flujo {
+    const TAU: f32 = 120.0;
+
+    fn poner(
+        &mut self,
+        instantaneo: f32,
+        charging: bool,
+        ahora: std::time::Instant,
+    ) -> Option<f32> {
+        let nuevo = match self.0 {
+            // Enchufar o desenchufar cambia lo que se mide: lo de antes no vale.
+            Some((cargando, previo, cuando)) if cargando == charging => {
+                let pasado = ahora.saturating_duration_since(cuando).as_secs_f32();
+                previo + (instantaneo - previo) * (1.0 - (-pasado / Self::TAU).exp())
+            }
+            _ => instantaneo,
+        };
+        self.0 = Some((charging, nuevo, ahora));
+        (nuevo > 0.0).then_some(nuevo)
+    }
+}
+
+/// El tope de carga, si el portátil tiene uno puesto. Es la explicación de por
+/// qué una batería enchufada se queda parada en el 80 % y no llega al 100.
+pub(crate) fn charge_limit() -> Option<u8> {
+    charge_limit_en(&battery_path()?)
+}
+
+fn charge_limit_en(path: &Path) -> Option<u8> {
+    read_num(path.join("charge_control_end_threshold"))
+        .filter(|u| *u > 0 && *u < 100)
+        .map(|u| u as u8)
 }
 
 fn ac_online() -> Option<bool> {
@@ -512,7 +585,10 @@ mod tests {
                 ("current_now", "523000\n"),
             ],
         );
-        assert_eq!(remaining_minutes(&dir, false), Some(352));
+        assert_eq!(
+            remaining_minutes(&dir, false, &mut Flujo::default()),
+            Some(352)
+        );
     }
 
     #[test]
@@ -526,7 +602,66 @@ mod tests {
                 ("current_now", "2000000\n"),
             ],
         );
-        assert_eq!(remaining_minutes(&dir, true), Some(30));
+        assert_eq!(
+            remaining_minutes(&dir, true, &mut Flujo::default()),
+            Some(30)
+        );
+    }
+
+    /// Con tope de carga, cargando se cuenta hasta el tope: al 53 % con el
+    /// umbral en 80 y 2,2 A faltan 30 minutos, no los 52 de llegar al lleno.
+    #[test]
+    fn cargando_con_tope_cuenta_hasta_el_tope() {
+        let dir = bateria_falsa(
+            "tope",
+            &[
+                ("charge_now", "2173000\n"),
+                ("charge_full", "4100000\n"),
+                ("current_now", "2196000\n"),
+                ("charge_control_end_threshold", "80\n"),
+            ],
+        );
+        assert_eq!(
+            remaining_minutes(&dir, true, &mut Flujo::default()),
+            Some(30)
+        );
+    }
+
+    /// Ya en el tope, aunque el driver aún diga «Charging», no hay tiempo.
+    #[test]
+    fn en_el_tope_no_hay_tiempo_de_carga() {
+        let dir = bateria_falsa(
+            "en-tope",
+            &[
+                ("charge_now", "3300000\n"),
+                ("charge_full", "4100000\n"),
+                ("current_now", "40000\n"),
+                ("charge_control_end_threshold", "80\n"),
+            ],
+        );
+        assert_eq!(remaining_minutes(&dir, true, &mut Flujo::default()), None);
+    }
+
+    /// Un pico de medio minuto mueve la media una quinta parte, no entera; y
+    /// enchufar la descarta.
+    #[test]
+    fn la_media_del_flujo_va_por_tiempo() {
+        let t0 = std::time::Instant::now();
+        let mut f = Flujo::default();
+        assert_eq!(f.poner(500.0, false, t0), Some(500.0));
+        let pico = f
+            .poner(1500.0, false, t0 + std::time::Duration::from_secs(30))
+            .expect("flujo positivo");
+        assert!((700.0..730.0).contains(&pico), "media tras el pico: {pico}");
+        // Una segunda lectura en el mismo instante no pesa nada.
+        let repetida = f
+            .poner(1500.0, false, t0 + std::time::Duration::from_secs(30))
+            .expect("flujo positivo");
+        assert_eq!(repetida, pico);
+        assert_eq!(
+            f.poner(2000.0, true, t0 + std::time::Duration::from_secs(31)),
+            Some(2000.0)
+        );
     }
 
     /// Algunos drivers dan la batería en energía (µWh) y no en carga (µAh).
@@ -540,7 +675,10 @@ mod tests {
                 ("power_now", "10000000\n"),
             ],
         );
-        assert_eq!(remaining_minutes(&dir, false), Some(180));
+        assert_eq!(
+            remaining_minutes(&dir, false, &mut Flujo::default()),
+            Some(180)
+        );
     }
 
     /// Corriente cero es lo que se lee justo al enchufar o con la carga
@@ -556,12 +694,12 @@ mod tests {
                 ("current_now", "0\n"),
             ],
         );
-        assert_eq!(remaining_minutes(&dir, false), None);
+        assert_eq!(remaining_minutes(&dir, false, &mut Flujo::default()), None);
     }
 
     #[test]
     fn sin_ficheros_no_hay_estimacion() {
         let dir = bateria_falsa("vacia", &[]);
-        assert_eq!(remaining_minutes(&dir, false), None);
+        assert_eq!(remaining_minutes(&dir, false, &mut Flujo::default()), None);
     }
 }

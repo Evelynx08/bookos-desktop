@@ -18,6 +18,10 @@ fn estado(clase: Clase, con_portada: bool, cola: usize) -> Estado {
             Clase::Player => "com.bookos.player",
             Clase::Timer => "com.bookos.clock",
             Clase::Recorder => "com.bookos.voicerecorder",
+            Clase::Transfer => "com.bookos.settings",
+            Clase::Calendar => "com.bookos.calendar",
+            Clase::Monitor => "com.bookos.systemmonitor",
+            Clase::Auriculares => "com.bookos.buds",
         }
         .into(),
         clase,
@@ -33,6 +37,7 @@ fn estado(clase: Clase, con_portada: bool, cola: usize) -> Estado {
         aleatorio: true,
         repetir: false,
         portada: con_portada.then(portada),
+        metricas: Vec::new(),
         cola: (0..cola)
             .map(|i| ItemCola {
                 id: i.to_string(),

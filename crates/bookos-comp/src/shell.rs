@@ -29,12 +29,15 @@ use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 /// Cada OSD tiene una confirmación audible, pero el evento concreto conserva
 /// el significado: el de volumen está pensado para juzgar el nivel resultante
 /// y el de error no debe sonar como una pulsación aceptada.
+///
+/// El de volumen no suena aquí: lo pone `multimedia::chasquido`, que es quien
+/// mira «Sonido al cambiar el volumen». Sonando también aquí, cada tecla daba
+/// dos chasquidos y el interruptor de Ajustes solo apagaba uno de ellos.
 fn reproducir_sonido_osd(icono: &str) {
     let evento = match icono {
         "sin-red" => "dialog-error",
-        nombre if nombre.starts_with("volumen") || nombre.starts_with("micro") => {
-            "audio-volume-change"
-        }
+        nombre if nombre.starts_with("volumen") => return,
+        nombre if nombre.starts_with("micro") => "audio-volume-change",
         _ => "keyboard-key",
     };
     let _ = Command::new("canberra-gtk-play")
@@ -49,6 +52,18 @@ fn reproducir_sonido_osd(icono: &str) {
 pub enum Barra {
     Panel,
     Dock,
+}
+
+/// Qué parte del shell se pide en [`ShellHost::elements`].
+///
+/// La isla se separa del resto con la vista de escritorios abierta: su tarjeta
+/// desplegada cuelga sobre las miniaturas, que la escena pone delante de todo
+/// lo del shell, y quedaba tapada por ellas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapaShell {
+    Todo,
+    SinIsla,
+    SoloIsla,
 }
 
 /// Cómo se comporta una barra ante las ventanas.
@@ -174,6 +189,7 @@ pub struct ShellHost {
     emergente: Option<Surface>,
     /// Página anterior del Launchpad mientras cruza con la nueva. Ambos
     /// buffers están ya rasterizados; la GPU solo cambia posición y alfa.
+    /// El `f32` es la dirección del paso de 140 px.
     pagina_anterior: Option<(Surface, std::time::Instant, f32)>,
     /// La vista anterior del launchpad mientras dura una transición suya —abrir
     /// o cerrar una carpeta, o un fundido—. Mismo truco que
@@ -474,10 +490,15 @@ impl ShellHost {
     /// Mientras la haya, la barra no puede apartarse: la tarjeta se quedaría
     /// flotando en la franja que la barra acaba de abandonar, o se iría con
     /// ella. Del dock solo cuelga su menú contextual; del panel, cualquiera de
-    /// sus emergentes.
+    /// sus emergentes y la isla desplegada: su tarjeta cuelga por debajo del
+    /// panel, así que bajar a sus controles sacaba el cursor de la franja de
+    /// retención y el panel se apartaba llevándosela.
     fn retenida_por_emergente(&self, cual: Barra) -> bool {
         match cual {
-            Barra::Panel => self.shell.hay_emergente(),
+            Barra::Panel => {
+                self.shell.hay_emergente()
+                    || (self.actividad_visible && self.shell.actividad_abierta())
+            }
             Barra::Dock => self.shell.emergente_nombre() == Some("menu-dock"),
         }
     }
@@ -1184,7 +1205,13 @@ impl ShellHost {
     /// El panel ocupa toda la franja de arriba y el dock flota abajo; ambos se
     /// dibujan **por encima** de las ventanas (ver `backend::escena`), así que
     /// tienen que ganar el hit-test.
-    pub fn contiene(&self, x: f64, y: f64) -> bool {
+    /// Con `completa` —una ventana a pantalla completa en la principal— el
+    /// panel, el dock y la isla no se dibujan (ver `elements`), así que
+    /// tampoco reciben clics. Con las barras en «siempre visible» no hay nada
+    /// más que las aparte, y la franja de arriba y el sitio del dock se
+    /// quedaban los clics del vídeo: un clic abajo en el centro podía
+    /// activar un icono del dock que no se veía.
+    pub fn contiene(&self, x: f64, y: f64, completa: bool) -> bool {
         if self.dead {
             return false;
         }
@@ -1203,6 +1230,9 @@ impl ShellHost {
         // en lo que tenga debajo.
         if self.toast_bajo(x, y).is_some() {
             return true;
+        }
+        if completa {
+            return self.shell.hay_emergente();
         }
         if Self::dentro(self.actividad_rect(), x, y).is_some() {
             return true;
@@ -1253,24 +1283,6 @@ impl ShellHost {
             return;
         }
         self.puntero_en = (x, y);
-
-        // `actividad_rect` devuelve solo la tarjeta, sin el aire transparente
-        // reservado para su sombra. La lógica de Actividad, igual que la de
-        // pulsación, trabaja en coordenadas del buffer completo; se repone el
-        // margen antes de entregarle el punto. Sin esto el hover del volumen
-        // quedaba desplazado 26 px arriba y a la izquierda.
-        let margen_actividad = bookos_shell::actividad::MARGEN_SOMBRA;
-        let x0 = self.shell.actividad_zona().map_or(0.0, |(x0, _)| x0);
-        let punto_actividad = Self::dentro(self.actividad_rect(), x, y)
-            .map(|(px, py)| (px + margen_actividad + x0, py + margen_actividad));
-        let repintar_actividad = self
-            .guard("puntero actividad", |host| {
-                host.shell.actividad_puntero(punto_actividad)
-            })
-            .unwrap_or(false);
-        if repintar_actividad {
-            self.pintar_actividad();
-        }
 
         if self.shell.hay_emergente() {
             // Con algo agarrado —el deslizador del volumen— el puntero le sigue
@@ -1358,7 +1370,10 @@ impl ShellHost {
         if let Some(t) = transicion
             && let Some(anterior) = self.emergente.take()
         {
-            tracing::debug!(?t, "transición del launchpad: se guarda la vista de antes");
+            tracing::debug!(
+                ?t,
+                "transición de la emergente: se guarda la vista de antes"
+            );
             self.vista_anterior = Some((anterior, std::time::Instant::now(), t));
         }
         let Some(((w, h), ancla, alto_colocacion)) = self.shell.emergente_geometria() else {
@@ -1485,15 +1500,32 @@ impl ShellHost {
             T::AbrirCarpeta => (tema::D_MODAL, tema::C_MUELLE),
             T::CerrarCarpeta => (tema::D_TARJETA, tema::C_ENTRADA),
             T::Fundido => (tema::D_HOVER, tema::C_SUAVE),
+            T::AbrirDetalle(_) => (tema::D_MODAL, tema::C_ENTRADA),
+            T::CerrarDetalle(_) => (tema::D_TARJETA, tema::C_SUAVE),
         };
         // Con los efectos reducidos, duración cero: el cruce salta al final en
-        // el primer fotograma y `animando()` deja de pedir más. Estas tres son
+        // el primer fotograma y `animando()` deja de pedir más. Estas transiciones son
         // adorno puro —el estado final es idéntico—, que es justo lo que ese
         // ajuste existe para quitar.
         if tema::efectos_reducidos() {
             return (std::time::Duration::ZERO, curva);
         }
         (duracion.mul_f32(Self::lento()), curva)
+    }
+
+    fn geometria_detalle(
+        tamano: (f32, f32),
+        origen: (f32, f32, f32, f32),
+        progreso: f32,
+        cerrando: bool,
+    ) -> (f32, f32, f32, f32) {
+        let t = progreso.clamp(0.0, 1.0);
+        let avance = if cerrando { 1.0 - t } else { t };
+        let inicial = (origen.2 / tamano.0).min(origen.3 / tamano.1);
+        let zoom = inicial + (1.0 - inicial) * avance;
+        let x = ((origen.0 + origen.2 / 2.0) - tamano.0 / 2.0) * (1.0 - avance);
+        let y = ((origen.1 + origen.3 / 2.0) - tamano.1 / 2.0) * (1.0 - avance);
+        ((avance * 1.5).min(1.0), zoom, x, y)
     }
 
     /// Multiplicador de las transiciones, de `BOOKOS_ANIM`.
@@ -1633,10 +1665,21 @@ impl ShellHost {
             // rectángulo entero deja la tarjeta por debajo del centro que se
             // percibe. Con algo más alto que el área útil —el launchpad— la
             // cuenta sale negativa y el recorte de abajo la deja en su sitio.
+            //
+            // Lo que tapa la pantalla —el launchpad— va sin panel, que no se
+            // dibuja con él, y con el dock solo si se ve por delante. Centrarlo
+            // entre panel y dock lo dejaba en y≈2 a 1440×900: el buscador
+            // pegado al borde de arriba.
             Ancla::Centrada => {
-                let arriba = self.shell.panel_height() as f64;
-                let (_, dock_y, _, _) = self.dock_rect();
-                let util = (dock_y - SEPARACION - arriba).max(1.0);
+                let (arriba, abajo) = if self.shell.emergente_tapa_la_pantalla() {
+                    (0.0, self.alto_launchpad())
+                } else {
+                    (
+                        self.shell.panel_height() as f64,
+                        self.dock_rect().1 - SEPARACION,
+                    )
+                };
+                let util = (abajo - arriba).max(1.0);
                 (
                     (self.screen.0 as f64 / escala - w as f64) / 2.0,
                     arriba + (util - h as f64) / 2.0,
@@ -1706,17 +1749,14 @@ impl ShellHost {
         ))
     }
 
-    /// Cierra la emergente que hubiera. `true` si había alguna.
-    pub fn cerrar_emergente(&mut self) -> bool {
-        if self.dead || !self.shell.hay_emergente() {
-            return false;
-        }
-        self.shell.cerrar_emergente();
-        self.resaltar_panel();
-        // Con la tarjeta abierta `reclamada` no mira el cursor, así que `pedida`
-        // se quedó como estaba al abrirla —el cursor arriba, pulsando el
-        // widget— aunque luego se bajara a pulsar fuera. Sin volver a mirarlo
-        // aquí el panel no se escondía hasta el siguiente movimiento del ratón.
+    /// Vuelve a preguntar a las barras si el cursor las pide, sin esperar a
+    /// que se mueva.
+    ///
+    /// Con una tarjeta abierta `reclamada` no mira el cursor, así que `pedida`
+    /// se quedó como estaba al abrirla —el cursor arriba, pulsando el widget—
+    /// aunque luego se bajara a pulsar fuera. Sin volver a mirarlo al cerrarla
+    /// el panel no se escondía hasta el siguiente movimiento del ratón.
+    fn reclamar_bajo_el_puntero(&mut self) {
         let (ancho, alto) = self.area_principal();
         let escala = self.escala_principal();
         let (x, y) = self.puntero_en;
@@ -1725,6 +1765,16 @@ impl ShellHost {
                 self.reclamada(cual, (x * escala, y * escala));
             }
         }
+    }
+
+    /// Cierra la emergente que hubiera. `true` si había alguna.
+    pub fn cerrar_emergente(&mut self) -> bool {
+        if self.dead || !self.shell.hay_emergente() {
+            return false;
+        }
+        self.shell.cerrar_emergente();
+        self.resaltar_panel();
+        self.reclamar_bajo_el_puntero();
         // Las superficies **no** se sueltan aquí: se quedan mientras dura la
         // salida. El realce sí, porque señalar algo que ya se está yendo no
         // significa nada; sin esto, además, se quedaba su recuadro gris
@@ -1761,7 +1811,7 @@ impl ShellHost {
         if self
             .desbloqueo
             .as_ref()
-            .is_some_and(|(_, t)| t.elapsed() >= Self::DESBLOQUEO)
+            .is_some_and(|(_, t)| t.elapsed() >= Self::dura_desbloqueo())
         {
             self.desbloqueo = None;
             self.bloqueo_velo = None;
@@ -1818,6 +1868,15 @@ impl ShellHost {
         self.sincronizar_emergente();
     }
 
+    /// Pasa de la tarjeta abierta a otra con las dos animaciones: la de ahora
+    /// sale y la nueva entra al acabar. Es lo que hace el clic en otro widget
+    /// del panel; sin esto, Meta+Z → Meta+X cambiaba el contenido de la misma
+    /// superficie y la tarjeta nueva aparecía de golpe.
+    pub fn cambiar_a_widget(&mut self, widget: &'static str) {
+        self.emergente_pendiente = Some(widget);
+        self.cerrar_emergente();
+    }
+
     pub fn confirmar_energia(&mut self, accion: bookos_shell::confirmacion::Energia) {
         self.guard("confirmar energía", |host| {
             host.shell
@@ -1843,6 +1902,18 @@ impl ShellHost {
                 .abrir(bookos_shell::Emergente::compartir(sesion, app, pantallas));
         });
         self.sincronizar_emergente();
+    }
+
+    /// Abre la caja para responder a una notificación. `false` si ya no existe.
+    pub fn abrir_respuesta(&mut self, id: u32) -> bool {
+        if self.dead {
+            return false;
+        }
+        let abierta = self
+            .guard("abrir respuesta", |host| host.shell.abrir_respuesta(id))
+            .unwrap_or(false);
+        self.sincronizar_emergente();
+        abierta
     }
 
     pub fn abrir_acerca(&mut self) {
@@ -1880,8 +1951,10 @@ impl ShellHost {
         }
         // Leer los `.desktop` puede tardar unos milisegundos, así que va dentro
         // del guard: un fichero raro no puede tumbar la sesión.
-        let escala = self.shell.scale();
-        let pantalla = (self.screen.0 as f32 / escala, self.screen.1 as f32 / escala);
+        let pantalla = (
+            self.screen.0 as f32 / self.shell.scale(),
+            self.alto_launchpad() as f32,
+        );
         self.guard("abrir launchpad", |host| {
             host.shell
                 .abrir(bookos_shell::Emergente::launchpad(pantalla));
@@ -1890,6 +1963,16 @@ impl ShellHost {
         // hasta que su superficie no está colocada no se sabe dónde empieza.
         self.sincronizar_emergente();
         self.avisar_zona_dock();
+    }
+
+    /// Hasta dónde llega el launchpad por abajo, en lógicos: el dock si se ve
+    /// por delante de él, o el borde de la pantalla.
+    fn alto_launchpad(&self) -> f64 {
+        if self.shell.dock_en_launchpad() {
+            self.dock_rect().1 - SEPARACION
+        } else {
+            self.screen.1 as f64 / self.shell.scale() as f64
+        }
     }
 
     /// Le pasa al launchpad dónde queda el dock, para que sepa que soltar ahí
@@ -2117,8 +2200,13 @@ impl ShellHost {
         // El aviso de una notificación gana a todo lo que tenga debajo: está
         // encima de las ventanas, y un clic que lo atravesara escribiría en una
         // aplicación que el usuario ni siquiera está mirando.
-        if let Some((id, clave)) = self.toast_accion(x, y) {
-            return Some(Accion::NotificacionAccion { id, clave });
+        if let Some((id, pulsado)) = self.toast_accion(x, y) {
+            use bookos_shell::toast::Pulsado;
+            return Some(match pulsado {
+                Pulsado::Boton(clave) => Accion::NotificacionAccion { id, clave },
+                // La ✕ borra: la quita también de la lista y avisa a la app.
+                Pulsado::Cerrar => Accion::CerrarNotificacion(id),
+            });
         }
         // Pulsar el cuerpo lo despide y, si la app ofrece `default`, la
         // ejecuta: es lo que abre la conversación de un aviso de mensajería.
@@ -2140,6 +2228,7 @@ impl ShellHost {
                 .flatten()
                 .map(Accion::Actividad);
             self.pintar_actividad();
+            self.reclamar_bajo_el_puntero();
             return accion;
         }
 
@@ -2281,6 +2370,18 @@ impl ShellHost {
         hecho
     }
 
+    /// El logo del panel con el color del canal de actualizaciones.
+    pub fn aplicar_canal(&mut self, canal: bookos_shell::marca::Canal) {
+        if self.dead {
+            return;
+        }
+        self.guard("canal", |host| {
+            host.shell.aplicar_canal(canal);
+            let buffer = &mut host.panel.buffer;
+            paint(buffer, |buf| host.shell.draw_panel(buf));
+        });
+    }
+
     /// Recarga la composición del bloqueo guardada por BookOS Settings.
     pub fn aplicar_bloqueo_config(&mut self, config: bookos_shell::ConfigBloqueo) -> bool {
         if self.dead {
@@ -2346,12 +2447,19 @@ impl ShellHost {
         self.pintar_actividad();
     }
 
+    /// La aplicación con el foco cambió: su actividad sale de la isla o vuelve.
+    pub fn poner_app_enfocada(&mut self, app_id: Option<String>) {
+        self.guard("app enfocada", |host| host.shell.poner_app_enfocada(app_id));
+        self.pintar_actividad();
+    }
+
     pub fn cerrar_actividad(&mut self, app_id: &str) -> bool {
         let cerrada = self.guard("cerrar actividad", |host| {
             host.shell.cerrar_actividad(app_id)
         }) == Some(true);
         if cerrada {
             self.pintar_actividad();
+            self.reclamar_bajo_el_puntero();
         }
         cerrada
     }
@@ -2371,6 +2479,7 @@ impl ShellHost {
             self.guard("alternar actividad", |host| host.shell.alternar_actividad()) == Some(true);
         if cambiada {
             self.pintar_actividad();
+            self.reclamar_bajo_el_puntero();
         }
         cambiada
     }
@@ -2429,6 +2538,7 @@ impl ShellHost {
             self.guard("recoger actividad", |host| host.shell.recoger_actividad()) == Some(true);
         if recogida {
             self.pintar_actividad();
+            self.reclamar_bajo_el_puntero();
         }
         recogida
     }
@@ -2440,8 +2550,18 @@ impl ShellHost {
         self.pintar_actividad();
     }
 
+    /// ¿Cae el punto sobre la isla? La vista de escritorios lo pregunta antes
+    /// de coger la ventana de una miniatura: la tarjeta desplegada se dibuja
+    /// delante de ellas y el clic es suyo.
+    pub fn sobre_actividad(&self, x: f64, y: f64) -> bool {
+        !self.dead && Self::dentro(self.actividad_rect(), x, y).is_some()
+    }
+
     fn actividad_rect(&self) -> Option<(f64, f64, f64, f64)> {
-        if !self.actividad_visible {
+        // Con el panel apartado la isla se va con él (ver `Papel::Actividad`),
+        // y su zona tampoco puede quedarse: se comía los clics a la ventana
+        // de debajo justo en el centro de su cabecera.
+        if !self.actividad_visible || !self.a_la_vista(Barra::Panel) {
             return None;
         }
         let s = self.actividad.as_ref()?;
@@ -2532,20 +2652,15 @@ impl ShellHost {
         }
     }
 
-    /// Cuánto baja cada aviso desde la cabeza de la pila, en lógicos: lo que
-    /// ocupan los de encima, cada uno por su peso —que crece al entrar y
-    /// mengua al salir—.
+    /// Cuánto baja cada aviso respecto al de delante, en lógicos, en el orden
+    /// en que se componen: el de delante primero, que en la lista de Smithay es
+    /// el que queda encima. Todos nacen en el mismo sitio y el nivel los
+    /// desplaza.
     fn toasts_desplazamientos(&self) -> Vec<(u32, f32)> {
-        let mut y = 0.0;
         self.shell
-            .toasts_ids()
+            .toasts_para_componer()
             .into_iter()
-            .filter_map(|id| {
-                let (_, _, peso, alto) = self.shell.toast_estado(id)?;
-                let aqui = y;
-                y += (alto + bookos_shell::toast::HUECO) * peso;
-                Some((id, aqui))
-            })
+            .filter_map(|id| Some((id, self.shell.toast_estado(id)?.2)))
             .collect()
     }
 
@@ -2654,18 +2769,17 @@ impl ShellHost {
     fn toast_bajo(&self, x: f64, y: f64) -> Option<(u32, (f64, f64, f64, f64))> {
         let escala = self.shell.scale() as f64;
         let sombra = bookos_shell::toast::MARGEN_SOMBRA as f64;
-        self.toasts_desplazamientos()
-            .into_iter()
-            .find_map(|(id, dy)| {
-                let (_, s) = self.toasts.iter().find(|(t, _)| *t == id)?;
-                let rect = (
-                    s.location.x / escala + sombra,
-                    s.location.y / escala + dy as f64 + sombra,
-                    s.logical.w as f64 - sombra * 2.0,
-                    s.logical.h as f64 - sombra * 2.0,
-                );
-                Self::dentro(Some(rect), x, y).map(|_| (id, rect))
-            })
+        // Solo el de delante: los de atrás son franjas sin contenido, y un clic
+        // sobre ellas no es pulsar un aviso.
+        let id = self.shell.toast_de_delante()?;
+        let (_, s) = self.toasts.iter().find(|(t, _)| *t == id)?;
+        let rect = (
+            s.location.x / escala + sombra,
+            s.location.y / escala + sombra,
+            s.logical.w as f64 - sombra * 2.0,
+            s.logical.h as f64 - sombra * 2.0,
+        );
+        Self::dentro(Some(rect), x, y).map(|_| (id, rect))
     }
 
     /// ¿Se ha pulsado un aviso? Entonces se va, y el clic no llega a la ventana
@@ -2682,21 +2796,21 @@ impl ShellHost {
         descartado
     }
 
-    pub fn toast_accion(&mut self, x: f64, y: f64) -> Option<(u32, String)> {
+    pub fn toast_accion(&mut self, x: f64, y: f64) -> Option<(u32, bookos_shell::toast::Pulsado)> {
         let (id, (tx, ty, _, _)) = self.toast_bajo(x, y)?;
-        let clave = self
+        let pulsado = self
             .guard("acción del toast", |host| {
-                let clave = host
-                    .shell
-                    .toast_accion_relativa(id, (x - tx) as f32, (y - ty) as f32);
-                if clave.is_some() {
+                let pulsado =
+                    host.shell
+                        .toast_accion_relativa(id, (x - tx) as f32, (y - ty) as f32);
+                if pulsado.is_some() {
                     host.shell.descartar_toast(id);
                 }
-                clave
+                pulsado
             })
             .flatten()?;
         self.pintar_toasts();
-        Some((id, clave))
+        Some((id, pulsado))
     }
 
     /// Retira una notificación por su identificador.
@@ -3004,32 +3118,6 @@ impl ShellHost {
                 )
             })
             .collect()
-    }
-
-    /// El chrome modal del selector, separado del resto del shell para que se
-    /// siga dibujando encima de una ventana a pantalla completa.
-    pub fn menu_ventana_element<R>(
-        &self,
-        renderer: &mut R,
-    ) -> Option<MemoryRenderBufferRenderElement<R>>
-    where
-        R: Renderer + ImportMem,
-        R::TextureId: Send + Clone + 'static,
-    {
-        if self.esta_bloqueado() || self.shell.emergente_nombre() != Some("menu-ventana") {
-            return None;
-        }
-        let surface = self.emergente.as_ref()?;
-        MemoryRenderBufferRenderElement::from_buffer(
-            renderer,
-            surface.location,
-            &surface.buffer,
-            Some(1.0),
-            Some(surface.src),
-            Some(surface.logical),
-            Kind::Unspecified,
-        )
-        .ok()
     }
 
     pub fn conmutador_element<R>(
@@ -3575,9 +3663,25 @@ impl ShellHost {
         }
     }
 
+    /// Cuánto han entrado las ventanas al desbloquear, de 0 a 1. Empiezan
+    /// al 30 % de la salida, cuando el bloqueo ya va por más de la mitad de
+    /// su desvanecido. `None` si no se está desbloqueando.
+    pub fn progreso_desbloqueo(&self) -> Option<f32> {
+        let (_, t0) = self.desbloqueo.as_ref()?;
+        let f = bookos_shell::tema::fraccion(t0.elapsed(), Self::dura_desbloqueo());
+        // Su propio tramo con su propia curva: recortar un tramo de la curva
+        // del bloqueo les dejaba solo la cola, que ya va frenando.
+        Some(bookos_shell::tema::C_ENTRADA.eval(((f - 0.3) / 0.7).clamp(0.0, 1.0)))
+    }
+
     /// Lo que dura la salida del bloqueo: la de una página, que es lo que es
     /// —se pasa de una pantalla entera a otra—.
-    const DESBLOQUEO: std::time::Duration = bookos_shell::tema::D_PAGINA;
+    const DESBLOQUEO: std::time::Duration = bookos_shell::tema::D_DESBLOQUEO;
+
+    /// [`Self::DESBLOQUEO`] con `BOOKOS_ANIM` aplicado, para poder mirarla.
+    fn dura_desbloqueo() -> std::time::Duration {
+        Self::DESBLOQUEO.mul_f32(Self::lento())
+    }
 
     pub fn esta_bloqueado(&self) -> bool {
         !self.dead && self.shell.esta_bloqueado()
@@ -3954,7 +4058,7 @@ impl ShellHost {
             || self
                 .desbloqueo
                 .as_ref()
-                .is_some_and(|(_, t)| t.elapsed() < Self::DESBLOQUEO)
+                .is_some_and(|(_, t)| t.elapsed() < Self::dura_desbloqueo())
     }
 
     /// El velo a pantalla completa que pide la emergente, si lo pide.
@@ -4002,7 +4106,15 @@ impl ShellHost {
         self.captura_pastilla
             .iter()
             .filter(|_| hay_recuadro)
-            .chain(self.captura.iter())
+            // La barra de modos se aparta mientras se arrastra: está en medio de
+            // la pantalla, y al marcar una zona que pasa por debajo tapaba justo
+            // lo que se quería capturar. Vuelve al soltar. La pastilla de
+            // medidas sí se queda, que es lo que se mira mientras se arrastra.
+            .chain(
+                self.captura
+                    .iter()
+                    .filter(|_| !self.shell.captura_animando()),
+            )
             .filter_map(|surface| {
                 MemoryRenderBufferRenderElement::from_buffer(
                     renderer,
@@ -4099,7 +4211,18 @@ impl ShellHost {
     }
 
     /// Los elementos que se le pasan a `render_output` como `custom_elements`.
-    pub fn elements<R>(&self, renderer: &mut R) -> Vec<MemoryRenderBufferRenderElement<R>>
+    /// `capa` deja pedir la isla aparte del resto: ver [`CapaShell`].
+    /// Con `completa` —una ventana a pantalla completa en la salida— no van
+    /// el panel, el dock ni la isla, que son del escritorio y taparían el
+    /// vídeo. Lo demás sí: la captura, el launchpad, una emergente abierta
+    /// con su atajo, el OSD. Antes se descartaba todo el shell, y con un vídeo
+    /// a pantalla completa no salía ni la capa de captura.
+    pub fn elements<R>(
+        &self,
+        renderer: &mut R,
+        completa: bool,
+        capa: CapaShell,
+    ) -> Vec<MemoryRenderBufferRenderElement<R>>
     where
         R: Renderer + ImportMem,
         R::TextureId: Send + Clone + 'static,
@@ -4176,12 +4299,15 @@ impl ShellHost {
         // escena, así que Meta+L escondía las ventanas y no enseñaba nada.
         let bloqueado = self.bloqueo.is_some();
         let desplazamientos_toast = self.toasts_desplazamientos();
+        let desbloqueo = self.progreso_desbloqueo();
         let superficies = self
             .desbloqueo
             .iter()
             .map(|(s, t0)| {
-                let t = bookos_shell::tema::C_SUAVE
-                    .eval(bookos_shell::tema::fraccion(t0.elapsed(), Self::DESBLOQUEO));
+                let t = bookos_shell::tema::C_SUAVE.eval(bookos_shell::tema::fraccion(
+                    t0.elapsed(),
+                    Self::dura_desbloqueo(),
+                ));
                 (s, Papel::Desbloqueo(t))
             })
             .chain(self.bloqueo.iter().map(|s| (s, Papel::Barra(Barra::Panel))))
@@ -4189,10 +4315,9 @@ impl ShellHost {
             // fijo mientras está echado y desvaneciéndose con él al quitarlo.
             .chain(self.bloqueo_velo.iter().map(|(s, _)| {
                 let papel = match &self.desbloqueo {
-                    Some((_, t0)) => Papel::Desbloqueo(
-                        bookos_shell::tema::C_SUAVE
-                            .eval(bookos_shell::tema::fraccion(t0.elapsed(), Self::DESBLOQUEO)),
-                    ),
+                    Some((_, t0)) => Papel::Desbloqueo(bookos_shell::tema::C_SUAVE.eval(
+                        bookos_shell::tema::fraccion(t0.elapsed(), Self::dura_desbloqueo()),
+                    )),
                     None => Papel::Barra(Barra::Panel),
                 };
                 (s, papel)
@@ -4218,7 +4343,7 @@ impl ShellHost {
                 self.actividad
                     .iter()
                     .map(|s| (s, Papel::Actividad))
-                    .filter(|_| !bloqueado && self.actividad_visible),
+                    .filter(|_| !bloqueado && !completa && self.actividad_visible),
             )
             .chain(
                 self.pagina_anterior
@@ -4251,6 +4376,7 @@ impl ShellHost {
                     .into_iter()
                     .filter(|_| {
                         !bloqueado
+                            && !completa
                             && self.captura.is_none()
                             && self.shell.emergente_tapa_la_pantalla()
                             && self.dock_a_la_vista()
@@ -4285,6 +4411,7 @@ impl ShellHost {
                     .into_iter()
                     .filter(|_| {
                         !bloqueado
+                            && !completa
                             && self.captura.is_none()
                             && !self.shell.emergente_tapa_la_pantalla()
                     }),
@@ -4297,17 +4424,23 @@ impl ShellHost {
                     .into_iter()
                     .filter(|_| {
                         !bloqueado
+                            && !completa
                             && self.captura.is_none()
                             && !self.shell.emergente_tapa_la_pantalla()
                     }),
             );
 
         superficies
+            .filter(|(_, papel)| match capa {
+                CapaShell::Todo => true,
+                CapaShell::SinIsla => !matches!(papel, Papel::Actividad),
+                CapaShell::SoloIsla => matches!(papel, Papel::Actividad),
+            })
             .filter_map(|(surface, papel)| {
                 let (alfa, zoom, desplazamiento_x, desplazamiento_y) = match papel {
                     Papel::Aviso => (alfa_osd, escala_osd, 0.0, 0.0),
                     Papel::Toast(id, dy) => match self.shell.toast_estado(id) {
-                        Some((alfa, zoom, _, _)) => (alfa, zoom, 0.0, dy),
+                        Some((alfa, zoom, _)) => (alfa, zoom, 0.0, dy),
                         None => (0.0, 1.0, 0.0, dy),
                     },
                     Papel::Emergente => match (pagina, vista) {
@@ -4317,12 +4450,19 @@ impl ShellHost {
                         // vuelve desde el 97 % y sin él.
                         (None, Some((t, cual))) => {
                             use bookos_shell::TransicionLaunchpad as T;
-                            let desde = match cual {
-                                T::AbrirCarpeta => 0.94,
-                                T::CerrarCarpeta => 0.97,
-                                T::Fundido => 1.0,
-                            };
-                            (t.clamp(0.0, 1.0), desde + (1.0 - desde) * t, 0.0, 0.0)
+                            match cual {
+                                T::AbrirDetalle(origen) => Self::geometria_detalle(
+                                    (surface.logical.w as f32, surface.logical.h as f32),
+                                    (origen.x, origen.y, origen.width, origen.height),
+                                    t,
+                                    false,
+                                ),
+                                T::AbrirCarpeta => (t.clamp(0.0, 1.0), 0.94 + 0.06 * t, 0.0, 0.0),
+                                T::CerrarCarpeta => (t.clamp(0.0, 1.0), 0.97 + 0.03 * t, 0.0, 0.0),
+                                T::Fundido | T::CerrarDetalle(_) => {
+                                    (t.clamp(0.0, 1.0), 1.0, 0.0, 0.0)
+                                }
+                            }
                         }
                         (None, None) => (alfa_emergente, zoom, 0.0, y_emergente),
                     },
@@ -4340,20 +4480,56 @@ impl ShellHost {
                         // La rejilla se aparta al abrir —se aleja al 96 %, que
                         // es lo que dice que la carpeta está DENTRO de ella— y
                         // el panel se encoge hacia su tapa al cerrarse.
-                        let hasta = match cual {
-                            T::AbrirCarpeta => 0.96,
-                            T::CerrarCarpeta => 0.94,
-                            T::Fundido => 1.0,
-                        };
-                        ((1.0 - t).clamp(0.0, 1.0), 1.0 + (hasta - 1.0) * t, 0.0, 0.0)
+                        match cual {
+                            T::CerrarDetalle(origen) => Self::geometria_detalle(
+                                (surface.logical.w as f32, surface.logical.h as f32),
+                                (origen.x, origen.y, origen.width, origen.height),
+                                t,
+                                true,
+                            ),
+                            T::AbrirCarpeta => {
+                                ((1.0 - t).clamp(0.0, 1.0), 1.0 - 0.04 * t, 0.0, 0.0)
+                            }
+                            T::CerrarCarpeta => {
+                                ((1.0 - t).clamp(0.0, 1.0), 1.0 - 0.06 * t, 0.0, 0.0)
+                            }
+                            T::AbrirDetalle(_) => {
+                                // El fundido simétrico superponía los dos textos
+                                // hasta media transición en la captura a cámara lenta.
+                                ((1.0 - 2.0 * t).clamp(0.0, 1.0), 1.0, 0.0, 0.0)
+                            }
+                            T::Fundido => ((1.0 - t).clamp(0.0, 1.0), 1.0, 0.0, 0.0),
+                        }
                     }
                     Papel::Realce => (alfa_emergente, zoom, 0.0, y_emergente),
+                    // La isla nace dentro de la franja del panel y se va con
+                    // él: con `panel_esquiva` y una ventana maximizada se
+                    // quedaba sola en y=3, tapando el centro de la cabecera de
+                    // la ventana —en el calendario, «Día · Semana · Mes · Año»—.
+                    //
+                    // Subirla el alto del panel no basta: su sombra cuelga 26 px
+                    // por debajo de la píldora y quedaba una mancha en el borde.
+                    // Por eso además se desvanece al mismo ritmo.
                     Papel::Actividad => {
                         let (a, z, y) = self.shell.actividad_entrada();
-                        (a, z, 0.0, y)
+                        let fuera = self.desplazamiento(Barra::Panel) / self.shell.scale() as f64;
+                        let visible = 1.0 - self.barra(Barra::Panel).fraccion();
+                        (a * visible, z, 0.0, y - fuera as f32)
                     }
-                    Papel::Desbloqueo(t) => (1.0 - t, 1.0 + 0.05 * t, 0.0, 0.0),
-                    Papel::Barra(_) | Papel::Fijo => (1.0, 1.0, 0.0, 0.0),
+                    // El bloqueo se va en el primer 55 % y las ventanas
+                    // entran a partir del 30 % (ver `progreso_desbloqueo`).
+                    // A la vez, a mitad de camino se veían las dos capas de
+                    // texto al 50 % una encima de otra (capturado con
+                    // BOOKOS_ANIM=8): ilegible.
+                    Papel::Desbloqueo(t) => {
+                        let t = (t * 1.8).min(1.0);
+                        (1.0 - t, 1.0 + 0.05 * t, 0.0, 0.0)
+                    }
+                    // Al desbloquear, panel y dock llegan con el escritorio,
+                    // como la barra de menús y el Dock de macOS: antes salían
+                    // enteros en el primer fotograma, antes que las ventanas.
+                    Papel::Barra(_) => (desbloqueo.unwrap_or(1.0), 1.0, 0.0, 0.0),
+                    Papel::Fijo => (1.0, 1.0, 0.0, 0.0),
                 };
                 // El zoom crece desde el centro, así que hay que compensar la
                 // posición: si no, la superficie se agranda hacia la derecha y
@@ -4369,9 +4545,13 @@ impl ShellHost {
                             Barra::Panel => -1.0,
                             Barra::Dock => 1.0,
                         };
+                        // Y entran desde su borde, 10 lógicos: lo justo para que
+                        // se lea «vuelve a su sitio» sin que parezca que se
+                        // esconden.
+                        let llegada = (1.0 - f64::from(desbloqueo.unwrap_or(1.0))) * 10.0 * escala;
                         Point::from((
                             surface.location.x,
-                            surface.location.y + signo * self.desplazamiento(cual),
+                            surface.location.y + signo * (self.desplazamiento(cual) + llegada),
                         ))
                     }
                     _ => Point::from((
@@ -4623,14 +4803,23 @@ mod tests {
         let mut host = ShellHost::new(1280, 800, 1.0, Some(bookos_shell::Config::default()));
         let (dx, dy, dw, dh) = host.dock_rect();
         let (x, y) = (dx + dw / 2.0, dy + dh / 2.0);
-        assert!(host.contiene(x, y), "a la vista, el dock es del shell");
+        assert!(
+            host.contiene(x, y, false),
+            "a la vista, el dock es del shell"
+        );
 
         // Escondido del todo, sin esperar a la animación.
         host.dock_barra.escondida = true;
         host.dock_barra.desde_fraccion = 1.0;
         assert!(!host.a_la_vista(Barra::Dock));
-        assert!(host.a_la_vista(Barra::Panel), "el caso del fallo: panel sí, dock no");
-        assert!(!host.contiene(x, y), "la franja del dock fantasma se tragaba el clic");
+        assert!(
+            host.a_la_vista(Barra::Panel),
+            "el caso del fallo: panel sí, dock no"
+        );
+        assert!(
+            !host.contiene(x, y, false),
+            "la franja del dock fantasma se tragaba el clic"
+        );
         assert_eq!(host.pulsar(x, y), None);
     }
 
@@ -4658,6 +4847,48 @@ mod tests {
 
         host.cerrar_emergente();
         assert_eq!(host.panel_barra.destino(), 1.0, "cerrada, se aparta");
+    }
+
+    /// La tarjeta de la isla cuelga por debajo del panel: bajar a sus
+    /// controles no puede apartarlo, y recogerla pulsando fuera sí.
+    #[test]
+    fn la_isla_desplegada_retiene_el_panel() {
+        use bookos_shell::actividad::{Clase, Estado};
+        let mut host = ShellHost::new(1280, 800, 1.0, Some(bookos_shell::Config::default()));
+        host.alternar_visibilidad(Barra::Panel);
+        host.estorbada(Barra::Panel, true);
+        host.publicar_actividad(Estado {
+            app_id: "com.bookos.test".into(),
+            clase: Clase::Player,
+            activo: true,
+            pausado: false,
+            titulo: "Pista".into(),
+            subtitulo: "Artista".into(),
+            posicion_ms: 0,
+            duracion_ms: 60_000,
+            restante_ms: 0,
+            volumen: 50,
+            nivel: 0.0,
+            aleatorio: false,
+            repetir: false,
+            portada: None,
+            cola: Vec::new(),
+            metricas: Vec::new(),
+        });
+
+        // El cursor arriba para pulsar la isla: el panel vuelve y se despliega.
+        host.puntero(640.0, 2.0);
+        host.reclamada(Barra::Panel, (640.0, 2.0));
+        assert!(host.abrir_actividad_previsualizacion("com.bookos.test"));
+
+        // Se baja hacia los controles, con la ventana aún debajo.
+        host.puntero(640.0, 200.0);
+        host.reclamada(Barra::Panel, (640.0, 200.0));
+        host.estorbada(Barra::Panel, true);
+        assert_eq!(host.panel_barra.destino(), 0.0, "desplegada, lo retiene");
+
+        assert!(host.recoger_actividad_fuera(640.0, 700.0));
+        assert_eq!(host.panel_barra.destino(), 1.0, "recogida, se aparta");
     }
 
     #[test]
@@ -4732,18 +4963,18 @@ mod tests {
         // Dentro de la principal, la franja del panel es suya.
         assert!(host.a_la_vista(Barra::Panel), "el panel arranca a la vista");
         assert!(
-            host.contiene(960.0, 4.0),
+            host.contiene(960.0, 4.0, false),
             "la franja del panel es del shell"
         );
 
         // La misma altura, pero en la pantalla de la izquierda.
         assert!(
-            !host.contiene(-400.0, 4.0),
+            !host.contiene(-400.0, 4.0, false),
             "x negativa es otro monitor: el clic es del cliente que haya ahí"
         );
         // Y a la derecha, pasado el borde.
         assert!(
-            !host.contiene(2400.0, 4.0),
+            !host.contiene(2400.0, 4.0, false),
             "pasado el ancho tampoco es suyo"
         );
 
@@ -4753,11 +4984,11 @@ mod tests {
         host.abrir_acerca();
         assert!(host.shell.hay_emergente(), "no se abrió la emergente");
         assert!(
-            host.contiene(960.0, 600.0),
+            host.contiene(960.0, 600.0, false),
             "con una emergente, el clic en la principal la cierra"
         );
         assert!(
-            !host.contiene(-400.0, 600.0),
+            !host.contiene(-400.0, 600.0, false),
             "una emergente en la principal no puede tragarse el ratón del monitor de al lado"
         );
 
@@ -4771,6 +5002,25 @@ mod tests {
 #[cfg(test)]
 mod pruebas_transicion {
     use super::*;
+
+    #[test]
+    fn el_detalle_crece_desde_el_boton_y_se_recoge_en_el_mismo_sitio() {
+        let tamano = (352.0, 420.0);
+        let origen = (180.0, 80.0, 156.0, 52.0);
+        for progreso in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let entrada = ShellHost::geometria_detalle(tamano, origen, progreso, false);
+            let salida = ShellHost::geometria_detalle(tamano, origen, 1.0 - progreso, true);
+            assert_eq!(entrada, salida, "la salida no deshace la entrada");
+        }
+        let (_, zoom, x, y) = ShellHost::geometria_detalle(tamano, origen, 0.0, false);
+        assert_eq!(tamano.0 / 2.0 + x, origen.0 + origen.2 / 2.0);
+        assert_eq!(tamano.1 / 2.0 + y, origen.1 + origen.3 / 2.0);
+        assert!((tamano.1 * zoom - origen.3).abs() < 0.001);
+        assert_eq!(
+            ShellHost::geometria_detalle(tamano, origen, 1.0, false),
+            (1.0, 1.0, 0.0, 0.0)
+        );
+    }
 
     /// Entrar en una carpeta guarda la vista de antes y deja al compositor
     /// dibujando mientras dure la transición.

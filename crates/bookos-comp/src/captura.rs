@@ -320,19 +320,28 @@ pub fn el_portapapeles_tiene_imagen(state: &crate::state::BookosComp) -> bool {
 }
 
 /// Pasa un rectángulo con el origen **arriba** a la izquierda al que espera
-/// `copy_framebuffer`, que lo tiene **abajo**.
+/// `copy_framebuffer`, que según la salida lo tiene **abajo**.
 ///
 /// `GlesRenderer::copy_framebuffer` le da la `y` de la región tal cual a
-/// `glReadPixels`, y el origen de OpenGL es la esquina inferior izquierda. Sin
-/// esta vuelta, pedir un recorte devuelve la franja simétrica de la pantalla:
-/// medido, un recuadro pedido en y=262 salía con el contenido de y=1014, que es
-/// `1801 − 262 − 525`. La captura de pantalla **entera** no lo notaba porque
-/// con `y = 0` y el alto completo el rectángulo es el mismo del derecho y del
-/// revés, y por eso el fallo solo aparecía al recortar.
+/// `glReadPixels`, que cuenta filas desde la primera de la memoria. Dónde cae
+/// esa fila depende del `Transform` de la salida, igual que la vuelta de filas
+/// de [`hay_que_voltear`], y las dos van juntas:
+///
+/// - Con la escena volteada (winit, `Flipped180`) la fila 0 es el borde de
+///   **abajo**: hay que reflejar la `y`. Medido en anidado, un recuadro pedido
+///   en y=262 salía con el contenido de y=1014, que es `1801 − 262 − 525`.
+/// - En `Transform::Normal` (udev) la fila 0 ya es la de arriba: reflejarla
+///   —que es lo que se hacía siempre— devolvía la franja simétrica, y es por
+///   lo que en la sesión real la captura salía de otro sitio que el marcado.
+///   La pantalla entera no lo notaba porque su rectángulo es simétrico.
 pub fn region_gl(
     region: Rectangle<i32, BufferCoord>,
     alto_total: i32,
+    volteada: bool,
 ) -> Rectangle<i32, BufferCoord> {
+    if !volteada {
+        return region;
+    }
     Rectangle::new(
         (region.loc.x, alto_total - region.loc.y - region.size.h).into(),
         region.size,
@@ -641,6 +650,13 @@ mod tests {
         );
         output.change_current_state(None, Some(transform), None, None);
         output
+    }
+
+    #[test]
+    fn el_recorte_solo_se_refleja_con_la_escena_volteada() {
+        let r = Rectangle::<i32, BufferCoord>::new((10, 262).into(), (100, 525).into());
+        assert_eq!(region_gl(r, 1801, false), r);
+        assert_eq!(region_gl(r, 1801, true).loc.y, 1801 - 262 - 525);
     }
 
     /// Lo que decide la vuelta es la orientación de la salida, y las dos que hay

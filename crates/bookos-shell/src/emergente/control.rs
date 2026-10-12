@@ -72,7 +72,7 @@ pub fn titulo<'a>(texto: impl iced_core::text::IntoFragment<'a>) -> PanelElement
 /// El relleno nunca es más estrecho que alto. Con menos, iced recorta su radio
 /// a la mitad del lado corto y sale una barrita recta asomando por las curvas
 /// del surco; así, a 0 % queda un punto, que es lo que dice que ahí hay un
-/// control y no un hueco.
+/// control y no un hueco. Ver [`lleno`] para cómo se reparte el resto.
 pub fn pildora<'a>(
     ancho: f32,
     alto: f32,
@@ -80,8 +80,10 @@ pub fn pildora<'a>(
     apagado: bool,
     surco: Color,
 ) -> PanelElement<'a> {
-    let lleno = (ancho * (nivel.min(100) as f32 / 100.0)).max(alto);
-    let color = if apagado {
+    let lleno = lleno(ancho, alto, nivel);
+    // A cero el punto va en el gris de apagado: en acento se leía como «un
+    // poco», que es justo lo que no se distinguía del 0.
+    let color = if apagado || nivel == 0 {
         tema::alfa(tema::TEXTO2, 0.35)
     } else {
         tema::acento()
@@ -269,12 +271,27 @@ pub fn seleccionada(señalada: f32) -> Color {
     tema::mezclar(tema::card(), tema::acento(), 0.10 + 0.06 * señalada)
 }
 
-/// De una `x` dentro de una píldora a su nivel, recortado a [0, 100].
+/// Hasta dónde llega el relleno de una píldora al `nivel` (de 0 a 100).
 ///
-/// Arrastrar más allá del borde deja el nivel en el tope y no en un número
-/// imposible, que es lo que espera cualquiera al pasarse de largo.
+/// El punto del 0 % ocupa `alto` y los niveles se reparten en lo que queda.
+/// Antes el relleno era `ancho × nivel` con ese punto como mínimo, y en la
+/// píldora de la Estación de Control (24 de alto) todo lo que había entre 0 y
+/// un 12 % se dibujaba igual: no había forma de saber si el volumen estaba a
+/// cero o al diez.
+pub fn lleno(ancho: f32, alto: f32, nivel: u8) -> f32 {
+    alto + (ancho - alto) * (nivel.min(100) as f32 / 100.0)
+}
+
+/// De una `x` dentro de una píldora de [`PILDORA`] de alto a su nivel,
+/// recortado a [0, 100].
+///
+/// Es la inversa de [`lleno`]: el final del relleno queda bajo el puntero
+/// mientras se arrastra, y el 0 y el 100 caen en el centro de los extremos
+/// redondos y no en el borde, que con el ratón no se alcanza sin pasarse.
+/// Arrastrar más allá deja el nivel en el tope y no en un número imposible.
 pub fn nivel_en(x: f32, x0: f32, ancho: f32) -> u8 {
-    (((x - x0) / ancho).clamp(0.0, 1.0) * 100.0).round() as u8
+    let recorrido = ancho - PILDORA;
+    (((x - x0 - PILDORA / 2.0) / recorrido).clamp(0.0, 1.0) * 100.0).round() as u8
 }
 
 /// La caja de una tarjeta emergente: fondo, borde, radio y margen del sistema.
@@ -300,13 +317,34 @@ pub fn tarjeta<'a>(contenido: PanelElement<'a>, ancho: f32, margen: f32) -> Pane
 
 #[cfg(test)]
 mod tests {
-    use super::nivel_en;
+    use super::{PILDORA, lleno, nivel_en};
 
     #[test]
     fn los_extremos_dan_cero_y_cien() {
         assert_eq!(nivel_en(20.0, 20.0, 200.0), 0);
         assert_eq!(nivel_en(220.0, 20.0, 200.0), 100);
         assert_eq!(nivel_en(120.0, 20.0, 200.0), 50);
+    }
+
+    /// El 0 y el 10 % tienen que verse distintos. Con el relleno a
+    /// `ancho × nivel` y el punto del 0 como mínimo, en una píldora de 200 los
+    /// dos medían 24.
+    #[test]
+    fn el_cero_y_el_diez_no_se_confunden() {
+        let ancho = 200.0;
+        assert_eq!(lleno(ancho, PILDORA, 0), PILDORA);
+        assert!(lleno(ancho, PILDORA, 10) - lleno(ancho, PILDORA, 0) > 15.0);
+        assert_eq!(lleno(ancho, PILDORA, 100), ancho);
+    }
+
+    /// Pulsar donde acaba el relleno devuelve el mismo nivel: si no, coger la
+    /// píldora la haría saltar.
+    #[test]
+    fn el_final_del_relleno_queda_bajo_el_puntero() {
+        for nivel in [0, 7, 10, 50, 93, 100] {
+            let x = 20.0 + lleno(200.0, PILDORA, nivel) - PILDORA / 2.0;
+            assert_eq!(nivel_en(x, 20.0, 200.0), nivel);
+        }
     }
 
     #[test]

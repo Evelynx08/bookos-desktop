@@ -1,0 +1,26 @@
+[Desktop Entry]
+Name=Aether Browser
+GenericName=Web Browser
+GenericName[es]=Navegador web
+Comment=Private web browser
+Comment[es]=Navegador web privado
+Exec=bookos-browser %u
+TryExec=bookos-browser
+StartupWMClass=bookos-browser
+Icon=bookos-browser
+Terminal=false
+Type=Application
+Categories=Network;WebBrowser;
+MimeType=text/html;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;
+Keywords=web;internet;browser;navegador;
+Actions=new-window;new-private-window;
+
+[Desktop Action new-window]
+Name=New Window
+Name[es]=Ventana nueva
+Exec=bookos-browser --new-window
+
+[Desktop Action new-private-window]
+Name=New Private Window
+Name[es]=Ventana privada nueva
+Exec=bookos-browser --private-window

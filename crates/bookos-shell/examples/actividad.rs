@@ -9,7 +9,7 @@
 //! del borde superior de la pantalla y su sombra tiene que verse contra lo que
 //! haya debajo.
 
-use bookos_shell::actividad::{Clase, Estado, ItemCola, Portada};
+use bookos_shell::actividad::{Clase, Estado, ItemCola, Metrica, Portada};
 use bookos_shell::{Config, Shell};
 
 const ESCALA: f32 = 2.0;
@@ -20,6 +20,10 @@ fn base(clase: Clase) -> Estado {
             Clase::Player => "com.bookos.player",
             Clase::Timer => "com.bookos.clock",
             Clase::Recorder => "com.bookos.voicerecorder",
+            Clase::Transfer => "com.bookos.settings",
+            Clase::Calendar => "com.bookos.calendar",
+            Clase::Monitor => "com.bookos.systemmonitor",
+            Clase::Auriculares => "com.bookos.buds",
         }
         .into(),
         clase,
@@ -35,6 +39,7 @@ fn base(clase: Clase) -> Estado {
         aleatorio: true,
         repetir: false,
         portada: Some(portada()),
+        metricas: Vec::new(),
         cola: vec![
             item("1", "Cielo de invierno", "La Habitación Roja", true, true),
             item("2", "Ayer", "Los Planetas", false, false),
@@ -47,6 +52,68 @@ fn base(clase: Clase) -> Estado {
                 false,
             ),
         ],
+    }
+}
+
+fn transferencia() -> Estado {
+    Estado {
+        titulo: "Apuntes_Tema3.pdf".into(),
+        subtitulo: "Enviando a S22 Ultra · 8,4 MB/s".into(),
+        nivel: 0.42,
+        restante_ms: 72_000,
+        portada: None,
+        cola: Vec::new(),
+        ..base(Clase::Transfer)
+    }
+}
+
+fn clase() -> Estado {
+    Estado {
+        titulo: "Programación de sistemas".into(),
+        subtitulo: "10:00–11:30 · Aula 3".into(),
+        restante_ms: 9 * 60_000,
+        portada: None,
+        cola: Vec::new(),
+        ..base(Clase::Calendar)
+    }
+}
+
+fn monitor() -> Estado {
+    let m = |e: &str, t: &str, critica| Metrica {
+        etiqueta: e.into(),
+        valor: 0.0,
+        texto: t.into(),
+        critica,
+    };
+    Estado {
+        titulo: "Rendimiento".into(),
+        metricas: vec![
+            m("CPU", "23 %", false),
+            m("GPU", "12 %", false),
+            m("RAM", "41 %", false),
+            m("Temperatura", "62°", false),
+            m("Batería", "12 %", true),
+        ],
+        portada: None,
+        cola: Vec::new(),
+        ..base(Clase::Monitor)
+    }
+}
+
+/// Lo que publica bookos-budsd al sacar los Buds, con el derecho bajo.
+fn auriculares() -> Estado {
+    let m = |e: &str, v: u8| Metrica {
+        etiqueta: e.into(),
+        valor: f32::from(v) / 100.0,
+        texto: format!("{v} %"),
+        critica: v <= 20,
+    };
+    Estado {
+        titulo: "Buds3 Pro de Evelyn".into(),
+        metricas: vec![m("Izquierdo", 59), m("Derecho", 18), m("Estuche", 40)],
+        portada: None,
+        cola: Vec::new(),
+        ..base(Clase::Auriculares)
     }
 }
 
@@ -166,9 +233,10 @@ fn main() {
             &format!("player-cola-{etiqueta}"),
             tema,
             base(Clase::Player),
-            // El segundo clic cae en el botón de la cola de la fila del
-            // progreso: 26 de margen + la posición que le dan las constantes.
-            &[(180.0, 55.0), (26.0 + 370.0, 26.0 + 205.0)],
+            // El segundo clic cae en «A continuación», en la fila de debajo
+            // del progreso: 26 de margen + la posición que le dan las
+            // constantes.
+            &[(180.0, 55.0), (26.0 + 60.0, 26.0 + 235.0)],
         );
         pinta(
             &format!("timer-compacto-{etiqueta}"),
@@ -212,6 +280,25 @@ fn main() {
             ],
             &[],
         );
+        for (nombre, estado) in [
+            ("transferencia", transferencia()),
+            ("clase", clase()),
+            ("monitor", monitor()),
+            ("auriculares", auriculares()),
+        ] {
+            pinta(
+                &format!("{nombre}-compacto-{etiqueta}"),
+                tema,
+                estado.clone(),
+                &[],
+            );
+            pinta(
+                &format!("{nombre}-abierto-{etiqueta}"),
+                tema,
+                estado,
+                &[(180.0, 55.0)],
+            );
+        }
         let mut pausado = base(Clase::Player);
         pausado.pausado = true;
         pausado.portada = None;

@@ -5,6 +5,7 @@
 
 mod ajustes;
 mod apariencia;
+mod atenuacion;
 mod autenticar;
 mod backend;
 mod brillo_auto;
@@ -24,6 +25,7 @@ mod gestos;
 mod handlers;
 mod input;
 mod keybinds;
+mod luz_nocturna;
 mod metricas;
 mod multimedia;
 mod notificaciones;
@@ -71,7 +73,7 @@ fn main() -> anyhow::Result<()> {
                        --cursor-info      dice qué fichero resuelve cada cursor y sale\n\
                        programa           cliente que lanzar dentro (p. ej. konsole)\n\n\
                      Atajos:\n  \
-                       Meta+Return        abrir un terminal (BOOKOS_TERMINAL, konsole por defecto)\n  \
+                       Meta+Return        abrir un terminal (BOOKOS_TERMINAL, bookos-shell por defecto)\n  \
                        Ctrl+Alt+T         lo mismo\n  \
                        Meta+Espacio       buscar aplicaciones, comandos y estados\n  \
                        Meta               abrir o cerrar el launchpad\n  \

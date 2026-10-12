@@ -34,9 +34,11 @@ pub const XF86_CAMARA_TOGGLE: u32 = 0x1008124D;
 /// Lo que hace cada tecla.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tecla {
+    /// Hacia dónde: 1 sube, −1 baja. Cuánto lo dice `panel.conf`.
     Volumen(i32),
     Silenciar,
     SilenciarMicro,
+    /// Igual que `Volumen`.
     Brillo(i32),
     BrilloTeclado(i32),
     AlternarBrilloTeclado,
@@ -45,22 +47,18 @@ pub enum Tecla {
     FnLock,
 }
 
-/// Cuánto mueve una pulsación. 5 % es el paso de KDE: con 10 se pasa de largo
-/// y con 2 hay que machacar la tecla.
-const PASO: i32 = 5;
-
 pub fn resolver(sym: u32) -> Option<Tecla> {
     Some(match sym {
-        XF86_SUBIR_VOLUMEN => Tecla::Volumen(PASO),
-        XF86_BAJAR_VOLUMEN => Tecla::Volumen(-PASO),
+        XF86_SUBIR_VOLUMEN => Tecla::Volumen(1),
+        XF86_BAJAR_VOLUMEN => Tecla::Volumen(-1),
         XF86_SILENCIAR => Tecla::Silenciar,
         XF86_SILENCIAR_MICRO => Tecla::SilenciarMicro,
         XF86_WEBCAM | XF86_CAMARA_TOGGLE => Tecla::Camara(None),
         XF86_CAMARA_ENABLE => Tecla::Camara(Some(true)),
         XF86_CAMARA_DISABLE => Tecla::Camara(Some(false)),
         XF86_FN_ESC => Tecla::FnLock,
-        XF86_BRILLO_MAS => Tecla::Brillo(PASO),
-        XF86_BRILLO_MENOS => Tecla::Brillo(-PASO),
+        XF86_BRILLO_MAS => Tecla::Brillo(1),
+        XF86_BRILLO_MENOS => Tecla::Brillo(-1),
         XF86_TECLADO_MAS => Tecla::BrilloTeclado(1),
         XF86_TECLADO_MENOS => Tecla::BrilloTeclado(-1),
         XF86_TECLADO_ALTERNAR => Tecla::AlternarBrilloTeclado,
@@ -71,8 +69,8 @@ pub fn resolver(sym: u32) -> Option<Tecla> {
 
 pub fn ejecutar(state: &mut BookosComp, tecla: Tecla) {
     let osd = match tecla {
-        Tecla::Volumen(paso) => {
-            volumen(paso);
+        Tecla::Volumen(sentido) => {
+            volumen(sentido * i32::from(state.pasos.volumen));
             None
         }
         Tecla::Silenciar => {
@@ -83,7 +81,7 @@ pub fn ejecutar(state: &mut BookosComp, tecla: Tecla) {
             silenciar("@DEFAULT_AUDIO_SOURCE@");
             None
         }
-        Tecla::Brillo(paso) => Some(brillo(state, paso)),
+        Tecla::Brillo(sentido) => Some(brillo(state, sentido * i32::from(state.pasos.brillo))),
         Tecla::BrilloTeclado(paso) => Some(brillo_teclado(state, paso)),
         Tecla::AlternarBrilloTeclado => Some(alternar_brillo_teclado(state)),
         Tecla::Touchpad => Some(touchpad(state)),
@@ -96,8 +94,46 @@ pub fn ejecutar(state: &mut BookosComp, tecla: Tecla) {
     state.needs_redraw = true;
 }
 
+/// Sigue subiendo o bajando volumen o brillo mientras se mantenga la tecla.
+///
+/// El compositor se queda estas teclas, así que nadie las repetía: mantener
+/// pulsado daba un solo paso. Empieza tras el retardo de repetición del
+/// teclado, como cualquier tecla, y la corta la siguiente pulsación o suelta
+/// (`input::tecla`).
+pub fn repetir_al_mantener(state: &mut BookosComp, tecla: Tecla) {
+    use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+    /// Diez repeticiones por segundo y no el ritmo del teclado (25 por
+    /// defecto): con él, el paso de mantener tendría que ser de décimas para
+    /// que diera tiempo a soltar donde se quiere.
+    const CADA: std::time::Duration = std::time::Duration::from_millis(100);
+    if !matches!(tecla, Tecla::Volumen(_) | Tecla::Brillo(_)) {
+        return;
+    }
+    let espera = std::time::Duration::from_millis(state.teclado_repeticion.0.into());
+    let token =
+        state
+            .loop_handle
+            .insert_source(Timer::from_duration(espera), move |_, _, state| {
+                match tecla {
+                    Tecla::Volumen(sentido) => {
+                        volumen(sentido * i32::from(state.pasos.volumen_mantener));
+                    }
+                    Tecla::Brillo(sentido) => {
+                        let osd = brillo(state, sentido * i32::from(state.pasos.brillo_mantener));
+                        avisar(state, osd);
+                    }
+                    _ => return TimeoutAction::Drop,
+                }
+                TimeoutAction::ToDuration(CADA)
+            });
+    match token {
+        Ok(token) => state.repeticion_multimedia = Some(token),
+        Err(err) => tracing::warn!("sin repetición de volumen y brillo: {err}"),
+    }
+}
+
 /// Enseña el aviso y programa su salida.
-fn avisar(
+pub(crate) fn avisar(
     state: &mut BookosComp,
     (icono, nivel, texto): (&'static str, Option<u8>, Option<String>),
 ) {
@@ -322,7 +358,11 @@ pub fn recibir_sistema(state: &mut BookosComp) {
     let mut mostro_osd = false;
     while let Some((operation, result)) = bookos_system::take_feedback() {
         if result.is_ok() && matches!(operation, Operation::VolumeStep { .. }) {
-            chasquido(state);
+            match state.chasquido {
+                Chasquido::Libre => chasquido(state),
+                Chasquido::Retenido => {}
+                Chasquido::Aplazado(_) => soltar_chasquido(state),
+            }
         }
         let osd = match result {
             Err(e) => Some(("sin-red", None, Some(e))),
@@ -351,6 +391,31 @@ pub fn recibir_sistema(state: &mut BookosComp) {
             mostro_osd = true;
         }
     }
+    // El volumen que cambia sin pasar por aquí: el gesto de unos auriculares
+    // Bluetooth (AVRCP lo lleva hasta PipeWire), u otra aplicación. Antes no
+    // salía nada, como si no hubiera cambiado.
+    let ahora = bookos_system::volume(false);
+    let anterior = std::mem::replace(&mut state.volumen_visto, ahora);
+    // Con una tarjeta abierta no: el deslizador del centro de control mueve el
+    // volumen y el aviso saldría encima de lo que se está tocando. Tampoco la
+    // primera lectura, que no es un cambio.
+    let tarjeta = state
+        .shell
+        .as_ref()
+        .is_some_and(|s| s.emergente_nombre().is_some());
+    if !mostro_osd
+        && !tarjeta
+        && let (Some(antes), Some((nivel, silenciado))) = (anterior, ahora)
+        && antes != (nivel, silenciado)
+        && let Some(shell) = state.shell.as_mut()
+    {
+        shell.mostrar_osd(
+            icono_volumen(nivel, silenciado),
+            Some(if silenciado { 0 } else { nivel }),
+            None,
+        );
+        mostro_osd = true;
+    }
     if mostro_osd {
         despertar_para_la_salida(state);
     }
@@ -368,13 +433,105 @@ fn chasquido(state: &mut BookosComp) {
     sonar(state, "audio-volume-change");
 }
 
-/// Toca un sonido del tema freedesktop sin esperar a que acabe.
-fn sonar(state: &mut BookosComp, nombre: &str) {
+/// Cuándo le toca sonar al volumen cuando se mueve con su tecla.
+///
+/// Suena al **soltar**, una vez, y no en cada paso. Con la tecla mantenida
+/// los pasos llegan diez por segundo y sonaban todos: un tableteo que tapa
+/// justo lo que el sonido tiene que decir, a qué nivel ha quedado. Sonar en
+/// la primera pulsación tampoco vale, porque al pulsar no se sabe todavía si
+/// la tecla se va a mantener.
+#[derive(Debug)]
+pub enum Chasquido {
+    /// Nadie tiene la tecla: un cambio de volumen suena en el acto.
+    Libre,
+    /// Tecla de volumen pulsada: los pasos se aplican callados.
+    Retenido,
+    /// Tecla soltada, a la espera del último paso.
+    Aplazado(smithay::reexports::calloop::RegistrationToken),
+}
+
+/// Se pulsó una tecla de volumen.
+pub fn retener_chasquido(state: &mut BookosComp) {
+    if let Chasquido::Aplazado(token) = std::mem::replace(&mut state.chasquido, Chasquido::Retenido)
+    {
+        state.loop_handle.remove(token);
+    }
+}
+
+/// Se soltó la tecla, o llegó un paso con ella ya suelta: suena en cuanto
+/// dejen de llegar.
+///
+/// No suena en el mismo instante de soltar porque los pasos van por una cola
+/// a `bookos-system` y el último puede confirmarse después: se oiría el nivel
+/// anterior, o dos veces.
+pub fn soltar_chasquido(state: &mut BookosComp) {
+    use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+    const MARGEN: std::time::Duration = std::time::Duration::from_millis(60);
+    match std::mem::replace(&mut state.chasquido, Chasquido::Libre) {
+        Chasquido::Libre => return,
+        Chasquido::Retenido => {}
+        Chasquido::Aplazado(token) => state.loop_handle.remove(token),
+    }
+    let token = state
+        .loop_handle
+        .insert_source(Timer::from_duration(MARGEN), |_, _, state| {
+            state.chasquido = Chasquido::Libre;
+            chasquido(state);
+            TimeoutAction::Drop
+        });
+    match token {
+        Ok(token) => state.chasquido = Chasquido::Aplazado(token),
+        Err(err) => tracing::warn!("sin sonido al soltar la tecla de volumen: {err}"),
+    }
+}
+
+/// Un sonido de los que acompañan un gesto (bloquear, desbloquear, capturar,
+/// iniciar sesión), si `sonidos_interfaz` está puesto.
+pub fn sonar_interfaz(state: &mut BookosComp, nombre: &str) {
+    if state.sonidos_interfaz {
+        sonar(state, nombre);
+    }
+}
+
+/// Dónde está el sonido de un evento: en el tema de BookOS y, si no lo tiene,
+/// en el de freedesktop, que es de quien hereda (ver su `index.theme`).
+///
+/// Va a mano y no por libcanberra porque aquí no se enlaza contra ella y
+/// `canberra-gtk-play` tarda en arrancar más que `pw-play`. Antes la ruta de
+/// freedesktop estaba escrita tal cual, y con el tema de BookOS instalado el
+/// volumen y el cargador seguían sonando con los de serie.
+fn ruta_sonido(nombre: &str) -> Option<std::path::PathBuf> {
+    let mut bases = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        bases.push(std::path::PathBuf::from(home).join(".local/share/sounds"));
+    }
+    bases.push("/usr/local/share/sounds".into());
+    bases.push("/usr/share/sounds".into());
+    ["bookos", "freedesktop"].into_iter().find_map(|tema| {
+        bases.iter().find_map(|base| {
+            ["oga", "ogg", "wav"]
+                .into_iter()
+                .map(|ext| {
+                    base.join(tema)
+                        .join("stereo")
+                        .join(format!("{nombre}.{ext}"))
+                })
+                .find(|ruta| ruta.is_file())
+        })
+    })
+}
+
+/// Toca un sonido del tema sin esperar a que acabe.
+pub fn sonar(state: &mut BookosComp, nombre: &str) {
     state
         .hijos
         .retain_mut(|hijo| !matches!(hijo.try_wait(), Ok(Some(_))));
+    let Some(ruta) = ruta_sonido(nombre) else {
+        tracing::warn!(nombre, "sin sonido: no está en ningún tema");
+        return;
+    };
     match std::process::Command::new("pw-play")
-        .arg(format!("/usr/share/sounds/freedesktop/stereo/{nombre}.oga"))
+        .arg(ruta)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

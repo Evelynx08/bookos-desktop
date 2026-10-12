@@ -34,17 +34,18 @@ const MUESTRA_HUECO: f32 = 11.0;
 const ROTULO: f32 = 30.0;
 /// Lado de la casilla de un color: el círculo de 30 más su anillo.
 const CASILLA: f32 = 42.0;
-const COLUMNAS: usize = 5;
+const COLUMNAS: usize = 6;
 const CIRCULO: f32 = 30.0;
 /// El divisor y el aire que lo rodea.
 const SEPARACION: f32 = 17.0;
-/// Alto de una miniatura de fondo, sin contar el aire de debajo.
-///
-/// El ancho sale de repartir la fila entre las familias que haya; el alto va en
-/// proporción 16:10, que es la de los fondos que trae BookOS.
-const FONDO_ALTO: f32 = 44.0;
-/// Hueco entre dos miniaturas de fondo.
-const FONDO_HUECO: f32 = 9.0;
+/// Las miniaturas de fondo van en rejilla de tres columnas, del mismo ancho que
+/// las muestras de tema de arriba, y no repartiendo la fila entre las familias
+/// que haya: con cinco salían miniaturas de 51 px casi cuadradas, con más aún
+/// menores, y no casaban con nada de lo que tienen encima. Con más familias la
+/// rejilla gana filas en vez de encoger.
+const FONDO_COLUMNAS: usize = 3;
+/// Hueco entre dos miniaturas de fondo, el mismo que entre las muestras.
+const FONDO_HUECO: f32 = MUESTRA_HUECO;
 /// Lo que se separa el anillo de elegida de la imagen. Sin este aire el anillo
 /// cae encima de la foto y con el acento azul sobre la miniatura azul no se ve.
 const HUECO_ANILLO: f32 = 4.0;
@@ -66,6 +67,22 @@ fn paso() -> f32 {
 
 fn filas() -> usize {
     Acento::TODOS.len().div_ceil(COLUMNAS)
+}
+
+/// Ancho de una miniatura de fondo: el de una muestra de tema.
+fn ancho_fondo() -> f32 {
+    ancho_muestra()
+}
+
+/// Alto de una miniatura: la proporción 16:10 de los fondos que trae BookOS.
+fn alto_fondo() -> f32 {
+    (ancho_fondo() * 10.0 / 16.0).round()
+}
+
+/// Lo que ocupa la rejilla de `n` familias, con el hueco entre filas.
+fn alto_fondos(n: usize) -> f32 {
+    let filas = n.div_ceil(FONDO_COLUMNAS) as f32;
+    filas * alto_fondo() + (filas - 1.0).max(0.0) * FONDO_HUECO
 }
 
 pub struct Apariencia {
@@ -143,19 +160,13 @@ impl Apariencia {
         (fondos, elegido)
     }
 
-    /// Ancho de una miniatura: la fila se reparte entre las familias que haya.
-    fn ancho_fondo(&self) -> f32 {
-        let n = self.fondos.len().max(1) as f32;
-        (ANCHO - MARGEN * 2.0 - FONDO_HUECO * (n - 1.0)) / n
-    }
-
     pub fn size(&self) -> (f32, f32) {
         let mut alto =
             CABECERA + MUESTRA + SEPARACION + ROTULO + CASILLA * filas() as f32 + MARGEN * 2.0;
         // Sin fondos instalados la sección no se dibuja: un rótulo con una fila
         // vacía debajo no es «no hay ninguno», es «esto está roto».
         if !self.fondos.is_empty() {
-            alto += SEPARACION + ROTULO + FONDO_ALTO;
+            alto += SEPARACION + ROTULO + alto_fondos(self.fondos.len());
         }
         (ANCHO, alto)
     }
@@ -210,17 +221,20 @@ impl Apariencia {
             return None;
         }
         let y0 = self.y_fondos();
-        if y < y0 || y > y0 + FONDO_ALTO || x < MARGEN || x > ANCHO - MARGEN {
+        if y < y0 || y > y0 + alto_fondos(self.fondos.len()) || x < MARGEN || x > ANCHO - MARGEN {
             return None;
         }
-        let paso = self.ancho_fondo() + FONDO_HUECO;
-        let rel = x - MARGEN;
-        let i = (rel / paso) as usize;
-        // La calle entre dos miniaturas no es de nadie.
-        if rel - i as f32 * paso > self.ancho_fondo() {
+        let (paso_x, paso_y) = (ancho_fondo() + FONDO_HUECO, alto_fondo() + FONDO_HUECO);
+        let (rel_x, rel_y) = (x - MARGEN, y - y0);
+        let (col, fila) = ((rel_x / paso_x) as usize, (rel_y / paso_y) as usize);
+        // Las calles entre miniaturas no son de nadie.
+        if rel_x - col as f32 * paso_x > ancho_fondo()
+            || rel_y - fila as f32 * paso_y > alto_fondo()
+        {
             return None;
         }
-        (i < self.fondos.len()).then_some(i)
+        let i = fila * FONDO_COLUMNAS + col;
+        (col < FONDO_COLUMNAS && i < self.fondos.len()).then_some(i)
     }
 
     fn color_en(&self, x: f32, y: f32) -> Option<usize> {
@@ -361,23 +375,30 @@ impl Apariencia {
         let contenido = if self.fondos.is_empty() {
             contenido
         } else {
-            let fila = self
-                .vistas
-                .iter()
-                .enumerate()
-                .fold(row![], |fila, (i, vista)| {
-                    let fila = if i > 0 {
-                        fila.push(Space::new().width(Length::Fixed(FONDO_HUECO)))
+            let rejilla = self.vistas.chunks(FONDO_COLUMNAS).enumerate().fold(
+                column![],
+                |rejilla, (f, trozo)| {
+                    let rejilla = if f > 0 {
+                        rejilla.push(Space::new().height(Length::Fixed(FONDO_HUECO)))
                     } else {
-                        fila
+                        rejilla
                     };
-                    fila.push(miniatura(
-                        vista.as_ref(),
-                        self.ancho_fondo(),
-                        self.marca_fondo.intensidad(i),
-                        self.hover_fondo.intensidad(i),
-                    ))
-                });
+                    rejilla.push(trozo.iter().enumerate().fold(row![], |fila, (c, vista)| {
+                        let i = f * FONDO_COLUMNAS + c;
+                        let fila = if c > 0 {
+                            fila.push(Space::new().width(Length::Fixed(FONDO_HUECO)))
+                        } else {
+                            fila
+                        };
+                        fila.push(miniatura(
+                            vista.as_ref(),
+                            ancho_fondo(),
+                            self.marca_fondo.intensidad(i),
+                            self.hover_fondo.intensidad(i),
+                        ))
+                    }))
+                },
+            );
             contenido
                 .push(separador())
                 .push(
@@ -385,7 +406,7 @@ impl Apariencia {
                         .height(Length::Fixed(ROTULO))
                         .center_y(Length::Fixed(ROTULO)),
                 )
-                .push(fila)
+                .push(rejilla)
         };
 
         super::control::tarjeta(contenido.into(), ANCHO, MARGEN)
@@ -470,9 +491,19 @@ fn mini<'a>(
     radio: iced_core::border::Radius,
 ) -> PanelElement<'a> {
     let (fondo, tarjeta) = colores(claro);
-    // La barra del panel no se dibuja como una pieza de 7 px con las esquinas
+    // La barra tiene su propio gris y no el de la tarjeta: era `tarjeta`, que
+    // en oscuro es el `#1c1c1e` de la emergente donde va la muestra, y en
+    // claro el blanco de la tarjeta clara. Se fundía con el fondo, y como ella
+    // es la que lleva las esquinas de arriba, la muestra se veía cortada en
+    // recto por arriba.
+    let barra = if claro {
+        Color::from_rgb(0.820, 0.820, 0.839)
+    } else {
+        Color::from_rgb(0.227, 0.227, 0.235)
+    };
+    // La barra del panel no se dibuja como una pieza de 8 px con las esquinas
     // de arriba redondeadas: tiny-skia limita el radio a la mitad del lado más
-    // corto, así que un radio de 12 en 7 px de alto se quedaba en 3,5 y la
+    // corto, así que un radio de 6 en 8 px de alto se quedaría en 4 y la
     // barra asomaba en pico por encima de la curva. Se hace al revés: el
     // contenedor de fuera pinta el color de la barra con el radio entero, y el
     // cuerpo de debajo tapa el resto redondeando solo por abajo.
@@ -505,11 +536,11 @@ fn mini<'a>(
         },
         ..Default::default()
     });
-    container(column![Space::new().height(Length::Fixed(7.0)), cuerpo])
+    container(column![Space::new().height(Length::Fixed(8.0)), cuerpo])
         .width(Length::Fixed(ancho))
         .height(Length::Fixed(alto))
         .style(move |_| container::Style {
-            background: Some(tarjeta.into()),
+            background: Some(barra.into()),
             border: Border {
                 radius: radio,
                 ..Default::default()
@@ -530,13 +561,16 @@ fn muestra<'a>(cual: ModoTema, elegida: f32, señalada: f32) -> PanelElement<'a>
     let alto_lienzo = MUESTRA - 22.0;
 
     use iced_core::border::Radius;
-    let entero = Radius::from(tema::R_BOTON);
+    // El radio no puede pasar del alto de la barra (8): el cuerpo va recto por
+    // arriba, y con R_BOTON (12) sus esquinas asomaban por fuera de la curva,
+    // que seguía bajando 4 px por debajo de la barra.
+    let entero = Radius::from(tema::R_CHIP);
     let izquierda = Radius::default()
-        .top_left(tema::R_BOTON)
-        .bottom_left(tema::R_BOTON);
+        .top_left(tema::R_CHIP)
+        .bottom_left(tema::R_CHIP);
     let derecha = Radius::default()
-        .top_right(tema::R_BOTON)
-        .bottom_right(tema::R_BOTON);
+        .top_right(tema::R_CHIP)
+        .bottom_right(tema::R_CHIP);
 
     let dentro: PanelElement<'a> = match cual {
         ModoTema::Claro => mini(true, ancho, alto_lienzo, entero),
@@ -556,7 +590,7 @@ fn muestra<'a>(cual: ModoTema, elegida: f32, señalada: f32) -> PanelElement<'a>
         .clip(true)
         .style(move |_| container::Style {
             border: Border {
-                radius: tema::R_BOTON.into(),
+                radius: tema::R_CHIP.into(),
                 // El marco de elegido crece con la animación en vez de
                 // aparecer: 2 px que salen de golpe se leen como un parpadeo.
                 width: 2.0 * elegida,
@@ -599,9 +633,10 @@ fn muestra<'a>(cual: ModoTema, elegida: f32, señalada: f32) -> PanelElement<'a>
 /// iced coloca un SVG y una imagen con un píxel de diferencia —medido: el SVG
 /// empezaba en (100, 320) y la capa en (101, 321)— y quedaba una raya.
 fn vistas_de(fondos: &[crate::fondos::Familia]) -> Vec<Option<iced_core::image::Handle>> {
-    let n = fondos.len().max(1) as f32;
-    let ancho = (ANCHO - MARGEN * 2.0 - FONDO_HUECO * (n - 1.0)) / n;
-    let (iw, ih) = (ancho - HUECO_ANILLO * 2.0, FONDO_ALTO - HUECO_ANILLO * 2.0);
+    let (iw, ih) = (
+        ancho_fondo() - HUECO_ANILLO * 2.0,
+        alto_fondo() - HUECO_ANILLO * 2.0,
+    );
     fondos
         .iter()
         .map(|f| {
@@ -663,7 +698,10 @@ fn miniatura<'a>(
     // La imagen va **dentro** de un margen y el anillo por fuera, igual que los
     // círculos de acento. Pegado a la imagen no se vería: el anillo es del color
     // de acento y con el acento azul sobre la miniatura azul son el mismo color.
-    let (iw, ih) = (ancho - HUECO_ANILLO * 2.0, FONDO_ALTO - HUECO_ANILLO * 2.0);
+    let (iw, ih) = (
+        ancho - HUECO_ANILLO * 2.0,
+        alto_fondo() - HUECO_ANILLO * 2.0,
+    );
     let imagen: PanelElement<'a> = match vista {
         Some(vista) => iced_widget::image(vista.clone())
             .width(Length::Fixed(iw))
@@ -686,9 +724,9 @@ fn miniatura<'a>(
 
     container(imagen)
         .width(Length::Fixed(ancho))
-        .height(Length::Fixed(FONDO_ALTO))
+        .height(Length::Fixed(alto_fondo()))
         .center_x(Length::Fixed(ancho))
-        .center_y(Length::Fixed(FONDO_ALTO))
+        .center_y(Length::Fixed(alto_fondo()))
         .style(move |_| container::Style {
             border: Border {
                 radius: (tema::R_BOTON + HUECO_ANILLO).into(),
@@ -823,7 +861,13 @@ mod tests {
         if fondos.len() < 2 {
             return;
         }
-        for acento in [Acento::Verde, Acento::Rojo, Acento::Morado, Acento::Azul] {
+        for acento in [
+            Acento::Verde,
+            Acento::Rojo,
+            Acento::Morado,
+            Acento::Azul,
+            Acento::Arena,
+        ] {
             let mut orden = fondos.clone();
             ordenar_por_afinidad(&mut orden, acento);
             let objetivo = tono_de_acento(acento).expect("estos cuatro tienen tono");
@@ -858,10 +902,11 @@ mod tests {
             assert_eq!(a.fondo_en(MARGEN + 1.0, a.y_fondos() + 1.0), None);
             return;
         }
-        let y = a.y_fondos() + 1.0;
-        let paso = a.ancho_fondo() + FONDO_HUECO;
+        let (paso_x, paso_y) = (ancho_fondo() + FONDO_HUECO, alto_fondo() + FONDO_HUECO);
         for i in 0..a.fondos.len() {
-            let x = MARGEN + i as f32 * paso + 1.0;
+            let (col, fila) = (i % FONDO_COLUMNAS, i / FONDO_COLUMNAS);
+            let x = MARGEN + col as f32 * paso_x + 1.0;
+            let y = a.y_fondos() + fila as f32 * paso_y + 1.0;
             assert_eq!(a.fondo_en(x, y), Some(i), "la miniatura {i} no responde");
             // Pulsar pide la pareja **entera**, que es lo que permite que el
             // cambio de tema se lleve el fondo con él.
@@ -875,18 +920,18 @@ mod tests {
             );
             assert_eq!(a.marca_fondo.actual(), Some(i));
         }
-        // La calle entre dos no es de nadie, y por debajo de la fila tampoco.
+        // Las calles entre dos no son de nadie, ni la zona de debajo de la
+        // última fila.
+        let y = a.y_fondos() + 1.0;
         if a.fondos.len() > 1 {
-            let calle = MARGEN + a.ancho_fondo() + FONDO_HUECO / 2.0;
+            let calle = MARGEN + ancho_fondo() + FONDO_HUECO / 2.0;
             assert_eq!(a.fondo_en(calle, y), None);
         }
-        assert_eq!(
-            a.fondo_en(MARGEN + 1.0, a.y_fondos() + FONDO_ALTO + 5.0),
-            None
-        );
-        // Y la fila entra en la tarjeta: con el alto mal contado, la última
-        // quedaría cortada por abajo.
-        assert!(a.y_fondos() + FONDO_ALTO <= a.size().1 - MARGEN + 0.01);
+        let fin = a.y_fondos() + alto_fondos(a.fondos.len());
+        assert_eq!(a.fondo_en(MARGEN + 1.0, fin + 5.0), None);
+        // Y la rejilla entra en la tarjeta: con el alto mal contado, la última
+        // fila quedaría cortada por abajo.
+        assert!(fin <= a.size().1 - MARGEN + 0.01);
     }
 
     /// Las tres muestras eligen su modo, cada una en su sitio, y las calles

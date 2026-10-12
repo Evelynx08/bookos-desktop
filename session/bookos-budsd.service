@@ -1,0 +1,14 @@
+[Unit]
+Description=Canal de control de los Galaxy Buds de BookOS
+# Lo arranca bookos-session.target, y no la activación por D-Bus, porque nadie
+# lo llama al empezar: tiene que estar ya escuchando a BlueZ cuando se saquen
+# los Buds del estuche.
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=org.bookos.Buds
+ExecStart=/usr/libexec/bookos-budsd
+Restart=on-failure
+RestartSec=3

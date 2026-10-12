@@ -16,34 +16,60 @@
 //! debajo, no lo que el usuario está usando; eso sale en su propio renglón,
 //! «Base», más abajo.
 //!
-//! El número de serie **no se enseña**: está en `/sys/class/dmi/id/product_serial`
-//! y ese fichero es 0400 de root, así que aquí siempre saldría vacío. Se deja
-//! el renglón con una raya, como hace el diseño, en vez de pedir permisos para
-//! un dato que solo sirve para el servicio técnico.
+//! El número de serie sale **tapado** y se destapa con el ojo: es un dato que
+//! se pide por teléfono al servicio técnico y no hace falta que quede a la
+//! vista en cada captura de pantalla. `/sys/class/dmi/id/product_serial` es
+//! 0400 de root; la regla `71-bookos-serie.rules` lo deja legible al grupo
+//! `wheel`. Sin ella el ojo destapa un aviso en vez del número.
 
 use std::fmt::Write as _;
 
-use iced_core::alignment::Horizontal;
-use iced_core::{Border, Color, Length};
-use iced_widget::{Space, column, container, row, text};
+use iced_core::alignment::{Horizontal, Vertical};
+use iced_core::{Border, Color, Length, Point, Rectangle};
+use iced_widget::{Space, column, container, row, stack, svg, text};
 
 use crate::Accion;
+use crate::icono;
 use crate::tema;
 use crate::view::PanelElement;
 
-use super::{Ancla, Tecla};
+use super::{Ancla, Tecla, t};
 
 const ANCHO: f32 = 420.0;
 const MARGEN: f32 = 32.0;
 /// Alto del dibujo del portátil de arriba.
 const RETRATO: f32 = 170.0;
+/// Proporción de `portatil.svg` (174×99).
+const RETRATO_ANCHO: f32 = RETRATO * 174.0 / 99.0;
+/// Alto del nombre del equipo y del renglón de BookOS bajo él. Fijos y no
+/// a lo que mida el texto: la ficha de debajo tiene que empezar siempre en el
+/// mismo sitio para que el ojo caiga donde lo busca [`Acerca::rect_ojo`].
+const TITULO: f32 = 40.0;
+const SUBTITULO: f32 = 20.0;
 /// Alto de cada renglón de la ficha, contando su respiro.
 const RENGLON: f32 = 26.0;
+/// Una línea más para el último renglón, «Base», que es el único que puede
+/// partirse en dos: "Fedora Linux 44 (KDE Plasma Desktop Edition)" no cabe.
+const LINEA_EXTRA: f32 = 18.0;
 /// Ancho de la columna de las etiquetas. Van alineadas a la derecha contra el
 /// valor, como en la ficha del diseño.
-const ETIQUETAS: f32 = 150.0;
+const ETIQUETAS: f32 = 160.0;
+/// Hueco entre etiqueta y valor.
+const SEPARACION: f32 = 12.0;
 /// Alto del botón de «Más información…».
-const BOTON: f32 = 40.0;
+const BOTON: f32 = 44.0;
+const ANCHO_BOTON: f32 = 264.0;
+/// Lado del ojo y de la ✕.
+const OJO: f32 = 18.0;
+const CIERRE: f32 = 24.0;
+/// Distancia de la ✕ a las esquinas de la tarjeta: con el radio de 22 de la
+/// tarjeta, a menos de 16 la ✕ pisa la curva.
+const CIERRE_MARGEN: f32 = 16.0;
+/// En qué renglón de la ficha va el número de serie.
+const RENGLON_SERIE: usize = 3;
+/// Lo que se enseña mientras el número está tapado. Siempre la misma
+/// cantidad de puntos: si dependiera del número, ya diría cuánto mide.
+const TAPADO: &str = "••••••••••";
 
 /// Un renglón de la ficha.
 struct Dato {
@@ -57,6 +83,12 @@ pub struct Acerca {
     /// La distribución, para el renglón bajo el título.
     sistema: String,
     datos: Vec<Dato>,
+    /// `None` si no se pudo leer: falta la regla de udev o no se es de `wheel`.
+    serie: Option<String>,
+    revelado: bool,
+    /// Se crea una vez: `Handle::from_memory` estrena identificador en cada
+    /// llamada y resvg volvería a rasterizar el dibujo en cada fotograma.
+    portatil: svg::Handle,
     /// Si el ratón está sobre el botón de «Más información…».
     /// El botón bajo el puntero, con su realce entrando y saliendo.
     señalado: tema::Transicion,
@@ -66,7 +98,7 @@ impl Acerca {
     pub fn new() -> Self {
         let modelo = dmi("product_family")
             .or_else(|| dmi("product_name"))
-            .unwrap_or_else(|| "Este equipo".into());
+            .unwrap_or_else(|| t("Este equipo", "This computer").into());
         // El subtítulo dice **BookOS**, no la distribución de base. BookOS no
         // es una distro aparte —es un escritorio que corre sobre Fedora—, así
         // que `/etc/os-release` describe el sistema anfitrión, no lo que el
@@ -82,16 +114,17 @@ impl Acerca {
                 valor: cpu().unwrap_or_else(|| "—".into()),
             },
             Dato {
-                etiqueta: "Gráficos",
+                etiqueta: t("Gráficos", "Graphics"),
                 valor: gpu().unwrap_or_else(|| "—".into()),
             },
             Dato {
-                etiqueta: "Memoria",
+                etiqueta: t("Memoria", "Memory"),
                 valor: memoria().unwrap_or_else(|| "—".into()),
             },
+            // Destapado, `ficha` pone el número en su lugar.
             Dato {
-                etiqueta: "Número de serie",
-                valor: dmi("product_serial").unwrap_or_else(|| "—".into()),
+                etiqueta: t("Número de serie", "Serial number"),
+                valor: TAPADO.into(),
             },
             Dato {
                 // Aquí sí es sitio para la base: a quien le importe qué hay
@@ -105,15 +138,22 @@ impl Acerca {
             modelo,
             sistema,
             datos,
+            serie: dmi("product_serial"),
+            revelado: false,
+            portatil: svg::Handle::from_memory(include_bytes!("../../assets/portatil.svg")),
             señalado: tema::Transicion::nueva(0.0, tema::D_HOVER, tema::C_SUAVE),
         }
     }
 
     pub fn size(&self) -> (f32, f32) {
-        let ficha = self.datos.len() as f32 * RENGLON;
         (
             ANCHO,
-            MARGEN * 2.0 + RETRATO + 24.0 + 34.0 + 22.0 + 24.0 + ficha + 28.0 + BOTON,
+            self.y_ficha()
+                + self.datos.len() as f32 * RENGLON
+                + LINEA_EXTRA
+                + 28.0
+                + BOTON
+                + MARGEN,
         )
     }
 
@@ -121,20 +161,47 @@ impl Acerca {
         Ancla::Centrada
     }
 
-    /// El rectángulo del botón, relativo a la tarjeta.
-    fn rect_boton(&self) -> iced_core::Rectangle {
-        let ficha = self.datos.len() as f32 * RENGLON;
-        iced_core::Rectangle {
-            x: (ANCHO - 220.0) / 2.0,
-            y: MARGEN + RETRATO + 24.0 + 34.0 + 22.0 + 24.0 + ficha + 28.0,
-            width: 220.0,
+    /// Dónde empieza la ficha, relativo a la tarjeta.
+    fn y_ficha(&self) -> f32 {
+        MARGEN + RETRATO + 24.0 + TITULO + SUBTITULO + 24.0
+    }
+
+    /// El botón va pegado al fondo de la tarjeta, así que su sitio no depende
+    /// de si «Base» ocupa una línea o dos.
+    fn rect_boton(&self) -> Rectangle {
+        Rectangle {
+            x: (ANCHO - ANCHO_BOTON) / 2.0,
+            y: self.size().1 - MARGEN - BOTON,
+            width: ANCHO_BOTON,
             height: BOTON,
         }
     }
 
+    /// Todo el valor del número de serie, no solo el ojo: el ojo mide 18 px y
+    /// pulsar sobre los puntos para destaparlos es lo que se intenta primero.
+    fn rect_ojo(&self) -> Rectangle {
+        let x = MARGEN + ETIQUETAS;
+        Rectangle {
+            x,
+            y: self.y_ficha() + RENGLON_SERIE as f32 * RENGLON,
+            width: ANCHO - MARGEN - x,
+            height: RENGLON,
+        }
+    }
+
+    fn rect_cierre(&self) -> Rectangle {
+        Rectangle {
+            x: ANCHO - CIERRE_MARGEN - CIERRE,
+            y: CIERRE_MARGEN,
+            width: CIERRE,
+            height: CIERRE,
+        }
+        // Un poco de holgura alrededor: 24 px en una esquina se fallan.
+        .expand(6.0)
+    }
+
     pub fn puntero(&mut self, punto: Option<(f32, f32)>) -> bool {
-        let dentro =
-            punto.is_some_and(|(x, y)| self.rect_boton().contains(iced_core::Point::new(x, y)));
+        let dentro = punto.is_some_and(|(x, y)| self.rect_boton().contains(Point::new(x, y)));
         self.señalado.ir_a(dentro as u8 as f32)
     }
 
@@ -144,15 +211,21 @@ impl Acerca {
     }
 
     pub fn pulsar(&mut self, x: f32, y: f32) -> Option<Accion> {
-        if !self.rect_boton().contains(iced_core::Point::new(x, y)) {
+        let punto = Point::new(x, y);
+        if self.rect_cierre().contains(punto) {
+            return Some(Accion::CerrarEmergente);
+        }
+        if self.rect_ojo().contains(punto) {
+            self.revelado = !self.revelado;
             return None;
         }
-        // «Más información…» abre los ajustes, que es donde vive el detalle.
-        // Con respaldo al centro de información de Plasma mientras
-        // bookos-settings no tenga esa página.
-        Some(Accion::Lanzar(
-            "bookos-settings --acerca || bookos-settings || kinfocenter".into(),
-        ))
+        if !self.rect_boton().contains(punto) {
+            return None;
+        }
+        // «Más información…» abre «Acerca del portátil» en los ajustes. Antes
+        // se pasaba `--acerca`, que bookos-settings no conoce: arrancaba sin
+        // error en su portada y el `||` de respaldo nunca saltaba.
+        Some(Accion::Lanzar("bookos-settings --page acerca".into()))
     }
 
     pub fn tecla(&mut self, tecla: crate::TeclaPulsada) -> Tecla {
@@ -171,107 +244,132 @@ impl Acerca {
         }
     }
 
-    /// El portátil dibujado de arriba.
-    ///
-    /// Es una silueta, no una foto: no hay fotos de los equipos en ningún sitio
-    /// del sistema, y una silueta con la pantalla del color de acento es lo que
-    /// enseña el diseño.
+    /// El portátil de arriba, el del diseño.
     fn retrato(&self) -> PanelElement<'_> {
-        let pantalla = container(Space::new())
-            .width(Length::Fixed(240.0))
-            .height(Length::Fixed(148.0))
-            .style(|_theme: &iced_widget::Theme| container::Style {
-                background: Some(Color::from_rgb(0.02, 0.04, 0.45).into()),
-                border: Border {
-                    radius: 8.0.into(),
-                    width: 6.0,
-                    color: Color::from_rgb(0.10, 0.10, 0.11),
-                },
-                ..Default::default()
-            });
-        // La base, más ancha que la pantalla: es lo que da la silueta de
-        // portátil abierto en vez de la de un monitor.
-        let base = container(Space::new())
-            .width(Length::Fixed(300.0))
-            .height(Length::Fixed(8.0))
-            .style(|_theme: &iced_widget::Theme| container::Style {
-                background: Some(
-                    Color {
-                        a: 0.55,
-                        ..tema::tinta()
-                    }
-                    .into(),
-                ),
-                border: Border {
-                    radius: 4.0.into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            });
         container(
-            column![pantalla, Space::new().height(Length::Fixed(6.0)), base]
-                .align_x(Horizontal::Center),
+            svg(self.portatil.clone())
+                .width(Length::Fixed(RETRATO_ANCHO))
+                .height(Length::Fixed(RETRATO)),
         )
         .width(Length::Fill)
         .align_x(Horizontal::Center)
         .into()
     }
 
+    /// El valor del número de serie con su ojo detrás.
+    fn serie(&self) -> PanelElement<'_> {
+        let (valor, ojo) = match (self.revelado, &self.serie) {
+            (false, _) => (TAPADO, "ojo"),
+            (true, Some(serie)) => (serie.as_str(), "ojo-tachado"),
+            (true, None) => (
+                t("Sin permiso para leerlo", "No permission to read it"),
+                "ojo-tachado",
+            ),
+        };
+        let ojo = match icono::propio(ojo) {
+            Some(ic) => icono::ver_teñido_propio(&ic, OJO, tema::TEXTO2),
+            None => Space::new().into(),
+        };
+        row![
+            text(valor).size(tema::T_CUERPO).color(tema::TEXTO2),
+            Space::new().width(Length::Fixed(10.0)),
+            ojo,
+        ]
+        .align_y(Vertical::Center)
+        .into()
+    }
+
     fn ficha(&self) -> PanelElement<'_> {
         let mut col = column![];
-        for dato in &self.datos {
-            col = col.push(
-                container(
-                    row![
-                        container(
-                            text(dato.etiqueta)
-                                .size(tema::T_CUERPO)
-                                .color(tema::texto())
-                                .align_x(Horizontal::Right),
-                        )
-                        .width(Length::Fixed(ETIQUETAS))
-                        .align_x(Horizontal::Right),
-                        Space::new().width(Length::Fixed(12.0)),
-                        text(dato.valor.clone())
+        let ultimo = self.datos.len() - 1;
+        for (i, dato) in self.datos.iter().enumerate() {
+            let valor: PanelElement<'_> = if i == RENGLON_SERIE {
+                self.serie()
+            } else {
+                text(dato.valor.as_str())
+                    .size(tema::T_CUERPO)
+                    .color(tema::TEXTO2)
+                    .into()
+            };
+            let renglon = container(
+                row![
+                    container(
+                        text(dato.etiqueta)
                             .size(tema::T_CUERPO)
-                            .color(tema::TEXTO2),
-                    ]
-                    .align_y(iced_core::alignment::Vertical::Center),
-                )
-                // Alto **mínimo**, no fijo: un valor que ocupe dos líneas tiene
-                // que empujar al renglón siguiente en vez de escribirse encima.
-                .padding(iced_core::Padding::ZERO.top(3.0).bottom(3.0)),
-            );
+                            .color(tema::texto())
+                            .align_x(Horizontal::Right),
+                    )
+                    .width(Length::Fixed(ETIQUETAS))
+                    .align_x(Horizontal::Right),
+                    Space::new().width(Length::Fixed(SEPARACION)),
+                    valor,
+                ]
+                .align_y(Vertical::Center),
+            )
+            .width(Length::Fill);
+            // Alto fijo en todos menos en el último, que puede partirse en dos
+            // líneas sin mover nada que se pulse: el ojo va encima de él.
+            col = col.push(if i == ultimo {
+                renglon.padding(iced_core::Padding::ZERO.top(4.0))
+            } else {
+                renglon
+                    .height(Length::Fixed(RENGLON))
+                    .align_y(Vertical::Center)
+            });
         }
         col.into()
+    }
+
+    /// La ✕ roja de la esquina, como la del Launchpad.
+    fn cierre(&self) -> PanelElement<'_> {
+        let aspa: PanelElement<'_> = match icono::propio("cerrar") {
+            Some(ic) => {
+                icono::ver_teñido_propio(&ic, CIERRE * 0.7, tema::tinta_sobre(tema::rojo()))
+            }
+            None => Space::new().into(),
+        };
+        container(
+            container(aspa)
+                .center_x(Length::Fixed(CIERRE))
+                .center_y(Length::Fixed(CIERRE))
+                .style(|_theme: &iced_widget::Theme| container::Style {
+                    background: Some(tema::rojo().into()),
+                    border: Border {
+                        radius: tema::R_CHIP.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+        )
+        .width(Length::Fill)
+        .align_x(Horizontal::Right)
+        .padding(CIERRE_MARGEN as u16)
+        .into()
     }
 
     pub fn view(&self) -> PanelElement<'_> {
         let boton = container(
             container(
-                text("Más información…")
-                    .size(tema::T_CUERPO)
+                text(t("Más información", "More info"))
+                    .size(tema::T_TITULO)
                     .color(tema::texto()),
             )
-            .width(Length::Fixed(220.0))
-            .height(Length::Fixed(BOTON))
-            .center_x(Length::Fixed(220.0))
+            .center_x(Length::Fixed(ANCHO_BOTON))
             .center_y(Length::Fixed(BOTON))
             .style({
                 let señalado = self.señalado.valor();
                 move |_theme: &iced_widget::Theme| container::Style {
                     background: Some(
                         tema::mezclar(
-                            tema::alfa(tema::tinta(), 0.08),
-                            tema::alfa(tema::tinta(), 0.16),
+                            tema::alfa(tema::tinta(), 0.28),
+                            tema::alfa(tema::tinta(), 0.36),
                             señalado,
                         )
                         .into(),
                     ),
                     border: Border {
                         radius: tema::R_BOTON.into(),
-                        width: 1.0,
-                        color: tema::borde(),
+                        ..Default::default()
                     },
                     ..Default::default()
                 }
@@ -283,33 +381,43 @@ impl Acerca {
         let contenido = column![
             self.retrato(),
             Space::new().height(Length::Fixed(24.0)),
-            text(self.modelo.clone())
-                .size(30.0)
-                .color(tema::texto())
-                .align_x(Horizontal::Center),
-            text(self.sistema.clone())
-                .size(tema::T_CUERPO)
-                .color(tema::TEXTO2)
-                .align_x(Horizontal::Center),
+            container(text(self.modelo.as_str()).size(30.0).color(tema::texto()))
+                .center_x(Length::Fill)
+                .height(Length::Fixed(TITULO)),
+            container(
+                text(self.sistema.as_str())
+                    .size(tema::T_CUERPO)
+                    .color(tema::TEXTO2)
+            )
+            .center_x(Length::Fill)
+            .height(Length::Fixed(SUBTITULO)),
             Space::new().height(Length::Fixed(24.0)),
             self.ficha(),
-            Space::new().height(Length::Fixed(28.0)),
+            // Lo que sobre si «Base» cabe en una línea va aquí, entre la ficha
+            // y el botón, que así queda siempre donde lo busca `rect_boton`.
+            Space::new().height(Length::Fill),
             boton,
-        ]
-        .align_x(Horizontal::Center);
+        ];
 
-        container(container(contenido).padding(MARGEN as u16))
-            .width(Length::Fixed(ANCHO))
-            .style(|_theme: &iced_widget::Theme| container::Style {
-                background: Some(tema::card().into()),
-                border: Border {
-                    radius: tema::R_TARJETA.into(),
-                    width: 1.0,
-                    color: tema::borde(),
-                },
-                ..Default::default()
-            })
-            .into()
+        let (_, alto) = self.size();
+        container(stack![
+            container(contenido)
+                .padding(MARGEN as u16)
+                .height(Length::Fixed(alto)),
+            self.cierre(),
+        ])
+        .width(Length::Fixed(ANCHO))
+        .height(Length::Fixed(alto))
+        .style(|_theme: &iced_widget::Theme| container::Style {
+            background: Some(tema::card().into()),
+            border: Border {
+                radius: tema::R_TARJETA.into(),
+                width: 1.0,
+                color: tema::borde(),
+            },
+            ..Default::default()
+        })
+        .into()
     }
 }
 
@@ -467,6 +575,28 @@ mod tests {
             assert!(!dato.valor.trim().is_empty(), "{} sin valor", dato.etiqueta);
         }
         assert!(!a.modelo.is_empty());
+    }
+
+    /// El número sale tapado al abrir y el ojo lo alterna. Sin permiso de
+    /// lectura —lo normal en un test, que no corre como `wheel` con la regla
+    /// puesta— destapa el aviso, nunca un renglón vacío.
+    #[test]
+    fn el_ojo_alterna_el_numero_de_serie() {
+        let mut a = Acerca::new();
+        assert!(!a.revelado);
+        let ojo = a.rect_ojo().center();
+        assert_eq!(a.pulsar(ojo.x, ojo.y), None);
+        assert!(a.revelado);
+        a.pulsar(ojo.x, ojo.y);
+        assert!(!a.revelado);
+    }
+
+    #[test]
+    fn la_aspa_cierra_y_el_boton_no_se_solapa_con_ella() {
+        let mut a = Acerca::new();
+        let c = a.rect_cierre().center();
+        assert_eq!(a.pulsar(c.x, c.y), Some(Accion::CerrarEmergente));
+        assert!(a.rect_boton().intersection(&a.rect_ojo()).is_none());
     }
 
     /// El subtítulo dice BookOS, no la distribución de base. Es justo el

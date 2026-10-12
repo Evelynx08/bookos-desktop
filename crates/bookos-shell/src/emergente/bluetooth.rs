@@ -177,8 +177,14 @@ impl Bluetooth {
     }
 
     pub fn view(&self) -> PanelElement<'_> {
+        control::tarjeta(self.contenido(false), lista::ANCHO, lista::MARGEN)
+    }
+
+    /// Lo de dentro de la tarjeta, sin la caja: la Estación de Control lo pone
+    /// en la suya. `volver` añade la flecha de volver a la cabecera.
+    pub fn contenido(&self, volver: bool) -> PanelElement<'_> {
         let mut filas = column![];
-        let cabecera = lista::cabecera("Bluetooth", Some(self.interruptor.valor()));
+        let cabecera = lista::cabecera("Bluetooth", Some(self.interruptor.valor()), volver);
         if let Some(status) = &self.estado_carga {
             filas = filas.push(lista::vacia(status));
         } else if self.entradas.is_empty() {
@@ -204,7 +210,7 @@ impl Bluetooth {
                     .into()
             ),
         ];
-        control::tarjeta(contenido.into(), lista::ANCHO, lista::MARGEN)
+        contenido.into()
     }
 }
 

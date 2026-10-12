@@ -25,8 +25,51 @@ use iced_core::alignment::{Horizontal, Vertical};
 use iced_core::{Border, Color, Length};
 use iced_widget::{Space, column, container, row, text};
 
+use crate::config::FuenteReloj;
 use crate::tema;
 use crate::view::PanelElement;
+
+/// De los 100…900 de la configuración a los nueve grosores de iced. Lo que no
+/// es un múltiplo de 100 no llega aquí: lo filtra la lectura de `panel.conf`.
+fn grosor(valor: u16) -> iced_core::font::Weight {
+    use iced_core::font::Weight;
+    match valor {
+        ..=100 => Weight::Thin,
+        101..=200 => Weight::ExtraLight,
+        201..=300 => Weight::Light,
+        301..=400 => Weight::Normal,
+        401..=500 => Weight::Medium,
+        501..=600 => Weight::Semibold,
+        601..=700 => Weight::Bold,
+        701..=800 => Weight::ExtraBold,
+        _ => Weight::Black,
+    }
+}
+
+/// Los estilos de reloj cuya fuente está instalada.
+///
+/// Se pregunta a la misma base de fuentes con la que se dibuja el bloqueo y no
+/// a fontconfig: fontdb no lee sus alias, y lo que importa es si *esto* la
+/// encuentra. Sin la fuente, cosmic-text dibujaría otra cualquiera, y el estilo
+/// elegido en Ajustes no se parecería a lo que sale en pantalla.
+pub fn estilos_instalados() -> Vec<FuenteReloj> {
+    // Un candado envenenado solo dice que otro hilo cayó con él cogido; la
+    // base de fuentes se carga una vez y no queda a medias por eso.
+    let mut sistema = iced_graphics::text::font_system()
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    let db = sistema.raw().db();
+    FuenteReloj::TODAS
+        .into_iter()
+        .filter(|f| {
+            db.faces().any(|cara| {
+                cara.families
+                    .iter()
+                    .any(|(nombre, _)| nombre == f.familia())
+            })
+        })
+        .collect()
+}
 
 /// Ancho de la píldora de contraseña, con su candado y su botón dentro. Es lo
 /// que ocupaban el campo de 260 y el botón suelto de al lado, así que el
@@ -52,7 +95,14 @@ const ESTADO_TOTAL: Duration = Duration::from_millis(520);
 const MEDIOS_ANCHO: f32 = 372.0;
 const MEDIOS_ARTE: f32 = 78.0;
 const MEDIOS_INFO: f32 = 246.0;
-const MEDIOS_ALTO: f32 = 102.0;
+const MEDIOS_ALTO: f32 = 124.0;
+const MEDIOS_PAD: f32 = 12.0;
+/// Alto de la fila de botones, que es también el diámetro del central.
+const MEDIOS_CONTROL: f32 = 34.0;
+/// Diámetro de anterior y siguiente.
+const MEDIOS_BOTON: f32 = 30.0;
+/// De centro a centro entre dos botones.
+const MEDIOS_PASO: f32 = 39.0;
 
 /// Alto de la línea del nombre de usuario: tamaño 20 con el interlineado
 /// habitual de 1,2.
@@ -90,19 +140,37 @@ const ALTO_ENTRADA: f32 = 46.0;
 /// Lado del icono de una entrada.
 const ICONO_ENTRADA: f32 = 18.0;
 
-/// Lo que ofrece el menú de apagado, en el orden del diseño.
-pub const ENTRADAS: &[(&str, &str, Peticion)] = &[
-    ("Apagar", "apagar", Peticion::Apagar),
-    ("Reiniciar", "reiniciar", Peticion::Reiniciar),
-    ("Suspender", "dormir", Peticion::Suspender),
-];
+/// Lo que ofrece el menú de apagado, en el orden del diseño. Hibernar solo si
+/// el equipo puede: ver [`crate::confirmacion::hibernar_disponible`].
+pub fn entradas() -> &'static [(&'static str, &'static str, Peticion)] {
+    const SIN: &[(&str, &str, Peticion)] = &[
+        ("Apagar", "apagar", Peticion::Apagar),
+        ("Reiniciar", "reiniciar", Peticion::Reiniciar),
+        ("Cerrar sesión", "salir", Peticion::CerrarSesion),
+        ("Suspender", "dormir", Peticion::Suspender),
+    ];
+    const CON: &[(&str, &str, Peticion)] = &[
+        ("Apagar", "apagar", Peticion::Apagar),
+        ("Reiniciar", "reiniciar", Peticion::Reiniciar),
+        ("Cerrar sesión", "salir", Peticion::CerrarSesion),
+        ("Suspender", "dormir", Peticion::Suspender),
+        ("Hibernar", "hibernar", Peticion::Hibernar),
+    ];
+    if crate::confirmacion::hibernar_disponible() {
+        CON
+    } else {
+        SIN
+    }
+}
 
 /// Lo que el bloqueo puede pedirle al compositor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Peticion {
     Apagar,
     Reiniciar,
+    CerrarSesion,
     Suspender,
+    Hibernar,
 }
 
 impl Peticion {
@@ -111,7 +179,9 @@ impl Peticion {
         match self {
             Self::Apagar => Energia::Apagar,
             Self::Reiniciar => Energia::Reiniciar,
+            Self::CerrarSesion => Energia::CerrarSesion,
             Self::Suspender => Energia::Suspender,
+            Self::Hibernar => Energia::Hibernar,
         }
     }
 }
@@ -239,7 +309,13 @@ fn foto_circular(ruta: &str) -> Option<iced_widget::image::Handle> {
     // incluso a escala 2 la GPU reduzca una imagen nítida en vez de ampliar una
     // miniatura; sigue siendo menos de 1 MiB y se genera una sola vez.
     let lado = 440_u32;
-    let imagen = image::open(ruta)
+    // `image::open` deduce el formato de la extensión, y `~/.face` y los iconos
+    // de AccountsService no la tienen: fallaba con «format could not be
+    // determined» (visto en bookos-session.log). Se mira el contenido.
+    let imagen = image::ImageReader::open(ruta)
+        .and_then(|lector| lector.with_guessed_format())
+        .map_err(image::ImageError::from)
+        .and_then(|lector| lector.decode())
         .inspect_err(|err| tracing::warn!(ruta, "no se pudo leer la foto de perfil: {err}"))
         .ok()?;
     // El cuadrado central: es lo que hace `ContentFit::Cover`, pero de verdad.
@@ -394,9 +470,15 @@ impl Bloqueo {
         let medios_avance = self.medio_avance();
         let energia_avance = self.entrada_avance(320, 360);
 
+        let familia = iced_core::font::Family::Name(self.config.reloj_fuente.familia());
         let mut reloj = column![
             text(self.hora.clone())
                 .size(self.config.reloj_tamano)
+                .font(iced_core::Font {
+                    family: familia,
+                    weight: grosor(self.config.reloj_grosor),
+                    ..iced_core::Font::DEFAULT
+                })
                 .color(Color {
                     a: reloj_avance,
                     ..Color::WHITE
@@ -409,6 +491,11 @@ impl Bloqueo {
             reloj = reloj.push(
                 text(self.fecha.clone())
                     .size(FECHA)
+                    .font(iced_core::Font {
+                        family: familia,
+                        weight: iced_core::font::Weight::Medium,
+                        ..iced_core::Font::DEFAULT
+                    })
                     .color(Color {
                         a: 0.75 * reloj_avance,
                         ..Color::WHITE
@@ -443,14 +530,15 @@ impl Bloqueo {
                     }),
             );
         }
-        let acceso = acceso.extend([
-            Space::new().height(Length::Fixed(16.0)).into(),
-            self.campo(acceso_avance),
-            Space::new().height(Length::Fixed(10.0)).into(),
-            self.mensaje(acceso_avance),
-            self.aviso_huella(acceso_avance),
-        ])
-        .align_x(Horizontal::Center);
+        let acceso = acceso
+            .extend([
+                Space::new().height(Length::Fixed(16.0)).into(),
+                self.campo(acceso_avance),
+                Space::new().height(Length::Fixed(10.0)).into(),
+                self.mensaje(acceso_avance),
+                self.aviso_huella(acceso_avance),
+            ])
+            .align_x(Horizontal::Center);
 
         let sacudida = self.sacudida();
         let acceso_desplazado = row![
@@ -561,7 +649,11 @@ impl Bloqueo {
             + 20.0
             + ALTO_HUELLA
             + MARGEN_MEDIOS;
-        (alto_pantalla * self.config.medios_y).max(piso)
+        // Tampoco se sale por abajo: con `medios_y` cerca del borde, la
+        // fracción deja menos sitio del que mide la tarjeta. El piso manda
+        // sobre este techo, porque tapar la contraseña es peor.
+        let techo = alto_pantalla - MEDIOS_ALTO - MARGEN_MEDIOS;
+        (alto_pantalla * self.config.medios_y).min(techo).max(piso)
     }
 
     /// Dónde está la tarjeta de medios **ahora mismo**, con la animación de
@@ -757,7 +849,7 @@ impl Bloqueo {
     fn entrada_energia(&self, i: usize, pantalla: (f32, f32)) -> (f32, f32, f32, f32) {
         let (x, y_boton, _, _) = self.boton_energia(pantalla);
         // El menú va encima del botón, con su hueco: abajo no hay sitio.
-        let alto_menu = ENTRADAS.len() as f32 * ALTO_ENTRADA;
+        let alto_menu = entradas().len() as f32 * ALTO_ENTRADA;
         let y0 = y_boton - 10.0 - alto_menu;
         (x, y0 + i as f32 * ALTO_ENTRADA, ANCHO_MENU, ALTO_ENTRADA)
     }
@@ -783,7 +875,7 @@ impl Bloqueo {
         let dentro =
             |r: (f32, f32, f32, f32)| x >= r.0 && x <= r.0 + r.2 && y >= r.1 && y <= r.1 + r.3;
         if self.menu {
-            for (i, (_, _, peticion)) in ENTRADAS.iter().enumerate() {
+            for (i, (_, _, peticion)) in entradas().iter().enumerate() {
                 if dentro(self.entrada_energia(i, pantalla)) {
                     self.cerrar_menu();
                     self.confirmacion = Some((
@@ -826,13 +918,15 @@ impl Bloqueo {
         if y < tarjeta_y || y > tarjeta_y + MEDIOS_ALTO {
             return None;
         }
-        let centro = tarjeta_x + 12.0 + MEDIOS_ARTE + 14.0 + MEDIOS_INFO / 2.0;
-        let control_y = tarjeta_y + 66.0;
-        if y < control_y || y > control_y + 34.0 {
+        let centro = tarjeta_x + MEDIOS_PAD + MEDIOS_ARTE + 14.0 + MEDIOS_INFO / 2.0;
+        let control_y = tarjeta_y + MEDIOS_ALTO - MEDIOS_PAD - MEDIOS_CONTROL;
+        if y < control_y || y > control_y + MEDIOS_CONTROL {
             return None;
         }
-        let centros = [centro - 39.0, centro, centro + 39.0];
-        let i = centros.iter().position(|cx| (x - cx).abs() <= 18.0)?;
+        let centros = [centro - MEDIOS_PASO, centro, centro + MEDIOS_PASO];
+        let i = centros
+            .iter()
+            .position(|cx| (x - cx).abs() <= MEDIOS_CONTROL / 2.0)?;
         Some(
             [
                 crate::medios::Orden::Anterior,
@@ -950,7 +1044,7 @@ impl Bloqueo {
         if avance > 0.001 {
             let alfa = avance.clamp(0.0, 1.0);
             let mut filas = column![];
-            for (i, (etiqueta, icono, _)) in ENTRADAS.iter().enumerate() {
+            for (i, (etiqueta, icono, _)) in entradas().iter().enumerate() {
                 let tinta = Color {
                     a: alfa,
                     ..Color::WHITE
@@ -974,7 +1068,7 @@ impl Bloqueo {
                 // El divisor va **dentro** de la altura de la entrada, no entre
                 // entradas: si sumara un píxel propio, el hit-test dejaría de
                 // caer donde se dibuja a partir de la segunda.
-                let ultima = i + 1 == ENTRADAS.len();
+                let ultima = i + 1 == entradas().len();
                 let alto_fila = if ultima {
                     ALTO_ENTRADA
                 } else {
@@ -1014,15 +1108,11 @@ impl Bloqueo {
             // El rebote del muelle se gasta en el desplazamiento, no en la
             // altura: pasarse de alto dejaría un hueco vacío dentro del menú.
             let desplazamiento = (1.0 - avance) * 18.0;
-            // Y además se despliega: el menú crece desde el botón en vez de
-            // aparecer entero. La altura se recorta con `clip`, con el contenido
-            // pegado abajo, que es de donde sale.
-            let alto_menu = ENTRADAS.len() as f32 * ALTO_ENTRADA;
-            let visible = (alto_menu * avance.min(1.0)).max(1.0);
-            let filas = container(filas)
-                .height(Length::Fixed(visible))
-                .align_y(Vertical::Bottom)
-                .clip(true);
+            // Entero desde el primer fotograma, sin desplegarse. Antes crecía
+            // recortando la altura, y el recorte enseñaba las **primeras**
+            // filas en el sitio de las últimas: a medio abrir, «Apagar» estaba
+            // dibujado donde el clic encuentra «Suspender». El HIG, además,
+            // solo deja animar opacidad y desplazamiento.
             columna = columna.push(
                 container(filas)
                     .style(move |_| container::Style {
@@ -1281,178 +1371,176 @@ impl Bloqueo {
     }
 
     /// Una tarjeta de lo que está sonando.
+    /// La tarjeta de «esto está sonando».
+    ///
+    /// Habla el mismo idioma que el reproductor de la isla, que es el mismo
+    /// objeto visto desde otro sitio: tarjeta de la paleta, texto del tema,
+    /// botones redondos y el acento solo en lo que está activo —el progreso y
+    /// el botón central—. Antes iba teñida con el color de la carátula, con
+    /// el texto en blanco fijo y los iconos sueltos, sin nada que dijera que
+    /// se podían pulsar.
+    ///
+    /// Los altos van fijos: `medio_en` busca los botones a una distancia
+    /// conocida del borde de abajo, y con un alto que dependiera del texto el
+    /// clic y el dibujo volverían a separarse.
     fn tarjeta<'a>(&self, medio: &'a Medio, alfa: f32) -> PanelElement<'a> {
-        let nota: PanelElement<'a> = match crate::icono::propio("musica") {
-            Some(ic) => crate::icono::ver_teñido_propio(
-                &ic,
-                30.0,
-                Color {
-                    a: 0.88 * alfa,
-                    ..Color::WHITE
-                },
-            ),
-            None => Space::new().width(Length::Fixed(30.0)).into(),
-        };
-        let arte = container(match medio.caratula.clone() {
+        use crate::actividad::{ANTERIOR, PAUSA, PLAY, SIGUIENTE};
+        let texto = con_alfa(tema::texto(), alfa);
+        let texto2 = con_alfa(tema::TEXTO2, alfa);
+        let acento = tema::acento();
+
+        let arte: PanelElement<'a> = match medio.caratula.clone() {
             Some(h) => iced_widget::image(h)
                 .width(MEDIOS_ARTE)
                 .height(MEDIOS_ARTE)
                 .opacity(alfa)
                 .into(),
-            None => nota,
-        })
-        .width(Length::Fixed(MEDIOS_ARTE))
-        .height(Length::Fixed(MEDIOS_ARTE))
-        .center_x(Length::Fixed(MEDIOS_ARTE))
-        .center_y(Length::Fixed(MEDIOS_ARTE))
-        .style(move |_| container::Style {
-            background: Some(con_alfa(tema::mezclar(medio.color, Color::BLACK, 0.18), alfa).into()),
-            border: Border {
-                radius: tema::R_CONTROL.into(),
+            None => container(match crate::icono::propio("musica") {
+                Some(ic) => crate::icono::ver_teñido_propio(&ic, 30.0, texto2),
+                None => Space::new().width(Length::Fixed(30.0)).into(),
+            })
+            .width(Length::Fixed(MEDIOS_ARTE))
+            .height(Length::Fixed(MEDIOS_ARTE))
+            .center_x(Length::Fixed(MEDIOS_ARTE))
+            .center_y(Length::Fixed(MEDIOS_ARTE))
+            .style(move |_| container::Style {
+                background: Some(con_alfa(tema::superficie_en_tarjeta(), alfa).into()),
+                border: Border {
+                    radius: tema::R_CONTROL.into(),
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
-            ..Default::default()
-        });
+            })
+            .into(),
+        };
 
-        let progreso = medio.progreso.unwrap_or(0.0).clamp(0.0, 1.0);
-        let lleno = MEDIOS_INFO * progreso;
+        let tramo = |ancho: f32, color: Color| {
+            container(Space::new())
+                .width(Length::Fixed(ancho))
+                .height(Length::Fixed(4.0))
+                .style(move |_| container::Style {
+                    background: Some(con_alfa(color, alfa).into()),
+                    border: Border {
+                        radius: 2.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+        };
+        let lleno = MEDIOS_INFO * medio.progreso.unwrap_or(0.0).clamp(0.0, 1.0);
         let barra = row![
-            container(Space::new())
-                .width(Length::Fixed(lleno))
-                .height(Length::Fixed(4.0))
-                .style(move |_| container::Style {
-                    background: Some(
-                        Color {
-                            a: alfa,
-                            ..Color::WHITE
-                        }
-                        .into()
-                    ),
-                    border: Border {
-                        radius: 2.0.into(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                }),
-            container(Space::new())
-                .width(Length::Fixed((MEDIOS_INFO - lleno).max(0.0)))
-                .height(Length::Fixed(4.0))
-                .style(move |_| container::Style {
-                    background: Some(
-                        Color {
-                            a: 0.20 * alfa,
-                            ..Color::WHITE
-                        }
-                        .into(),
-                    ),
-                    border: Border {
-                        radius: 2.0.into(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                }),
+            tramo(lleno, acento),
+            tramo((MEDIOS_INFO - lleno).max(0.0), tema::control_apagado()),
         ];
+        let tiempo = |segundos: Option<u64>| {
+            text(segundos.map(crate::medios::reloj).unwrap_or_default())
+                .size(tema::T_PEQUENO)
+                .color(texto2)
+        };
         let tiempos = row![
-            text(medio.posicion.map(crate::medios::reloj).unwrap_or_default())
-                .size(10.0)
-                .color(Color {
-                    a: 0.60 * alfa,
-                    ..Color::WHITE
-                }),
+            tiempo(medio.posicion),
             Space::new().width(Length::Fill),
-            text(medio.duracion.map(crate::medios::reloj).unwrap_or_default())
-                .size(10.0)
-                .color(Color {
-                    a: 0.60 * alfa,
-                    ..Color::WHITE
-                }),
+            tiempo(medio.duracion),
         ]
         .width(Length::Fixed(MEDIOS_INFO));
 
-        let control = |nombre: &str| -> PanelElement<'a> {
-            match crate::icono::propio(nombre) {
-                Some(ic) => crate::icono::ver_teñido_propio(
-                    &ic,
-                    17.0,
-                    Color {
-                        a: 0.92 * alfa,
-                        ..Color::WHITE
-                    },
-                ),
-                None => Space::new().width(Length::Fixed(17.0)).into(),
-            }
-        };
-        let controles = row![
-            control("anterior"),
-            Space::new().width(Length::Fixed(22.0)),
-            control(if medio.reproduciendo {
-                "pausa"
+        let boton = |svg: &str, lado: f32, principal: bool| -> PanelElement<'a> {
+            let (relleno, tinta) = if principal {
+                (acento, tema::tinta_sobre(acento))
             } else {
-                "reproducir"
-            }),
-            Space::new().width(Length::Fixed(22.0)),
-            control("siguiente"),
+                (tema::superficie_en_tarjeta(), tema::texto())
+            };
+            container(crate::icono::ver_teñido_propio(
+                &crate::icono::desde_svg(svg),
+                lado * 0.4,
+                con_alfa(tinta, alfa),
+            ))
+            .width(Length::Fixed(lado))
+            .height(Length::Fixed(lado))
+            .align_x(Horizontal::Center)
+            .align_y(Vertical::Center)
+            .style(move |_| container::Style {
+                background: Some(con_alfa(relleno, alfa).into()),
+                border: Border {
+                    radius: (lado / 2.0).into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .into()
+        };
+        // Los centros quedan a `MEDIOS_PASO` uno de otro, que es donde los
+        // busca `medio_en`.
+        let hueco = MEDIOS_PASO - (MEDIOS_BOTON + MEDIOS_CONTROL) / 2.0;
+        let controles = row![
+            boton(ANTERIOR, MEDIOS_BOTON, false),
+            Space::new().width(Length::Fixed(hueco)),
+            boton(
+                if medio.reproduciendo { PAUSA } else { PLAY },
+                MEDIOS_CONTROL,
+                true
+            ),
+            Space::new().width(Length::Fixed(hueco)),
+            boton(SIGUIENTE, MEDIOS_BOTON, false),
         ]
         .align_y(Vertical::Center);
 
         let info = column![
-            text(medio.titulo.clone())
-                .size(tema::T_CUERPO)
-                .font(iced_core::Font {
-                    weight: iced_core::font::Weight::Semibold,
-                    ..iced_core::Font::DEFAULT
-                })
-                .color(Color {
-                    a: alfa,
-                    ..Color::WHITE
-                }),
-            text(medio.detalle.clone())
-                .size(tema::T_PEQUENO)
-                .color(con_alfa(tema::TEXTO2, alfa)),
+            text(crate::emergente::recortar_texto(
+                &medio.titulo,
+                MEDIOS_INFO,
+                tema::T_CUERPO
+            ))
+            .size(tema::T_CUERPO)
+            .font(iced_core::Font {
+                weight: iced_core::font::Weight::Semibold,
+                ..iced_core::Font::DEFAULT
+            })
+            .wrapping(iced_core::text::Wrapping::None)
+            .color(texto),
+            text(crate::emergente::recortar_texto(
+                &medio.detalle,
+                MEDIOS_INFO,
+                tema::T_PEQUENO
+            ))
+            .size(tema::T_PEQUENO)
+            .wrapping(iced_core::text::Wrapping::None)
+            .color(texto2),
             Space::new().height(Length::Fixed(7.0)),
             barra,
             Space::new().height(Length::Fixed(3.0)),
             tiempos,
+            Space::new().height(Length::Fill),
             container(controles)
                 .width(Length::Fixed(MEDIOS_INFO))
+                .height(Length::Fixed(MEDIOS_CONTROL))
                 .center_x(Length::Fill),
         ]
-        .width(Length::Fixed(MEDIOS_INFO));
+        .width(Length::Fixed(MEDIOS_INFO))
+        .height(Length::Fill);
 
         container(
             row![arte, Space::new().width(Length::Fixed(14.0)), info].align_y(Vertical::Center),
         )
         .width(Length::Fixed(MEDIOS_ANCHO))
-        .padding(12.0)
+        .height(Length::Fixed(MEDIOS_ALTO))
+        .padding(MEDIOS_PAD)
         .style(move |_| container::Style {
-            background: Some(con_alfa(oscurecer(medio.color, 0.64), alfa).into()),
+            background: Some(con_alfa(tema::card(), alfa).into()),
+            // El borde que el HIG pide a una tarjeta superpuesta, al 9 % del
+            // texto: es lo que la separa del fondo de pantalla.
             border: Border {
                 radius: tema::R_TARJETA.into(),
                 width: 1.0,
-                color: Color {
-                    a: 0.16 * alfa,
-                    ..Color::WHITE
-                },
+                color: con_alfa(tema::texto(), 0.09 * alfa),
             },
             // Sin sombra, a diferencia de las tarjetas del escritorio: iced la
             // calcula en CPU píxel a píxel en cada repintado, y el bloqueo se
             // repinta en cada tecla de la contraseña. Medido a escala 2 con
-            // música, 16 ms de los 26 de cada tecla. Sobre el fondo oscurecido
-            // y el velo de la canción un 18 % de negro apenas se distinguía.
+            // música, 16 ms de los 26 de cada tecla.
             ..Default::default()
         })
         .into()
-    }
-}
-
-/// Mezcla un color con negro. Las tarjetas llevan el color de su aplicación,
-/// pero a plena intensidad taparían el fondo y competirían con el campo.
-fn oscurecer(c: Color, cuanto: f32) -> Color {
-    Color {
-        r: c.r * (1.0 - cuanto),
-        g: c.g * (1.0 - cuanto),
-        b: c.b * (1.0 - cuanto),
-        a: 0.92,
     }
 }
 
@@ -1498,7 +1586,7 @@ mod tests {
         assert!(b.menu, "el botón no desplegó el menú");
 
         // La última entrada es Suspender, y el menú cae encima del botón.
-        let (ex, ey, ew, eh) = b.entrada_energia(ENTRADAS.len() - 1, pantalla);
+        let (ex, ey, ew, eh) = b.entrada_energia(entradas().len() - 1, pantalla);
         assert!(ey + eh < by, "el menú se dibuja sobre el botón, no debajo");
         assert_eq!(b.pulsar(ex + ew / 2.0, ey + eh / 2.0, pantalla).0, None);
         assert!(!b.menu, "elegir una entrada tiene que cerrar el menú");
@@ -1610,7 +1698,7 @@ mod tests {
         let pantalla = (1645.0, 1029.0);
         let x0 = (pantalla.0 - MEDIOS_ANCHO) / 2.0;
         let centro = x0 + 12.0 + MEDIOS_ARTE + 14.0 + MEDIOS_INFO / 2.0;
-        let y = pantalla.1 * config.medios_y + 80.0;
+        let y = pantalla.1 * config.medios_y + MEDIOS_ALTO - MEDIOS_PAD - MEDIOS_CONTROL / 2.0;
         assert_eq!(
             b.medio_en(centro - 39.0, y, pantalla),
             Some(crate::medios::Orden::Anterior)
@@ -1658,7 +1746,9 @@ mod tests {
         // con el término de la animación incluido. Si `medio_en` la ignora,
         // este punto cae fuera de lo que el hit-test busca y el `assert`
         // de abajo falla con `None`.
-        let y = b.medios_y_actual(pantalla.1, b.medio_avance()) + 66.0 + 17.0;
+        let y = b.medios_y_actual(pantalla.1, b.medio_avance()) + MEDIOS_ALTO
+            - MEDIOS_PAD
+            - MEDIOS_CONTROL / 2.0;
         assert_eq!(
             b.medio_en(centro, y, pantalla),
             Some(crate::medios::Orden::Alternar),

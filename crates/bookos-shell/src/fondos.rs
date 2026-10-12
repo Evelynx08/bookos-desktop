@@ -121,15 +121,23 @@ pub fn instaladas(claro: bool) -> Vec<Familia> {
 /// prohíbe (`abrir_apariencia_no_decodifica_los_fondos`). Del vectorial basta
 /// con leer la cabecera y quedarse con el color más vivo que declare.
 ///
+/// Solo cuentan las paradas de los degradados (`stop-color`), que es lo que se
+/// ve. Los SVG exportados traen debajo de todo un `<rect fill="#103042">`, el
+/// fondo del marco, tapado entero por el primer `<path>`: contando los `fill`,
+/// ese azul ganaba a los grises cálidos de `beige_alice`, que salía a 202° en
+/// vez de 34°. En los otros cuatro el resultado es el mismo con y sin `fill`.
+///
 /// «Más vivo» es saturación por cercanía al gris medio: sin el segundo factor
 /// gana un `#031E10` casi negro, que en tono es verde pero no es el color con
 /// el que nadie reconoce el fondo. Medido contra los cuatro que trae BookOS:
-/// blue 210°, ember 14°, pine 126°, purple 276°, que es lo que se ve.
+/// beige_alice 34°, blue 210°, ember 14°, pine 126°, purple 276°, que es lo que
+/// se ve.
 ///
 /// `None` si la familia no trae vectorial o no declara ningún color.
 pub fn tono(familia: &Familia) -> Option<f32> {
-    // 4 KiB llegan de sobra: en los cuatro fondos de BookOS los colores están
-    // en las primeras doce declaraciones y el resto del fichero son curvas.
+    // 4 KiB llegan: en los fondos de BookOS las paradas empiezan antes del byte
+    // 3100, detrás de las curvas. En `beige_alice` claro las últimas quedan
+    // fuera y sale 39° en vez de 34°, que sigue siendo su color.
     let vista = familia.vista.as_ref()?;
     use std::io::Read as _;
     let fichero = std::fs::File::open(vista).ok()?;
@@ -138,7 +146,7 @@ pub fn tono(familia: &Familia) -> Option<f32> {
     let texto = String::from_utf8_lossy(&cabecera);
 
     let mut mejor: Option<(f32, f32)> = None;
-    for trozo in texto.split('#').skip(1) {
+    for trozo in texto.split("stop-color=\"#").skip(1) {
         let hex = trozo.as_bytes();
         if hex.len() < 6 || !hex[..6].iter().all(|b| b.is_ascii_hexdigit()) {
             continue;
@@ -245,15 +253,16 @@ mod tests {
         assert_eq!(f("/"), None);
     }
 
-    /// El tono sale del SVG y acierta con los cuatro fondos que trae BookOS.
+    /// El tono sale del SVG y acierta con los fondos que trae BookOS.
     ///
     /// Los grados están medidos sobre los ficheros de `Wallpapers-0.6`. El
-    /// margen es de 15°, que es mucho más fino que la distancia entre dos
-    /// familias cualesquiera —la más corta es blue↔purple, 66°— y a la vez
-    /// tolera que alguien retoque un degradado sin romper la prueba.
+    /// margen es de 8°, por debajo de la distancia más corta entre dos
+    /// familias —beige_alice↔ember, 20°— y a la vez tolera que alguien retoque
+    /// un degradado sin romper la prueba.
     #[test]
     fn el_tono_de_cada_familia_es_el_que_se_ve() {
         let esperados = [
+            ("beige_alice", 34.0),
             ("blue", 210.0),
             ("ember", 14.0),
             ("pine", 126.0),
@@ -271,10 +280,7 @@ mod tests {
                 panic!("{nombre} no dio tono");
             };
             let d = distancia_de_tono(t, grados);
-            assert!(
-                d < 15.0,
-                "{nombre}: {t:.0}° contra los {grados:.0}° medidos"
-            );
+            assert!(d < 8.0, "{nombre}: {t:.0}° contra los {grados:.0}° medidos");
         }
     }
 

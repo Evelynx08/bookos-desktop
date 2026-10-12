@@ -1,0 +1,8 @@
+# Deja leer el número de serie del equipo a los administradores.
+#
+# El kernel publica /sys/class/dmi/id/product_serial como 0400 de root, y
+# «Acerca de este PC» lo enseña cuando se pulsa el ojo. Se abre al grupo
+# `wheel` y no a todos: es el mismo público al que hostnamed se lo da
+# (GetHardwareSerial pide auth_admin), sin necesitar un agente de polkit que
+# la sesión BookOS no tiene.
+SUBSYSTEM=="dmi", KERNEL=="id", ACTION!="remove", RUN+="/usr/bin/chgrp wheel /sys%p/product_serial", RUN+="/usr/bin/chmod 0440 /sys%p/product_serial"

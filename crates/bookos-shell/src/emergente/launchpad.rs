@@ -1,7 +1,7 @@
 //! El launchpad: la rejilla de aplicaciones a pantalla completa.
 //!
-//! Es la versión propia del plasmoide `bookos-launchpad`: rejilla de **6×5**,
-//! campo de búsqueda arriba del todo, puntos de página abajo, y la misma
+//! Es la versión propia del plasmoide `bookos-launchpad`: rejilla de hasta
+//! **7×5** —la forma sale del hueco, ver [`Launchpad::forma`]—, campo de búsqueda arriba del todo, puntos de página abajo, y la misma
 //! puntuación de búsqueda (exacto, prefijo, prefijo de palabra, iniciales,
 //! substring, subsecuencia difusa).
 //!
@@ -93,9 +93,14 @@ use crate::view::PanelElement;
 
 use super::{Ancla, Tecla};
 
-/// La rejilla del plasmoide.
-const COLUMNAS: usize = 6;
-const FILAS: usize = 5;
+/// Tope de columnas: con más, la búsqueda visual por fila se alarga y el
+/// paso horizontal se encoge por debajo del vertical en pantallas 16:9.
+const COLUMNAS_MAX: usize = 7;
+/// La fila más baja con la que se sigue usando una quinta fila. Por debajo se
+/// pasa a cuatro: a 1440×900 con el dock delante quedan 541 px de rejilla, que
+/// en cinco filas dan 108 por fila y un icono de 63 —«se ve pequeño»—; en
+/// cuatro, 135 y un icono de 78.
+const FILA_MINIMA: f32 = 120.0;
 
 /// La unidad de rejilla de Plasma, de la que salen todos los espaciados del
 /// plasmoide. Con la fuente por defecto son 18 px.
@@ -111,6 +116,9 @@ const BUSQUEDA_ANCHO: f32 = UNIDAD * 20.0;
 const HUECO: f32 = UNIDAD * 4.0;
 /// Alto de la fila de puntos de página, con su margen.
 const PUNTOS: f32 = UNIDAD * 3.0;
+/// Aire mínimo entre el launchpad y los bordes de su hueco: el de la pantalla
+/// arriba y el del dock abajo.
+const AIRE: f32 = UNIDAD * 2.0;
 /// Alto reservado a la etiqueta bajo cada icono: 2 unidades.
 const ETIQUETA: f32 = UNIDAD * 2.0;
 /// Qué fracción de la pantalla ocupa la rejilla. Es el 0,72 del plasmoide: el
@@ -292,17 +300,7 @@ fn tinte_del_fondo() -> Option<Color> {
 /// cruce las dos superficies en la GPU, que es lo que ya hace con el cambio de
 /// página. Esto es el aviso de «acabo de cambiar de estado, guarda lo que había
 /// y crúzalo así».
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Transicion {
-    /// Se ha entrado en una carpeta: el panel crece y la rejilla se aparta.
-    AbrirCarpeta,
-    /// Se ha salido: al revés y sin muelle, que rebotar al salir se lee como
-    /// que la carpeta no quería cerrarse.
-    CerrarCarpeta,
-    /// Lo de dentro ha cambiado sin cambiar de vista —el color de la carpeta,
-    /// una aplicación que se quita, el modo edición—: fundido y nada más.
-    Fundido,
-}
+pub use super::Transicion;
 
 /// Un grupo de aplicaciones con su nombre.
 #[derive(Clone, Debug)]
@@ -318,8 +316,9 @@ pub struct Carpeta {
 }
 
 pub struct Launchpad {
-    /// Tamaño **lógico** de la pantalla: el launchpad la ocupa entera y la
-    /// rejilla se dimensiona a partir de ahí, como el plasmoide.
+    /// Tamaño **lógico** del hueco donde va: la pantalla entera, menos el
+    /// dock si se ve por delante. La rejilla se dimensiona a partir de ahí,
+    /// como el plasmoide.
     pantalla: (f32, f32),
     apps: Vec<App>,
     /// Las carpetas, tal y como están en el disco.
@@ -905,8 +904,8 @@ impl Launchpad {
     /// cuesta nada, y aquí solo se rasteriza lo que tiene contenido.
     pub fn size(&self) -> (f32, f32) {
         (
-            self.celda_ancho() * COLUMNAS as f32,
-            BUSQUEDA + HUECO + self.celda_alto() * FILAS as f32 + PUNTOS,
+            self.celda_ancho() * self.forma().0 as f32,
+            BUSQUEDA + HUECO + self.celda_alto() * self.forma().1 as f32 + PUNTOS,
         )
     }
 
@@ -990,21 +989,42 @@ impl Launchpad {
 
     /// El área que ocupa la rejilla, y su esquina. Es el 72 % de la pantalla
     /// con un mínimo de 640×480, centrado.
+    ///
+    /// De alto, además, lo que deje libre el resto del launchpad —buscador, su
+    /// hueco y los puntos— con [`AIRE`] arriba y abajo. El 72 % solo era de la
+    /// rejilla y lo demás iba encima: a 1440×900 el bloque medía 828 en los
+    /// 800 que deja el dock, y el buscador acababa a 2 px del borde.
     fn area(&self) -> (f32, f32) {
+        let cabe = self.pantalla.1 - BUSQUEDA - HUECO - PUNTOS - AIRE * 2.0;
         (
             (self.pantalla.0 * FRACCION).max(640.0),
-            (self.pantalla.1 * FRACCION).max(480.0),
+            (self.pantalla.1 * FRACCION).min(cabe).max(480.0),
         )
+    }
+
+    /// Columnas y filas de la rejilla principal.
+    ///
+    /// Un 6×5 fijo no se adapta: en 16:10 el alto es el eje que manda y cinco
+    /// filas lo trocean hasta dejar iconos de 63 px con medio ancho vacío. Así
+    /// que se quitan filas cuando no caben a [`FILA_MINIMA`], y las columnas
+    /// salen de cuántas celdas un 10 % más anchas que altas caben a lo ancho:
+    /// 7×4 a 1440×900 y a 1280×800, 7×5 a 1920×1080, 4×5 en vertical.
+    fn forma(&self) -> (usize, usize) {
+        let (ancho, alto) = self.area();
+        let filas = if alto / 5.0 >= FILA_MINIMA { 5 } else { 4 };
+        let columnas = (ancho / (alto / filas as f32 * 1.1)).round() as usize;
+        (columnas.clamp(4, COLUMNAS_MAX), filas)
     }
 
     /// El paso **vertical**: lo que mide una fila.
     ///
     /// Sale del alto, con el ancho de tope por si la pantalla es vertical. De
     /// aquí salen también el tamaño del icono y el aire de la celda, y por eso
-    /// no es simplemente `alto / FILAS`: es el eje que manda.
+    /// no es simplemente `alto / filas`: es el eje que manda.
     fn paso(&self) -> f32 {
         let (ancho, alto) = self.area();
-        (alto / FILAS as f32).min(ancho / COLUMNAS as f32).max(80.0)
+        let (columnas, filas) = self.forma();
+        (alto / filas as f32).min(ancho / columnas as f32).max(80.0)
     }
 
     /// El paso **horizontal**: lo que mide una columna.
@@ -1023,7 +1043,7 @@ impl Launchpad {
     /// vuelven las bandas.
     fn paso_x(&self) -> f32 {
         let paso = self.paso();
-        (self.area().0 / COLUMNAS as f32).clamp(paso, paso * 1.35)
+        (self.area().0 / self.forma().0 as f32).clamp(paso, paso * 1.35)
     }
 
     fn celda_ancho(&self) -> f32 {
@@ -1060,7 +1080,7 @@ impl Launchpad {
             // siempre, una carpeta de dos aplicaciones es un panel con media
             // fila vacía y las dos pegadas a la izquierda.
             Some(_) => self.visibles.len().clamp(1, COLUMNAS_CARPETA),
-            None => COLUMNAS,
+            None => self.forma().0,
         }
     }
 
@@ -1068,7 +1088,7 @@ impl Launchpad {
         if self.dentro.is_some() {
             FILAS_CARPETA
         } else {
-            FILAS
+            self.forma().1
         }
     }
 
@@ -1807,6 +1827,7 @@ impl Launchpad {
             T::Fin => self.mover(self.visibles.len() as isize),
             T::PaginaArriba => self.pasar_pagina(-1),
             T::PaginaAbajo => self.pasar_pagina(1),
+            T::SeleccionarTodo => Tecla::Ignorada,
             // El tabulador despliega el selector de color de la carpeta
             // abierta. Es la única tecla libre ahí: las letras buscan, las
             // flechas recorren la rejilla y Esc va deshaciendo.
@@ -3058,13 +3079,15 @@ mod tests {
         let nombres: Vec<String> = (0..45).map(|i| format!("App{i:02}")).collect();
         let refs: Vec<&str> = nombres.iter().map(String::as_str).collect();
         let mut l = con_apps(&refs);
-        assert_eq!(l.paginas(), 2, "45 apps a 30 por página");
+        // La forma depende de la pantalla: se lee en vez de suponer el 6×5.
+        let (columnas, filas) = l.forma();
+        assert_eq!(l.paginas(), 2, "45 apps a {} por página", columnas * filas);
 
-        // Bajar cinco filas desde el principio se sale de la primera página.
-        for _ in 0..5 {
+        // Bajar todas las filas desde el principio se sale de la primera página.
+        for _ in 0..filas {
             l.tecla(T::Abajo);
         }
-        assert_eq!(l.seleccion, Some(30));
+        assert_eq!(l.seleccion, Some(columnas * filas));
         assert_eq!(l.pagina, 1, "la selección arrastra la página");
     }
 

@@ -3,9 +3,34 @@ use crate::{TeclaPulsada, tema, view::PanelElement};
 use iced_core::{Border, Font, Length, font::Weight};
 use iced_widget::{Space, column, container, row, text};
 
+/// ¿Puede hibernar este equipo? Lo decide logind (`CanHibernate`): hace falta
+/// swap en disco del tamaño de la RAM y `resume=` en el arranque, y sin eso
+/// `systemctl hibernate` falla. Con zram como única swap, que es lo que trae
+/// Fedora, contesta `na`, así que la opción no se enseña.
+///
+/// Se pregunta una vez por proceso (3-4 ms medidos con `busctl`). Lo que cambia
+/// la respuesta —swap nueva, `resume=`— necesita reiniciar de todos modos.
+pub fn hibernar_disponible() -> bool {
+    static DISPONIBLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISPONIBLE.get_or_init(|| {
+        std::process::Command::new("busctl")
+            .args([
+                "--timeout=2s",
+                "call",
+                "org.freedesktop.login1",
+                "/org/freedesktop/login1",
+                "org.freedesktop.login1.Manager",
+                "CanHibernate",
+            ])
+            .output()
+            .is_ok_and(|salida| String::from_utf8_lossy(&salida.stdout).trim() == "s \"yes\"")
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Energia {
     Suspender,
+    Hibernar,
     Bloquear,
     CerrarSesion,
     Reiniciar,
@@ -16,6 +41,7 @@ impl Energia {
     pub fn etiqueta(self) -> &'static str {
         match self {
             Self::Suspender => "Suspender",
+            Self::Hibernar => "Hibernar",
             Self::Bloquear => "Bloquear",
             Self::CerrarSesion => "Cerrar sesión",
             Self::Reiniciar => "Reiniciar",
@@ -31,6 +57,7 @@ impl Energia {
             crate::Accion::CerrarSesion => Some(Self::CerrarSesion),
             crate::Accion::Lanzar(cmd) => match cmd.as_str() {
                 "systemctl suspend" => Some(Self::Suspender),
+                "systemctl hibernate" => Some(Self::Hibernar),
                 "systemctl reboot" => Some(Self::Reiniciar),
                 "systemctl poweroff" => Some(Self::Apagar),
                 _ => None,
@@ -89,6 +116,9 @@ impl Confirmacion {
         let mensaje = match self.accion {
             Energia::Bloquear => "Necesitarás autenticarte para volver a entrar.",
             Energia::Suspender => "El equipo entrará en reposo. Tu sesión se conservará.",
+            Energia::Hibernar => {
+                "Tu sesión se guardará en el disco y el equipo se apagará. Al encenderlo volverás donde estabas."
+            }
             _ => "Guarda tu trabajo antes de continuar. Se cerrarán las aplicaciones abiertas.",
         };
         let boton = |label, primario, foco| {

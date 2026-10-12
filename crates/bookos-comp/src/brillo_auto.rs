@@ -242,6 +242,7 @@ pub fn partida_tecla(state: &BookosComp) -> Option<u8> {
 /// y suelta su rampa: si no, la rampa en curso seguía escribiendo su objetivo
 /// encima del de la tecla y el brillo bailaba al soltar.
 pub fn tecla(state: &mut BookosComp, nivel: u8) {
+    crate::atenuacion::olvidar(state);
     let e = &mut state.brillo_auto;
     if let Some(token) = e.rampa.take() {
         state.loop_handle.remove(token);
@@ -294,6 +295,21 @@ fn recibir(state: &mut BookosComp, lux: f64) {
     state.brillo_auto.espera = token.ok();
 }
 
+/// El compositor ha puesto `nivel` por su cuenta (la atenuación). A diferencia
+/// de [`tecla`] no cuenta como desvío del usuario: el automático tiene que dar
+/// por bueno ese nivel y no «corregirlo» al volver, ni aprender de él.
+pub fn fijar(state: &mut BookosComp, nivel: u8) {
+    let e = &mut state.brillo_auto;
+    if let Some(token) = e.rampa.take() {
+        state.loop_handle.remove(token);
+    }
+    if e.pantalla_puesta.is_some() {
+        e.pantalla_puesta = Some(nivel);
+    }
+    e.a_mano = Some(nivel);
+    e.escrito = Some(Instant::now());
+}
+
 /// Ajusta lo que esté en automático a la última lectura.
 ///
 /// Se llama también al volver de DPMS: con la pantalla apagada no se ajusta
@@ -302,7 +318,9 @@ pub fn evaluar(state: &mut BookosComp) {
     let Some(lux) = state.brillo_auto.lux else {
         return;
     };
-    if !state.dpms_encendido {
+    // Atenuada, la pantalla está donde el compositor la ha puesto: ajustarla a
+    // la luz la devolvería a su brillo en mitad de la advertencia.
+    if !state.dpms_encendido || state.atenuacion.activa() {
         return;
     }
     if state.brillo_auto.elegido.pantalla {

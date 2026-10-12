@@ -271,6 +271,30 @@ pub fn renombrar(state: &mut BookosComp, indice: usize, nombre: &str) -> bool {
     true
 }
 
+/// Lleva los escritorios a lo que dice `panel.conf`: cuántos hay y cómo se
+/// llaman. Es lo que hace en vivo un cambio desde Ajustes; antes solo se leía
+/// al arrancar, y la vista de Meta+W seguía con el número viejo hasta volver a
+/// iniciar sesión.
+///
+/// Por las mismas `crear` y `eliminar` que usa la vista, así que quitar
+/// escritorios lleva sus ventanas al vecino en vez de cerrarlas. Se quitan
+/// por el final, que es lo que se espera al bajar el número. Devuelve si
+/// cambió algo.
+pub fn ajustar(state: &mut BookosComp, cuantos: usize, nombres: &[String]) -> bool {
+    let cuantos = cuantos.clamp(1, MAXIMO);
+    let mut cambio = false;
+    while state.escritorios.cuantos < cuantos && crear(state) {
+        cambio = true;
+    }
+    while state.escritorios.cuantos > cuantos && eliminar(state, state.escritorios.cuantos - 1) {
+        cambio = true;
+    }
+    for (i, nombre) in nombres.iter().enumerate().take(cuantos) {
+        cambio |= renombrar(state, i, nombre);
+    }
+    cambio
+}
+
 /// Elimina un escritorio, pero nunca el último. Sus ventanas se trasladan al
 /// vecino más próximo para que borrar organización nunca cierre trabajo.
 ///
@@ -1279,6 +1303,69 @@ fn ventana_bajo(
         .find(|(_, _, r)| r.to_f64().contains(punto))
 }
 
+/// Lado del ✕ de cerrar en la vista, en lógicos. 26 es el botón pequeño del
+/// HIG, el mismo que los semáforos de la barra de título.
+pub const LADO_CERRAR: i32 = 26;
+
+/// Dónde va el ✕ de una ventana repartida en la vista: montado sobre su
+/// esquina superior izquierda, como en macOS, por encima de la barra de
+/// título si BookOS la dibuja.
+pub fn boton_cerrar(window: &Window, destino: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
+    let arriba = if crate::decoracion::decorada(window) {
+        let factor = destino.size.w as f64 / window.geometry().size.w.max(1) as f64;
+        destino.loc.y - (crate::decoracion::ALTO as f64 * factor).round() as i32
+    } else {
+        destino.loc.y
+    };
+    let medio = LADO_CERRAR / 2;
+    Rectangle::new(
+        (destino.loc.x - medio, arriba - medio).into(),
+        (LADO_CERRAR, LADO_CERRAR).into(),
+    )
+}
+
+/// La ventana de la vista cuyo ✕ se enseña: la que tiene el puntero encima, o
+/// su ✕, que sobresale de ella. Solo una: con todas a la vez la rejilla se
+/// llenaba de botones de cerrar, que es lo último que se quiere pulsar sin
+/// querer.
+pub fn con_cierre_visible(
+    expuestas: &[(Window, Rectangle<i32, Logical>)],
+    puntero: Point<f64, Logical>,
+) -> Option<(Window, Rectangle<i32, Logical>)> {
+    expuestas.iter().rev().find_map(|(w, r)| {
+        let boton = boton_cerrar(w, *r);
+        (r.to_f64().contains(puntero) || boton.to_f64().contains(puntero))
+            .then(|| (w.clone(), boton))
+    })
+}
+
+/// El ✕ rasterizado a `lado` píxeles físicos. Disco gris oscuro con borde
+/// claro para que se lea igual sobre una ventana clara que sobre una oscura.
+pub fn imagen_cerrar(
+    lado: i32,
+) -> Option<smithay::backend::renderer::element::memory::MemoryRenderBuffer> {
+    const SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 26 26"><circle cx="13" cy="13" r="12" fill="#3a3a3c" stroke="#ffffff" stroke-opacity="0.35" stroke-width="1"/><path d="M9 9l8 8M17 9l-8 8" stroke="#ffffff" stroke-width="2" stroke-linecap="round"/></svg>"##;
+    let arbol = resvg::usvg::Tree::from_str(SVG, &resvg::usvg::Options::default()).ok()?;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(lado as u32, lado as u32)?;
+    let k = lado as f32 / LADO_CERRAR as f32;
+    resvg::render(
+        &arbol,
+        resvg::tiny_skia::Transform::from_scale(k, k),
+        &mut pixmap.as_mut(),
+    );
+    // tiny-skia da RGBA premultiplicado: en little-endian es Abgr8888.
+    Some(
+        smithay::backend::renderer::element::memory::MemoryRenderBuffer::from_slice(
+            pixmap.data(),
+            smithay::backend::allocator::Fourcc::Abgr8888,
+            (lado, lado),
+            1,
+            smithay::utils::Transform::Normal,
+            None,
+        ),
+    )
+}
+
 /// Una ventana cogida de una miniatura de la vista de escritorios.
 pub struct ArrastreVista {
     pub window: Window,
@@ -1308,6 +1395,34 @@ impl ArrastreVista {
 /// haberla movido es un clic, y hace lo de siempre —ir a ese escritorio— y
 /// además trae delante esa ventana, que es la que se ha señalado.
 pub fn boton_en_vista(state: &mut BookosComp, pulsado: bool) -> bool {
+    if !pulsado && std::mem::take(&mut state.cierre_en_vista) {
+        return true;
+    }
+    let puntero = state.pointer_location;
+    if pulsado
+        && state
+            .shell
+            .as_ref()
+            .is_some_and(|s| s.sobre_actividad(puntero.x, puntero.y))
+    {
+        return false;
+    }
+    if pulsado
+        && state
+            .shell
+            .as_ref()
+            .is_some_and(|s| s.vista_escritorios_abierta())
+        && let Some((window, boton)) =
+            con_cierre_visible(&exposicion(state), state.pointer_location)
+        && boton.to_f64().contains(state.pointer_location)
+    {
+        // Una petición, como Meta+Q: la aplicación puede preguntar si guardar.
+        // Si cierra, la rejilla se recoloca sola en el siguiente fotograma.
+        crate::keybinds::cerrar(&window);
+        state.cierre_en_vista = true;
+        state.needs_redraw = true;
+        return true;
+    }
     if pulsado {
         if !state
             .shell

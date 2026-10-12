@@ -206,8 +206,6 @@ pub struct Bateria {
     icono: Option<Icono>,
     /// Con qué nombre se cargó, para no volver a buscarlo mientras no cambie.
     icono_nombre: String,
-    /// Media suavizada de los minutos restantes. Ver [`Bateria::suavizar`].
-    minutos: Option<f32>,
     /// El perfil de energía, que decide el color cuando no manda el nivel.
     perfil: Option<String>,
     /// Cuándo se leyó por última vez cada una de las dos cosas caras. Ver
@@ -228,9 +226,9 @@ pub struct Bateria {
 /// cada evento de `power_supply` —que llegan de varios en varios.
 ///
 /// Los intervalos son los de lo que enseñan, no números redondos: el perfil
-/// solo cambia cuando alguien lo cambia a mano, y los minutos restantes ya van
-/// suavizados y redondeados a cinco, así que leerlos más de una vez cada medio
-/// minuto no cambia ni un píxel de lo dibujado.
+/// solo cambia cuando alguien lo cambia a mano, y los minutos restantes salen
+/// de una corriente media de dos minutos y se enseñan al minuto, así que
+/// leerlos más de una vez cada medio minuto no cambia ni un píxel.
 const CADA_PERFIL: Duration = Duration::from_secs(5);
 /// Un latido del aviso de batería crítica, y cuántos da.
 const D_ALERTA: Duration = Duration::from_millis(900);
@@ -243,7 +241,6 @@ impl Bateria {
             dato: None,
             icono: None,
             icono_nombre: String::new(),
-            minutos: None,
             perfil: None,
             // Restados, para que el primer refresco —el del arranque— lea las
             // dos: el panel tiene que salir con su color y su tiempo puestos.
@@ -329,49 +326,26 @@ impl Bateria {
             .ok();
     }
 
-    /// Amortigua el tiempo restante antes de enseñarlo.
+    /// Rellena el tiempo restante en los refrescos que no lo leen.
     ///
-    /// El kernel da la corriente **instantánea**, así que el cálculo crudo se
-    /// mueve una barbaridad: en este portátil, 1:28 con el compilador a tope y
-    /// 8:18 treinta segundos después en reposo. Enseñar eso tal cual convierte
-    /// el panel en algo que nadie puede creerse, así que se promedia.
-    ///
-    /// Es una media exponencial sobre las **lecturas**, no sobre el tiempo: no
-    /// se puede suponer una cadencia fija cuando cualquier evento de udev
-    /// provoca una lectura de más. Sube y baja igual de despacio a propósito —
-    /// lo que se quiere es un número estable, no uno que reaccione rápido.
-    fn suavizar(&mut self, fresco: &mut Battery, leido: bool) {
-        const PESO: f32 = 0.25;
-        // Enchufar o desenchufar cambia el signo de lo que se mide: la media
-        // anterior ya no vale de nada y se empieza de cero. Tiene que ir antes
-        // del `return` de abajo: el evento de udev del cargador llega casi
-        // siempre en un refresco sin lectura, y si ahí se copiaba la media,
-        // `dato` ya pasaba a «cargando» y la lectura siguiente no veía cambio.
-        // El panel seguía con la autonomía de descarga (1:35 en vez de ~0:30).
-        if self.dato.map(|b| b.charging) != Some(fresco.charging) {
-            self.minutos = None;
-        }
-        // Sin lectura nueva se conserva la media que había. Sin esto, los
-        // refrescos de entre medias —los que solo miran el porcentaje— dejarían
-        // `minutes` en `None` y la etiqueta perdería el «2:15» hasta la
-        // siguiente lectura cara: un parpadeo cada pocos segundos.
-        if !leido {
-            fresco.minutes = self.minutos.map(|m| (m / 5.0).round() as u32 * 5);
+    /// La media de la corriente ya la hace `state` (ver `flujo_medio`), que es
+    /// la misma para el panel, el emergente y el buscador. Aquí solo queda no
+    /// perder la cifra entre dos lecturas caras: sin esto, los refrescos que
+    /// solo miran el porcentaje dejarían `minutes` en `None` y la etiqueta
+    /// perdería el «2:15» hasta la siguiente lectura, un parpadeo cada pocos
+    /// segundos.
+    fn conservar_minutos(&self, fresco: &mut Battery, leido: bool) {
+        // Enchufar o desenchufar cambia el signo de lo que se mide: la cifra
+        // anterior no vale. El evento de udev del cargador llega casi siempre
+        // en un refresco sin lectura, y si ahí se copiaba, el panel seguía con
+        // la autonomía de descarga (1:35 en vez de ~0:30).
+        if leido {
             return;
         }
-        let Some(crudo) = fresco.minutes else {
-            self.minutos = None;
-            return;
-        };
-        let suave = match self.minutos {
-            Some(previo) => previo + (crudo as f32 - previo) * PESO,
-            None => crudo as f32,
-        };
-        self.minutos = Some(suave);
-        // Redondeado a cinco minutos: la precisión de un minuto en una
-        // estimación así es mentira, y además haría repintar el panel más a
-        // menudo de lo que aporta.
-        fresco.minutes = Some((suave / 5.0).round() as u32 * 5);
+        fresco.minutes = self
+            .dato
+            .filter(|b| b.charging == fresco.charging)
+            .and_then(|b| b.minutes);
     }
 }
 
@@ -441,8 +415,9 @@ impl Bateria {
         // como lo escribe el diseño («67 %»).
         let mut etiqueta = format!("{} %", bat.percent);
         // El tiempo solo aparece cuando la cuenta sale y aún tiene sentido
-        // enseñarla: a punto de llenarse, "0:04 para el 100%" es ruido.
-        if let Some(min) = bat.minutes.filter(|_| !bat.charging || bat.percent < 95) {
+        // enseñarla: a punto de llegar al tope, "0:04" es ruido. Se mira el
+        // tiempo y no el porcentaje porque el tope puede ser 80 y no 100.
+        if let Some(min) = bat.minutes.filter(|m| !bat.charging || *m >= 5) {
             etiqueta.push_str(&format!(" {}:{:02}", min / 60, min % 60));
         }
         etiqueta
@@ -466,9 +441,8 @@ impl Widget for Bateria {
             self.minutos_leidos = Instant::now();
         }
         let mut fresco = Battery::read(toca_minutos);
-        match fresco.as_mut() {
-            Some(b) => self.suavizar(b, toca_minutos),
-            None => self.minutos = None,
+        if let Some(b) = fresco.as_mut() {
+            self.conservar_minutos(b, toca_minutos);
         }
         let perfil = self.perfil();
         if fresco == self.dato && perfil == self.perfil {
@@ -560,12 +534,12 @@ mod tests {
             minutes: Some(95),
             ..bat(67, false, false)
         };
-        w.suavizar(&mut descarga, true);
+        w.conservar_minutos(&mut descarga, true);
         w.dato = Some(descarga);
 
         // El evento del cargador, sin lectura cara.
         let mut enchufado = bat(67, true, true);
-        w.suavizar(&mut enchufado, false);
+        w.conservar_minutos(&mut enchufado, false);
         assert_eq!(enchufado.minutes, None);
         w.dato = Some(enchufado);
 
@@ -573,8 +547,8 @@ mod tests {
             minutes: Some(31),
             ..bat(67, true, true)
         };
-        w.suavizar(&mut carga, true);
-        assert_eq!(carga.minutes, Some(30));
+        w.conservar_minutos(&mut carga, true);
+        assert_eq!(carga.minutes, Some(31));
     }
 
     /// El símbolo solo se pinta en negro cuando el relleno lo tapa ENTERO.

@@ -309,6 +309,13 @@ impl Dock {
         alguno
     }
 
+    /// Vuelve a cargar todos los iconos, tras cambiar el tema de iconos.
+    pub fn recargar_iconos(&mut self) {
+        for item in &mut self.items {
+            item.icon = icono::cargar(&item.icono_nombre);
+        }
+    }
+
     /// Marca qué lanzadores tienen ventana abierta, a partir de los `app_id`
     /// que hay en el escritorio. Devuelve `true` si cambió algo.
     ///

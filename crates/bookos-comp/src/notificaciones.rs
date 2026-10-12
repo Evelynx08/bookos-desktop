@@ -130,6 +130,10 @@ impl Servidor {
             "persistence".into(),
             "icon-static".into(),
             "actions".into(),
+            // La convención de KDE: una acción `inline-reply` pide texto, y la
+            // respuesta vuelve por `NotificationReplied`. Sin anunciarla, las
+            // aplicaciones ni ofrecen el botón.
+            "inline-reply".into(),
         ]
     }
 
@@ -150,6 +154,16 @@ impl Servidor {
         emisor: &zbus::object_server::SignalEmitter<'_>,
         id: u32,
         motivo: u32,
+    ) -> zbus::Result<()>;
+
+    /// La respuesta escrita a una notificación con `inline-reply`. Es la señal
+    /// de KDE —no está en la especificación— y la que ya escuchan KDE Connect y
+    /// Lumina.
+    #[zbus(signal)]
+    async fn notification_replied(
+        emisor: &zbus::object_server::SignalEmitter<'_>,
+        id: u32,
+        texto: &str,
     ) -> zbus::Result<()>;
 
     #[zbus(signal)]
@@ -277,5 +291,20 @@ pub fn accion_invocada(conexion: Option<&zbus::blocking::Connection>, id: u32, a
         conexion.emit_signal(None::<&str>, RUTA, INTERFAZ, "ActionInvoked", &(id, accion))
     {
         tracing::warn!(id, %accion, "no se pudo avisar de la acción de notificación: {err}");
+    }
+}
+
+pub fn respondida(conexion: Option<&zbus::blocking::Connection>, id: u32, texto: &str) {
+    let Some(conexion) = conexion else {
+        return;
+    };
+    if let Err(err) = conexion.emit_signal(
+        None::<&str>,
+        RUTA,
+        INTERFAZ,
+        "NotificationReplied",
+        &(id, texto),
+    ) {
+        tracing::warn!(id, "no se pudo entregar la respuesta: {err}");
     }
 }

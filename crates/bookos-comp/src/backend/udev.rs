@@ -280,6 +280,37 @@ pub fn run(
         }));
     }
 
+    // La curva de la luz nocturna, una por CRTC encendido. Cada CRTC dice
+    // cuántas entradas tiene su tabla: no hay un tamaño que valga para todos.
+    {
+        let udev = udev.clone();
+        state.aplicar_gamma = Some(Box::new(move |[r, g, b]| {
+            let u = udev
+                .try_borrow()
+                .map_err(|_| "el backend está ocupado dibujando".to_string())?;
+            if !u.activa {
+                // En otro TTY la pantalla no es nuestra: se repone al volver.
+                return Ok(());
+            }
+            let device = u.manager.device();
+            for salida in &u.salidas {
+                let crtc = salida.surface.crtc();
+                let n = device
+                    .get_crtc(crtc)
+                    .map_err(|err| format!("{}: {err}", salida.output.name()))?
+                    .gamma_length() as usize;
+                if n == 0 {
+                    return Err(format!("{} no tiene tabla de gamma", salida.output.name()));
+                }
+                let rampa = |m| crate::luz_nocturna::rampa(n, m);
+                device
+                    .set_gamma(crtc, &rampa(r), &rampa(g), &rampa(b))
+                    .map_err(|err| format!("{}: {err}", salida.output.name()))?;
+            }
+            Ok(())
+        }));
+    }
+
     // --- Pantallas ---------------------------------------------------------
     // Los dos cierres que van del hilo del compositor a KMS. Nadie más toca el
     // backend: D-Bus solo empuja peticiones por el canal de calloop, y estas se
@@ -350,6 +381,17 @@ pub fn run(
         }));
     }
 
+    // Todos los dispositivos, para reaplicar los ajustes de entrada en vivo.
+    let dispositivos: Rc<RefCell<Vec<InputDevice>>> = Rc::new(RefCell::new(Vec::new()));
+    {
+        let dispositivos = dispositivos.clone();
+        state.aplicar_entrada = Some(Box::new(move |cfg, touchpad_activo| {
+            for device in dispositivos.borrow_mut().iter_mut() {
+                configurar_dispositivo(device, cfg, touchpad_activo);
+            }
+        }));
+    }
+
     // Solo en la sesión real: anidado, la luz del teclado es del anfitrión.
     crate::multimedia::vigilar_luz_teclado(state);
     crate::multimedia::vigilar_tapa_camara(state);
@@ -382,6 +424,7 @@ pub fn run(
                 if let smithay::backend::input::InputEvent::DeviceAdded { device } = &event {
                     let mut device = device.clone();
                     configurar_dispositivo(&mut device, &state.entrada, state.touchpad_activo);
+                    dispositivos.borrow_mut().push(device.clone());
                     if device.has_capability(smithay::reexports::input::DeviceCapability::Keyboard)
                     {
                         // Nace con las luces de ahora: tras un cambio de TTY,
@@ -509,6 +552,11 @@ pub fn run(
                         state.dpms_encendido = true;
                         state.needs_redraw = true;
                         dibujar_todas(state, &mut u);
+                        // El maestro del otro TTY pudo dejar la curva a su
+                        // gusto. `aplicar_gamma` toma el backend prestado, así
+                        // que va con `u` ya soltado.
+                        drop(u);
+                        crate::luz_nocturna::reponer(state);
                     }
                 }
             })
@@ -520,14 +568,20 @@ pub fn run(
     // El despertar del tema automático, si está puesto. Con un modo fijo no
     // deja ningún temporizador. Ver `crate::apariencia`.
     crate::apariencia::programar_cambio(state);
+    let luz = state.luz_nocturna.config;
+    crate::luz_nocturna::recargar(state, luz);
     // El tema pudo cambiar con la sesión cerrada —el automático, o editando
     // `panel.conf`—: las apps GTK tienen que arrancar ya con el que toca.
     crate::portal::tema_gtk();
+    crate::keybinds::inhibir_boton_de_encendido();
+    crate::backend::escuchar_reanudacion(state);
     crate::backend::watch_hardware(state);
 
     // Primer frame: deja el escritorio pintado antes de que arranque nada más,
     // que es lo que evita el parpadeo al iniciar sesión.
     dibujar_todas(state, &mut udev.borrow_mut());
+    // Con el escritorio ya en pantalla, no antes: el sonido dice «ya está».
+    crate::multimedia::sonar_interfaz(state, "desktop-login");
 
     tracing::info!(socket = ?state.socket_name, "compositor listo (sesión real)");
 

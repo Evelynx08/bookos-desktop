@@ -22,3 +22,6 @@ BindsTo=graphical-session.target
 Wants=graphical-session-pre.target
 After=graphical-session-pre.target
 Before=graphical-session.target
+# Arranca ya con el entorno de la sesión importado (LANG para sus textos).
+# `Wants` tolera que no esté instalado.
+Wants=bookos-budsd.service

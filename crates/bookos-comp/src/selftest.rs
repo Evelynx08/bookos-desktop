@@ -231,7 +231,7 @@ fn comprobar_dock(state: &mut BookosComp) {
     let dentro = state
         .shell
         .as_ref()
-        .is_some_and(|s| s.contiene(centro.0, centro.1));
+        .is_some_and(|s| s.contiene(centro.0, centro.1, false));
     // Si esto falla, el dock se dibuja en un sitio y se pulsa en otro: casi
     // siempre es la escala, que convierte físicos en lógicos.
     tracing::info!(?centro, dentro, "centro del primer icono");
@@ -2117,6 +2117,11 @@ fn paso_de_guion(state: &mut BookosComp, pasos: std::rc::Rc<Vec<String>>, i: usi
                 tracing::error!(linea, "faltan las coordenadas");
                 return;
             };
+            // Lo que hace `input::handle` con cualquier entrada real: el guion
+            // no pasa por ahí, y sin esto no habría forma de probar lo que
+            // depende de que el usuario vuelva (la atenuación, el bloqueo).
+            state.last_input = Some(std::time::Instant::now());
+            crate::atenuacion::actividad(state);
             crate::input::set_pointer(state, (x, y).into(), t);
             let espera = despues(3);
             if partes[0] == "clic" {
@@ -2153,6 +2158,31 @@ fn paso_de_guion(state: &mut BookosComp, pasos: std::rc::Rc<Vec<String>>, i: usi
             despues(2)
         }
         // Lo que hacen tres dedos hacia arriba, que en el anidado no llegan.
+        // Echar y quitar el bloqueo, para mirar sus animaciones. Quitarlo salta
+        // PAM, como el autotest del bloqueo: esto solo existe bajo
+        // BOOKOS_INPUT_SELFTEST.
+        ["bloquear"] => {
+            crate::keybinds::ejecutar(state, crate::keybinds::Accion::Bloquear);
+            RESPIRO
+        }
+        ["desbloquear"] => {
+            crate::keybinds::ejecutar(state, crate::keybinds::Accion::Desbloquear);
+            0
+        }
+        // Pone a pantalla completa, o la quita, la ventana de más arriba. En el
+        // anidado no hay ningún reproductor que lo pida solo.
+        ["completa"] => {
+            if let Some(ventana) = state.space.elements().last().cloned() {
+                let poner = !crate::ventanas::completa(&ventana);
+                state.pantalla_completa(&ventana, poner);
+            }
+            RESPIRO
+        }
+        // El OSD del volumen, sin tocar el volumen real.
+        ["osd", ..] => {
+            crate::multimedia::avisar(state, ("volumen-medio", Some(50), None));
+            despues(1)
+        }
         ["exponer"] => {
             crate::input::exponer(state);
             state.needs_redraw = true;
@@ -2360,10 +2390,10 @@ fn run(state: &mut BookosComp) {
         use crate::multimedia::Tecla;
         let cual = std::env::var("BOOKOS_SELFTEST_OSD").unwrap_or_default();
         let tecla = match cual.as_str() {
-            "brillo" => Tecla::Brillo(5),
+            "brillo" => Tecla::Brillo(1),
             "teclado" => Tecla::BrilloTeclado(1),
             "touchpad" => Tecla::Touchpad,
-            _ => Tecla::Volumen(5),
+            _ => Tecla::Volumen(1),
         };
         crate::multimedia::ejecutar(state, tecla);
         tracing::info!(

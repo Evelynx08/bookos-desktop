@@ -189,6 +189,7 @@ and queue; the clock shows timers; and the recorder lets you pause or stop a
 recording. It only accepts the closed set of identifiers from Player, Clock and
 Voice Recorder, and each activity has a compact and an expanded state, light and
 dark themes and a reduced-motion option.
+An app's activity is hidden while that app has the focus, since you are already looking at it, and comes back when you leave it.
 
 **Displays and BookOS Settings** — the compositor exposes over D-Bus the census
 of outputs, modes, refresh rate, fractional scale, rotation and VRR. BookOS
@@ -345,7 +346,7 @@ translates the saved floating geometry using logical coordinates.
 
 | Shortcut | What it does |
 |---|---|
-| <kbd>Meta</kbd>+<kbd>Return</kbd>, <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>T</kbd> | Open a terminal (`BOOKOS_TERMINAL`, `konsole` by default) |
+| <kbd>Meta</kbd>+<kbd>Return</kbd>, <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>T</kbd> | Open a terminal (`BOOKOS_TERMINAL`, `bookos-shell` by default) |
 | <kbd>Meta</kbd> alone | Open or close the launchpad |
 | <kbd>Meta</kbd>+<kbd>Space</kbd> | Central search: applications, settings, commands and states |
 | <kbd>Meta</kbd>+<kbd>W</kbd> | The overview: desktop thumbnails and the current desktop's windows in a grid |
@@ -358,6 +359,8 @@ translates the saved floating geometry using logical coordinates.
 | <kbd>Meta</kbd>+<kbd>H</kbd> | Minimise to the dock; its icon toggles minimise/restore with Magic Lamp |
 | <kbd>Meta</kbd>+<kbd>←→↑↓</kbd> | Snap to half the screen; another arrow, to a quarter |
 | <kbd>Meta</kbd>+<kbd>Q</kbd> | Close the focused window |
+| <kbd>Meta</kbd>+<kbd>E</kbd> | Open the BookOS file explorer |
+| <kbd>Meta</kbd>+<kbd>Z</kbd> | The BookOS menu (About, Settings…), same as clicking the logo |
 | <kbd>Meta</kbd>+<kbd>L</kbd> | Lock straight away (password or fingerprint unlocks it) |
 | <kbd>Meta</kbd>+<kbd>Esc</kbd> · power button | The power dialog: sleep, lock, log out, restart, shut down |
 | <kbd>Meta</kbd>+<kbd>Alt</kbd>+<kbd>A</kbd> | Start or finish a spoken command for the BookOS assistant |
@@ -366,17 +369,10 @@ translates the saved floating geometry using logical coordinates.
 | <kbd>Meta</kbd>+drag | Move the window (with the right button, resize) |
 | drag to an edge | Snap: the sides give halves, the corners quarters |
 
-For the **power button** to reach the desktop and open the dialog instead of
-powering the machine off on its own, systemd has to let the key go:
-
-```ini
-# /etc/systemd/logind.conf.d/bookos.conf
-[Login]
-HandlePowerKey=ignore
-```
-
-Without that, `logind` gets to it before anyone else and the dialog never
-appears; <kbd>Meta</kbd>+<kbd>Esc</kbd> opens it either way.
+The compositor takes a logind `handle-power-key` inhibitor while it runs, so the
+**power button** reaches the desktop and opens the dialog instead of powering
+the machine off; nothing to configure in `/etc`, and logind gets the key back
+when the session ends. <kbd>Meta</kbd>+<kbd>Esc</kbd> opens it either way.
 
 And only in a real session on a TTY:
 <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>F1</kbd>…<kbd>F12</kbd> to switch virtual

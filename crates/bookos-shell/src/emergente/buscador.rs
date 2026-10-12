@@ -27,7 +27,7 @@
 //! molesta no se paga.
 
 use iced_core::alignment::Vertical;
-use iced_core::{Border, Length};
+use iced_core::{Border, Color, Length};
 use iced_widget::{Space, column, container, row, text};
 
 use crate::icono::{self, Icono};
@@ -49,18 +49,82 @@ const CAMPO: f32 = 60.0;
 const FILA: f32 = 52.0;
 /// Márgenes internos.
 const MARGEN: f32 = 10.0;
-/// El pelo que separa el campo de la lista. Es una constante y no un `1.0`
-/// suelto en el `view` porque la **posición** de la lista depende de él: el
-/// hit-test suponía que la lista empezaba en `CAMPO + MARGEN/2` = 65 y en el
-/// dibujo empieza en `CAMPO + 1` = 61, así que el hover y el clic iban cuatro
-/// píxeles por debajo de la fila que se veía y los últimos cuatro de la última
-/// eran zona muerta.
+/// Línea y aire entre el campo y los resultados.
 const DIVISOR: f32 = 1.0;
+const SEPARACION: f32 = 8.0;
 /// Cuántos resultados se enseñan. Más de seis y la lista pide desplazarse, que
 /// es justo lo que un buscador de teclado no quiere.
 const MAXIMO: usize = 6;
 /// Lado del icono de una fila.
 const ICONO: f32 = 28.0;
+
+#[derive(Clone, Copy)]
+struct Colores {
+    tarjeta: Color,
+    texto: Color,
+    secundario: Color,
+    divisor: Color,
+    borde: Color,
+    hover: Color,
+    acento: Color,
+}
+
+impl Colores {
+    fn actuales() -> Self {
+        let respaldo = Self {
+            tarjeta: tema::card(),
+            texto: tema::texto(),
+            secundario: tema::TEXTO2,
+            divisor: tema::divisor(),
+            borde: tema::borde(),
+            hover: tema::hover(),
+            acento: tema::acento(),
+        };
+        if tema::alto_contraste() {
+            return respaldo;
+        }
+        // Ajustes publica el JSON para renderizadores sin CSS. Se relee al
+        // dibujar para que reabrir o escribir no conserve una semilla antigua.
+        let paleta = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .and_then(|dir| std::fs::read_to_string(dir.join(".config/bookos/palette.json")).ok())
+            .and_then(|json| Self::desde_json(&json, tema::es_claro()));
+        paleta.unwrap_or(respaldo)
+    }
+
+    fn desde_json(json: &str, claro: bool) -> Option<Self> {
+        let paleta: serde_json::Value = serde_json::from_str(json).ok()?;
+        let roles = paleta.get(if claro { "light" } else { "dark" })?;
+        let rol = |nombre| color_css(roles.get(nombre)?.as_str()?);
+        Some(Self {
+            tarjeta: rol("card")?,
+            texto: rol("tx")?,
+            secundario: rol("tx2")?,
+            divisor: rol("div")?,
+            borde: rol("brd")?,
+            hover: rol("hov")?,
+            acento: rol("blue")?,
+        })
+    }
+}
+
+fn color_css(valor: &str) -> Option<Color> {
+    if let Some(hex) = valor.strip_prefix('#') {
+        return (hex.len() == 6)
+            .then(|| u32::from_str_radix(hex, 16).ok())
+            .flatten()
+            .map(tema::hex);
+    }
+    let rgba = valor.strip_prefix("rgba(")?.strip_suffix(')')?;
+    let mut canales = rgba.split(',').map(str::trim);
+    let mut canal = || canales.next()?.parse::<u8>().ok().map(|n| n as f32 / 255.0);
+    let (r, g, b) = (canal()?, canal()?, canal()?);
+    let a = canales.next()?.parse::<f32>().ok()?;
+    if canales.next().is_some() || !(0.0..=1.0).contains(&a) {
+        return None;
+    }
+    Some(Color::from_rgba(r, g, b, a))
+}
 
 /// Lo que se puede encontrar.
 pub enum Resultado {
@@ -144,6 +208,9 @@ pub struct Buscador {
     /// Lo señalado con el ratón, que es otra cosa que lo elegido con el
     /// teclado: mover el ratón por encima no debe cambiar lo que Intro lanza.
     señalada: Option<usize>,
+    /// Tras Ctrl+A: lo siguiente que se escriba o borre sustituye la consulta
+    /// entera. No hay cursor movible, así que basta con esto y no un rango.
+    todo_seleccionado: bool,
 }
 
 impl Buscador {
@@ -156,6 +223,7 @@ impl Buscador {
             resultados: Vec::new(),
             seleccion: 0,
             señalada: None,
+            todo_seleccionado: false,
         };
         buscador.buscar();
         buscador
@@ -188,7 +256,7 @@ impl Buscador {
         if filas == 0.0 {
             CAMPO
         } else {
-            CAMPO + DIVISOR + filas * FILA + MARGEN
+            CAMPO + DIVISOR + SEPARACION + filas * FILA + MARGEN
         }
     }
 
@@ -218,10 +286,10 @@ impl Buscador {
         self.señalada = None;
     }
 
-    /// Dónde empieza la lista dentro de la tarjeta. Tiene que ser exactamente
-    /// lo que apila `view()`: el campo y el divisor, sin relleno.
+    /// Dónde empieza la lista dentro de la tarjeta. Tiene que incluir todo el
+    /// aire que apila `view()` entre el campo y los resultados.
     fn y_lista(&self) -> f32 {
-        CAMPO + DIVISOR
+        CAMPO + DIVISOR + SEPARACION
     }
 
     /// Qué fila cae en `y`, si cae en alguna.
@@ -254,7 +322,21 @@ impl Buscador {
     pub fn tecla(&mut self, tecla: crate::TeclaPulsada) -> Tecla {
         use crate::TeclaPulsada as T;
         let visibles = self.resultados.len().min(MAXIMO);
+        if std::mem::take(&mut self.todo_seleccionado)
+            && matches!(tecla, T::Caracter(_) | T::Retroceso | T::BorrarTodo)
+        {
+            self.consulta.clear();
+            if let T::Caracter(c) = tecla {
+                self.consulta.push(c);
+            }
+            self.buscar();
+            return Tecla::Consumida;
+        }
         match tecla {
+            T::SeleccionarTodo => {
+                self.todo_seleccionado = !self.consulta.is_empty();
+                Tecla::Consumida
+            }
             // Esc borra lo escrito antes de cerrar, como el launchpad.
             T::Escape if !self.consulta.is_empty() => {
                 self.consulta.clear();
@@ -269,6 +351,14 @@ impl Buscador {
             }
             T::Retroceso => {
                 self.consulta.pop();
+                self.buscar();
+                Tecla::Consumida
+            }
+            // Ctrl+Retroceso borra la última palabra, como en cualquier campo
+            // de texto. Antes caía en `Ignorada` y el compositor se la pasaba
+            // a la ventana con foco, que borraba una palabra suya por detrás.
+            T::BorrarTodo => {
+                borrar_palabra(&mut self.consulta);
                 self.buscar();
                 Tecla::Consumida
             }
@@ -288,7 +378,9 @@ impl Buscador {
                 // ventana, porque lo que quieres es seguir leyéndolo.
                 None => Tecla::Consumida,
             },
-            _ => Tecla::Ignorada,
+            // El buscador es modal: lo que no entiende tampoco es para la
+            // ventana de debajo, que no se ve y no sabe que se escribe aquí.
+            _ => Tecla::Consumida,
         }
     }
 
@@ -297,8 +389,9 @@ impl Buscador {
     }
 
     pub fn view(&self) -> PanelElement<'_> {
+        let colores = Colores::actuales();
         let lupa = icono::propio("buscar")
-            .map(|ic| icono::ver_teñido_propio(&ic, 22.0, tema::TEXTO2))
+            .map(|ic| icono::ver_teñido_propio(&ic, 22.0, colores.secundario))
             .unwrap_or_else(crate::widget::vacio);
         // El cursor va pegado al texto y siempre a la vista: no parpadea. Un
         // parpadeo son dos repintados por segundo de una tarjeta de 640 px
@@ -306,12 +399,29 @@ impl Buscador {
         let escrito: PanelElement<'_> = if self.consulta.is_empty() {
             text("Buscar aplicaciones, comandos o estados")
                 .size(16.0)
-                .color(tema::TEXTO2)
+                .color(colores.secundario)
                 .into()
+        } else if self.todo_seleccionado {
+            let acento = colores.acento;
+            container(
+                text(&self.consulta)
+                    .size(16.0)
+                    .color(tema::tinta_sobre(acento)),
+            )
+            .padding([0, 2])
+            .style(move |_theme| container::Style {
+                background: Some(acento.into()),
+                border: Border {
+                    radius: 3.0.into(),
+                    ..Border::default()
+                },
+                ..container::Style::default()
+            })
+            .into()
         } else {
             text(format!("{}▏", self.consulta))
                 .size(16.0)
-                .color(tema::texto())
+                .color(colores.texto)
                 .into()
         };
         let campo = container(
@@ -332,14 +442,15 @@ impl Buscador {
             contenido = contenido.push(
                 container(Space::new().height(Length::Fixed(DIVISOR)))
                     .width(Length::Fixed(self.ancho))
-                    .style(|_theme| container::Style {
-                        background: Some(tema::divisor().into()),
+                    .style(move |_theme| container::Style {
+                        background: Some(colores.divisor.into()),
                         ..Default::default()
                     }),
             );
+            contenido = contenido.push(Space::new().height(Length::Fixed(SEPARACION)));
             let mut lista = column![];
             for (i, resultado) in self.resultados.iter().take(MAXIMO).enumerate() {
-                lista = lista.push(self.fila(i, resultado));
+                lista = lista.push(self.fila(i, resultado, colores));
             }
             contenido = contenido.push(lista);
             // El respiro bajo la última fila: sin él su realce llega al borde y
@@ -351,39 +462,45 @@ impl Buscador {
 
         container(contenido)
             .width(Length::Fixed(self.ancho))
-            .style(|_theme| container::Style {
+            .style(move |_theme| container::Style {
                 // El HIG reserva el cristal para la superficie temporal que
                 // está detrás (el overlay). La tarjeta propia permanece
                 // legible y opaca en ambos temas.
-                background: Some(tema::card().into()),
+                background: Some(colores.tarjeta.into()),
                 border: Border {
                     radius: tema::R_DIALOGO.into(),
                     width: 1.0,
-                    color: tema::borde(),
+                    color: colores.borde,
                 },
                 ..Default::default()
             })
             .into()
     }
 
-    fn fila<'a>(&'a self, i: usize, resultado: &'a Resultado) -> PanelElement<'a> {
+    fn fila<'a>(
+        &'a self,
+        i: usize,
+        resultado: &'a Resultado,
+        colores: Colores,
+    ) -> PanelElement<'a> {
         let elegida = i == self.seleccion;
         let señalada = self.señalada == Some(i);
         // El acento se reserva para lo que Intro va a lanzar. El ratón por
         // encima solo levanta un velo de tinta: si las dos cosas se pintaran
         // igual, pasar el ratón parecería cambiar lo que va a ejecutarse.
         let fondo = match (elegida, señalada) {
-            (true, _) => tema::alfa(tema::acento(), 0.10),
-            (false, true) => tema::hover(),
+            (true, _) => tema::alfa(colores.acento, 0.10),
+            (false, true) => colores.hover,
             (false, false) => iced_core::Color::TRANSPARENT,
         };
         let dibujo: PanelElement<'a> = match resultado.icono() {
             // Los de aplicación no se tiñen —el zorro de Firefox en silueta
             // blanca no lo quiere nadie—; los propios sí, que son monocromos.
+            Some(ic) if matches!(resultado, Resultado::App { .. }) => icono::ver(ic, ICONO, ICONO),
             Some(ic @ Icono::Raster(_)) => icono::ver(ic, ICONO, ICONO),
-            Some(ic) => icono::ver_teñido(ic, ICONO, None),
+            Some(ic) => icono::ver_teñido(ic, ICONO, Some(colores.texto)),
             None => icono::propio("terminal")
-                .map(|ic| icono::ver_teñido_propio(&ic, ICONO, tema::texto()))
+                .map(|ic| icono::ver_teñido_propio(&ic, ICONO, colores.texto))
                 .unwrap_or_else(crate::widget::vacio),
         };
         let textos = column![
@@ -393,14 +510,14 @@ impl Buscador {
                 14.0
             ))
             .size(14.0)
-            .color(tema::texto()),
+            .color(colores.texto),
             text(super::recortar_texto(
                 &resultado.detalle(),
                 self.ancho - 140.0,
                 11.0
             ))
             .size(11.0)
-            .color(tema::TEXTO2),
+            .color(colores.secundario),
         ];
         // El realce va **dentro** de un margen y con esquinas: pegado a los
         // bordes de la tarjeta, la última fila se comía su esquina redondeada.
@@ -720,9 +837,72 @@ fn gpu_estado() -> Option<u32> {
     None
 }
 
+/// Quita la última palabra y los espacios que la siguen, que es lo que hace
+/// Ctrl+Retroceso en GTK y en Qt: «abrir ajustes  » queda en «abrir ».
+fn borrar_palabra(texto: &mut String) {
+    let sin_espacios = texto.trim_end().len();
+    let corte = texto[..sin_espacios]
+        .rfind(char::is_whitespace)
+        .map_or(0, |i| {
+            i + texto[i..].chars().next().map_or(1, char::len_utf8)
+        });
+    texto.truncate(corte);
+}
+
 #[cfg(test)]
 mod pruebas {
     use super::*;
+
+    #[test]
+    fn ctrl_retroceso_borra_la_ultima_palabra() {
+        let casos = [
+            ("abrir ajustes", "abrir "),
+            ("abrir ajustes  ", "abrir "),
+            ("ajustes", ""),
+            ("   ", ""),
+            ("", ""),
+            ("música año", "música "),
+        ];
+        for (antes, despues) in casos {
+            let mut t = antes.to_string();
+            borrar_palabra(&mut t);
+            assert_eq!(t, despues, "desde «{antes}»");
+        }
+    }
+
+    #[test]
+    fn la_paleta_compartida_resuelve_los_roles_de_ambos_temas() {
+        let json = r##"{
+            "light": {"card":"#FFFFFF","tx":"#241E1A","tx2":"#78675B",
+                "div":"rgba(149,78,0,0.14)","brd":"rgba(149,78,0,0.12)",
+                "hov":"rgba(149,78,0,0.07)","blue":"#954E00"},
+            "dark": {"card":"#241E1A","tx":"#FAF2EC","tx2":"#B4A295",
+                "div":"rgba(255,179,123,0.13)","brd":"rgba(255,179,123,0.1)",
+                "hov":"rgba(255,179,123,0.09)","blue":"#FFB37B"}
+        }"##;
+        let claro = Colores::desde_json(json, true).expect("roles claros publicados por Ajustes");
+        let oscuro =
+            Colores::desde_json(json, false).expect("roles oscuros publicados por Ajustes");
+        assert_eq!(claro.tarjeta, Color::WHITE);
+        assert_eq!(oscuro.tarjeta, tema::hex(0x241e1a));
+        assert_eq!(oscuro.tarjeta.a, 1.0, "el matiz no necesita translucidez");
+        assert_eq!(claro.texto, tema::hex(0x241e1a));
+        assert_eq!(oscuro.secundario, tema::hex(0xb4a295));
+        assert_eq!(oscuro.acento, tema::hex(0xffb37b));
+        assert_eq!(claro.divisor, tema::hexa(0x954e00, 0.14));
+        assert_eq!(oscuro.borde, tema::hexa(0xffb37b, 0.1));
+        assert_eq!(oscuro.hover, tema::hexa(0xffb37b, 0.09));
+    }
+
+    #[test]
+    fn una_paleta_incompleta_o_invalida_deja_el_respaldo() {
+        for json in ["", "{}", r##"{"dark":{"card":"#241E1A"}}"##] {
+            assert!(Colores::desde_json(json, false).is_none());
+        }
+        for color in ["#zzzzzz", "#fff", "rgba(256,0,0,1)", "rgba(0,0,0,NaN)"] {
+            assert!(color_css(color).is_none(), "color inválido: {color}");
+        }
+    }
 
     fn app(nombre: &str, exec: &str) -> apps::App {
         apps::App {
@@ -731,6 +911,27 @@ mod pruebas {
             icono: String::new(),
             normalizado: nombre.to_lowercase(),
         }
+    }
+
+    #[test]
+    fn ctrl_a_y_escribir_sustituye_la_consulta() {
+        use crate::TeclaPulsada as T;
+        let mut b = Buscador::new((1920.0, 1080.0));
+        for c in "firefox".chars() {
+            b.tecla(T::Caracter(c));
+        }
+        b.tecla(T::SeleccionarTodo);
+        b.tecla(T::Caracter('k'));
+        assert_eq!(b.consulta, "k");
+        b.tecla(T::SeleccionarTodo);
+        b.tecla(T::Retroceso);
+        assert!(b.consulta.is_empty());
+        // Una flecha deshace la selección sin tocar el texto.
+        b.tecla(T::Caracter('x'));
+        b.tecla(T::SeleccionarTodo);
+        b.tecla(T::Abajo);
+        b.tecla(T::Caracter('y'));
+        assert_eq!(b.consulta, "xy");
     }
 
     #[test]

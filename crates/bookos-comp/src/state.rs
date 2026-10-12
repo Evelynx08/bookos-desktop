@@ -237,6 +237,7 @@ pub struct BookosComp {
     pub needs_redraw: bool,
     pub brillo_poll_activo: bool,
     pub brillo_auto: crate::brillo_auto::Estado,
+    pub atenuacion: crate::atenuacion::Estado,
     /// Lo que se lleva escrito en la pantalla de bloqueo.
     pub bloqueo: Bloqueo,
     /// Cuándo llegó el último evento de entrada. Decide si el backend anidado
@@ -262,6 +263,9 @@ pub struct BookosComp {
     /// echar el bloqueo.
     pub tick_dpms: Option<smithay::reexports::calloop::RegistrationToken>,
     pub dpms_encendido: bool,
+    /// Hasta cuándo la entrada no enciende la pantalla tras apagarla para
+    /// dormir: la suelta del clic o del Intro que pidió dormir llega después.
+    pub dpms_sordo_hasta: Option<std::time::Instant>,
     /// Backend real: apagar o reactivar las superficies KMS. Anidado queda en
     /// `None`, porque la energía de la pantalla pertenece al anfitrión.
     pub aplicar_dpms: Option<AplicarDpms>,
@@ -358,6 +362,14 @@ pub struct BookosComp {
     pub cierres: Vec<crate::cierre::Cierre>,
     /// Una ventana cogida de una miniatura de la vista de escritorios.
     pub arrastre_vista: Option<crate::escritorios::ArrastreVista>,
+    /// La pulsación cayó en el ✕ de una ventana de la vista: el soltar
+    /// también es nuestro, o el shell lo tomaría por un clic suelto.
+    pub cierre_en_vista: bool,
+    /// El ✕ de la vista ya rasterizado, con su lado en píxeles físicos.
+    pub boton_cerrar_vista: Option<(
+        i32,
+        smithay::backend::renderer::element::memory::MemoryRenderBuffer,
+    )>,
     /// La foto del tema anterior mientras se desvanece. Ver [`crate::fundido`].
     pub fundido: Option<crate::fundido::Fundido>,
     pub transicion_vista: crate::escritorios::TransicionVista,
@@ -407,6 +419,9 @@ pub struct BookosComp {
     pub touchpad_activo: bool,
     /// `sonido_volumen` de `panel.conf`; la config entera no se guarda.
     pub sonido_volumen: bool,
+    /// `sonidos_interfaz` de `panel.conf`: bloquear, desbloquear, capturar e
+    /// iniciar sesión. Ver `multimedia::sonar_interfaz`.
+    pub sonidos_interfaz: bool,
     /// `genio` de `panel.conf`: el shader sigue compilado, esto solo decide si se usa.
     pub genio_activo: bool,
     /// Si estaba enchufado en el último aviso de `power_supply`, para sonar
@@ -416,6 +431,26 @@ pub struct BookosComp {
     /// el backend de sesión real; anidado se queda en `None` porque ahí la
     /// entrada la da el compositor de debajo.
     pub aplicar_touchpad: Option<Box<dyn Fn(bool)>>,
+    /// Reaplica velocidad, toque y scroll a todos los dispositivos abiertos.
+    /// Sin esto los ajustes de entrada solo llegaban a los que aparecían
+    /// después del cambio, o sea, al volver a iniciar sesión.
+    pub aplicar_entrada: Option<Box<dyn Fn(&bookos_shell::Entrada, bool)>>,
+    /// Distribución con la que se compiló el teclado ahora mismo; evita
+    /// recompilar el mapa (y reenviarlo a los clientes) en recargas que no la
+    /// tocan.
+    pub teclado_activo: Option<String>,
+    /// `(retardo ms, repeticiones/s)` puestos en el teclado del seat. smithay
+    /// no deja leerlos de vuelta y el Retroceso del launchpad los necesita.
+    pub teclado_repeticion: (u32, u32),
+    /// Cuánto mueven las teclas de volumen y brillo, de `panel.conf`.
+    pub pasos: bookos_shell::Pasos,
+    /// La repetición de volumen o brillo con la tecla mantenida.
+    pub repeticion_multimedia: Option<smithay::reexports::calloop::RegistrationToken>,
+    /// Si el sonido del volumen espera a que se suelte su tecla.
+    pub chasquido: crate::multimedia::Chasquido,
+    /// El último volumen de salida visto, para enseñar el aviso cuando lo
+    /// cambia otro (el gesto de unos auriculares, otra aplicación).
+    pub volumen_visto: Option<(u8, bool)>,
     /// Cómo encender las luces de Bloq Mayús, Bloq Num y Bloq Despl en los
     /// teclados abiertos. Con libinput las luces no van solas: si el
     /// compositor no las manda, Bloq Mayús funciona pero no se enciende. Lo
@@ -465,6 +500,11 @@ pub struct BookosComp {
     /// El despertar del próximo cambio automático. `None` con un modo fijo: sin
     /// nada que esperar no se deja ningún temporizador puesto.
     pub tick_tema: Option<smithay::reexports::calloop::RegistrationToken>,
+    /// La luz nocturna: lo configurado, lo que hay puesto y sus despertares.
+    pub luz_nocturna: crate::luz_nocturna::Estado,
+    /// Cómo poner la curva de gamma en las pantallas. Solo la rellena el
+    /// backend real: anidado no hay curva que tocar.
+    pub aplicar_gamma: Option<crate::luz_nocturna::AplicarGamma>,
     /// Tamaño lógico del cursor. Copia de la configuración por lo mismo que
     /// `escala_forzada`: el tema se vuelve a cargar cada vez que cambia la
     /// escala, y para entonces la `Config` ya se la llevó el shell.
@@ -499,6 +539,8 @@ pub struct BookosComp {
     pub xwm: Option<smithay::xwayland::X11Wm>,
     /// El número de pantalla de XWayland, para el `DISPLAY` de los hijos.
     pub display_x11: Option<u32>,
+    /// El cliente Wayland que es XWayland, para fijarle la escala.
+    pub cliente_x11: Option<smithay::reexports::wayland_server::Client>,
 
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
@@ -676,7 +718,9 @@ pub struct BookosComp {
 /// vez al arrancar y vive lo que dure la sesión. Un `String` en el estado
 /// obligaría a arrastrar el préstamo por medio compositor para ahorrar treinta
 /// bytes.
-fn distribucion_teclado(config: Option<&str>) -> smithay::input::keyboard::XkbConfig<'static> {
+pub(crate) fn distribucion_teclado(
+    config: Option<&str>,
+) -> smithay::input::keyboard::XkbConfig<'static> {
     let layout = config
         .map(str::to_string)
         .or_else(|| std::env::var("XKB_DEFAULT_LAYOUT").ok())
@@ -803,8 +847,13 @@ impl BookosComp {
 
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&dh, "bookos");
-        // Repetición de teclas: 25/s tras 600 ms, los valores por defecto de KDE.
-        seat.add_keyboard(distribucion_teclado(teclado_config.as_deref()), 600, 25)?;
+        let teclado_repeticion = (config.teclado_retardo, config.teclado_velocidad);
+        let pasos = config.pasos;
+        seat.add_keyboard(
+            distribucion_teclado(teclado_config.as_deref()),
+            teclado_repeticion.0 as i32,
+            teclado_repeticion.1 as i32,
+        )?;
         let pointer = seat.add_pointer();
 
         let socket_name = Self::init_socket(&loop_handle, display)?;
@@ -908,6 +957,7 @@ impl BookosComp {
         let suspension_inactividad = std::time::Duration::from_secs(config.suspension_inactividad);
         let modo_tema = config.modo_tema;
         let horas_tema = (config.tema_claro_desde, config.tema_oscuro_desde);
+        let luz_nocturna = crate::luz_nocturna::Estado::nuevo(config.luz_nocturna);
         let fondo_config = crate::fondo::Eleccion {
             ambos: config.fondo.clone(),
             claro: config.fondo_claro.clone(),
@@ -928,12 +978,14 @@ impl BookosComp {
             bloqueo_inactividad,
             suspension_inactividad,
             tick_bloqueo: None,
+            atenuacion: Default::default(),
             tick_suspension: None,
             tick_centro: None,
             repeticion_retroceso: None,
             remitentes_actividad: Default::default(),
             tick_dpms: None,
             dpms_encendido: true,
+            dpms_sordo_hasta: None,
             aplicar_dpms: None,
             metricas: crate::metricas::Metricas::new(),
             tick_diagnostico: None,
@@ -974,6 +1026,8 @@ impl BookosComp {
             capturas: Vec::new(),
             cierres: Vec::new(),
             arrastre_vista: None,
+            cierre_en_vista: false,
+            boton_cerrar_vista: None,
             fundido: None,
             transicion_vista: Default::default(),
             contexto_gl: None,
@@ -982,6 +1036,7 @@ impl BookosComp {
             minimizadas: Vec::new(),
             minimizando: Vec::new(),
             sonido_volumen: config.sonido_volumen,
+            sonidos_interfaz: config.sonidos_interfaz,
             genio_activo: config.genio,
             // Leído al arrancar: entrar en la sesión con el cargador puesto no
             // es «conectarlo».
@@ -991,6 +1046,13 @@ impl BookosComp {
             entrada,
             touchpad_activo: true,
             aplicar_touchpad: None,
+            aplicar_entrada: None,
+            teclado_activo: teclado_config.clone(),
+            teclado_repeticion,
+            pasos,
+            repeticion_multimedia: None,
+            chasquido: crate::multimedia::Chasquido::Libre,
+            volumen_visto: None,
             aplicar_leds: None,
             leds: Default::default(),
             cursor_nominal,
@@ -1002,6 +1064,8 @@ impl BookosComp {
             modo_tema,
             horas_tema,
             tick_tema: None,
+            luz_nocturna,
+            aplicar_gamma: None,
             arrastre: None,
             arrastre_escritorio: None,
             ultimo_clic: None,
@@ -1009,6 +1073,7 @@ impl BookosComp {
             hijos: Vec::new(),
             xwm: None,
             display_x11: None,
+            cliente_x11: None,
             compositor_state,
             xdg_shell_state,
             xdg_decoration_state,
@@ -1115,6 +1180,49 @@ impl BookosComp {
         Ok(socket_name)
     }
 
+    /// La ventana bajo un punto y dónde se dibuja, como `Space::element_under`,
+    /// pero sin las que se están yendo al dock o volviendo de él. Esas siguen
+    /// en el `Space` con su tamaño entero durante los 280 ms de la animación,
+    /// y se quedaban los clics y el foco en un rectángulo donde ya solo se
+    /// veía la ventana de debajo.
+    pub fn ventana_bajo(
+        &self,
+        punto: smithay::utils::Point<f64, smithay::utils::Logical>,
+    ) -> Option<(
+        smithay::desktop::Window,
+        smithay::utils::Point<i32, smithay::utils::Logical>,
+    )> {
+        use smithay::desktop::space::SpaceElement;
+        self.space
+            .elements()
+            .rev()
+            .filter(|w| crate::ventanas::encogido(w).is_none())
+            .find_map(|w| {
+                if !self.space.element_bbox(w)?.to_f64().contains(punto) {
+                    return None;
+                }
+                let dibujada = self.space.element_location(w)? - w.geometry().loc;
+                w.is_in_input_region(&(punto - dibujada.to_f64()))
+                    .then(|| (w.clone(), dibujada))
+            })
+    }
+
+    /// ¿Es del shell este punto? Con la pantalla completa que haya en la
+    /// salida bajo el punto, la misma que decide qué se dibuja.
+    pub fn shell_contiene(
+        &self,
+        point: smithay::utils::Point<f64, smithay::utils::Logical>,
+    ) -> bool {
+        let completa = self
+            .space
+            .output_under(point)
+            .next()
+            .is_some_and(|output| self.hay_pantalla_completa_en(output));
+        self.shell
+            .as_ref()
+            .is_some_and(|s| s.contiene(point.x, point.y, completa))
+    }
+
     /// Qué superficie hay bajo un punto, y en qué posición está dibujada.
     ///
     /// Devuelve la coordenada *relativa a la superficie*, que es lo que espera
@@ -1156,18 +1264,20 @@ impl BookosComp {
                 }
             }
         }
+        // Las ventanas siguen en el espacio debajo del candado: sin cortar aquí
+        // reciben el hover a ciegas y la de debajo impone su cursor —el de
+        // texto de una terminal— sobre la pantalla de bloqueo.
+        if bloqueado {
+            return None;
+        }
         // El panel y el dock se dibujan encima de las ventanas: mientras el
         // puntero esté sobre ellos, para los clientes no hay nada bajo el
         // cursor. Sin esto la ventana de debajo se cree señalada y cambia la
         // forma del cursor al pasar por encima del dock.
-        if self
-            .shell
-            .as_ref()
-            .is_some_and(|s| s.contiene(point.x, point.y))
-        {
+        if self.shell_contiene(point) {
             return None;
         }
-        let (window, location) = self.space.element_under(point)?;
+        let (window, location) = self.ventana_bajo(point)?;
         window
             .surface_under(point - location.to_f64(), WindowSurfaceType::ALL)
             .map(|(surface, offset)| (surface, (location + offset).to_f64()))

@@ -215,11 +215,8 @@ fn el_launchpad_cambia_de_pagina_en_un_solo_repintado() {
 /// El buscador declara el alto que de verdad dibuja, y sus filas se pulsan
 /// donde se ven.
 ///
-/// Los dos números iban descuadrados: `size()` reportaba `campo + filas + 10`
-/// cuando `view()` apila `campo + 1 + filas`, o sea nueve píxeles de aire al
-/// fondo del buffer que además entraban en el centrado; y el hit-test suponía
-/// que la lista empezaba en 65 cuando empieza en 61, así que el hover y el clic
-/// iban cuatro píxeles por debajo de la fila que se veía.
+/// El espacio entre el campo y la lista cuenta tanto en el alto como en el
+/// hit-test, para que el puntero señale la fila que se ve.
 #[test]
 fn el_buscador_pulsa_donde_dibuja() {
     use bookos_shell::TeclaPulsada;
@@ -231,14 +228,14 @@ fn el_buscador_pulsa_donde_dibuja() {
     let ((_, alto), _, _) = shell.emergente_geometria().unwrap();
 
     // Cuántas filas hay: lo que sobra del campo y el divisor, en filas de 52.
-    let filas = (alto - 60 - 1 - 10) / 52;
+    let filas = (alto - 60 - 1 - 8 - 10) / 52;
     assert!(
         filas >= 1,
         "«sh» tiene que encontrar algo: el alto es {alto}"
     );
     assert_eq!(
         alto,
-        60 + 1 + filas * 52 + 10,
+        60 + 1 + 8 + filas * 52 + 10,
         "el alto declarado no cuadra con lo que apila la vista"
     );
 
@@ -248,12 +245,12 @@ fn el_buscador_pulsa_donde_dibuja() {
     // **cambia**, así que partiendo de ninguna, el orden de estas dos dice
     // exactamente dónde empieza la lista.
     assert!(
-        !shell.emergente_puntero(Some((100.0, 59.0))),
+        !shell.emergente_puntero(Some((100.0, 68.0))),
         "el campo de texto no es ninguna fila: no puede cambiar el realce"
     );
     assert!(
-        shell.emergente_puntero(Some((100.0, 61.0))),
-        "el primer píxel de la lista tiene que señalar la fila 0"
+        shell.emergente_puntero(Some((100.0, 69.0))),
+        "el primer píxel tras la separación señala la fila 0"
     );
 }
 
@@ -394,6 +391,58 @@ fn las_tarjetas_de_conectividad_se_pintan() {
         shell.draw_emergente(&mut buf);
         volcar(var, &buf, w, h);
         assert!(tinta(&buf, w, h, 0, w) > 0, "{var} sale en blanco");
+    }
+}
+
+/// Pulsar lo gris de la píldora del Wi-Fi abre su lista **dentro** de la
+/// Estación de Control, como la bandeja de Plasma, y Esc vuelve.
+///
+/// Con `BOOKOS_CENTRO_WIFI_PNG` y `BOOKOS_CENTRO_BT_PNG` las guarda.
+#[test]
+fn la_estacion_abre_las_listas_en_el_sitio() {
+    // Margen, cabecera y hueco hasta las píldoras, y su mitad.
+    let y = 16.0 + 52.0 + 12.0 + 26.0;
+    for (x, var) in [
+        (110.0, "BOOKOS_CENTRO_WIFI_PNG"),
+        (290.0, "BOOKOS_CENTRO_BT_PNG"),
+    ] {
+        let mut shell = shell(1.0);
+        shell.abrir(bookos_shell::Emergente::centro());
+        let antes = shell.emergente_buffer_size().expect("tiene superficie");
+        assert_eq!(
+            shell.emergente_pulsar(x, y),
+            None,
+            "{var}: no abre otra tarjeta"
+        );
+        assert!(shell.hay_emergente(), "{var}: la estación sigue abierta");
+        let (w, h) = shell.emergente_buffer_size().expect("tiene superficie");
+        // Sin servicio de red o Bluetooth no hay lista que abrir: la píldora no
+        // hace nada y la estación se queda igual. No es un fallo del shell.
+        if (w, h) == antes {
+            continue;
+        }
+        assert_eq!(w, antes.0, "{var}: el ancho no cambia al entrar");
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        shell.draw_emergente(&mut buf);
+        volcar(var, &buf, w, h);
+        let (consumida, _) = shell.emergente_tecla(bookos_shell::TeclaPulsada::Escape);
+        assert!(
+            consumida && shell.hay_emergente(),
+            "{var}: Esc vuelve, no cierra"
+        );
+        assert_eq!(
+            shell.emergente_buffer_size(),
+            Some(antes),
+            "{var}: y vuelve entera"
+        );
+        // La flecha de la cabecera hace lo mismo que Esc.
+        shell.emergente_pulsar(x, y);
+        assert_eq!(shell.emergente_pulsar(32.0, 16.0 + 16.0), None);
+        assert_eq!(
+            shell.emergente_buffer_size(),
+            Some(antes),
+            "{var}: la flecha vuelve"
+        );
     }
 }
 
@@ -1258,16 +1307,18 @@ fn el_conmutador_se_pinta_y_recorre() {
     assert_eq!(shell.cerrar_conmutador(), Some(1));
     assert!(!shell.hay_conmutador(), "cerrarlo lo suelta");
 
-    // Con una sola celda no hay nada que conmutar.
+    // Con una sola celda se abre igual —se ve qué hay abierto— y se queda en ella.
     let una = vec![bookos_shell::entrada_de_ventana("firefox", "")];
     assert!(
-        !shell.abrir_conmutador(
+        shell.abrir_conmutador(
             bookos_shell::conmutador::Modo::Aplicaciones,
             una,
             (1280.0, 720.0),
         ),
-        "con una sola no se abre"
+        "con una sola también se abre"
     );
+    shell.conmutador_mover(1);
+    assert_eq!(shell.cerrar_conmutador(), Some(0));
 }
 
 /// Dos ventanas de la **misma** aplicación: el caso que dejó Alt+Tab muerto.
@@ -1689,8 +1740,10 @@ fn el_launchpad_dibuja_carpetas() {
     assert!(tinta(&buf, w, h, 0, w) > 0, "el launchpad sale en blanco");
 
     // La carpeta va la primera de la rejilla: pulsarla entra dentro y no lanza
-    // nada.
-    let accion = shell.emergente_pulsar(40.0, 120.0);
+    // nada. Se pulsa el centro de su celda y no un punto fijo: el (40, 120)
+    // que había caía en el hueco bajo el buscador desde que pasó a 4 unidades.
+    let (cx, cy) = shell.launchpad_celda(0).expect("la carpeta tiene celda");
+    let accion = shell.emergente_pulsar(cx, cy);
     assert!(accion.is_none(), "pulsar agarra, no lanza: {accion:?}");
     let (_, accion) = shell.soltar();
     assert!(accion.is_none(), "entrar en una carpeta no es una acción");
@@ -2056,4 +2109,18 @@ fn el_bloqueo_no_se_solapa_a_1280x800() {
     let mut buf = vec![0u8; (w * h * 4) as usize];
     shell.draw_bloqueo(&mut buf);
     volcar("BOOKOS_BLOQUEO_1280_PNG", &buf, w, h);
+}
+
+#[test]
+fn ahorro_cambia_el_perfil_sin_cerrar_el_centro() {
+    let mut shell = shell(1.0);
+    shell.abrir(bookos_shell::Emergente::centro());
+    let accion = shell.emergente_pulsar(212.5, 182.0);
+    assert!(matches!(
+        accion,
+        Some(bookos_shell::Accion::PerfilEnergia(_))
+    ));
+    assert!(shell.hay_emergente(), "ahorro cerró el centro de control");
+    let siguiente = shell.emergente_pulsar(212.5, 182.0);
+    assert_ne!(accion, siguiente, "el segundo clic repitió el mismo perfil");
 }

@@ -37,8 +37,9 @@ fn la_apariencia_elige_acento_y_repinta_el_shell() {
 
     // Pulsar el tercer color pide cambiarlo; el shell no lo aplica solo, eso
     // es cosa del compositor, que es quien además lo guarda.
-    let ((lw, _), _, _) = shell.emergente_geometria().unwrap();
-    let accion = shell.emergente_pulsar(lw as f32 / 2.0, 250.0);
+    // Centro del tercer círculo de la primera fila de la rejilla de seis
+    // columnas: 21 de margen, dos pasos de 50,2 y media casilla de 42.
+    let accion = shell.emergente_pulsar(142.0, 207.0);
     let Some(bookos_shell::Accion::Apariencia { modo, acento }) = accion else {
         panic!("pulsar en la rejilla tiene que pedir un cambio: {accion:?}");
     };

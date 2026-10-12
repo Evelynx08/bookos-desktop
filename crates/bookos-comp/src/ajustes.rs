@@ -11,7 +11,8 @@
 //! ReloadConfig(s seccion) -> b
 //!     Relee `panel.conf`. Secciones: "lockscreen"/"bloqueo",
 //!     "activities"/"actividades", "keys"/"teclas" (este, `teclas.conf`),
-//!     "brightness"/"brillo", "all".
+//!     "brightness"/"brillo", "all". "channel"/"canal" no lee `panel.conf`
+//!     sino `bookos-update.conf`: el color del logo según el canal.
 //!
 //! GetCapabilities() -> a{sv}
 //!     Qué sabe hacer este backend. Diccionario a propósito: añadir una
@@ -160,9 +161,41 @@ fn config_json(config: &bookos_shell::Config) -> serde_json::Value {
     // Fuera del `json!`: con una clave más, el macro pasa del límite de
     // recursión de rustc.
     json["sonido_volumen"] = config.sonido_volumen.into();
+    json["sonidos_interfaz"] = config.sonidos_interfaz.into();
     json["genio"] = config.genio.into();
+    json["teclado_retardo"] = config.teclado_retardo.into();
+    json["teclado_velocidad"] = config.teclado_velocidad.into();
+    json["volumen_paso"] = config.pasos.volumen.into();
+    json["volumen_paso_mantener"] = config.pasos.volumen_mantener.into();
+    json["brillo_paso"] = config.pasos.brillo.into();
+    json["brillo_paso_mantener"] = config.pasos.brillo_mantener.into();
     json["bloqueo_nombre"] = config.bloqueo.nombre.into();
     json["bloqueo_energia"] = config.bloqueo.energia.into();
+    json["dock_esquiva"] = config.dock_esquiva.into();
+    json["panel_esquiva"] = config.panel_esquiva.into();
+    json["bloqueo_reloj_fuente"] = config.bloqueo.reloj_fuente.nombre().into();
+    json["bloqueo_reloj_grosor"] = config.bloqueo.reloj_grosor.into();
+    // Solo lectura: los estilos que se pueden elegir porque su fuente está
+    // instalada. Ajustes ofrece estos y no la lista entera; la ISO solo
+    // garantiza Noto Sans y Nunito.
+    json["bloqueo_reloj_fuentes"] = bookos_shell::bloqueo::estilos_instalados()
+        .into_iter()
+        .map(|f| serde_json::json!({ "nombre": f.nombre(), "familia": f.familia() }))
+        .collect::<Vec<_>>()
+        .into();
+    let luz = config.luz_nocturna;
+    json["luz_nocturna"] = match luz.modo {
+        bookos_shell::ModoLuzNocturna::Apagada => "no",
+        bookos_shell::ModoLuzNocturna::Encendida => "si",
+        bookos_shell::ModoLuzNocturna::Programada => "programada",
+    }
+    .into();
+    json["luz_nocturna_temperatura"] = luz.temperatura.into();
+    json["luz_nocturna_desde"] = format!("{:02}:{:02}", luz.desde.0, luz.desde.1).into();
+    json["luz_nocturna_hasta"] = format!("{:02}:{:02}", luz.hasta.0, luz.hasta.1).into();
+    // Lo que se ve ahora, con el horario y lo encendido a mano ya resueltos.
+    // Solo lectura, como `tema_efectivo`.
+    json["luz_nocturna_activa"] = bookos_shell::luz_nocturna_encendida().into();
     json
 }
 
@@ -315,6 +348,20 @@ fn validar_config_json(json: &str) -> Result<Vec<(String, String)>, String> {
             "bloqueo_medios_y" => numero(valor, clave, 0.42, 0.88)?,
             "bloqueo_reloj_tamano" => numero(valor, clave, 72.0, 220.0)?,
             "bloqueo_avatar_tamano" => numero(valor, clave, 64.0, 220.0)?,
+            "bloqueo_reloj_grosor" => {
+                let v = entero(valor, clave, 100, 900)?;
+                if v.parse::<u16>().is_ok_and(|n| n % 100 != 0) {
+                    return Err("«bloqueo_reloj_grosor» va de 100 en 100".into());
+                }
+                v
+            }
+            "bloqueo_reloj_fuente" => {
+                let v = texto(valor, clave)?;
+                if bookos_shell::FuenteReloj::desde_nombre(&v).is_none() {
+                    return Err("«bloqueo_reloj_fuente» no es un estilo de reloj conocido".into());
+                }
+                v
+            }
             "bloqueo_animaciones"
             | "bloqueo_fecha"
             | "bloqueo_nombre"
@@ -324,7 +371,10 @@ fn validar_config_json(json: &str) -> Result<Vec<(String, String)>, String> {
             | "actividades_animaciones"
             | "temporizador_siempre_visible"
             | "sonido_volumen"
+            | "sonidos_interfaz"
             | "genio"
+            | "dock_esquiva"
+            | "panel_esquiva"
             | "toque_para_clic"
             | "scroll_natural" => booleano(valor, clave)?,
             "tema" => {
@@ -346,6 +396,18 @@ fn validar_config_json(json: &str) -> Result<Vec<(String, String)>, String> {
             | "brillo_automatico_pantalla"
             | "brillo_automatico_teclado" => booleano(valor, clave)?,
             "dock_tamano" => entero(valor, clave, 32, 80)?,
+            "teclado_retardo" => entero(valor, clave, 150, 1500)?,
+            "teclado_velocidad" => entero(valor, clave, 0, 60)?,
+            "volumen_paso" | "volumen_paso_mantener" | "brillo_paso" | "brillo_paso_mantener" => {
+                let maximo = bookos_shell::Pasos::maximo_de(clave)
+                    .expect("las cuatro claves de este brazo son pasos");
+                entero(
+                    valor,
+                    clave,
+                    bookos_shell::Pasos::MINIMO.into(),
+                    maximo.into(),
+                )?
+            }
             "acento" => {
                 let v = texto(valor, clave)?;
                 if bookos_shell::tema::Acento::desde_nombre(&v).is_none() {
@@ -353,7 +415,21 @@ fn validar_config_json(json: &str) -> Result<Vec<(String, String)>, String> {
                 }
                 v
             }
-            "tema_claro_desde" | "tema_oscuro_desde" => {
+            "luz_nocturna" => {
+                let v = texto(valor, clave)?;
+                if !matches!(v.as_str(), "no" | "si" | "programada") {
+                    return Err("«luz_nocturna» debe ser no, si o programada".into());
+                }
+                v
+            }
+            "luz_nocturna_temperatura" => entero(
+                valor,
+                clave,
+                bookos_shell::LuzNocturna::MINIMA as u64,
+                bookos_shell::LuzNocturna::MAXIMA as u64,
+            )?,
+            "tema_claro_desde" | "tema_oscuro_desde" | "luz_nocturna_desde"
+            | "luz_nocturna_hasta" => {
                 let v = texto(valor, clave)?;
                 let valida = v
                     .split_once(':')
@@ -367,7 +443,7 @@ fn validar_config_json(json: &str) -> Result<Vec<(String, String)>, String> {
             // Derivada y de solo lectura. Se ignora en vez de rechazarse para
             // que un cliente pueda devolver tal cual el objeto que leyó de
             // `GetConfig` sin que la llamada entera falle.
-            "tema_efectivo" => continue,
+            "tema_efectivo" | "luz_nocturna_activa" | "bloqueo_reloj_fuentes" => continue,
             otro => return Err(format!("clave de configuración desconocida: «{otro}»")),
         };
         salida.push((clave.clone(), guardado));
@@ -422,6 +498,20 @@ struct ActividadJson {
     portada: String,
     #[serde(default)]
     cola: Vec<ItemColaJson>,
+    #[serde(default)]
+    metricas: Vec<MetricaJson>,
+}
+
+#[derive(Deserialize)]
+struct MetricaJson {
+    #[serde(default)]
+    etiqueta: String,
+    #[serde(default)]
+    valor: f32,
+    #[serde(default)]
+    texto: String,
+    #[serde(default)]
+    critica: bool,
 }
 
 #[derive(Deserialize)]
@@ -610,6 +700,23 @@ impl Servidor {
                     portada: decodificar_portada(&i.portada),
                 })
                 .collect(),
+            // Cinco filas caben en la tarjeta; más es un monitor que se ha
+            // convertido en una tabla.
+            metricas: json
+                .metricas
+                .into_iter()
+                .take(6)
+                .map(|m| bookos_shell::actividad::Metrica {
+                    etiqueta: limitar(m.etiqueta, 24),
+                    valor: if m.valor.is_finite() {
+                        m.valor.clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    },
+                    texto: limitar(m.texto, 16),
+                    critica: m.critica,
+                })
+                .collect(),
         };
         let remitente = cabecera.sender().map(|u| u.to_string());
         self.canal.send(Aviso::Actividad(estado, remitente)).is_ok()
@@ -727,6 +834,14 @@ fn clase_permitida(app_id: &str, kind: &str) -> Option<bookos_shell::actividad::
         ("com.bookos.player", "player" | "") => Some(Clase::Player),
         ("com.bookos.clock", "timer" | "") => Some(Clase::Timer),
         ("com.bookos.voicerecorder", "recorder" | "") => Some(Clase::Recorder),
+        // Book Share vive en Ajustes: es quien recibe y envía por Quick Share.
+        ("com.bookos.settings", "transfer" | "") => Some(Clase::Transfer),
+        // Las copias y movimientos largos entre carpetas y discos.
+        ("com.bookos.explorer", "transfer" | "") => Some(Clase::Transfer),
+        ("com.bookos.calendar", "calendar" | "") => Some(Clase::Calendar),
+        ("com.bookos.systemmonitor", "monitor" | "") => Some(Clase::Monitor),
+        // bookos-budsd, el servicio de sesión de los Galaxy Buds.
+        ("com.bookos.buds", "auriculares" | "") => Some(Clase::Auriculares),
         _ => None,
     }
 }
@@ -768,6 +883,10 @@ fn recargar(state: &mut crate::state::BookosComp, seccion: &str) {
         "escritorio",
         "brightness",
         "brillo",
+        "entrada",
+        "teclado",
+        "channel",
+        "canal",
         "all",
     ];
     if !CONOCIDAS.contains(&seccion) {
@@ -777,7 +896,39 @@ fn recargar(state: &mut crate::state::BookosComp, seccion: &str) {
     if matches!(seccion, "keys" | "teclas" | "all") {
         state.teclas = crate::teclas::cargar();
     }
-    let config = bookos_shell::Config::cargar();
+    if matches!(seccion, "channel" | "canal" | "all")
+        && let Some(shell) = state.shell.as_mut()
+    {
+        shell.aplicar_canal(bookos_shell::marca::Canal::leer());
+    }
+    let mut config = bookos_shell::Config::cargar();
+
+    // Velocidad, toque y scroll caían en los dispositivos solo al aparecer.
+    if matches!(seccion, "entrada" | "all") {
+        state.entrada = std::mem::take(&mut config.entrada);
+        if let Some(aplicar) = state.aplicar_entrada.as_ref() {
+            aplicar(&state.entrada, state.touchpad_activo);
+        }
+    }
+    let repeticion = (config.teclado_retardo, config.teclado_velocidad);
+    if matches!(seccion, "teclado" | "all")
+        && repeticion != state.teclado_repeticion
+        && let Some(teclado) = state.seat.get_keyboard()
+    {
+        // Lo reciben también los clientes ya conectados: son ellos los que
+        // repiten, y sin el aviso seguirían con el ritmo de cuando entraron.
+        teclado.change_repeat_info(repeticion.1 as i32, repeticion.0 as i32);
+        state.teclado_repeticion = repeticion;
+    }
+    if matches!(seccion, "teclado" | "all") && config.teclado != state.teclado_activo {
+        if let Some(teclado) = state.seat.get_keyboard() {
+            let xkb = crate::state::distribucion_teclado(config.teclado.as_deref());
+            match teclado.set_xkb_config(state, xkb) {
+                Ok(()) => state.teclado_activo = config.teclado.clone(),
+                Err(err) => tracing::warn!(?err, "no se pudo aplicar la distribución de teclado"),
+            }
+        }
+    }
 
     if matches!(seccion, "desktop" | "escritorio" | "all")
         && state
@@ -844,8 +995,49 @@ fn recargar(state: &mut crate::state::BookosComp, seccion: &str) {
     if matches!(seccion, "appearance" | "apariencia" | "all") {
         crate::backend::programar_fondo_animado(state);
     }
+    // Solo si cambió: `recargar` descarta lo encendido a mano, y cualquier
+    // otro ajuste guardado desde Settings pasa por aquí con «all».
+    if matches!(seccion, "brightness" | "brillo" | "all")
+        && config.luz_nocturna != state.luz_nocturna.config
+    {
+        crate::luz_nocturna::recargar(state, config.luz_nocturna);
+    }
+    // «desktop» y «escritorio» estaban en `CONOCIDAS` sin que nada los
+    // atendiera: el número de escritorios guardado desde Ajustes no llegaba a
+    // la vista de Meta+W hasta volver a iniciar sesión.
+    // Lo mismo que hace Meta+Alt+B, pero solo si lo guardado no coincide con
+    // lo que hay: alternar sin mirar invertiría la barra en cada recarga.
+    if matches!(seccion, "desktop" | "escritorio" | "all") {
+        let mut cambio = false;
+        for (cual, esquiva) in [
+            (crate::shell::Barra::Panel, config.panel_esquiva),
+            (crate::shell::Barra::Dock, config.dock_esquiva),
+        ] {
+            if let Some(shell) = state.shell.as_mut()
+                && (shell.visibilidad(cual) == crate::shell::Visibilidad::Esquivando) != esquiva
+            {
+                shell.alternar_visibilidad(cual);
+                cambio = true;
+            }
+        }
+        if cambio {
+            state.recolocar_encajadas();
+            state.revisar_barras();
+        }
+    }
+    if matches!(seccion, "desktop" | "escritorio" | "all")
+        && crate::escritorios::ajustar(state, config.escritorios, &config.nombres_escritorios)
+    {
+        let activo = crate::escritorios::activo_aqui(state);
+        let nombres = state.escritorios.nombres().to_vec();
+        if let Some(shell) = state.shell.as_mut() {
+            shell.actualizar_vista_escritorios(activo, nombres);
+        }
+    }
     if seccion == "all" {
         state.sonido_volumen = config.sonido_volumen;
+        state.sonidos_interfaz = config.sonidos_interfaz;
+        state.pasos = config.pasos;
         state.genio_activo = config.genio;
     }
     if matches!(seccion, "brightness" | "brillo" | "all") {
@@ -1201,6 +1393,67 @@ mod pruebas {
         assert!(validar_config_json(r#"{"dock_tamano":80,"bloqueo_huella":true}"#).is_ok());
     }
 
+    /// Al pulsar hasta 10 y al mantener hasta 30, en volumen y en brillo.
+    #[test]
+    fn los_pasos_tienen_un_techo_distinto_al_pulsar_y_al_mantener() {
+        for ok in [
+            r#"{"volumen_paso":10}"#,
+            r#"{"brillo_paso":1}"#,
+            r#"{"volumen_paso_mantener":30}"#,
+            r#"{"brillo_paso_mantener":30}"#,
+        ] {
+            assert!(validar_config_json(ok).is_ok(), "{ok}");
+        }
+        for mal in [
+            r#"{"volumen_paso":11}"#,
+            r#"{"brillo_paso":0}"#,
+            r#"{"volumen_paso_mantener":31}"#,
+            r#"{"brillo_paso_mantener":0}"#,
+        ] {
+            assert!(validar_config_json(mal).is_err(), "{mal}");
+        }
+    }
+
+    /// La luz nocturna con los mismos límites que lee `panel.conf`: fuera de
+    /// ellos el compositor rechaza la actualización entera.
+    #[test]
+    fn el_estilo_del_reloj_se_valida() {
+        let valores =
+            validar_config_json(r#"{"bloqueo_reloj_fuente":"clasica","bloqueo_reloj_grosor":700}"#)
+                .expect("estilo válido");
+        assert!(valores.contains(&("bloqueo_reloj_fuente".into(), "clasica".into())));
+        assert!(valores.contains(&("bloqueo_reloj_grosor".into(), "700".into())));
+        for json in [
+            r#"{"bloqueo_reloj_fuente":"Comic Sans"}"#,
+            r#"{"bloqueo_reloj_grosor":450}"#,
+            r#"{"bloqueo_reloj_grosor":1000}"#,
+        ] {
+            assert!(validar_config_json(json).is_err(), "{json}");
+        }
+        // La lista de instaladas se puede devolver tal cual: se ignora.
+        assert!(validar_config_json(r#"{"bloqueo_reloj_fuentes":[]}"#).is_ok());
+    }
+
+    #[test]
+    fn la_luz_nocturna_se_valida() {
+        for json in [
+            r#"{"luz_nocturna":true}"#,
+            r#"{"luz_nocturna":"siempre"}"#,
+            r#"{"luz_nocturna_temperatura":2499}"#,
+            r#"{"luz_nocturna_temperatura":8001}"#,
+            r#"{"luz_nocturna_desde":"24:00"}"#,
+        ] {
+            assert!(validar_config_json(json).is_err(), "{json}");
+        }
+        let ok = validar_config_json(
+            r#"{"luz_nocturna":"programada","luz_nocturna_temperatura":3400,
+                "luz_nocturna_desde":"21:30","luz_nocturna_hasta":"07:00",
+                "luz_nocturna_activa":true}"#,
+        )
+        .expect("configuración válida");
+        assert_eq!(ok.len(), 4, "`luz_nocturna_activa` es de solo lectura");
+    }
+
     #[test]
     fn get_config_entrega_un_contrato_versionado_completo() {
         let json = config_json(&bookos_shell::Config::default());
@@ -1213,6 +1466,11 @@ mod pruebas {
         assert_eq!(
             validar_config_json(r#"{"sonido_volumen":false}"#),
             Ok(vec![("sonido_volumen".into(), "no".into())])
+        );
+        assert_eq!(json["sonidos_interfaz"], true);
+        assert_eq!(
+            validar_config_json(r#"{"sonidos_interfaz":false}"#),
+            Ok(vec![("sonidos_interfaz".into(), "no".into())])
         );
     }
 
@@ -1228,6 +1486,11 @@ mod pruebas {
             modo_tema: ModoTema::Automatico,
             ..Default::default()
         };
+        // El tema es global y los tests que crean un `ShellHost` lo reescriben
+        // en paralelo. La primera llamada a `config_json` carga la base de
+        // fuentes (`bloqueo_reloj_fuentes`) y tarda: se hace aquí, antes de
+        // fijar el tema, para no abrir esa ventana entre fijarlo y leerlo.
+        config_json(&config);
 
         tema::aplicar(Tema::Claro);
         let json = config_json(&config);

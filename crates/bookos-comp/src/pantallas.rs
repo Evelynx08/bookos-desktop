@@ -242,7 +242,9 @@ impl Compartido {
         // anuncia como ausentes para que Settings no tenga que adivinar.
         poner("hdr", Value::from(false));
         poner("icc", Value::from(false));
-        poner("night_light", Value::from(false));
+        // La curva de gamma solo existe con KMS: anidado, la pantalla es del
+        // compositor anfitrión. Ver `crate::luz_nocturna`.
+        poner("night_light", Value::from(udev));
         poner("escalas", Value::from(ESCALAS.to_vec()));
         m
     }
@@ -750,6 +752,8 @@ pub fn aplicar(
     state.pantallas.ultima = peticion.clone();
 
     tras_aplicar(state, aplicado);
+    // Una pantalla recién encendida nace con la curva identidad.
+    crate::luz_nocturna::reponer(state);
 
     if let Err(err) = guardar(&peticion) {
         // Se aplicó y se ve: que no se pueda escribir el fichero es un fallo
@@ -907,6 +911,7 @@ pub fn tras_aplicar(state: &mut crate::state::BookosComp, aplicado: Aplicado) {
 
     state.pantallas.compartido.publicar(salidas);
     state.needs_redraw = true;
+    crate::xwayland::actualizar_escala(state);
     crate::ajustes::avisar_salidas(state);
 }
 

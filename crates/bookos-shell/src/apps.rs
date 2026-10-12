@@ -147,6 +147,19 @@ pub(crate) fn leer_lanzador(ruta: &std::path::Path) -> Option<App> {
     leer_entrada(ruta).map(|(app, _)| app)
 }
 
+/// Un `Icon=` con ruta absoluta se salta el tema de iconos y sale sin teñir
+/// con los pack Tinted (Zen trae `.../default128.png`). Si el tema tiene un
+/// icono con el nombre de su `StartupWMClass`, gana ese.
+fn icono_del_tema(icono: Option<String>, clase: Option<&str>) -> Option<String> {
+    let clase = clase.map(str::to_lowercase);
+    match (icono, clase) {
+        (Some(ruta), Some(clase)) if ruta.starts_with('/') => {
+            Some(crate::icono::resolve_icon(&clase).map_or(ruta, |_| clase))
+        }
+        (icono, _) => icono,
+    }
+}
+
 /// La aplicación y si pide quedarse fuera de los menús (`NoDisplay`).
 fn leer_entrada(ruta: &std::path::Path) -> Option<(App, bool)> {
     let texto = std::fs::read_to_string(ruta).ok()?;
@@ -204,7 +217,8 @@ fn leer_entrada(ruta: &std::path::Path) -> Option<(App, bool)> {
     let normalizado = normalizar(&nombre);
     Some((
         App {
-            icono: icono.unwrap_or_else(|| nombre.clone()),
+            icono: icono_del_tema(icono, startup_wm_class(&texto))
+                .unwrap_or_else(|| nombre.clone()),
             nombre,
             exec,
             normalizado,

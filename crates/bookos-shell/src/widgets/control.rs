@@ -1,11 +1,4 @@
-//! El botón del centro de control.
-//!
-//! Es la entrada a la Estación de Control del diseño —wifi, bluetooth, brillo,
-//! volumen y perfiles en un solo sitio—, que todavía no está: son doce mil
-//! líneas de QML en el plasmoide original. El botón entra ya con su hueco y su
-//! icono para que el panel tenga el orden definitivo desde el principio, y
-//! porque el sitio de un icono en la barra es de las cosas que la mano aprende
-//! y conviene no mover después.
+//! El botón que abre el centro de control del shell.
 
 use crate::icono::{self, Icono};
 use crate::tema;

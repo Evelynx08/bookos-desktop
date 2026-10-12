@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use iced_core::alignment::Vertical;
 use iced_core::font::Weight;
 use iced_core::{Border, Color, Font, Length};
-use iced_widget::{Space, column, container, row, text};
+use iced_widget::{Space, column, container, row, stack, text};
 
 use crate::notificaciones::Notificacion;
 use crate::tema;
@@ -43,9 +43,15 @@ pub const MARGEN_SUPERIOR: f32 = 8.0;
 pub const MAXIMO_A_LA_VISTA: usize = 3;
 const ALTO_BOTON: f32 = 30.0;
 const HUECO_BOTONES: f32 = 6.0;
-/// Entre una tarjeta y la siguiente, el mismo aire que hay entre el panel y la
-/// primera: la pila tiene un solo ritmo.
-pub const HUECO: f32 = MARGEN_SUPERIOR;
+/// Cuánto asoma por debajo la tarjeta de cada nivel de la pila. Se ve la
+/// franja y no el contenido: las de atrás son tarjetas vacías, que es lo que
+/// las hace leer como «hay más» y no como un aviso partido en dos.
+pub const ASOMO: f32 = 10.0;
+/// Cuánto más estrecha es cada nivel que el de delante.
+const ENCOGE_POR_NIVEL: f32 = 0.05;
+/// El círculo de la ✕ y su distancia a la esquina de la tarjeta.
+const CIERRE: f32 = 22.0;
+const CIERRE_BORDE: f32 = 10.0;
 
 /// Lo que se queda a la vista una normal, y una crítica.
 ///
@@ -67,6 +73,21 @@ pub struct Toast {
     /// Cuánto se queda quieto antes de empezar a irse.
     quieto: Duration,
     desde: Instant,
+    /// Cuántos avisos tiene delante: 0 es el que se lee y se pulsa. Lo pone
+    /// [`crate::Shell`] al reordenar la pila.
+    profundidad: usize,
+    /// Alto impuesto a los de atrás: el de la cabeza. Con el suyo propio una
+    /// tarjeta de atrás más alta que la de delante asomaría por arriba.
+    fijo: Option<f32>,
+}
+
+/// Lo que se ha pulsado dentro de un aviso.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Pulsado {
+    /// El botón de una acción, con su clave.
+    Boton(String),
+    /// La ✕: quitarlo también de la lista.
+    Cerrar,
 }
 
 impl Toast {
@@ -91,7 +112,13 @@ impl Toast {
             notificacion,
             quieto,
             desde: Instant::now(),
+            profundidad: 0,
+            fijo: None,
         }
+    }
+
+    pub fn profundidad(&self) -> usize {
+        self.profundidad
     }
 
     pub fn id(&self) -> u32 {
@@ -123,15 +150,40 @@ impl Toast {
         self.desde.elapsed() >= self.quieto
     }
 
-    /// Cuánto sitio ocupa en la pila, de 0 a 1. Crece mientras entra y se
-    /// encoge mientras sale, y así las de debajo se deslizan en vez de saltar
-    /// cuando llega o se va una.
-    pub fn peso(&self) -> f32 {
-        let t = self.desde.elapsed();
-        if t < self.quieto {
-            return tema::C_SUAVE.eval(tema::fraccion(t, ENTRADA));
+    /// Pone el sitio en la pila. `true` si con eso hay que volver a pintarlo.
+    pub fn colocar(&mut self, profundidad: usize, fijo: Option<f32>) -> bool {
+        let cambia = self.profundidad != profundidad || self.fijo != fijo;
+        self.profundidad = profundidad;
+        self.fijo = fijo;
+        cambia
+    }
+
+    /// El alto que tendría delante, que es el que heredan los de atrás.
+    pub fn alto_propio(&self) -> f32 {
+        let n = &self.notificacion;
+        let mut alto = MARGEN * 2.0 + ICONO;
+        if !n.cuerpo.is_empty() {
+            alto += RESPIRO + LINEA_CUERPO * 2.0;
         }
-        self.alfa()
+        if n.progreso.is_some() || n.progreso_indeterminado {
+            alto += ALTO_PROGRESO;
+        }
+        if !self.botones().is_empty() {
+            alto += RESPIRO + ALTO_BOTON;
+        }
+        alto
+    }
+
+    /// Cuánto más abajo asoma que el de delante, en lógicos. El zoom del
+    /// compositor crece desde el centro, así que además de bajar `ASOMO` por
+    /// nivel hay que compensar lo que la tarjeta encogida sube su base.
+    pub fn desplazamiento(&self) -> f32 {
+        let nivel = self.profundidad as f32;
+        nivel * ASOMO + self.alto_tarjeta() * (1.0 - self.encogido()) / 2.0
+    }
+
+    fn encogido(&self) -> f32 {
+        1.0 - ENCOGE_POR_NIVEL * self.profundidad as f32
     }
 
     /// Alto de la tarjeta, sin el margen de la sombra.
@@ -142,10 +194,12 @@ impl Toast {
     /// Entra creciendo un poco, como los popovers.
     pub fn escala(&self) -> f32 {
         let t = self.desde.elapsed();
-        if t >= ENTRADA {
-            return 1.0;
-        }
-        0.94 + 0.06 * tema::C_MUELLE_POPOVER.eval(tema::fraccion(t, ENTRADA))
+        let entrada = if t >= ENTRADA {
+            1.0
+        } else {
+            0.94 + 0.06 * tema::C_MUELLE_POPOVER.eval(tema::fraccion(t, ENTRADA))
+        };
+        entrada * self.encogido()
     }
 
     /// Solo mientras entra: lo demás es alfa, y de eso se encarga el compositor
@@ -188,18 +242,7 @@ impl Toast {
     /// cuerpo, la barra y los botones solo si hay. Con alto fijo, un aviso sin
     /// cuerpo dejaba un hueco y uno con cuerpo y botones no cabía.
     fn alto(&self) -> f32 {
-        let n = &self.notificacion;
-        let mut alto = MARGEN * 2.0 + ICONO;
-        if !n.cuerpo.is_empty() {
-            alto += RESPIRO + LINEA_CUERPO * 2.0;
-        }
-        if n.progreso.is_some() || n.progreso_indeterminado {
-            alto += ALTO_PROGRESO;
-        }
-        if !self.botones().is_empty() {
-            alto += RESPIRO + ALTO_BOTON;
-        }
-        alto
+        self.fijo.unwrap_or_else(|| self.alto_propio())
     }
 
     /// Dónde empiezan los botones, desde arriba de la tarjeta: pegados al
@@ -215,9 +258,19 @@ impl Toast {
         )
     }
 
-    /// Devuelve la clave de la acción pulsada, en coordenadas relativas a la
-    /// tarjeta (sin el margen reservado para la sombra).
-    pub fn accion_en(&self, x: f32, y: f32) -> Option<String> {
+    /// Lo pulsado en un punto, en coordenadas relativas a la tarjeta (sin el
+    /// margen reservado para la sombra). Solo el de delante tiene algo que
+    /// pulsar: los de atrás no enseñan contenido.
+    pub fn accion_en(&self, x: f32, y: f32) -> Option<Pulsado> {
+        if self.profundidad > 0 {
+            return None;
+        }
+        let x_cierre = ANCHO - CIERRE_BORDE - CIERRE;
+        if (x_cierre..=x_cierre + CIERRE).contains(&x)
+            && (CIERRE_BORDE..=CIERRE_BORDE + CIERRE).contains(&y)
+        {
+            return Some(Pulsado::Cerrar);
+        }
         let botones = self.botones();
         let y_botones = self.y_botones();
         if botones.is_empty() || !(y_botones..=y_botones + ALTO_BOTON).contains(&y) {
@@ -226,17 +279,21 @@ impl Toast {
         Self::huecos_botones(botones.len())
             .zip(botones)
             .find(|((x0, ancho), _)| (*x0..=x0 + ancho).contains(&x))
-            .map(|(_, a)| a.clave.clone())
+            .map(|(_, a)| Pulsado::Boton(a.clave.clone()))
     }
 
     pub fn view(&self) -> PanelElement<'_> {
+        if self.profundidad > 0 {
+            return self.vista_de_atras();
+        }
         let n = &self.notificacion;
         let dibujo: PanelElement<'_> = match &n.icono {
             Some(ic) => crate::icono::ver(ic, ICONO, ICONO),
             None => Space::new().width(Length::Fixed(ICONO)).into(),
         };
         let ancho_texto = ANCHO - MARGEN * 2.0;
-        let ancho_titulos = ancho_texto - ICONO - 12.0;
+        // Sin pisar la ✕, que cuelga de la esquina de la cabecera.
+        let ancho_titulos = ancho_texto - ICONO - 12.0 - CIERRE - 8.0;
         // Quién avisa, en negrita, y debajo el resumen. En rojo si es crítica:
         // es lo único que la distingue de las demás sin meterle un fondo de
         // color que taparía su icono.
@@ -372,10 +429,13 @@ impl Toast {
                 .push(botones);
         }
         let alto = self.alto();
-        let tarjeta = container(contenido)
+        let cuerpo = container(contenido)
             .width(Length::Fixed(ANCHO))
             .height(Length::Fixed(alto))
-            .padding(MARGEN as u16)
+            .padding(MARGEN as u16);
+        let tarjeta = container(stack![cuerpo, Self::cierre()])
+            .width(Length::Fixed(ANCHO))
+            .height(Length::Fixed(alto))
             .style(|_theme: &iced_widget::Theme| container::Style {
                 background: Some(tema::card().into()),
                 border: Border {
@@ -401,11 +461,59 @@ impl Toast {
             });
         container(tarjeta).padding(MARGEN_SOMBRA).into()
     }
+
+    /// La ✕ de la esquina: gris y discreta, porque la roja es la de cerrar
+    /// ventanas y esta solo quita un aviso.
+    fn cierre() -> PanelElement<'static> {
+        let aspa: PanelElement<'static> = match crate::icono::propio("cerrar") {
+            Some(ic) => crate::icono::ver_teñido_propio(&ic, CIERRE * 0.55, tema::TEXTO2),
+            None => Space::new().into(),
+        };
+        container(
+            container(aspa)
+                .center_x(Length::Fixed(CIERRE))
+                .center_y(Length::Fixed(CIERRE))
+                .style(|_| container::Style {
+                    background: Some(tema::hover().into()),
+                    border: Border {
+                        radius: tema::R_CHIP.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+        )
+        .width(Length::Fill)
+        .align_x(iced_core::alignment::Horizontal::Right)
+        .padding(CIERRE_BORDE as u16)
+        .into()
+    }
+
+    /// Un nivel de la pila que no es el de delante: la tarjeta sola, un punto
+    /// más oscura cuanto más al fondo, sin contenido ni sombra.
+    fn vista_de_atras(&self) -> PanelElement<'_> {
+        let nivel = self.profundidad as f32;
+        let tarjeta = container(Space::new())
+            .width(Length::Fixed(ANCHO))
+            .height(Length::Fixed(self.alto()))
+            .style(move |_| container::Style {
+                background: Some(tema::mezclar(tema::card(), Color::BLACK, 0.15 * nivel).into()),
+                border: Border {
+                    radius: tema::R_DIALOGO.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        container(tarjeta).padding(MARGEN_SOMBRA).into()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn boton(clave: &str) -> Pulsado {
+        Pulsado::Boton(clave.into())
+    }
 
     fn notif(critica: bool) -> Notificacion {
         Notificacion::nueva(
@@ -493,13 +601,13 @@ mod tests {
         let y = t.y_botones() + ALTO_BOTON / 2.0;
         for ((x0, ancho), clave) in Toast::huecos_botones(2).zip(["responder", "leido"]) {
             for x in [x0 + 1.0, x0 + ancho / 2.0, x0 + ancho - 1.0] {
-                assert_eq!(t.accion_en(x, y).as_deref(), Some(clave), "x={x}");
+                assert_eq!(t.accion_en(x, y), Some(boton(clave)), "x={x}");
             }
         }
         // La mitad de arriba del botón también es el botón.
         assert_eq!(
-            t.accion_en(MARGEN + 5.0, t.y_botones() + 1.0).as_deref(),
-            Some("responder")
+            t.accion_en(MARGEN + 5.0, t.y_botones() + 1.0),
+            Some(boton("responder"))
         );
         // Por encima de los botones es el cuerpo, no una acción.
         assert_eq!(t.accion_en(MARGEN + 5.0, t.y_botones() - 10.0), None);
@@ -526,9 +634,41 @@ mod tests {
         );
         assert!(t.size().1 > MARGEN * 2.0 + ICONO + MARGEN_SOMBRA * 2.0);
         assert_eq!(
-            t.accion_en(80.0, t.y_botones() + ALTO_BOTON / 2.0)
-                .as_deref(),
-            Some("abrir")
+            t.accion_en(80.0, t.y_botones() + ALTO_BOTON / 2.0),
+            Some(boton("abrir"))
         );
+    }
+
+    /// La ✕ quita el aviso, y solo en el de delante: los de atrás no enseñan
+    /// nada que pulsar.
+    #[test]
+    fn la_aspa_cierra_solo_el_de_delante() {
+        let mut t = Toast::new(notif(false), -1);
+        let (x, y) = (
+            ANCHO - CIERRE_BORDE - CIERRE / 2.0,
+            CIERRE_BORDE + CIERRE / 2.0,
+        );
+        assert_eq!(t.accion_en(x, y), Some(Pulsado::Cerrar));
+        t.colocar(1, Some(t.alto_propio()));
+        assert_eq!(t.accion_en(x, y), None);
+    }
+
+    /// Cada nivel asoma `ASOMO` más por debajo que el anterior, aunque la
+    /// tarjeta encogida suba su base: la base del nivel n queda a n·ASOMO de la
+    /// de delante, que es lo que se ve.
+    #[test]
+    fn cada_nivel_asoma_por_debajo_del_anterior() {
+        let mut t = Toast::new(notif(false), -1);
+        std::thread::sleep(ENTRADA);
+        let alto = t.alto_propio();
+        for nivel in 1..=2 {
+            t.colocar(nivel, Some(alto));
+            let base = t.alto_tarjeta() * t.escala() / 2.0 + t.desplazamiento();
+            let esperada = alto / 2.0 + nivel as f32 * ASOMO;
+            assert!(
+                (base - esperada).abs() < 0.01,
+                "nivel {nivel}: {base} ≠ {esperada}"
+            );
+        }
     }
 }
