@@ -40,8 +40,8 @@ use smithay::desktop::utils::{
     surface_primary_scanout_output, update_surface_primary_scanout_output,
 };
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel};
-use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+use smithay::reexports::calloop::{EventLoop, LoopHandle};
 use smithay::reexports::drm::control::property::Value as PropValue;
 use smithay::reexports::drm::control::{Device as _, ModeTypeFlags, connector, crtc};
 use smithay::reexports::input::{AccelProfile, ClickMethod, Device as InputDevice, Libinput};
@@ -334,11 +334,12 @@ pub fn run(
     }
     {
         let udev = udev.clone();
+        let lazo = state.loop_handle.clone();
         state.aplicar_pantallas = Some(Box::new(move |peticion| {
             let mut u = udev
                 .try_borrow_mut()
                 .map_err(|_| "el backend está ocupado dibujando".to_string())?;
-            aplicar_en_kms(&mut u, peticion)
+            aplicar_en_kms(&mut u, &lazo, peticion)
         }));
     }
     {
@@ -1053,7 +1054,11 @@ fn censar(u: &Udev) -> Vec<Salida> {
 ///
 /// Devuelve el censo releído, no lo que se pidió: si el driver acabó en otro
 /// sitio, lo que gana es lo que hay.
-fn aplicar_en_kms(u: &mut Udev, peticion: &[Peticion]) -> Result<Aplicado, String> {
+fn aplicar_en_kms(
+    u: &mut Udev,
+    lazo: &LoopHandle<'static, BookosComp>,
+    peticion: &[Peticion],
+) -> Result<Aplicado, String> {
     let recursos = u
         .manager
         .device()
@@ -1094,8 +1099,34 @@ fn aplicar_en_kms(u: &mut Udev, peticion: &[Peticion]) -> Result<Aplicado, Strin
     // sesión. Soltar `DrmOutput` libera su CRTC y permite encender/apagar o
     // cambiar el cable en caliente sin reiniciar BookOS. Antes se retiran sus
     // globales `wl_output` para no acumular salidas fantasma en los clientes.
-    for vieja in u.salidas.drain(..) {
-        u.display_handle.remove_global::<BookosComp>(vieja.global);
+    //
+    // En dos tiempos, como pide la documentación de `remove_global`: un
+    // cliente que hiciera `bind` justo mientras se quita recibiría un error
+    // de protocolo y libwayland lo desconectaría. Deshabilitado, ya no se
+    // anuncia pero el `bind` en vuelo sigue valiendo; a los cinco segundos
+    // —«unos segundos», dice la documentación— se libera.
+    let mut viejas: Vec<_> = u
+        .salidas
+        .drain(..)
+        .map(|vieja| {
+            u.display_handle
+                .disable_global::<BookosComp>(vieja.global.clone());
+            vieja.global
+        })
+        .collect();
+    if !viejas.is_empty() {
+        let r = lazo.insert_source(
+            Timer::from_duration(std::time::Duration::from_secs(5)),
+            move |_, _, state| {
+                for global in viejas.drain(..) {
+                    state.display_handle.remove_global::<BookosComp>(global);
+                }
+                TimeoutAction::Drop
+            },
+        );
+        if let Err(err) = r {
+            tracing::warn!("los wl_output retirados se quedan deshabilitados: {err}");
+        }
     }
     for (pedido, crtc) in peticion.iter().filter(|p| p.activa).zip(asignados) {
         let conector = recursos

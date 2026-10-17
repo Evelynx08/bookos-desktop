@@ -1770,9 +1770,15 @@ impl Shell {
 
     // --- Superficies emergentes --------------------------------------------
 
+    /// Suelta la máscara de pantalla completa al cerrar la última modal.
+    ///
+    /// `renderer_modal` **no** se reinicia: medido con el ejemplo del
+    /// Launchpad a 1440×900 escala 2, reiniciarlo ahorraba 4,1 MB pero cada
+    /// apertura volvía a rasterizar glifos e iconos, con un primer dibujo de
+    /// ~107 ms en vez de ~6. Su caché tampoco crece: iced descarta en cada
+    /// `draw` lo que ese dibujo no usó.
     fn limpiar_cache_modal(&mut self) {
         if self.emergente.is_none() && self.bloqueo.is_none() {
-            self.renderer_modal = Renderer::new(Font::DEFAULT, Pixels(13.0));
             self.mask = None;
         }
     }
