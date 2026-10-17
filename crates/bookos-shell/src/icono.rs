@@ -429,6 +429,9 @@ pub fn cargar(nombre: &str) -> Option<Icono> {
     if es_dinamico(nombre) {
         return cargar_dinamico(nombre);
     }
+    if es_temporal(nombre) {
+        return cargar_sin_cache(nombre);
+    }
     let cache = CACHE.get_or_init(Default::default);
     {
         // No se conserva el bloqueo mientras se resuelve el icono. La ruta de
@@ -466,6 +469,29 @@ const DINAMICOS: &[&str] = &["bookos-clock", "bookos-calendar"];
 
 pub fn es_dinamico(nombre: &str) -> bool {
     DINAMICOS.contains(&nombre)
+}
+
+/// Cuándo se reescribió el icono dinámico; `None` si no lo es o no está.
+/// El dock lo compara para no releer un fichero que no ha cambiado.
+pub fn modificado_si_dinamico(nombre: &str) -> Option<std::time::SystemTime> {
+    if !es_dinamico(nombre) {
+        return None;
+    }
+    std::fs::metadata(resolve_icon(nombre)?)
+        .ok()?
+        .modified()
+        .ok()
+}
+
+/// Rutas donde las aplicaciones dejan imágenes de usar y tirar: los avatares
+/// y carátulas que acompañan a un aviso (`image-path`) suelen tener un nombre
+/// distinto en cada uno. Por la caché, que no olvida nada en toda la sesión,
+/// cada aviso dejaba su mapa de bits —hasta 256 KB a [`LADO_RASTER`]— para
+/// siempre. El aviso ya se queda con su `Icono`, así que no hace falta.
+fn es_temporal(nombre: &str) -> bool {
+    ["/tmp/", "/var/tmp/", "/run/"]
+        .iter()
+        .any(|dir| nombre.starts_with(dir))
 }
 
 /// Sin caché, y el SVG desde sus bytes en vez de desde la ruta: el
@@ -683,6 +709,12 @@ pub fn resolve_icon(name: &str) -> Option<PathBuf> {
     None
 }
 
+/// Lado máximo, en píxeles, al que se guarda un icono de mapa de bits.
+///
+/// El icono más grande que se dibuja es el del launchpad, unos 78 px lógicos:
+/// a escala 2 son 156, y 256 deja margen para una pantalla a escala 3.
+const LADO_RASTER: u32 = 256;
+
 /// Carga un icono desde disco.
 ///
 /// Los SVG se los queda iced (los rasteriza resvg al tamaño que toque). Los
@@ -696,6 +728,18 @@ fn load_icon(path: &Path) -> Option<Icono> {
     }
     match image::ImageReader::open(path).ok()?.decode() {
         Ok(img) => {
+            // La caché los guarda toda la sesión, y hay aplicaciones que traen
+            // un PNG de 1024 px: medido, uno solo eran 4,2 MB de los 33 que el
+            // compositor tenía reservados en reposo.
+            let img = if img.width().max(img.height()) > LADO_RASTER {
+                img.resize(
+                    LADO_RASTER,
+                    LADO_RASTER,
+                    image::imageops::FilterType::Lanczos3,
+                )
+            } else {
+                img
+            };
             let rgba = img.to_rgba8();
             let (w, h) = (rgba.width(), rgba.height());
             Some(Icono::Raster(iced_image::Handle::from_rgba(

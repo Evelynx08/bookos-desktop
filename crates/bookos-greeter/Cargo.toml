@@ -1,0 +1,19 @@
+[package]
+name = "bookos-greeter"
+description = "Pantalla de acceso de BookOS para greetd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+greetd_ipc = { version = "0.10", features = ["sync-codec"] }
+bookos-shell = { path = "../bookos-shell" }
+iced = { version = "0.14", default-features = false, features = ["tiny-skia", "wayland", "thread-pool", "svg", "image-without-codecs"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+
+[dev-dependencies]
+iced_graphics = "0.14"
+iced_runtime = "0.14"
+iced_tiny_skia = { version = "0.14", default-features = false, features = ["wayland"] }
+tiny-skia = "0.11"

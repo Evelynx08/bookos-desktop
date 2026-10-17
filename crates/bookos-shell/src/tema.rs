@@ -47,7 +47,7 @@
 //!   texto sobre una tarjeta blanca no se leen. En claro se usan los de la
 //!   sección 2.1 del sistema de diseño.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use iced_core::Color;
 
@@ -347,10 +347,8 @@ tokens! {
 // literalmente los mismos valores: dos amarillos casi iguales en el mismo
 // escritorio es lo que hace que se note cosido a mano.
 
-/// El color de acento elegido. Es una tabla cerrada y no un `#rrggbb` libre:
-/// un acento arbitrario se sale del contraste que el resto de la paleta da por
-/// hecho —el texto blanco encima, el `hover` con alfa— y no hay dónde
-/// comprobarlo.
+/// El color elegido: una muestra fija o el dominante del fondo, cuyo contraste
+/// se ajusta al tema antes de usarlo en los controles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Acento {
     #[default]
@@ -365,12 +363,11 @@ pub enum Acento {
     Verde,
     Turquesa,
     Grafito,
+    Automatico,
 }
 
 impl Acento {
-    /// Todos, en el orden en que se pintan en la rejilla de Apariencia: el
-    /// círculo cromático, que es el orden en que se buscan con el ojo.
-    pub const TODOS: [Acento; 11] = [
+    pub const FIJOS: [Acento; 11] = [
         Acento::Azul,
         Acento::Indigo,
         Acento::Morado,
@@ -382,6 +379,23 @@ impl Acento {
         Acento::Verde,
         Acento::Turquesa,
         Acento::Grafito,
+    ];
+
+    /// Todos, en el orden en que se pintan en la rejilla de Apariencia: el
+    /// círculo cromático, que es el orden en que se buscan con el ojo.
+    pub const TODOS: [Acento; 12] = [
+        Acento::Azul,
+        Acento::Indigo,
+        Acento::Morado,
+        Acento::Rosa,
+        Acento::Rojo,
+        Acento::Naranja,
+        Acento::Amarillo,
+        Acento::Arena,
+        Acento::Verde,
+        Acento::Turquesa,
+        Acento::Grafito,
+        Acento::Automatico,
     ];
 
     /// Su nombre en la configuración y en la interfaz. Sin tildes ni mayúsculas
@@ -399,6 +413,7 @@ impl Acento {
             Acento::Verde => "verde",
             Acento::Turquesa => "turquesa",
             Acento::Grafito => "grafito",
+            Acento::Automatico => "automatico",
         }
     }
 
@@ -432,12 +447,131 @@ impl Acento {
             // gris del texto secundario y usarlo aquí haría que un botón
             // primario se leyera como deshabilitado.
             Acento::Grafito => (0x6e6e73, 0xa1a1a6),
+            Acento::Automatico => {
+                return color_automatico(hex(PALETA_FONDO[0].load(Ordering::Relaxed)), es_claro());
+            }
         };
         hex(if es_claro() { claro } else { oscuro })
     }
 }
 
 static ACENTO: AtomicU8 = AtomicU8::new(0);
+/// Los colores del fondo, el dominante primero. El acento automático es el
+/// primero; los otros dos solo se enseñan en su casilla de Apariencia.
+static PALETA_FONDO: [AtomicU32; 3] = [const { AtomicU32::new(0x5c95ff) }; 3];
+
+/// Se calcula al cargar la imagen, también con un acento fijo, para que elegir
+/// el automático no tenga que volver a decodificarla. En animaciones se
+/// conserva el primer fotograma: cambiar la paleta en cada frame haría
+/// parpadear los controles.
+pub fn actualizar_acento_del_fondo(rgba: &[u8]) -> bool {
+    PALETA_FONDO
+        .iter()
+        .zip(paleta_del_fondo(rgba))
+        // El `swap` delante del `||`: detrás, el cortocircuito dejaría sin
+        // guardar los colores que siguen al primero que cambie.
+        .fold(false, |cambio, (guardado, color)| {
+            guardado.swap(color, Ordering::Relaxed) != color || cambio
+        })
+}
+
+/// La paleta ya corregida para el tema puesto, como se vería cada color si
+/// fuera el acento. El primero **es** el acento automático.
+pub fn paleta_automatica() -> [Color; 3] {
+    let claro = es_claro();
+    PALETA_FONDO
+        .each_ref()
+        .map(|c| color_automatico(hex(c.load(Ordering::Relaxed)), claro))
+}
+
+fn paleta_del_fondo(rgba: &[u8]) -> [u32; 3] {
+    let mut grupos = [(0.0_f32, [0_u32; 3], 0_u32); 512];
+    let paso = (rgba.len() / 4 / 4096).max(1);
+    for p in rgba.as_chunks::<4>().0.iter().step_by(paso) {
+        if p[3] < 128 {
+            continue;
+        }
+        let max = p[0].max(p[1]).max(p[2]);
+        let min = p[0].min(p[1]).min(p[2]);
+        let i = ((p[0] as usize >> 5) << 6) | ((p[1] as usize >> 5) << 3) | (p[2] as usize >> 5);
+        let grupo = &mut grupos[i];
+        // Las franjas negras no deben ganar al paisaje que enmarcan. El croma
+        // pesa más, pero una foto gris también debe aportar su propio acento.
+        grupo.0 += (max - min) as f32 + max as f32 * 0.05;
+        for (suma, canal) in grupo.1.iter_mut().zip(p) {
+            *suma += *canal as u32;
+        }
+        grupo.2 += 1;
+    }
+    let mut vivos: Vec<(f32, [u32; 3])> = grupos
+        .iter()
+        .filter(|g| g.2 > 0)
+        .map(|(peso, suma, cantidad)| (*peso, suma.map(|canal| canal / cantidad)))
+        .collect();
+    vivos.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let primero = vivos.first().map_or([0x5c, 0x95, 0xff], |g| g.1);
+    let mut paleta = [primero; 3];
+    let mut elegidos = 1;
+    for (_, color) in vivos.iter().skip(1) {
+        if elegidos == paleta.len() {
+            break;
+        }
+        // Dos cubos vecinos son el mismo color partido por la rejilla de 32
+        // niveles: sin esta distancia las tres franjas salían casi iguales.
+        let distinto = paleta[..elegidos].iter().all(|ya| {
+            ya.iter()
+                .zip(color)
+                .map(|(a, b)| a.abs_diff(*b))
+                .sum::<u32>()
+                >= 96
+        });
+        if distinto {
+            paleta[elegidos] = *color;
+            elegidos += 1;
+        }
+    }
+    // Un fondo de un solo color deja las tres iguales, y la casilla lisa.
+    paleta.map(|c| (c[0] << 16) | (c[1] << 8) | c[2])
+}
+
+/// Sube la saturación y lleva el color a su brillo máximo, sin mover el tono.
+///
+/// El color de una foto es la media de un cubo y sale apagado; aclararlo luego
+/// hacia blanco para que contraste lo dejaba en gris. Así llega a ese paso con
+/// croma de sobra. La saturación se multiplica y se topa en 0,6 en vez de
+/// fijarse: un fondo gris se queda gris y no se inventa un color del ruido.
+fn avivar(c: Color) -> Color {
+    let max = c.r.max(c.g).max(c.b);
+    let croma = max - c.r.min(c.g).min(c.b);
+    if croma <= f32::EPSILON {
+        return c;
+    }
+    let saturacion = croma / max;
+    let objetivo = (saturacion * 2.5).min(0.6).max(saturacion);
+    let canal = |x: f32| (max - (max - x) * objetivo / saturacion) / max;
+    Color {
+        r: canal(c.r),
+        g: canal(c.g),
+        b: canal(c.b),
+        a: c.a,
+    }
+}
+
+fn color_automatico(color: Color, claro: bool) -> Color {
+    let color = avivar(color);
+    let superficie = if claro { Color::WHITE } else { hex(0x1c1c1e) };
+    let destino = if claro { Color::BLACK } else { Color::WHITE };
+    // 4,5:1 permite usar el acento también como texto de acción en la tarjeta.
+    for paso in 0..=100 {
+        let candidato = mezclar(color, destino, paso as f32 / 100.0);
+        let a = luminancia(candidato);
+        let b = luminancia(superficie);
+        if (a.max(b) + 0.05) / (a.min(b) + 0.05) >= 4.5 {
+            return candidato;
+        }
+    }
+    destino
+}
 
 /// Pone el acento del proceso. Como con el tema, quien lo llame tiene que
 /// repintar: lo ya dibujado no se entera.
@@ -492,7 +626,19 @@ pub fn enlace() -> Color {
 /// tiene luminancia 0,66 y el texto blanco encima desaparece. Donde el fondo es
 /// el acento se pregunta aquí, no se asume.
 pub fn sobre_acento() -> Color {
-    tinta_sobre(acento())
+    if acento_actual() == Acento::Automatico {
+        tinta_automatica(acento())
+    } else {
+        tinta_sobre(acento())
+    }
+}
+
+pub fn tinta_automatica(fondo: Color) -> Color {
+    if luminancia(fondo) > 0.179 {
+        Color::BLACK
+    } else {
+        Color::WHITE
+    }
 }
 
 /// Interpola dos colores. `t = 0` da `a`, `t = 1` da `b`.
@@ -550,6 +696,21 @@ pub fn superficie_en_tarjeta() -> Color {
     mezclar(card(), Color { a: 1.0, ..s }, s.a)
 }
 
+/// Lo que va **en relieve** dentro de un grupo: baldosas, botones redondos,
+/// el surco de un deslizador.
+///
+/// En claro es la tarjeta blanca sobre el grupo gris y ya se despega. En oscuro
+/// la tarjeta es más oscura que el grupo y esas piezas se veían como agujeros:
+/// todo hundido y apagado. Por eso aquí sube un escalón por encima del grupo
+/// (8 % de tinta): al 16 % queda en `#3d3d3f`, casi el `#3a3a3c` de iOS.
+pub fn elevado() -> Color {
+    if es_claro() {
+        card()
+    } else {
+        mezclar(card(), tinta(), 0.16)
+    }
+}
+
 /// El color de la tinta, para rellenos y bordes con muy poco alfa.
 ///
 /// Es lo que había escrito como `Color { a: 0.12, ..Color::WHITE }` por todo el
@@ -603,6 +764,11 @@ pub fn perfil_rendimiento() -> Color {
 /// luminancia relativa de la WCAG: azul 0,31 —blanco—, verde 0,76 y amarillo
 /// 0,71 —negro—.
 pub fn tinta_sobre(fondo: Color) -> Color {
+    let l = luminancia(fondo);
+    if l > 0.45 { Color::BLACK } else { Color::WHITE }
+}
+
+fn luminancia(fondo: Color) -> f32 {
     // Los canales de iced ya están en 0..1 pero con la curva de sRGB; hay que
     // linealizarlos antes de pesarlos o el verde sale muy por debajo de lo que
     // el ojo ve.
@@ -613,8 +779,7 @@ pub fn tinta_sobre(fondo: Color) -> Color {
             ((c + 0.055) / 1.055).powf(2.4)
         }
     };
-    let l = 0.2126 * lin(fondo.r) + 0.7152 * lin(fondo.g) + 0.0722 * lin(fondo.b);
-    if l > 0.45 { Color::BLACK } else { Color::WHITE }
+    0.2126 * lin(fondo.r) + 0.7152 * lin(fondo.g) + 0.0722 * lin(fondo.b)
 }
 
 // Los cuatro rellenos de encima de una superficie son el **mismo color de la
@@ -1127,6 +1292,70 @@ mod tema_automatico {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn el_dominante_descarta_las_franjas_negras_y_admite_grises() {
+        let mut rgba = vec![0; 400];
+        for p in rgba.as_chunks_mut::<4>().0 {
+            p[3] = 255;
+        }
+        rgba.extend_from_slice(&[20, 100, 200, 255].repeat(10));
+        assert_eq!(super::paleta_del_fondo(&rgba)[0], 0x1464c8);
+        assert_eq!(super::paleta_del_fondo(&[80, 80, 80, 255])[0], 0x505050);
+        assert_eq!(super::paleta_del_fondo(&[255, 0, 0, 0])[0], 0x5c95ff);
+    }
+
+    #[test]
+    fn la_paleta_no_repite_un_color_partido_en_dos_cubos() {
+        // 95 y 97 caen en cubos distintos de la rejilla y son el mismo azul.
+        let mut rgba = [20, 95, 200, 255].repeat(10);
+        rgba.extend_from_slice(&[20, 97, 200, 255].repeat(8));
+        rgba.extend_from_slice(&[200, 60, 40, 255].repeat(4));
+        let paleta = super::paleta_del_fondo(&rgba);
+        assert_eq!(paleta[0], 0x145fc8);
+        assert_eq!(
+            paleta[1], 0xc83c28,
+            "el segundo es el rojo, no el otro azul"
+        );
+        assert_eq!(
+            paleta[2], paleta[0],
+            "sin tercer color se repite el primero"
+        );
+    }
+
+    #[test]
+    fn avivar_conserva_el_tono_y_deja_el_gris_como_estaba() {
+        use super::*;
+        assert_eq!(avivar(hex(0x505050)), hex(0x505050));
+        let apagado = hex(0x8a7a60);
+        let vivo = avivar(apagado);
+        assert!(
+            vivo.r > vivo.g && vivo.g > vivo.b,
+            "el orden de canales es el tono"
+        );
+        assert!((vivo.r - 1.0).abs() < 1e-6);
+        assert!(1.0 - vivo.b > 0.59, "saturación {}", 1.0 - vivo.b);
+    }
+
+    #[test]
+    fn el_acento_automatico_y_su_letra_tienen_contraste() {
+        use super::*;
+        let contraste = |a, b| {
+            let (a, b) = (luminancia(a), luminancia(b));
+            (a.max(b) + 0.05) / (a.min(b) + 0.05)
+        };
+        for color in [0x000000, 0xffffff, 0x505050, 0xff0000, 0x00ff00, 0x0000ff] {
+            for claro in [false, true] {
+                let acento = color_automatico(hex(color), claro);
+                let tarjeta = if claro { Color::WHITE } else { hex(0x1c1c1e) };
+                assert!(contraste(acento, tarjeta) >= 4.5, "acento sobre tarjeta");
+                assert!(
+                    contraste(acento, tinta_automatica(acento)) >= 4.5,
+                    "letra sobre acento"
+                );
+            }
+        }
+    }
+
     use super::*;
 
     /// El tema conmuta de verdad y la tinta lo sigue.

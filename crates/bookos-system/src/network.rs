@@ -46,6 +46,13 @@ pub async fn state(c: &Connection) -> Result<Json, String> {
     let mut networks = Vec::new();
     let mut ethernet = json!({"present":false,"connected":false});
     let mut ssid = String::new();
+    // Una lectura por refresco y no una por red: con 9 perfiles son ~3,4 ms
+    // (medido), poco al lado de las 5 propiedades que se piden por cada AP.
+    let guardadas: HashMap<Vec<u8>, bool> =
+        wifi_profiles(c).await?.into_iter().fold(HashMap::new(), |mut m, (ssid, _, s)| {
+            *m.entry(ssid).or_default() |= autoconnect(&s);
+            m
+        });
     for d in devices(c).await? {
         let device = proxy(c, d.as_str(), "org.freedesktop.NetworkManager.Device").await?;
         let kind: u32 = device
@@ -96,8 +103,9 @@ pub async fn state(c: &Connection) -> Result<Json, String> {
             if connected {
                 ssid = name.clone();
             }
+            let guardada = guardadas.get(&bytes);
             networks.push(json!({"id":ap.as_str(),"device":d.as_str(),"ssid":name,
-                "signal":strength,"active":connected,"security":if flags & 1 == 0 { "" } else if rsn != 0 { "WPA2" } else if wpa != 0 { "WPA" } else { "WEP" },
+                "signal":strength,"active":connected,"saved":guardada.is_some(),"autoconnect":guardada.copied().unwrap_or(false),"security":if flags & 1 == 0 { "" } else if rsn != 0 { "WPA2" } else if wpa != 0 { "WPA" } else { "WEP" },
                 "band":if freq >= 5925 { "6G" } else if freq >= 3000 { "5G" } else { "2.4G" }}));
         }
     }
@@ -114,7 +122,8 @@ pub async fn state(c: &Connection) -> Result<Json, String> {
         json!({"enabled":enabled,"hardwareEnabled":hardware,"ssid":ssid,"networks":networks,"ethernet":ethernet}),
     )
 }
-async fn profiles(c: &Connection, ssid: &str) -> Result<Vec<OwnedObjectPath>, String> {
+/// Perfiles Wi-Fi guardados: SSID, ruta y ajustes (sin secretos).
+async fn wifi_profiles(c: &Connection) -> Result<Vec<(Vec<u8>, OwnedObjectPath, Settings)>, String> {
     let settings = proxy(
         c,
         "/org/freedesktop/NetworkManager/Settings",
@@ -137,16 +146,31 @@ async fn profiles(c: &Connection, ssid: &str) -> Result<Vec<OwnedObjectPath>, St
             .call("GetSettings", &())
             .await
             .map_err(|e| e.to_string())?;
-        let matches = s
+        let ssid = s
             .get("802-11-wireless")
             .and_then(|w| w.get("ssid"))
-            .and_then(|v| Vec::<u8>::try_from(v.try_clone().ok()?).ok())
-            .is_some_and(|b| b == ssid.as_bytes());
-        if matches {
-            result.push(path);
+            .and_then(|v| Vec::<u8>::try_from(v.try_clone().ok()?).ok());
+        if let Some(ssid) = ssid {
+            result.push((ssid, path, s));
         }
     }
     Ok(result)
+}
+async fn profiles(c: &Connection, ssid: &str) -> Result<Vec<OwnedObjectPath>, String> {
+    Ok(wifi_profiles(c)
+        .await?
+        .into_iter()
+        .filter(|(s, _, _)| s == ssid.as_bytes())
+        .map(|(_, path, _)| path)
+        .collect())
+}
+/// NetworkManager no manda las propiedades que están en su valor por
+/// defecto, y `connection.autoconnect` lo tiene a `true`.
+fn autoconnect(s: &Settings) -> bool {
+    s.get("connection")
+        .and_then(|c| c.get("autoconnect"))
+        .and_then(|v| bool::try_from(v).ok())
+        .unwrap_or(true)
 }
 pub async fn perform(c: &Connection, op: &Operation) -> Result<(), String> {
     let manager = proxy(c, ROOT, NAME).await?;
@@ -188,6 +212,31 @@ pub async fn perform(c: &Connection, op: &Operation) -> Result<(), String> {
                 .call::<_, _, ()>("Delete", &())
                 .await
                 .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        }
+        // `Update` con lo que devuelve `GetSettings`, que no lleva secretos, no
+        // borra la contraseña guardada: comprobado con NetworkManager 1.56 en
+        // un perfil de prueba (la psk seguía tras pasar autoconnect a «no»).
+        Operation::WifiAutoconnect { ssid, enabled } => {
+            let perfiles: Vec<_> = wifi_profiles(c)
+                .await?
+                .into_iter()
+                .filter(|(s, _, _)| s == ssid.as_bytes())
+                .collect();
+            if perfiles.is_empty() {
+                return Err("No hay perfil guardado para esa red".into());
+            }
+            for (_, path, mut settings) in perfiles {
+                settings.entry("connection".into()).or_default().insert(
+                    "autoconnect".into(),
+                    Value::from(*enabled).try_to_owned().map_err(|e| e.to_string())?,
+                );
+                proxy(c, path.as_str(), "org.freedesktop.NetworkManager.Settings.Connection")
+                    .await?
+                    .call::<_, _, ()>("Update", &(settings,))
+                    .await
+                    .map_err(|e| e.to_string())?;
             }
             Ok(())
         }

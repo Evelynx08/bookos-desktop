@@ -208,7 +208,7 @@ pub fn ejecutar_en(bus: &str, que: Orden) -> bool {
         Orden::Siguiente => "Next",
         Orden::Alternar => "PlayPause",
     };
-    Command::new("busctl")
+    let Ok(mut hijo) = Command::new("busctl")
         .args([
             "--user",
             "call",
@@ -220,7 +220,15 @@ pub fn ejecutar_en(bus: &str, que: Orden) -> bool {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .is_ok()
+    else {
+        return false;
+    };
+    // Sin `wait`, cada pulsación dejaba un `busctl` zombi; en un hilo para no
+    // parar el bucle lo que tarde en contestar el reproductor.
+    std::thread::spawn(move || {
+        let _ = hijo.wait();
+    });
+    true
 }
 
 /// Los tres botones de la tarjeta.

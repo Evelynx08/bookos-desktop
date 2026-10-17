@@ -25,6 +25,7 @@ fn main() {
         Acento::Rojo,
         Acento::Morado,
         Acento::Grafito,
+        Acento::Automatico,
     ] {
         // Por la config y no con `tema::aplicar_acento`: `con_config` la
         // reaplica al construirse y pisaría lo que se dejara puesto antes.

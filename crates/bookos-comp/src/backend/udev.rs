@@ -63,6 +63,7 @@ type Surface = DrmOutput<Alloc, Exporter, OutputPresentationFeedback, DrmDeviceF
 /// Lo que el backend necesita y el estado del compositor no debe conocer.
 struct SalidaKms {
     output: Output,
+    global: smithay::reexports::wayland_server::backend::GlobalId,
     surface: Surface,
     conector: connector::Handle,
     id: String,
@@ -229,6 +230,9 @@ pub fn run(
     state.contexto_gl = Some(smithay::backend::renderer::Renderer::context_id(&renderer));
     state.velo_captura = crate::captura::Velo::new(&mut renderer);
     state.fondo = crate::fondo::Fondo::cargar(&state.fondo_config);
+    crate::publicar::activar();
+    crate::publicar::publicar(&state.fondo_config);
+    crate::backend::actualizar_acento_del_fondo(state);
     crate::backend::programar_fondo_animado(state);
     // El cristal desenfoca el fondo, así que necesita su propia copia con
     // mipmaps. En fondos animados se sustituye al avanzar el fotograma.
@@ -421,20 +425,29 @@ pub fn run(
                 // está escrito contra `InputBackend` genérico y no puede tocar la
                 // API de libinput. Llega uno por dispositivo al arrancar y otra
                 // tanda tras cada cambio de TTY, cuando libseat los devuelve.
-                if let smithay::backend::input::InputEvent::DeviceAdded { device } = &event {
-                    let mut device = device.clone();
-                    configurar_dispositivo(&mut device, &state.entrada, state.touchpad_activo);
-                    dispositivos.borrow_mut().push(device.clone());
-                    if device.has_capability(smithay::reexports::input::DeviceCapability::Keyboard)
-                    {
-                        // Nace con las luces de ahora: tras un cambio de TTY,
-                        // o un teclado USB enchufado con Bloq Mayús puesto.
-                        device.led_update(luces(state.leds));
-                        teclados.borrow_mut().push(device.clone());
+                match &event {
+                    smithay::backend::input::InputEvent::DeviceAdded { device } => {
+                        let mut device = device.clone();
+                        configurar_dispositivo(&mut device, &state.entrada, state.touchpad_activo);
+                        dispositivos.borrow_mut().push(device.clone());
+                        if device
+                            .has_capability(smithay::reexports::input::DeviceCapability::Keyboard)
+                        {
+                            // Nace con las luces de ahora: tras un cambio de TTY,
+                            // o un teclado USB enchufado con Bloq Mayús puesto.
+                            device.led_update(luces(state.leds));
+                            teclados.borrow_mut().push(device.clone());
+                        }
+                        if device.config_tap_finger_count() > 0 {
+                            touchpads.borrow_mut().push(device);
+                        }
                     }
-                    if device.config_tap_finger_count() > 0 {
-                        touchpads.borrow_mut().push(device);
+                    smithay::backend::input::InputEvent::DeviceRemoved { device } => {
+                        dispositivos.borrow_mut().retain(|d| d != device);
+                        teclados.borrow_mut().retain(|d| d != device);
+                        touchpads.borrow_mut().retain(|d| d != device);
                     }
+                    _ => {}
                 }
                 crate::input::handle(state, event);
             },
@@ -753,7 +766,6 @@ fn crear_salidas(
             size: (w as i32, h as i32).into(),
             refresh: (modo.vrefresh() * 1000) as i32,
         };
-        output.create_global::<BookosComp>(&state.display_handle);
         output.change_current_state(
             Some(output_mode),
             Some(transformacion),
@@ -776,6 +788,7 @@ fn crear_salidas(
                 continue;
             }
         };
+        let global = output.create_global::<BookosComp>(&state.display_handle);
         if guardada.as_ref().is_some_and(|g| g.vrr)
             && let Err(err) = surface.with_compositor(|c| c.use_vrr(true))
         {
@@ -793,6 +806,7 @@ fn crear_salidas(
             escala, x = posicion.x, y = posicion.y, "salida multipantalla activa");
         salidas.push(SalidaKms {
             output,
+            global,
             surface,
             conector: conector.handle(),
             id,
@@ -1078,8 +1092,11 @@ fn aplicar_en_kms(u: &mut Udev, peticion: &[Peticion]) -> Result<Aplicado, Strin
 
     // Se reconstruyen únicamente las superficies KMS, no el compositor ni la
     // sesión. Soltar `DrmOutput` libera su CRTC y permite encender/apagar o
-    // cambiar el cable en caliente sin reiniciar BookOS.
-    u.salidas.clear();
+    // cambiar el cable en caliente sin reiniciar BookOS. Antes se retiran sus
+    // globales `wl_output` para no acumular salidas fantasma en los clientes.
+    for vieja in u.salidas.drain(..) {
+        u.display_handle.remove_global::<BookosComp>(vieja.global);
+    }
     for (pedido, crtc) in peticion.iter().filter(|p| p.activa).zip(asignados) {
         let conector = recursos
             .connectors()
@@ -1132,7 +1149,6 @@ fn aplicar_en_kms(u: &mut Udev, peticion: &[Peticion]) -> Result<Aplicado, Strin
             size: (pedido.ancho as i32, pedido.alto as i32).into(),
             refresh: pedido.refresco_mhz as i32,
         };
-        output.create_global::<BookosComp>(&u.display_handle);
         output.change_current_state(
             Some(output_mode),
             Some(transformacion),
@@ -1157,8 +1173,10 @@ fn aplicar_en_kms(u: &mut Udev, peticion: &[Peticion]) -> Result<Aplicado, Strin
                 .with_compositor(|c| c.use_vrr(true))
                 .map_err(|err| format!("no se pudo activar VRR en «{}»: {err}", pedido.id))?;
         }
+        let global = output.create_global::<BookosComp>(&u.display_handle);
         u.salidas.push(SalidaKms {
             output,
+            global,
             surface,
             conector: conector.handle(),
             id: pedido.id.clone(),

@@ -40,11 +40,16 @@ fn reproducir_sonido_osd(icono: &str) {
         nombre if nombre.starts_with("micro") => "audio-volume-change",
         _ => "keyboard-key",
     };
-    let _ = Command::new("canberra-gtk-play")
+    if let Ok(mut hijo) = Command::new("canberra-gtk-play")
         .args(["-i", evento])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn();
+        .spawn()
+    {
+        std::thread::spawn(move || {
+            let _ = hijo.wait();
+        });
+    }
 }
 
 /// Cuál de las dos barras del escritorio.
@@ -2726,9 +2731,6 @@ impl ShellHost {
 
     /// Tira las barras de las ventanas que ya no existen.
     pub fn barras_retener(&mut self, vivas: &[u64]) {
-        if self.barras.len() == vivas.len() {
-            return;
-        }
         self.barras.retain(|id, _| vivas.contains(id));
         self.guard("purgar barras de título", |host| {
             host.shell.barras_retener(vivas)
@@ -2773,8 +2775,9 @@ impl ShellHost {
         // sobre ellas no es pulsar un aviso.
         let id = self.shell.toast_de_delante()?;
         let (_, s) = self.toasts.iter().find(|(t, _)| *t == id)?;
+        let dx = self.shell.toast_desplazamiento_horizontal(id)? as f64;
         let rect = (
-            s.location.x / escala + sombra,
+            s.location.x / escala + sombra + dx,
             s.location.y / escala + sombra,
             s.logical.w as f64 - sombra * 2.0,
             s.logical.h as f64 - sombra * 2.0,
@@ -3005,18 +3008,28 @@ impl ShellHost {
         let Some((lw, lh)) = self.shell.diagnostico_logical_size() else {
             return;
         };
+        let escala = self.shell.scale() as f64;
+        let margen = 12.0 * escala;
+        let location = (
+            self.screen.0 as f64 - w as f64 - margen,
+            bookos_shell::PANEL_HEIGHT as f64 * escala + margen,
+        )
+            .into();
+        let tam = (w as f64, h as f64).into();
+        if let Some(surface) = self.diagnostico.as_mut()
+            && surface.src.size == tam
+            && surface.logical == (lw as i32, lh as i32).into()
+        {
+            surface.location = location;
+            paint(&mut surface.buffer, |buf| self.shell.draw_diagnostico(buf));
+            return;
+        }
         let mut surface = Surface::new((w, h), (lw as i32, lh as i32));
         // Arriba a la derecha, justo debajo del panel: es la esquina que menos
         // tapa mientras se prueba algo, y no se solapa con el OSD ni con los
         // avisos, que salen abajo y arriba a la derecha respectivamente. El
         // toast se le puede poner encima; se acepta, es una herramienta.
-        let escala = self.shell.scale() as f64;
-        let margen = 12.0 * escala;
-        surface.location = (
-            self.screen.0 as f64 - w as f64 - margen,
-            bookos_shell::PANEL_HEIGHT as f64 * escala + margen,
-        )
-            .into();
+        surface.location = location;
         paint(&mut surface.buffer, |buf| self.shell.draw_diagnostico(buf));
         self.diagnostico = Some(surface);
     }
@@ -3180,14 +3193,25 @@ impl ShellHost {
         let Some((lw, lh)) = self.shell.conmutador_logical_size() else {
             return;
         };
-        let mut surface = Surface::new((w, h), (lw as i32, lh as i32));
-        // Centrado en los dos ejes, como el de macOS: es una tarjeta modal, no
-        // un aviso que se asoma por un borde.
-        surface.location = (
+        let location = (
             (self.screen.0 as f64 - w as f64) / 2.0,
             (self.screen.1 as f64 - h as f64) / 2.0,
         )
             .into();
+        let tam = (w as f64, h as f64).into();
+        if let Some(surface) = self.conmutador.as_mut()
+            && surface.src.size == tam
+            && surface.logical == (lw as i32, lh as i32).into()
+        {
+            surface.location = location;
+            paint(&mut surface.buffer, |buf| self.shell.draw_conmutador(buf));
+            self.sincronizar_conmutador();
+            return;
+        }
+        let mut surface = Surface::new((w, h), (lw as i32, lh as i32));
+        // Centrado en los dos ejes, como el de macOS: es una tarjeta modal, no
+        // un aviso que se asoma por un borde.
+        surface.location = location;
         paint(&mut surface.buffer, |buf| self.shell.draw_conmutador(buf));
         self.conmutador = Some(surface);
         self.sincronizar_conmutador();
@@ -3257,15 +3281,27 @@ impl ShellHost {
         }
 
         let (logico, fisico) = medida(renglon.width, renglon.height);
-        let mut surface = Surface::new(fisico, (logico.0 as i32, logico.1 as i32));
-        surface.location = colocar(renglon.x, renglon.y);
+        let tam = (fisico.0 as f64, fisico.1 as f64).into();
+        let location = colocar(renglon.x, renglon.y);
+        let rehacer = self
+            .conmutador_rotulo
+            .as_ref()
+            .is_none_or(|s| s.src.size != tam || s.logical != (logico.0 as i32, logico.1 as i32).into());
+        if rehacer {
+            self.conmutador_rotulo = Some(Surface::new(fisico, (logico.0 as i32, logico.1 as i32)));
+        }
+        if let Some(surface) = self.conmutador_rotulo.as_mut() {
+            surface.location = location;
+        }
         self.guard("pintar rótulo del conmutador", |host| {
+            let Some(surface) = host.conmutador_rotulo.as_mut() else {
+                return;
+            };
             paint(&mut surface.buffer, |buf| {
                 host.shell.draw_conmutador_rotulo(buf, logico.0, logico.1);
                 Vec::new()
             });
         });
-        self.conmutador_rotulo = Some(surface);
     }
 
     /// Dónde está el recuadro del conmutador **ahora**, contando el deslizamiento.
@@ -4440,7 +4476,14 @@ impl ShellHost {
                 let (alfa, zoom, desplazamiento_x, desplazamiento_y) = match papel {
                     Papel::Aviso => (alfa_osd, escala_osd, 0.0, 0.0),
                     Papel::Toast(id, dy) => match self.shell.toast_estado(id) {
-                        Some((alfa, zoom, _)) => (alfa, zoom, 0.0, dy),
+                        Some((alfa, zoom, _)) => (
+                            alfa,
+                            zoom,
+                            self.shell
+                                .toast_desplazamiento_horizontal(id)
+                                .unwrap_or(0.0),
+                            dy,
+                        ),
                         None => (0.0, 1.0, 0.0, dy),
                     },
                     Papel::Emergente => match (pagina, vista) {

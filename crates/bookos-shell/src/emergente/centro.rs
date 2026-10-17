@@ -968,7 +968,7 @@ impl Centro {
         let (fondo, tinta) = if conectado.is_some() {
             (acento_centro(), tema::sobre_acento())
         } else {
-            (tema::card(), tinta_apagado())
+            (tema::elevado(), tinta_apagado())
         };
         container(
             row![
@@ -1021,7 +1021,7 @@ impl Centro {
         let (base, tinta) = if baldosa.activa {
             (acento_centro(), tema::sobre_acento())
         } else {
-            (tema::card(), tema::texto())
+            (tema::elevado(), tema::texto())
         };
         let fondo = tema::mezclar(base, tema::tinta(), 0.08 * self.señalada.intensidad(i));
         let celda = (ANCHO - (MARGEN + REJILLA_MARGEN) * 2.0) / COLUMNAS as f32;
@@ -1095,7 +1095,7 @@ impl Centro {
         let (fondo, tinta) = if encendido {
             (acento_centro(), tema::sobre_acento())
         } else {
-            (tema::card(), tema::TEXTO2)
+            (tema::elevado(), tema::TEXTO2)
         };
         row![
             dibujo(icono, control::ICONO, tema::texto()),
@@ -1105,7 +1105,7 @@ impl Centro {
                 control::PILDORA,
                 nivel,
                 apagado,
-                tema::card()
+                tema::elevado()
             ),
             Space::new().width(Length::Fixed(control::HUECO)),
             Self::circulo(boton, control::BOTON, 16.0, fondo, tinta),
@@ -1164,7 +1164,7 @@ impl Centro {
                 .align_y(Vertical::Center)
                 .height(Length::Fixed(CARATULA)),
             Space::new().height(Length::Fixed(10.0)),
-            control::pildora(ancho, AVANCE, avance, false, tema::card()),
+            control::pildora(ancho, AVANCE, avance, false, tema::elevado()),
             Space::new().height(Length::Fixed(6.0)),
             row![
                 text(medios::reloj(sonando.posicion.unwrap_or(0)))

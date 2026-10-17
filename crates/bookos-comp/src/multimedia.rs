@@ -251,6 +251,13 @@ fn buscar_evento(nombre: &str) -> Option<std::path::PathBuf> {
 /// Un hilo que duerme en `poll(POLLPRI)`, que es como sysfs notifica un
 /// atributo, y no un temporizador que relea el fichero: no despierta la CPU
 /// hasta que alguien pulsa la tecla.
+///
+/// El mismo `poll` escucha los uevents de `leds`: si el driver se recarga
+/// (`modprobe -r` al reinstalar el módulo), el LED nace de nuevo y el fichero
+/// abierto queda apuntando al nodo viejo, que ya no notifica nunca. Pasó así:
+/// tras una recarga a las 05:26 el hilo seguía dormido en el nodo muerto y
+/// Fn+F9 dejó de enseñar el aviso.
+#[cfg(feature = "udev")]
 pub fn vigilar_luz_teclado(state: &mut BookosComp) {
     use smithay::reexports::calloop::channel;
     let Some((dispositivo, _, maximo)) = bookos_shell::brillo_teclado_actual() else {
@@ -263,6 +270,9 @@ pub fn vigilar_luz_teclado(state: &mut BookosComp) {
     let Ok(fichero) = std::fs::File::open(&ruta) else {
         return;
     };
+    // El hilo compara los uevents con este nombre; el original se lo queda el
+    // receptor del bucle principal.
+    let nombre = dispositivo.clone();
     let (emisor, receptor) = channel::channel::<u32>();
     let registrado = state
         .loop_handle
@@ -284,9 +294,21 @@ pub fn vigilar_luz_teclado(state: &mut BookosComp) {
         .name("bookos-luz-teclado".into())
         .spawn(move || {
             use smithay::reexports::rustix::event::{PollFd, PollFlags, poll};
-            let leer = || {
+            use smithay::reexports::udev::{EventType, MonitorBuilder};
+            let monitor = MonitorBuilder::new()
+                .and_then(|m| m.match_subsystem("leds"))
+                .and_then(|m| m.listen());
+            let monitor = match monitor {
+                Ok(monitor) => monitor,
+                Err(err) => {
+                    tracing::warn!("sin aviso de la luz del teclado: {err}");
+                    return;
+                }
+            };
+            let mut fichero = fichero;
+            let leer = |fichero: &std::fs::File| {
                 let mut buf = [0u8; 16];
-                let n = smithay::reexports::rustix::io::pread(&fichero, &mut buf, 0).ok()?;
+                let n = smithay::reexports::rustix::io::pread(fichero, &mut buf, 0).ok()?;
                 std::str::from_utf8(&buf[..n])
                     .ok()?
                     .trim()
@@ -295,13 +317,41 @@ pub fn vigilar_luz_teclado(state: &mut BookosComp) {
             };
             // sysfs exige una lectura antes del primer `poll`, o vuelve en
             // seguida; antes del primer cambio falla con ENODATA y da igual.
-            let _ = leer();
+            let _ = leer(&fichero);
             loop {
-                let mut fds = [PollFd::new(&fichero, PollFlags::PRI | PollFlags::ERR)];
+                let mut fds = [
+                    PollFd::new(&fichero, PollFlags::PRI | PollFlags::ERR),
+                    PollFd::new(&monitor, PollFlags::IN),
+                ];
                 if poll(&mut fds, None).is_err() {
                     return;
                 }
-                if let Some(nivel) = leer()
+                let (luz, uevent) = (!fds[0].revents().is_empty(), !fds[1].revents().is_empty());
+                if uevent {
+                    // `count` y no `any`: hay que vaciar la cola entera, o lo
+                    // que quede sin leer vuelve a despertar el `poll`.
+                    let renacido = monitor
+                        .iter()
+                        .filter(|evento| {
+                            evento.event_type() == EventType::Add
+                                && evento.sysname() == nombre.as_str()
+                        })
+                        .count();
+                    if renacido > 0 {
+                        match std::fs::File::open(&ruta) {
+                            Ok(nuevo) => {
+                                fichero = nuevo;
+                                let _ = leer(&fichero);
+                                tracing::info!("luz del teclado reabierta tras recargar el driver");
+                            }
+                            Err(err) => {
+                                tracing::warn!("no se pudo reabrir la luz del teclado: {err}")
+                            }
+                        }
+                    }
+                }
+                if luz
+                    && let Some(nivel) = leer(&fichero)
                     && emisor.send(nivel).is_err()
                 {
                     // El compositor se ha ido: no hay a quién avisar.

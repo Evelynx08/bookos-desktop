@@ -123,6 +123,14 @@ pub fn actualizar_escala(state: &mut BookosComp) {
         return;
     }
     datos.compositor_state.set_client_scale(escala);
+    // Smithay solo reenvía el tamaño de la salida en la escala nueva dentro de
+    // `change_current_state`, y XWayland ya la tenía enlazada a escala 1. Sin
+    // esto su raíz se quedaba en lógicos (medido con `xdpyinfo`: 1440x900 en
+    // el panel de 2880x1800) mientras las ventanas iban en físicos: todo lo
+    // que caía fuera de ese cuarto de pantalla no recibía el puntero.
+    for salida in state.space.outputs() {
+        salida.change_current_state(None, None, None, None);
+    }
     tracing::info!(escala, "escala de XWayland");
     let Some(n) = state.display_x11 else {
         return;
@@ -479,6 +487,23 @@ impl smithay::xwayland::XwmHandler for BookosComp {
 impl smithay::wayland::xwayland_shell::XWaylandShellHandler for BookosComp {
     fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState {
         &mut self.xwayland_shell_state
+    }
+
+    /// `colocar_si_es_nueva` enfoca la ventana en el `MapNotify`, pero ahí una
+    /// ventana X11 todavía no tiene `wl_surface` y el foco de teclado se queda
+    /// en nada: no se podía escribir en ella hasta hacerle clic. Se repite
+    /// aquí, que es cuando ya hay a quién dárselo.
+    fn surface_associated(
+        &mut self,
+        _xwm: XwmId,
+        _wl_surface: smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+        surface: X11Surface,
+    ) {
+        if surface.is_activated()
+            && let Some(elemento) = self.window_de_x11(&surface)
+        {
+            self.enfocar(&elemento);
+        }
     }
 }
 

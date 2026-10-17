@@ -18,6 +18,7 @@
 //! temporizador repintando por fotograma — justo lo que este compositor evita.
 
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use iced_core::{Border, Color, Length};
 use iced_widget::{Space, column, container, image as iced_image, row, svg, text};
@@ -115,6 +116,9 @@ pub struct DockItem {
     /// lista en la configuración al anclar o desanclar algo: sin él habría que
     /// adivinarlo del `exec`, y no siempre coinciden.
     icono_nombre: String,
+    /// Cuándo se reescribió en disco el icono, solo si es dinámico. Ver
+    /// [`Dock::refrescar_dinamicos`].
+    icono_modificado: Option<SystemTime>,
     /// Tiene al menos una ventana en el escritorio.
     abierta: bool,
     /// Está fijada por el usuario. Los que no lo están salen en el dock solo
@@ -135,6 +139,7 @@ impl DockItem {
             label: label.to_string(),
             app_id: app_id.to_string(),
             icono_nombre: icon_name.to_string(),
+            icono_modificado: icono::modificado_si_dinamico(icon_name),
             anclada: true,
             icon,
             abierta: false,
@@ -294,19 +299,28 @@ impl Dock {
     }
 
     /// Vuelve a leer los iconos que cambian solos (reloj, calendario).
-    /// Devuelve `true` si hay alguno en el dock, que es cuando hay que
-    /// repintarlo.
+    /// Devuelve `true` si alguno cambió, que es cuando hay que repintar.
+    ///
+    /// Se mira el `mtime` antes de leer: el calendario reescribe su PNG una vez
+    /// al día y esto se llama cada minuto y con cada aviso del kernel. Sin la
+    /// comprobación, cada llamada decodificaba el PNG en un `Handle` de id
+    /// nuevo —iced vuelve a subir la imagen— y repintaba el dock entero.
     pub fn refrescar_dinamicos(&mut self) -> bool {
-        let mut alguno = false;
+        let mut cambio = false;
         for item in self
             .items
             .iter_mut()
             .filter(|i| icono::es_dinamico(&i.icono_nombre))
         {
+            let modificado = icono::modificado_si_dinamico(&item.icono_nombre);
+            if modificado == item.icono_modificado {
+                continue;
+            }
+            item.icono_modificado = modificado;
             item.icon = icono::cargar(&item.icono_nombre);
-            alguno = true;
+            cambio = true;
         }
-        alguno
+        cambio
     }
 
     /// Vuelve a cargar todos los iconos, tras cambiar el tema de iconos.
@@ -621,6 +635,7 @@ mod tests {
                 label: format!("P{i}"),
                 app_id: format!("org.bookos.prog{i}"),
                 icono_nombre: String::new(),
+                icono_modificado: None,
                 icon: None,
                 anclada: true,
                 abierta: false,
@@ -702,6 +717,7 @@ mod tests {
             label: "Terminal".into(),
             app_id: "konsole".into(),
             icono_nombre: "konsole".into(),
+            icono_modificado: None,
             icon: None,
             anclada: true,
             abierta: false,

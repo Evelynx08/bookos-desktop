@@ -1050,6 +1050,7 @@ fn recargar(state: &mut crate::state::BookosComp, seccion: &str) {
         crate::backend::programar_bloqueo_inactividad(state);
         crate::backend::programar_suspension_inactividad(state);
     }
+    crate::publicar::publicar(&state.fondo_config);
     state.needs_redraw = true;
 }
 

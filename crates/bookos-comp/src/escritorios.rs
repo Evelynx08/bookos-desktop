@@ -197,6 +197,15 @@ impl Escritorios {
     pub fn despejado(&self) -> bool {
         !self.escondidas.is_empty()
     }
+
+    /// Las ventanas que no están en el `Space` pero siguen vivas: las de los
+    /// otros escritorios y las que apartó «mostrar escritorio».
+    pub fn apartadas(&self) -> impl Iterator<Item = &Window> {
+        self.escondidas
+            .iter()
+            .chain(self.guardadas.values().flatten().flatten())
+            .map(|(w, _)| w)
+    }
 }
 
 /// Instantánea de las ventanas de todos los escritorios **de una salida**, para
@@ -870,6 +879,7 @@ pub fn purgar(state: &mut BookosComp) {
     {
         lista.retain(|(w, _)| w.alive());
     }
+    state.capturas.retain(|(w, _)| w.alive());
 }
 
 #[cfg(test)]
@@ -1303,13 +1313,12 @@ fn ventana_bajo(
         .find(|(_, _, r)| r.to_f64().contains(punto))
 }
 
-/// Lado del ✕ de cerrar en la vista, en lógicos. 26 es el botón pequeño del
-/// HIG, el mismo que los semáforos de la barra de título.
-pub const LADO_CERRAR: i32 = 26;
+/// Zona sensible del cierre, igual que en la barra de título (HIG §11.2).
+pub const LADO_CERRAR: i32 = 28;
 
-/// Dónde va el ✕ de una ventana repartida en la vista: montado sobre su
-/// esquina superior izquierda, como en macOS, por encima de la barra de
-/// título si BookOS la dibuja.
+/// El cierre conserva su tamaño al reducir la ventana para que siga siendo
+/// pulsable. Sobresale de la esquina para no solaparse con el cierre de la
+/// barra de título, que también se ve dentro de la miniatura.
 pub fn boton_cerrar(window: &Window, destino: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
     let arriba = if crate::decoracion::decorada(window) {
         let factor = destino.size.w as f64 / window.geometry().size.w.max(1) as f64;
@@ -1319,13 +1328,13 @@ pub fn boton_cerrar(window: &Window, destino: Rectangle<i32, Logical>) -> Rectan
     };
     let medio = LADO_CERRAR / 2;
     Rectangle::new(
-        (destino.loc.x - medio, arriba - medio).into(),
+        (destino.loc.x + destino.size.w - medio, arriba - medio).into(),
         (LADO_CERRAR, LADO_CERRAR).into(),
     )
 }
 
 /// La ventana de la vista cuyo ✕ se enseña: la que tiene el puntero encima, o
-/// su ✕, que sobresale de ella. Solo una: con todas a la vez la rejilla se
+/// su ✕. Solo una: con todas a la vez la rejilla se
 /// llenaba de botones de cerrar, que es lo último que se quiere pulsar sin
 /// querer.
 pub fn con_cierre_visible(
@@ -1339,20 +1348,12 @@ pub fn con_cierre_visible(
     })
 }
 
-/// El ✕ rasterizado a `lado` píxeles físicos. Disco gris oscuro con borde
-/// claro para que se lea igual sobre una ventana clara que sobre una oscura.
+/// El mismo glifo, tinta y placa de la barra de título (HIG §11.2).
 pub fn imagen_cerrar(
     lado: i32,
+    señalado: bool,
 ) -> Option<smithay::backend::renderer::element::memory::MemoryRenderBuffer> {
-    const SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 26 26"><circle cx="13" cy="13" r="12" fill="#3a3a3c" stroke="#ffffff" stroke-opacity="0.35" stroke-width="1"/><path d="M9 9l8 8M17 9l-8 8" stroke="#ffffff" stroke-width="2" stroke-linecap="round"/></svg>"##;
-    let arbol = resvg::usvg::Tree::from_str(SVG, &resvg::usvg::Options::default()).ok()?;
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(lado as u32, lado as u32)?;
-    let k = lado as f32 / LADO_CERRAR as f32;
-    resvg::render(
-        &arbol,
-        resvg::tiny_skia::Transform::from_scale(k, k),
-        &mut pixmap.as_mut(),
-    );
+    let pixmap = pixmap_cerrar(lado, señalado)?;
     // tiny-skia da RGBA premultiplicado: en little-endian es Abgr8888.
     Some(
         smithay::backend::renderer::element::memory::MemoryRenderBuffer::from_slice(
@@ -1364,6 +1365,46 @@ pub fn imagen_cerrar(
             None,
         ),
     )
+}
+
+fn pixmap_cerrar(lado: i32, señalado: bool) -> Option<resvg::tiny_skia::Pixmap> {
+    use bookos_shell::tema;
+    let fondo = tema::rojo();
+    let tinta = if señalado {
+        tema::tinta_sobre(fondo)
+    } else {
+        tema::texto()
+    };
+    let rgb = |[r, g, b]: [f32; 3]| {
+        format!(
+            "rgb({},{},{})",
+            (r * 255.0).round(),
+            (g * 255.0).round(),
+            (b * 255.0).round()
+        )
+    };
+    let placa = if señalado {
+        format!(
+            r#"<rect width="28" height="28" rx="6" fill="{}" fill-opacity="0.95"/>"#,
+            rgb([fondo.r, fondo.g, fondo.b])
+        )
+    } else {
+        String::new()
+    };
+    let svg = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28">{placa}<path transform="translate(6 6)" d="M4.6 4.6 L11.4 11.4 M11.4 4.6 L4.6 11.4" fill="none" stroke="{}" stroke-opacity="{}" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>"#,
+        rgb([tinta.r, tinta.g, tinta.b]),
+        if señalado { 1.0 } else { 0.55 },
+    );
+    let arbol = resvg::usvg::Tree::from_str(&svg, &resvg::usvg::Options::default()).ok()?;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(lado as u32, lado as u32)?;
+    let k = lado as f32 / LADO_CERRAR as f32;
+    resvg::render(
+        &arbol,
+        resvg::tiny_skia::Transform::from_scale(k, k),
+        &mut pixmap.as_mut(),
+    );
+    Some(pixmap)
 }
 
 /// Una ventana cogida de una miniatura de la vista de escritorios.

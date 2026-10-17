@@ -86,6 +86,7 @@ pub use emergente::Transicion as TransicionLaunchpad;
 /// por la rejilla.
 pub use emergente::launchpad::UMBRAL_ARRASTRE;
 pub use emergente::mantener_despierto;
+pub use emergente::recortar_texto;
 pub use emergente::{Ancla, Emergente, ModoProyeccion, PantallaCompartible};
 /// El icono ya cargado de una aplicación. Sale al exterior porque el conmutador
 /// lo arma el compositor, que conoce las ventanas pero no el tema de iconos.
@@ -126,17 +127,23 @@ pub use config::{
     Entrada, FuenteReloj, LuzNocturna, MAXIMO_ESCRITORIOS, ModoLuzNocturna, Pasos,
     guardar_apariencia, guardar_brillo_automatico, guardar_configuracion, guardar_dock,
     guardar_efectos, guardar_escritorios, guardar_esquiva, guardar_fondo, guardar_luz_nocturna,
-    luz_nocturna_encendida, marcar_luz_nocturna, olvidar_fondo,
+    luz_nocturna_encendida, marcar_luz_nocturna, olvidar_fondo, ruta as ruta_config,
 };
 pub use dock::{
     Dock, DockItem, ICON as DOCK_ICON, MARGIN as DOCK_MARGIN, PAD as DOCK_PAD,
     icon_path as icon_debug,
 };
+/// Donde cada sesión deja la apariencia que la pantalla de acceso puede leer
+/// antes de que nadie haya entrado: `<login>/panel.conf`, los fondos y el
+/// avatar. No vale `~/.config`: el greeter es otro usuario y no llega.
+pub const APARIENCIA_PUBLICA: &str = "/var/lib/bookos/apariencia";
 pub use state::PanelData;
 /// La hora local de ahora, en `(hora, minuto)`. La necesita el compositor para
 /// el temporizador del tema automático.
 pub use state::hora_local_ahora;
+pub use state::{Battery, Link, Network};
 pub use widget::Widget;
+pub use widgets::bateria_sobre_fondo;
 
 /// Alto del panel en píxeles lógicos.
 pub const PANEL_HEIGHT: u32 = 32;
@@ -658,7 +665,15 @@ pub struct Shell {
     /// estático compartido que no se duplica.
     renderer_panel: Renderer,
     renderer_dock: Renderer,
+    /// El de las superficies modales grandes (emergente y bloqueo), aislado de
+    /// `renderer` para que las ondas de la isla de actividades o una barra de
+    /// título en segundo plano no purguen los iconos del launchpad a mitad de
+    /// animación, y para poder soltar sus bitmaps al cerrar la modal.
+    renderer_modal: Renderer,
     renderer: Renderer,
+    /// Máscara de recorte reutilizada entre llamadas a `paint_con_fondo` para
+    /// no reservar y liberar varios MB por fotograma.
+    mask: Option<tiny_skia::Mask>,
 
     panel: Canvas,
     widgets: widget::Panel,
@@ -811,7 +826,9 @@ impl Shell {
             // Font::DEFAULT resuelve contra las fuentes del sistema vía fontdb.
             renderer_panel: Renderer::new(Font::DEFAULT, Pixels(13.0)),
             renderer_dock: Renderer::new(Font::DEFAULT, Pixels(13.0)),
+            renderer_modal: Renderer::new(Font::DEFAULT, Pixels(13.0)),
             renderer: Renderer::new(Font::DEFAULT, Pixels(13.0)),
+            mask: None,
             theme: view::theme(),
             panel: Canvas::new(Size::new(width as f32, PANEL_HEIGHT as f32), scale),
             widgets,
@@ -949,9 +966,10 @@ impl Shell {
             renderer,
             theme,
             escritorio_canvas,
+            mask,
             ..
         } = self;
-        Self::paint(escritorio_canvas, renderer, theme, view, buf)
+        Self::paint(escritorio_canvas, renderer, mask, theme, view, buf)
     }
 
     /// Relee los estados. Devuelve `true` si hay que repintar el panel.
@@ -1008,6 +1026,7 @@ impl Shell {
             self.actividades.clear();
             return;
         }
+        let portada_nueva = estado.portada.is_some();
         // La portada pesa cientos de KB. El Player solo la reenvía al cambiar
         // de canción y las actualizaciones de posición llegan vacías.
         //
@@ -1020,6 +1039,10 @@ impl Shell {
         if let Some(mut anterior) = self.actividades.remove(&estado.app_id) {
             if estado.portada.is_none() {
                 estado.portada = anterior.portada.take();
+            } else if let Some((actual, _)) = self.actividad.as_mut()
+                && actual.app_id() == estado.app_id
+            {
+                actual.invalidar_arte();
             }
             for item in estado.cola.iter_mut().filter(|i| i.portada.is_none()) {
                 item.portada = anterior
@@ -1028,6 +1051,11 @@ impl Shell {
                     .find(|a| a.id == item.id)
                     .and_then(|a| a.portada.take());
             }
+        } else if portada_nueva
+            && let Some((actual, _)) = self.actividad.as_mut()
+            && actual.app_id() == estado.app_id
+        {
+            actual.invalidar_arte();
         }
         self.actividades.insert(estado.app_id.clone(), estado);
         self.sincronizar_actividad();
@@ -1089,7 +1117,7 @@ impl Shell {
             self.actividad = None;
             return;
         }
-        let estado = vivas.remove(principal).clone();
+        let elegido = vivas.remove(principal);
         let burbujas = vivas
             .iter()
             .map(|e| actividad::Burbuja {
@@ -1101,7 +1129,47 @@ impl Shell {
             .collect();
         let escala = self.panel.scale;
         match self.actividad.as_mut() {
-            Some((actual, canvas)) if actual.app_id() == estado.app_id => {
+            Some((actual, canvas)) if actual.app_id() == elegido.app_id => {
+                // La carátula y las miniaturas ya están recortadas en `actual`:
+                // clonar varios MB de RGBA cada segundo solo para mover la
+                // posición de reproducción desperdiciaría RAM y CPU.
+                let mut estado = actividad::Estado {
+                    app_id: elegido.app_id.clone(),
+                    clase: elegido.clase,
+                    titulo: elegido.titulo.clone(),
+                    subtitulo: elegido.subtitulo.clone(),
+                    posicion_ms: elegido.posicion_ms,
+                    duracion_ms: elegido.duracion_ms,
+                    restante_ms: elegido.restante_ms,
+                    pausado: elegido.pausado,
+                    activo: elegido.activo,
+                    nivel: elegido.nivel,
+                    volumen: elegido.volumen,
+                    aleatorio: elegido.aleatorio,
+                    repetir: elegido.repetir,
+                    portada: None,
+                    cola: elegido
+                        .cola
+                        .iter()
+                        .map(|item| actividad::ItemCola {
+                            id: item.id.clone(),
+                            titulo: item.titulo.clone(),
+                            artista: item.artista.clone(),
+                            duracion_ms: item.duracion_ms,
+                            favorita: item.favorita,
+                            actual: item.actual,
+                            portada: if actual.tiene_miniatura(&item.id) {
+                                None
+                            } else {
+                                item.portada.clone()
+                            },
+                        })
+                        .collect(),
+                    metricas: elegido.metricas.clone(),
+                };
+                if !actual.tiene_arte() {
+                    estado.portada = elegido.portada.clone();
+                }
                 actual.actualizar(estado);
                 actual.poner_burbujas(burbujas);
                 let (w, h) = actual.size();
@@ -1113,8 +1181,10 @@ impl Shell {
                 }
             }
             _ => {
-                let mut actividad =
-                    actividad::Actividad::nueva(estado, self.actividades_config.animaciones);
+                let mut actividad = actividad::Actividad::nueva(
+                    elegido.clone(),
+                    self.actividades_config.animaciones,
+                );
                 actividad.poner_burbujas(burbujas);
                 let (w, h) = actividad.size();
                 self.actividad = Some((actividad, Canvas::new(Size::new(w, h), escala)));
@@ -1256,7 +1326,14 @@ impl Shell {
             return Vec::new();
         };
         let vista = actividad.view();
-        let damage = Self::paint(canvas, &mut self.renderer, &self.theme, vista, buf);
+        let damage = Self::paint(
+            canvas,
+            &mut self.renderer,
+            &mut self.mask,
+            &self.theme,
+            vista,
+            buf,
+        );
         actividad.marcar_ondas_pintadas();
         damage
     }
@@ -1350,6 +1427,10 @@ impl Shell {
     pub fn toast_estado(&self, id: u32) -> Option<(f32, f32, f32)> {
         self.toast(id)
             .map(|(t, _)| (t.alfa(), t.escala(), t.desplazamiento()))
+    }
+
+    pub fn toast_desplazamiento_horizontal(&self, id: u32) -> Option<f32> {
+        self.toast(id).map(|(t, _)| t.desplazamiento_horizontal())
     }
 
     /// Los avisos en el orden en que hay que componerlos: el de delante
@@ -1486,6 +1567,7 @@ impl Shell {
         Self::paint(
             &mut barra.canvas,
             &mut self.renderer,
+            &mut self.mask,
             &self.theme,
             vista,
             buf,
@@ -1504,7 +1586,14 @@ impl Shell {
             return Vec::new();
         };
         let vista = t.view();
-        Self::paint(canvas, &mut self.renderer, &self.theme, vista, buf)
+        Self::paint(
+            canvas,
+            &mut self.renderer,
+            &mut self.mask,
+            &self.theme,
+            vista,
+            buf,
+        )
     }
 
     /// Retira la del `id`, la haya cerrado quien la haya cerrado.
@@ -1681,6 +1770,13 @@ impl Shell {
 
     // --- Superficies emergentes --------------------------------------------
 
+    fn limpiar_cache_modal(&mut self) {
+        if self.emergente.is_none() && self.bloqueo.is_none() {
+            self.renderer_modal = Renderer::new(Font::DEFAULT, Pixels(13.0));
+            self.mask = None;
+        }
+    }
+
     /// Abre una emergente, cerrando la que hubiera.
     pub fn abrir(&mut self, mut emergente: Emergente) {
         // La tarjeta de notificaciones nace con la cola dentro. Va aquí y no
@@ -1724,7 +1820,11 @@ impl Shell {
 
     /// Cierra la emergente abierta. `true` si había alguna.
     pub fn cerrar_emergente(&mut self) -> bool {
-        self.emergente.take().is_some()
+        let cerrada = self.emergente.take().is_some();
+        if cerrada {
+            self.limpiar_cache_modal();
+        }
+        cerrada
     }
 
     /// El nombre de la emergente abierta, para las trazas y las pruebas.
@@ -1815,6 +1915,7 @@ impl Shell {
         // hueco no: ahí el usuario ha fallado la puntería, no ha decidido nada.
         if accion.as_ref().is_some_and(|a| !a.conserva_emergente()) {
             self.emergente = None;
+            self.limpiar_cache_modal();
         } else if accion.is_some() {
             canvas.painted_once = false;
         }
@@ -1866,6 +1967,7 @@ impl Shell {
         match e.tecla(tecla) {
             emergente::Tecla::Cerrar => {
                 self.emergente = None;
+                self.limpiar_cache_modal();
                 (true, None)
             }
             emergente::Tecla::Consumida => {
@@ -1879,6 +1981,7 @@ impl Shell {
                     canvas.painted_once = false;
                 } else {
                     self.emergente = None;
+                    self.limpiar_cache_modal();
                 }
                 (true, Some(accion))
             }
@@ -1991,7 +2094,14 @@ impl Shell {
 
         let escala = self.panel.scale;
         let mut canvas = Canvas::new(Size::new(ancho, alto), escala);
-        Self::paint(&mut canvas, &mut self.renderer, &self.theme, vista, buf);
+        Self::paint(
+            &mut canvas,
+            &mut self.renderer,
+            &mut self.mask,
+            &self.theme,
+            vista,
+            buf,
+        );
     }
 
     /// Pinta la emergente. `buf` debe tener el tamaño de
@@ -2002,7 +2112,15 @@ impl Shell {
         };
         let fondo = e.fondo().unwrap_or(Color::TRANSPARENT);
         let view = e.view();
-        Self::paint_con_fondo(canvas, &mut self.renderer, &self.theme, view, buf, fondo)
+        Self::paint_con_fondo(
+            canvas,
+            &mut self.renderer_modal,
+            &mut self.mask,
+            &self.theme,
+            view,
+            buf,
+            fondo,
+        )
     }
 
     /// Qué pasa al pulsar en el panel, en coordenadas lógicas de pantalla.
@@ -2145,6 +2263,7 @@ impl Shell {
         // salía de `pulsar`.
         if accion.as_ref().is_some_and(|a| !a.conserva_emergente()) {
             self.emergente = None;
+            self.limpiar_cache_modal();
         }
         (repintar, accion)
     }
@@ -2197,7 +2316,14 @@ impl Shell {
         };
         let escala = self.panel.scale;
         let mut canvas = Canvas::new(Size::new(lado, lado), escala);
-        Self::paint(&mut canvas, &mut self.renderer, &self.theme, vista, buf);
+        Self::paint(
+            &mut canvas,
+            &mut self.renderer,
+            &mut self.mask,
+            &self.theme,
+            vista,
+            buf,
+        );
     }
 
     /// El centro de una celda del launchpad, en coordenadas de pantalla. Para
@@ -2357,7 +2483,14 @@ impl Shell {
             return Vec::new();
         };
         let vista = osd.view();
-        Self::paint(canvas, &mut self.renderer, &self.theme, vista, buf)
+        Self::paint(
+            canvas,
+            &mut self.renderer,
+            &mut self.mask,
+            &self.theme,
+            vista,
+            buf,
+        )
     }
 
     /// Cambia la preferencia de efectos y la aplica. Devuelve la elegida, que
@@ -2457,7 +2590,14 @@ impl Shell {
             return Vec::new();
         };
         let vista = hud.view();
-        Self::paint(canvas, &mut self.renderer, &self.theme, vista, buf)
+        Self::paint(
+            canvas,
+            &mut self.renderer,
+            &mut self.mask,
+            &self.theme,
+            vista,
+            buf,
+        )
     }
 
     // --- Conmutador de aplicaciones ----------------------------------------
@@ -2565,7 +2705,14 @@ impl Shell {
     pub fn draw_conmutador_realce(&mut self, buf: &mut [u8], ancho: f32, alto: f32) {
         let mut canvas = Canvas::new(Size::new(ancho, alto), self.panel.scale);
         let vista = conmutador::Conmutador::view_realce();
-        Self::paint(&mut canvas, &mut self.renderer, &self.theme, vista, buf);
+        Self::paint(
+            &mut canvas,
+            &mut self.renderer,
+            &mut self.mask,
+            &self.theme,
+            vista,
+            buf,
+        );
     }
 
     /// Pinta el rótulo de la elegida en `buf`, de `ancho` × `alto` lógicos. Es
@@ -2578,6 +2725,7 @@ impl Shell {
         Self::paint(
             &mut canvas,
             &mut self.renderer,
+            &mut self.mask,
             &self.theme,
             c.view_rotulo(),
             buf,
@@ -2589,7 +2737,14 @@ impl Shell {
             return Vec::new();
         };
         let vista = c.view();
-        Self::paint(canvas, &mut self.renderer, &self.theme, vista, buf)
+        Self::paint(
+            canvas,
+            &mut self.renderer,
+            &mut self.mask,
+            &self.theme,
+            vista,
+            buf,
+        )
     }
 
     /// Echa el bloqueo, con la hora ya formateada.
@@ -2729,11 +2884,19 @@ impl Shell {
             PiezaCaptura::Barra => (c.vista_barra(), barra),
             PiezaCaptura::Pastilla => (c.vista_pastilla(), pastilla),
         };
-        Self::paint(canvas, &mut self.renderer, &self.theme, vista, buf)
+        Self::paint(
+            canvas,
+            &mut self.renderer,
+            &mut self.mask,
+            &self.theme,
+            vista,
+            buf,
+        )
     }
 
     pub fn desbloquear(&mut self) {
         self.bloqueo = None;
+        self.limpiar_cache_modal();
     }
 
     pub fn esta_bloqueado(&self) -> bool {
@@ -2860,7 +3023,14 @@ impl Shell {
             return Vec::new();
         };
         let vista = bloqueo.view((canvas.size.width, canvas.size.height));
-        Self::paint(canvas, &mut self.renderer, &self.theme, vista, buf)
+        Self::paint(
+            canvas,
+            &mut self.renderer_modal,
+            &mut self.mask,
+            &self.theme,
+            vista,
+            buf,
+        )
     }
 
     /// Qué aplicación hay en ese punto del dock: `(app_id, exec, icono)`.
@@ -3015,9 +3185,10 @@ impl Shell {
             renderer_panel,
             theme,
             panel,
+            mask,
             ..
         } = self;
-        Self::paint(panel, renderer_panel, theme, view, buf)
+        Self::paint(panel, renderer_panel, mask, theme, view, buf)
     }
 
     /// Pinta el dock en `buf`, que debe tener el tamaño de
@@ -3038,19 +3209,21 @@ impl Shell {
             renderer_dock,
             theme,
             dock,
+            mask,
             ..
         } = self;
-        Self::paint(dock, renderer_dock, theme, view, buf)
+        Self::paint(dock, renderer_dock, mask, theme, view, buf)
     }
 
     fn paint(
         canvas: &mut Canvas,
         renderer: &mut Renderer,
+        mask: &mut Option<tiny_skia::Mask>,
         theme: &Theme,
         view: view::PanelElement<'_>,
         buf: &mut [u8],
     ) -> Vec<Damage> {
-        Self::paint_con_fondo(canvas, renderer, theme, view, buf, Color::TRANSPARENT)
+        Self::paint_con_fondo(canvas, renderer, mask, theme, view, buf, Color::TRANSPARENT)
     }
 
     /// Como [`Self::paint`], pero el buffer se limpia con `fondo` en vez de
@@ -3062,6 +3235,7 @@ impl Shell {
     fn paint_con_fondo(
         canvas: &mut Canvas,
         renderer: &mut Renderer,
+        mask: &mut Option<tiny_skia::Mask>,
         theme: &Theme,
         view: view::PanelElement<'_>,
         buf: &mut [u8],
@@ -3116,8 +3290,11 @@ impl Shell {
             height: logical.height,
         }];
 
-        let mut mask = tiny_skia::Mask::new(w, h).expect("máscara del tamaño del pixmap");
-        renderer.draw(&mut pixmap, &mut mask, &viewport, &zonas, fondo);
+        let mask_ref = match mask {
+            Some(m) if m.width() == w && m.height() == h => m,
+            _ => mask.insert(tiny_skia::Mask::new(w, h).expect("máscara del tamaño del pixmap")),
+        };
+        renderer.draw(&mut pixmap, mask_ref, &viewport, &zonas, fondo);
 
         canvas.painted_once = true;
         vec![Damage {

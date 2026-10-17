@@ -639,6 +639,7 @@ pub fn tema_gtk() {
     // claro u oscuro.
     let tintado = bookos_shell::icono::tema_elegido().filter(|t| t.starts_with("BookOS-Tinted"));
     let iconos = tintado.as_deref().unwrap_or_else(|| tema_iconos(claro));
+    let mut hijos = Vec::new();
     for (clave, valor) in [
         ("gtk-theme", tema.as_str()),
         ("icon-theme", iconos),
@@ -647,23 +648,37 @@ pub fn tema_gtk() {
             if claro { "prefer-light" } else { "prefer-dark" },
         ),
     ] {
-        // Sin esperar: `gsettings` habla con dconf por D-Bus y no hay nada que
-        // hacer con su respuesta. Mismo trato que `canberra-gtk-play`.
-        let _ = std::process::Command::new("gsettings")
+        // Sin esperar en este hilo: `gsettings` habla con dconf por D-Bus y no
+        // hay nada que hacer con su respuesta. Se recoge en segundo plano para
+        // no dejar zombis.
+        if let Ok(hijo) = std::process::Command::new("gsettings")
             .args(["set", "org.gnome.desktop.interface", clave, valor])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .spawn();
+            .spawn()
+        {
+            hijos.push(hijo);
+        }
     }
     let sonido = tema_sonido();
     if let Some(sonido) = sonido {
         // El OSD suena con `canberra-gtk-play`, que sigue este ajuste; las apps
         // GTK que avisan con sonido, también.
-        let _ = std::process::Command::new("gsettings")
+        if let Ok(hijo) = std::process::Command::new("gsettings")
             .args(["set", "org.gnome.desktop.sound", "theme-name", sonido])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .spawn();
+            .spawn()
+        {
+            hijos.push(hijo);
+        }
+    }
+    if !hijos.is_empty() {
+        std::thread::spawn(move || {
+            for mut hijo in hijos {
+                let _ = hijo.wait();
+            }
+        });
     }
     let Some(config) =
         std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))

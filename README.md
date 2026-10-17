@@ -333,6 +333,12 @@ It leaves in place:
 
 The log of each start-up lands in `$XDG_RUNTIME_DIR/bookos-session.log`.
 
+### Pantalla de acceso de BookOS
+
+El crate `bookos-greeter` ofrece un login básico en iced sobre greetd y Cage.
+Incluye usuario, preguntas PAM y entrada a la sesión de BookOS. Consulta
+[instalación, vista previa y recuperación](session/greeter/README.md).
+
 ---
 
 ## Shortcuts

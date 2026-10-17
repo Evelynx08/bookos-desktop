@@ -624,7 +624,7 @@ impl Config {
 
     /// El análisis, separado de la lectura para poder probarlo sin tocar el
     /// disco: es donde están todas las decisiones que pueden salir mal.
-    fn desde_texto(texto: &str, ruta: &std::path::Path) -> Self {
+    pub fn desde_texto(texto: &str, ruta: &std::path::Path) -> Self {
         let mut config = Self::default();
         for (n, linea) in texto.lines().enumerate() {
             let linea = linea.trim();
@@ -1415,7 +1415,7 @@ fn ruta_escritorio() -> Option<PathBuf> {
     Some(ruta()?.with_file_name("escritorio.conf"))
 }
 
-fn ruta() -> Option<PathBuf> {
+pub fn ruta() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
         return Some(PathBuf::from(dir).join("bookos/panel.conf"));
     }
@@ -1636,6 +1636,10 @@ mod tests {
 
     #[test]
     fn el_acento_sale_de_la_tabla_y_lo_demas_se_ignora() {
+        assert_eq!(
+            parsear("acento = automatico").acento,
+            crate::tema::Acento::Automatico
+        );
         assert_eq!(
             parsear("acento = morado").acento,
             crate::tema::Acento::Morado

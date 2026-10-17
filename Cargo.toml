@@ -1,9 +1,10 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+exclude = ["vendor/smithay"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/bookos/bookos-desktop"
@@ -13,6 +14,25 @@ smithay = { version = "0.7", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+
+# Smithay 0.7.0 con dos cambios. El primero es el commit ae6c51ba de upstream («xwm:
+# Properly cleanup non-incremental outgoing transfers», +16/−5 en
+# `src/xwayland/xwm/mod.rs`). Sin él, el gestor X11 guarda cada pegado ya
+# terminado y, al siguiente, lo «cancela» con un SelectionNotify de fallo.
+# VirtualBox pide siempre con `CurrentTime` y el mismo destino, así que toma
+# ese fallo por la respuesta al pegado nuevo: el portapapeles del anfitrión
+# llegaba a la máquina virtual una vez y luego `VERR_SHCLPB_NO_DATA` siempre.
+#
+# Y un segundo cambio que upstream no tiene: `X11Wm::new_selection` vacía la
+# conexión. Sin eso, lo copiado en Wayland no se anunciaba a X11 hasta que
+# otro suceso X11 cualquiera hacía escribir al gestor.
+# Lo que no es de upstream va marcado con «BookOS» dentro de la copia.
+#
+# Copia entera y no `git = …master`: del 0.7.0 al arreglo hay 101 commits que
+# tocan DRM y render, y no ha salido versión nueva. Cuando salga la 0.8, se
+# borran `vendor/smithay`, este bloque y el `exclude` de arriba.
+[patch.crates-io]
+smithay = { path = "vendor/smithay" }
 
 # El perfil de release importa aquí: el compositor corre en el bucle de frames.
 # fat LTO + 1 unidad de codegen dan menos saltos indirectos y binario más

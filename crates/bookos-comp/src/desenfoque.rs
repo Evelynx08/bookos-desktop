@@ -202,6 +202,36 @@ impl Cristal {
     /// Sube el fondo del escritorio con mipmaps. Se llama al cargarlo y cuando
     /// cambia el fotograma de una animación.
     pub fn preparar(&mut self, renderer: &mut GlesRenderer, rgba: &[u8], tam: (i32, i32)) {
+        if rgba.len() < (tam.0 * tam.1 * 4) as usize {
+            tracing::warn!("el fondo no tiene los píxeles que dice su tamaño");
+            return;
+        }
+        if let Some((ref tex, tam_actual)) = self.fondo
+            && tam_actual == tam
+        {
+            let tex_id = tex.tex_id();
+            if renderer
+                .with_context(|gl| unsafe {
+                    gl.BindTexture(ffi::TEXTURE_2D, tex_id);
+                    gl.TexSubImage2D(
+                        ffi::TEXTURE_2D,
+                        0,
+                        0,
+                        0,
+                        tam.0,
+                        tam.1,
+                        ffi::RGBA,
+                        ffi::UNSIGNED_BYTE,
+                        rgba.as_ptr() as *const _,
+                    );
+                    gl.GenerateMipmap(ffi::TEXTURE_2D);
+                    gl.BindTexture(ffi::TEXTURE_2D, 0);
+                })
+                .is_ok()
+            {
+                return;
+            }
+        }
         self.fondo = crear_textura(renderer, rgba, tam).map(|t| (t, tam));
     }
 

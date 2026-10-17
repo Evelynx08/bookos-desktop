@@ -105,6 +105,17 @@ impl Simbolo {
 /// el aire muerto del `viewBox` de 24: con él, la batería se vería un tercio
 /// más pequeña que sus vecinas a igualdad de altura.
 fn pictograma(porciento: u8, simbolo: Simbolo, color: iced_core::Color) -> String {
+    pictograma_con(porciento, simbolo, color, crate::view::TEXT())
+}
+
+/// El contorno aparte del tema: sobre un fondo de pantalla no vale el color del
+/// texto, que con el tema claro es negro.
+fn pictograma_con(
+    porciento: u8,
+    simbolo: Simbolo,
+    color: iced_core::Color,
+    contorno: iced_core::Color,
+) -> String {
     // La referencia usa un bloque compacto, casi a toda la altura interior,
     // con muy poco aire respecto a la carcasa. El radio bajo evita que parezca
     // una píldora y hace que se lea como nivel incluso a escala 1x.
@@ -112,7 +123,7 @@ fn pictograma(porciento: u8, simbolo: Simbolo, color: iced_core::Color) -> Strin
     const ANCHO_UTIL: f32 = 21.4;
     let relleno = ANCHO_UTIL * porciento.min(100) as f32 / 100.0;
     let c = hex(color);
-    let contorno = hex(crate::view::TEXT());
+    let contorno = hex(contorno);
     let mut svg = format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="{VIEWBOX}">
 <rect x="1.5" y="7.5" width="24.75" height="10.5" rx="2.25" fill="none"
@@ -133,7 +144,7 @@ fn pictograma(porciento: u8, simbolo: Simbolo, color: iced_core::Color) -> Strin
     let tinta = if porciento as f32 >= (simbolo.borde_derecho() - X0) / ANCHO_UTIL * 100.0 {
         "#000000".to_string()
     } else {
-        hex(crate::view::TEXT())
+        contorno.clone()
     };
     match simbolo {
         Simbolo::Nada => {}
@@ -198,6 +209,47 @@ pub fn icono_aviso(bat: &Battery) -> Icono {
         Simbolo::de(bat),
         Bateria::color(bat, None),
     ))
+}
+
+/// El widget del panel para pintarlo fuera de él, sobre el fondo de pantalla:
+/// la misma pila, con el color del perfil de energía, y la misma cifra al lado.
+///
+/// Cambian dos cosas. El contorno va en blanco fijo, porque ahí el color del
+/// texto del tema puede ser negro. Y enchufado no se cambia la pila por el rayo
+/// suelto: en el panel el rayo tiene vecinos que dicen que aquello es la
+/// batería, y solo sobre una foto se lee como un adorno. Se deja la pila, en
+/// verde, con el rayo dentro.
+///
+/// Devuelve el pictograma, su tamaño, la etiqueta y el color de la etiqueta.
+pub fn sobre_fondo(bat: &Battery) -> (Icono, (f32, f32), String, iced_core::Color) {
+    let blanco = iced_core::Color::WHITE;
+    let color = if bat.plugged {
+        tema::verde()
+    } else {
+        let perfil = std::fs::read_to_string("/sys/firmware/acpi/platform_profile").ok();
+        match Bateria::color(bat, perfil.as_deref().map(str::trim)) {
+            // Sin perfil conocido el panel usa el color del texto del tema.
+            color if color == TEXT() => blanco,
+            color => color,
+        }
+    };
+    let icono = icono::desde_svg(&pictograma_con(
+        bat.percent,
+        Simbolo::de(bat),
+        color,
+        blanco,
+    ));
+    let tinta = if bat.percent <= 15 && !bat.plugged {
+        PELIGRO()
+    } else {
+        blanco
+    };
+    (
+        icono,
+        (ANCHO_ICONO, ALTO_ICONO),
+        Bateria::etiqueta(bat),
+        tinta,
+    )
 }
 
 pub struct Bateria {

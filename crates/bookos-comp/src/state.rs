@@ -58,6 +58,10 @@ pub struct Bloqueo {
     /// vuelve a intentar mientras dure el bloqueo: cada intento son varios
     /// segundos de espera y un mensaje de error por algo que no va a cambiar.
     pub huella_sin_lector: bool,
+    /// Cuántas veces ha vuelto el equipo de dormir con este bloqueo echado.
+    /// La conversación con el lector compara el valor con el que tenía al
+    /// lanzarse: si cambió, su «no disponible» lo provocó la suspensión.
+    pub huella_reanudaciones: u32,
     /// El último intento falló y aún no se ha vuelto a escribir.
     pub fallo: bool,
     /// Fallos consecutivos y barrera local adicional a la que aplique PAM.
@@ -365,9 +369,11 @@ pub struct BookosComp {
     /// La pulsación cayó en el ✕ de una ventana de la vista: el soltar
     /// también es nuestro, o el shell lo tomaría por un clic suelto.
     pub cierre_en_vista: bool,
-    /// El ✕ de la vista ya rasterizado, con su lado en píxeles físicos.
+    /// El cierre rasterizado; el tema y el hover invalidan también la textura.
     pub boton_cerrar_vista: Option<(
         i32,
+        bookos_shell::tema::Tema,
+        bool,
         smithay::backend::renderer::element::memory::MemoryRenderBuffer,
     )>,
     /// La foto del tema anterior mientras se desvanece. Ver [`crate::fundido`].
@@ -1294,6 +1300,8 @@ impl BookosComp {
     }
 
     pub fn post_dispatch(&mut self) {
+        self.hijos
+            .retain_mut(|hijo| !matches!(hijo.try_wait(), Ok(Some(_))));
         self.actualizar_foreign_toplevels();
         self.popups.cleanup();
         // Retira layer-surfaces cuyo cliente desapareció sin dejar residuos

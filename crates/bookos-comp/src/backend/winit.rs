@@ -170,6 +170,7 @@ pub fn run(
     ));
     state.velo_captura = crate::captura::Velo::new(backend.renderer());
     state.fondo = crate::fondo::Fondo::cargar(&state.fondo_config);
+    crate::backend::actualizar_acento_del_fondo(state);
     crate::backend::programar_fondo_animado(state);
     // El cristal desenfoca el fondo, así que necesita su propia copia con
     // mipmaps. En fondos animados se sustituye al avanzar el fotograma.

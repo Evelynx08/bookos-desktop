@@ -460,6 +460,20 @@ pub fn elements(
                     .map(|d| d.lock().unwrap().hotspot)
                     .unwrap_or_default()
             });
+            // Un programa X11 carga el cursor a `XCURSOR_SIZE` píxeles sin
+            // saber de escalas, y con XWayland en físicos eso es la mitad de
+            // grande en un panel a 2. Se amplía aquí: el entorno es el mismo
+            // para clientes X11 y Wayland, así que no se le puede dar a unos
+            // un tamaño y a otros otro.
+            use smithay::reexports::wayland_server::Resource;
+            let scale = scale
+                * surface
+                    .client()
+                    .and_then(|c| {
+                        c.get_data::<smithay::xwayland::XWaylandClientData>()
+                            .map(|d| d.compositor_state.client_scale())
+                    })
+                    .unwrap_or(1.0);
             let origin = (
                 location.x - hotspot.x as f64 * scale,
                 location.y - hotspot.y as f64 * scale,

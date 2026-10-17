@@ -391,7 +391,10 @@ impl Energia {
         if self.activo.as_deref() == Some(clave.as_str()) {
             return None;
         }
-        let _ = Command::new("busctl")
+        // Esperado en un hilo aparte: sin `wait` el `busctl` terminado se
+        // queda de zombi colgando del compositor, y esperarlo aquí detendría
+        // el bucle lo que tarde el daemon en contestar.
+        if let Ok(mut hijo) = Command::new("busctl")
             .args([
                 "--system",
                 "set-property",
@@ -404,7 +407,12 @@ impl Energia {
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn();
+            .spawn()
+        {
+            std::thread::spawn(move || {
+                let _ = hijo.wait();
+            });
+        }
         // Se da por puesto sin releer: la lectura tardaría lo que tarde el
         // daemon en aplicarlo y la fila se quedaría sin marcar hasta el
         // siguiente refresco. Si la llamada falla, el próximo `new` lo corrige.
@@ -665,10 +673,12 @@ impl Energia {
         let base = tema::superficie_en_tarjeta();
 
         // El elegido, con el acento al 10 % como lo seleccionado en cualquier
-        // lista del sistema; el color del perfil se queda en el círculo.
+        // lista del sistema —al 20 % en oscuro, por lo mismo que en
+        // `control::seleccionada`—; el color del perfil se queda en el círculo.
+        let mezcla = if tema::es_claro() { 0.10 } else { 0.20 };
         let (fondo, color) = if activo {
             (
-                tema::mezclar(base, tema::acento(), 0.10 + 0.06 * señalado),
+                tema::mezclar(base, tema::acento(), mezcla + 0.06 * señalado),
                 tema::acento(),
             )
         } else {

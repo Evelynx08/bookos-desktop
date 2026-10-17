@@ -260,15 +260,23 @@ pub fn divisor<'a>(ancho: f32) -> PanelElement<'a> {
 /// con alfa, y encima de una baldosa opaca lo que se ve es la tarjeta de detrás
 /// asomando, no un realce.
 pub fn baldosa(señalada: f32) -> Color {
-    tema::mezclar(tema::card(), tema::tinta(), 0.05 * señalada)
+    tema::mezclar(tema::elevado(), tema::tinta(), 0.05 * señalada)
 }
 
 /// Lo seleccionado dentro de un grupo: el acento al 10 % sobre la tarjeta.
 ///
 /// Es lo que pide el sistema de diseño para una selección en lista, en vez del
 /// relleno sólido de la referencia, que dejaba el texto sin contraste.
+///
+/// En oscuro el 10 % sobre `#1c1c1e` apenas tiñe y la fila se leía gris
+/// sucio; parte de [`tema::elevado`] y con el doble, como el resto de filas.
 pub fn seleccionada(señalada: f32) -> Color {
-    tema::mezclar(tema::card(), tema::acento(), 0.10 + 0.06 * señalada)
+    let (base, mezcla) = if tema::es_claro() {
+        (tema::card(), 0.10)
+    } else {
+        (tema::elevado(), 0.20)
+    };
+    tema::mezclar(base, tema::acento(), mezcla + 0.06 * señalada)
 }
 
 /// Hasta dónde llega el relleno de una píldora al `nivel` (de 0 a 100).

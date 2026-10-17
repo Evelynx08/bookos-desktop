@@ -17,7 +17,6 @@ if ! command -v kwin_wayland >/dev/null 2>&1 || ! python3 -c 'import PySide6.QtW
     echo "La recuperación gráfica requiere kwin_wayland, python3 y PySide6 (QtWidgets)." >&2
     exit 1
 fi
-comp_bin=""
 if [ -e /etc/pam.d/system-auth ]; then
     cuenta_pam=system-auth
 elif [ -e /etc/pam.d/common-account ]; then
@@ -26,33 +25,25 @@ else
     echo "No se reconoce la política PAM de cuentas; no se instalarán los servicios de bloqueo." >&2
     cuenta_pam=""
 fi
-for candidate in "$aqui/../target/release/bookos-comp" "$aqui/../target/debug/bookos-comp"; do
-    [ -x "$candidate" ] || continue
-    if [ -z "$comp_bin" ] || [ "$candidate" -nt "$comp_bin" ]; then comp_bin="$candidate"; fi
-done
-if [ -z "$comp_bin" ]; then
-    echo "Compila primero: cargo build --release -p bookos-comp" >&2
-    exit 1
-fi
+# Solo release. Antes se instalaba el más reciente de release y debug, y con
+# un `cargo build` de desarrollo de por medio acababa instalado el de
+# depuración: el 2026-10-15 bookos-comp (577 MB, sin optimizar) gastaba un 63 %
+# de CPU de forma continua y calentaba el equipo hasta encender los
+# ventiladores en el modo silencioso. No se comparan fechas con el de
+# depuración: cargo no reenlaza en release lo que no ha cambiado, y quedaría
+# «más viejo» estando al día.
+binario_release() {
+    local release="$aqui/../target/release/$1"
+    if [ ! -x "$release" ]; then
+        echo "Compila primero: cargo build --release -p $1" >&2
+        exit 1
+    fi
+    echo "$release"
+}
+comp_bin="$(binario_release bookos-comp)"
 # Build before installing so D-Bus never points to a missing executable.
-system_bin=""
-for candidate in "$aqui/../target/release/bookos-system" "$aqui/../target/debug/bookos-system"; do
-    [ -x "$candidate" ] || continue
-    if [ -z "$system_bin" ] || [ "$candidate" -nt "$system_bin" ]; then system_bin="$candidate"; fi
-done
-if [ -z "$system_bin" ]; then
-    echo "Compila primero: cargo build --release -p bookos-system" >&2
-    exit 1
-fi
-budsd_bin=""
-for candidate in "$aqui/../target/release/bookos-budsd" "$aqui/../target/debug/bookos-budsd"; do
-    [ -x "$candidate" ] || continue
-    if [ -z "$budsd_bin" ] || [ "$candidate" -nt "$budsd_bin" ]; then budsd_bin="$candidate"; fi
-done
-if [ -z "$budsd_bin" ]; then
-    echo "Compila primero: cargo build --release -p bookos-budsd" >&2
-    exit 1
-fi
+system_bin="$(binario_release bookos-system)"
+budsd_bin="$(binario_release bookos-budsd)"
 # Las unidades vienen con la ruta del RPM (/usr/libexec); en desarrollo el
 # binario va a /usr/local/libexec, así que aquí se reescribe al vuelo. Antes
 # era al revés y el paquete instalado quedaba apuntando a /usr/local.

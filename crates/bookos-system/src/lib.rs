@@ -36,6 +36,7 @@ pub enum Operation {
     WifiScan {},
     WifiConnect { ssid: String, password: String },
     WifiForget { ssid: String },
+    WifiAutoconnect { ssid: String, enabled: bool },
     NetworkDisconnect { device: String },
     BluetoothPower { enabled: bool },
     BluetoothScan { enabled: bool },
@@ -63,6 +64,7 @@ impl Operation {
             | Self::WifiScan { .. }
             | Self::WifiConnect { .. }
             | Self::WifiForget { .. }
+            | Self::WifiAutoconnect { .. }
             | Self::NetworkDisconnect { .. } => "network",
             Self::BluetoothPower { .. }
             | Self::BluetoothScan { .. }

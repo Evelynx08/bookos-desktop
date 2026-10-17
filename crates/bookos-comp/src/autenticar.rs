@@ -213,7 +213,63 @@ fn servicio() -> &'static str {
 }
 
 fn autenticar(usuario: &str, contrasena: &[u8]) -> Veredicto {
+    if pin_correcto(usuario, contrasena) {
+        return Veredicto::Correcto;
+    }
     autenticar_servicio(servicio(), usuario, contrasena, None)
+}
+
+/// El PIN que pone Ajustes en `/etc/bookos/pin/<usuario>`: hash SHA-512 crypt,
+/// de root y legible por el grupo del usuario. Va fuera de PAM a propósito:
+/// en la pila `bookos` haría falta `pam_exec` y un ayudante instalado, y el PIN
+/// solo debe abrir el bloqueo, no valer para sudo ni polkit. Lo que no son
+/// cifras ni se mira: una contraseña normal va directa a PAM.
+fn pin_correcto(usuario: &str, intento: &[u8]) -> bool {
+    if intento.is_empty() || !intento.iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+    let Ok(guardado) = std::fs::read_to_string(format!("/etc/bookos/pin/{usuario}")) else {
+        return false;
+    };
+    pin_casa(guardado.trim(), intento)
+}
+
+fn pin_casa(guardado: &str, intento: &[u8]) -> bool {
+    let (Ok(hash), Ok(frase)) = (CString::new(guardado), CString::new(intento)) else {
+        return false;
+    };
+    // libxcrypt: `.so.2` en Fedora, `.so.1` (compat) en Arch y Debian.
+    // `crypt_ra` y no `crypt` porque este hilo puede coincidir con el de la
+    // huella y `crypt` devuelve un búfer estático compartido.
+    let Some(lib) = ["libcrypt.so.2", "libcrypt.so.1"]
+        .into_iter()
+        .find_map(|n| unsafe { libloading::Library::new(n) }.ok())
+    else {
+        tracing::error!("no se pudo cargar libcrypt para comprobar el PIN");
+        return false;
+    };
+    type CryptRa = unsafe extern "C" fn(
+        *const c_char,
+        *const c_char,
+        *mut *mut c_void,
+        *mut c_int,
+    ) -> *const c_char;
+    // SAFETY: firma de `crypt_ra` en crypt.h de libxcrypt; `datos` lo reserva
+    // la biblioteca y se libera con `free` cuando ya no se lee el resultado.
+    unsafe {
+        let Ok(crypt_ra) = lib.get::<CryptRa>(b"crypt_ra\0") else {
+            return false;
+        };
+        let mut datos: *mut c_void = std::ptr::null_mut();
+        let mut tamano: c_int = 0;
+        let r = crypt_ra(frase.as_ptr(), hash.as_ptr(), &mut datos, &mut tamano);
+        // Un fallo devuelve NULL o una cadena que empieza por «*», que nunca
+        // coincide con un hash `$6$`.
+        let vale = !r.is_null() && CStr::from_ptr(r) == hash.as_c_str();
+        libc::free(datos);
+        borrar(&mut frase.into_bytes());
+        vale
+    }
 }
 
 fn autenticar_servicio(
@@ -475,6 +531,15 @@ mod tests {
             avisos: None,
         };
         assert_eq!(comprobacion.resultado(), Some(Veredicto::Rechazado));
+    }
+
+    #[test]
+    fn el_pin_casa_con_un_hash_de_openssl() {
+        // `echo 1234 | openssl passwd -6 -stdin`, como lo genera Ajustes.
+        let hash = "$6$yxDdl7B1K2j0KxRU$/LIFIhW18mW1RvDLzHR0OLfzhfFhs2.DNHnglX4zcNAmop3IVI3CFDC7kFVPHZVpG0YjuaJUp7I2mXdaAXPVU1";
+        assert!(pin_casa(hash, b"1234"));
+        assert!(!pin_casa(hash, b"1235"));
+        assert!(!pin_casa("", b"1234"));
     }
 
     #[test]

@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -eu
+ulimit -c 0
+
+# La sesión de bienvenida no debe heredar el socket de una sesión de usuario.
+unset WAYLAND_DISPLAY DISPLAY
+if [ -f /etc/default/bookos-greeter ]; then
+    set -a
+    . /etc/default/bookos-greeter
+    set +a
+fi
+export XKB_DEFAULT_LAYOUT="${XKB_DEFAULT_LAYOUT:-es}"
+exec dbus-run-session -- cage -s -- /usr/local/libexec/bookos-greeter \
+    --session /usr/local/bin/bookos-session

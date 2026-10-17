@@ -221,6 +221,7 @@ pub fn vivas(state: &BookosComp) -> Vec<u64> {
         .space
         .elements()
         .chain(state.minimizadas.iter().map(|(w, _)| w))
+        .chain(state.escritorios.apartadas())
         .filter_map(id)
         // La barra de una ventana que se está cerrando se sigue pintando
         // mientras dura la animación: sin esto desaparecía de golpe y el

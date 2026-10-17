@@ -31,7 +31,7 @@ use crate::view::PanelElement;
 
 /// De los 100…900 de la configuración a los nueve grosores de iced. Lo que no
 /// es un múltiplo de 100 no llega aquí: lo filtra la lectura de `panel.conf`.
-fn grosor(valor: u16) -> iced_core::font::Weight {
+pub fn grosor(valor: u16) -> iced_core::font::Weight {
     use iced_core::font::Weight;
     match valor {
         ..=100 => Weight::Thin,
@@ -74,16 +74,16 @@ pub fn estilos_instalados() -> Vec<FuenteReloj> {
 /// Ancho de la píldora de contraseña, con su candado y su botón dentro. Es lo
 /// que ocupaban el campo de 260 y el botón suelto de al lado, así que el
 /// bloque no cambia de ancho.
-const CAMPO: f32 = 312.0;
+pub const CAMPO: f32 = 312.0;
 /// Lado del botón redondo de dentro de la píldora.
-const BOTON: f32 = 36.0;
+pub const BOTON: f32 = 36.0;
 /// La ola de los puntos mientras PAM comprueba: dos vueltas y se para. No dura
 /// lo que tarde PAM a propósito, para no repintar la pantalla entera todo ese
 /// rato; si tarda más, los puntos se quedan quietos y el texto dice
 /// «Comprobando…».
 const D_OLA: Duration = Duration::from_millis(1040);
 /// Alto del campo y lado del botón redondo que lleva al lado.
-const ALTO_CAMPO: f32 = 44.0;
+pub const ALTO_CAMPO: f32 = 44.0;
 /// Cuerpo de la fecha, bajo el reloj.
 const FECHA: f32 = 22.0;
 /// Diámetro de los puntos de la contraseña.
@@ -125,7 +125,7 @@ const MARGEN_MEDIOS: f32 = 24.0;
 
 /// Fondo del campo y del botón: casi negro y translúcido, para que se vea el
 /// fondo por debajo sin perder el contraste de los puntos.
-const FONDO_CAMPO: Color = tema::hexa(0x16191e, 0.82);
+pub const FONDO_CAMPO: Color = tema::hexa(0x16191e, 0.82);
 
 /// Separación del botón de apagado respecto al borde de la pantalla.
 pub const MARGEN_ENERGIA: f32 = 28.0;
@@ -133,10 +133,10 @@ pub const MARGEN_ENERGIA: f32 = 28.0;
 pub const LADO_ENERGIA: f32 = 44.0;
 /// Ancho del menú que despliega. Da para el icono, su hueco y la palabra más
 /// larga de las tres a 15 px.
-const ANCHO_MENU: f32 = 196.0;
+pub const ANCHO_MENU: f32 = 196.0;
 /// Alto de cada entrada del menú. Fijo y no derivado del padding porque el
 /// hit-test tiene que dar exactamente lo mismo que el dibujo.
-const ALTO_ENTRADA: f32 = 46.0;
+pub const ALTO_ENTRADA: f32 = 46.0;
 /// Lado del icono de una entrada.
 const ICONO_ENTRADA: f32 = 18.0;
 
@@ -304,7 +304,7 @@ impl Usuario {
 /// recortarla al cuadrado central —una foto apaisada metida en un círculo se
 /// deforma—, sale más barato hacer las dos cosas de una pasada al cargarla, que
 /// ocurre **una vez** por bloqueo y no por frame.
-fn foto_circular(ruta: &str) -> Option<iced_widget::image::Handle> {
+pub fn foto_circular(ruta: &str) -> Option<iced_widget::image::Handle> {
     // La configuración admite hasta 220 lógicos. Se guarda al doble para que
     // incluso a escala 2 la GPU reduzca una imagen nítida en vez de ampliar una
     // miniatura; sigue siendo menos de 1 MiB y se genera una sola vez.
@@ -351,7 +351,7 @@ fn foto_circular(ruta: &str) -> Option<iced_widget::image::Handle> {
 
 /// El nombre completo de `/etc/passwd`. Sin `libc`: el fichero es de texto y
 /// leerlo entero son cuatro líneas en un equipo de escritorio.
-fn nombre_completo(login: &str) -> Option<String> {
+pub fn nombre_completo(login: &str) -> Option<String> {
     let texto = std::fs::read_to_string("/etc/passwd").ok()?;
     for linea in texto.lines() {
         let mut campos = linea.split(':');
@@ -424,8 +424,8 @@ pub struct Bloqueo {
 }
 
 /// Candado y flecha de Heroicons, macizos: el teñido sustituye el relleno.
-const CANDADO: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#fff"><path fill-rule="evenodd" clip-rule="evenodd" d="M12 1.5a5.25 5.25 0 0 0-5.25 5.25v3a3 3 0 0 0-3 3v6.75a3 3 0 0 0 3 3h10.5a3 3 0 0 0 3-3v-6.75a3 3 0 0 0-3-3v-3c0-2.9-2.35-5.25-5.25-5.25Zm3.75 8.25v-3a3.75 3.75 0 1 0-7.5 0v3h7.5Z"/></svg>"##;
-const FLECHA: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#fff"><path fill-rule="evenodd" clip-rule="evenodd" d="M12.97 3.97a.75.75 0 0 1 1.06 0l7.5 7.5a.75.75 0 0 1 0 1.06l-7.5 7.5a.75.75 0 1 1-1.06-1.06l6.22-6.22H3a.75.75 0 0 1 0-1.5h16.19l-6.22-6.22a.75.75 0 0 1 0-1.06Z"/></svg>"##;
+pub const CANDADO: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#fff"><path fill-rule="evenodd" clip-rule="evenodd" d="M12 1.5a5.25 5.25 0 0 0-5.25 5.25v3a3 3 0 0 0-3 3v6.75a3 3 0 0 0 3 3h10.5a3 3 0 0 0 3-3v-6.75a3 3 0 0 0-3-3v-3c0-2.9-2.35-5.25-5.25-5.25Zm3.75 8.25v-3a3.75 3.75 0 1 0-7.5 0v3h7.5Z"/></svg>"##;
+pub const FLECHA: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#fff"><path fill-rule="evenodd" clip-rule="evenodd" d="M12.97 3.97a.75.75 0 0 1 1.06 0l7.5 7.5a.75.75 0 0 1 0 1.06l-7.5 7.5a.75.75 0 1 1-1.06-1.06l6.22-6.22H3a.75.75 0 0 1 0-1.5h16.19l-6.22-6.22a.75.75 0 0 1 0-1.06Z"/></svg>"##;
 
 impl Bloqueo {
     pub fn new(
@@ -1373,20 +1373,26 @@ impl Bloqueo {
     /// Una tarjeta de lo que está sonando.
     /// La tarjeta de «esto está sonando».
     ///
-    /// Habla el mismo idioma que el reproductor de la isla, que es el mismo
-    /// objeto visto desde otro sitio: tarjeta de la paleta, texto del tema,
+    /// Habla el idioma del propio bloqueo, no el del escritorio: el mismo
+    /// cristal oscuro y el mismo blanco que el campo de la contraseña, con
     /// botones redondos y el acento solo en lo que está activo —el progreso y
-    /// el botón central—. Antes iba teñida con el color de la carátula, con
-    /// el texto en blanco fijo y los iconos sueltos, sin nada que dijera que
-    /// se podían pulsar.
+    /// el botón central—. Con la paleta del tema, en claro salía una losa
+    /// blanca opaca bajo una píldora oscura, y en oscuro un gris macizo al
+    /// lado del cristal: dos piezas de sitios distintos. El bloqueo no cambia
+    /// con el tema —reloj, campo y menú van en blanco sobre el fondo—, y la
+    /// tarjeta tampoco.
     ///
     /// Los altos van fijos: `medio_en` busca los botones a una distancia
     /// conocida del borde de abajo, y con un alto que dependiera del texto el
     /// clic y el dibujo volverían a separarse.
     fn tarjeta<'a>(&self, medio: &'a Medio, alfa: f32) -> PanelElement<'a> {
         use crate::actividad::{ANTERIOR, PAUSA, PLAY, SIGUIENTE};
-        let texto = con_alfa(tema::texto(), alfa);
-        let texto2 = con_alfa(tema::TEXTO2, alfa);
+        let blanco = move |a: f32| Color {
+            a: a * alfa,
+            ..Color::WHITE
+        };
+        let texto = blanco(1.0);
+        let texto2 = blanco(0.6);
         let acento = tema::acento();
 
         let arte: PanelElement<'a> = match medio.caratula.clone() {
@@ -1404,7 +1410,7 @@ impl Bloqueo {
             .center_x(Length::Fixed(MEDIOS_ARTE))
             .center_y(Length::Fixed(MEDIOS_ARTE))
             .style(move |_| container::Style {
-                background: Some(con_alfa(tema::superficie_en_tarjeta(), alfa).into()),
+                background: Some(blanco(0.08).into()),
                 border: Border {
                     radius: tema::R_CONTROL.into(),
                     ..Default::default()
@@ -1419,7 +1425,7 @@ impl Bloqueo {
                 .width(Length::Fixed(ancho))
                 .height(Length::Fixed(4.0))
                 .style(move |_| container::Style {
-                    background: Some(con_alfa(color, alfa).into()),
+                    background: Some(color.into()),
                     border: Border {
                         radius: 2.0.into(),
                         ..Default::default()
@@ -1429,8 +1435,8 @@ impl Bloqueo {
         };
         let lleno = MEDIOS_INFO * medio.progreso.unwrap_or(0.0).clamp(0.0, 1.0);
         let barra = row![
-            tramo(lleno, acento),
-            tramo((MEDIOS_INFO - lleno).max(0.0), tema::control_apagado()),
+            tramo(lleno, con_alfa(acento, alfa)),
+            tramo((MEDIOS_INFO - lleno).max(0.0), blanco(0.18)),
         ];
         let tiempo = |segundos: Option<u64>| {
             text(segundos.map(crate::medios::reloj).unwrap_or_default())
@@ -1445,22 +1451,27 @@ impl Bloqueo {
         .width(Length::Fixed(MEDIOS_INFO));
 
         let boton = |svg: &str, lado: f32, principal: bool| -> PanelElement<'a> {
+            // Los secundarios, como el botón del campo cuando aún no hay
+            // nada que mandar.
             let (relleno, tinta) = if principal {
-                (acento, tema::tinta_sobre(acento))
+                (
+                    con_alfa(acento, alfa),
+                    con_alfa(tema::tinta_sobre(acento), alfa),
+                )
             } else {
-                (tema::superficie_en_tarjeta(), tema::texto())
+                (blanco(0.12), texto)
             };
             container(crate::icono::ver_teñido_propio(
                 &crate::icono::desde_svg(svg),
                 lado * 0.4,
-                con_alfa(tinta, alfa),
+                tinta,
             ))
             .width(Length::Fixed(lado))
             .height(Length::Fixed(lado))
             .align_x(Horizontal::Center)
             .align_y(Vertical::Center)
             .style(move |_| container::Style {
-                background: Some(con_alfa(relleno, alfa).into()),
+                background: Some(relleno.into()),
                 border: Border {
                     radius: (lado / 2.0).into(),
                     ..Default::default()
@@ -1526,13 +1537,13 @@ impl Bloqueo {
         .height(Length::Fixed(MEDIOS_ALTO))
         .padding(MEDIOS_PAD)
         .style(move |_| container::Style {
-            background: Some(con_alfa(tema::card(), alfa).into()),
+            background: Some(con_alfa(FONDO_CAMPO, alfa).into()),
             // El borde que el HIG pide a una tarjeta superpuesta, al 9 % del
             // texto: es lo que la separa del fondo de pantalla.
             border: Border {
                 radius: tema::R_TARJETA.into(),
                 width: 1.0,
-                color: con_alfa(tema::texto(), 0.09 * alfa),
+                color: blanco(0.09),
             },
             // Sin sombra, a diferencia de las tarjetas del escritorio: iced la
             // calcula en CPU píxel a píxel en cada repintado, y el bloqueo se

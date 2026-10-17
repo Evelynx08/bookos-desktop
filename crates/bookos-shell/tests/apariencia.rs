@@ -68,5 +68,27 @@ fn la_apariencia_elige_acento_y_repinta_el_shell() {
     volcar("BOOKOS_APARIENCIA_CLARO_PNG", &claro, w, h);
     assert_ne!(buf, claro, "la tarjeta se pinta igual con la otra paleta");
 
+    let accion = shell.emergente_pulsar(293.0, 249.0);
+    assert!(matches!(
+        accion,
+        Some(bookos_shell::Accion::Apariencia {
+            acento: Acento::Automatico,
+            ..
+        })
+    ));
+    tema::actualizar_acento_del_fondo(&[30, 80, 160, 255]);
+    shell.aplicar_apariencia(Tema::Oscuro, Acento::Automatico);
+    let azul = tema::acento();
+    // Tres colores, para que el volcado enseñe las franjas de la casilla.
+    tema::actualizar_acento_del_fondo(&[160, 30, 40, 255, 40, 140, 90, 255, 150, 120, 60, 255]);
+    shell.aplicar_apariencia(Tema::Oscuro, Acento::Automatico);
+    assert_ne!(azul, tema::acento(), "el automático debe seguir al fondo");
+    assert_eq!(tema::acento_actual(), Acento::Automatico);
+    shell.draw_emergente(&mut buf);
+    volcar("BOOKOS_APARIENCIA_AUTO_PNG", &buf, w, h);
+    shell.aplicar_apariencia(Tema::Claro, Acento::Automatico);
+    shell.draw_emergente(&mut claro);
+    volcar("BOOKOS_APARIENCIA_AUTO_CLARO_PNG", &claro, w, h);
+
     shell.aplicar_apariencia(antes.0, antes.1);
 }

@@ -251,7 +251,7 @@ impl Animacion {
     }
 }
 
-fn es_video(ruta: &Path) -> bool {
+pub fn es_video(ruta: &Path) -> bool {
     ruta.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| EXTENSIONES_VIDEO.contains(&e.to_ascii_lowercase().as_str()))
@@ -769,13 +769,27 @@ impl Fondo {
                 return false;
             }
         };
-        self.buffer = compartido(&fotograma.rgba);
+        let mismo_tamano = self.pixeles == fotograma.pixeles;
         self.rgba = fotograma.rgba;
         self.pixeles = fotograma.pixeles;
         self.mini_rgba = fotograma.mini_rgba;
         self.mini_pixeles = fotograma.mini_pixeles;
         self.mini.get_mut().clear();
         *self.gemelo.get_mut() = None;
+        if mismo_tamano {
+            let mut ctx = self.buffer.render();
+            let tam = self.pixeles;
+            let src = &self.rgba[..];
+            let _ = ctx.draw(|dst| {
+                let n = dst.len().min(src.len());
+                dst[..n].copy_from_slice(&src[..n]);
+                Ok::<_, std::convert::Infallible>(vec![smithay::utils::Rectangle::from_size(
+                    tam.into(),
+                )])
+            });
+        } else {
+            self.buffer = compartido(&self.rgba);
+        }
         true
     }
 
@@ -1011,7 +1025,20 @@ const FAMILIA: &str = "blue";
 /// que pasar a claro cambie también la imagen. Antes tenía `blue` escrito a
 /// fuego y las rutas de las cuatro familias instaladas no se miraban siquiera.
 fn buscar() -> Option<PathBuf> {
-    let (carpeta, archivo) = if bookos_shell::tema::es_claro() {
+    buscar_para(bookos_shell::tema::es_claro())
+}
+
+/// El fondo de un tema concreto, lo elija el usuario o venga de serie. Lo pide
+/// quien publica los dos a la vez para la pantalla de acceso.
+pub fn ruta_para(eleccion: &Eleccion, claro: bool) -> Option<PathBuf> {
+    eleccion
+        .para(claro)
+        .map(PathBuf::from)
+        .or_else(|| buscar_para(claro))
+}
+
+fn buscar_para(claro: bool) -> Option<PathBuf> {
+    let (carpeta, archivo) = if claro {
         ("Light", format!("{FAMILIA}.png"))
     } else {
         ("Dark", format!("{FAMILIA}_dark.png"))

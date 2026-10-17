@@ -1331,6 +1331,7 @@ fn comprobar_huella(state: &mut BookosComp) {
     // el sensor. Solo corre mientras PAM espera el dedo, como mucho 15 s.
     const CADA: std::time::Duration = std::time::Duration::from_millis(25);
     let generacion = state.bloqueo_generacion;
+    let reanudaciones = state.bloqueo.huella_reanudaciones;
     let lanzada = std::time::Instant::now();
     let resultado = state.loop_handle.insert_source(
         Timer::from_duration(CADA),
@@ -1370,7 +1371,17 @@ fn comprobar_huella(state: &mut BookosComp) {
                 // tiempo agotado a los 15,4. Tomarlo por «no hay lector»
                 // apagaba la huella a los 15 s de bloquear, o sea justo al
                 // volver al portátil. Se vuelve a esperar el dedo.
-                Some(Veredicto::NoDisponible) if lanzada.elapsed() >= HUELLA_AGOTADA => {
+                // Y hay un tercer «no disponible» que el tiempo no separa:
+                // «Suspender» bloquea y duerme seguido, fprintd suelta el
+                // lector al recibir `PrepareForSleep` y PAM contesta en 0,52 s
+                // (medido: bloqueo 13:53:21,55, veredicto 13:53:22,07). El
+                // veredicto se recoge al despertar, y `Instant` no cuenta el
+                // rato dormido, así que parecía una máquina sin lector y la
+                // huella quedaba apagada hasta desbloquear con contraseña.
+                Some(Veredicto::NoDisponible)
+                    if lanzada.elapsed() >= HUELLA_AGOTADA
+                        || state.bloqueo.huella_reanudaciones != reanudaciones =>
+                {
                     state.bloqueo.huella = None;
                     comprobar_huella(state);
                     TimeoutAction::Drop
@@ -1399,6 +1410,17 @@ fn comprobar_huella(state: &mut BookosComp) {
         state.bloqueo.huella = None;
         mensaje_huella(state, Huella::Callada);
     }
+}
+
+/// Vuelve a pedir la huella al despertar con el bloqueo echado.
+///
+/// El veredicto de antes de dormir puede haberse recogido ya —y haber dejado
+/// `huella_sin_lector`— o seguir pendiente: lo primero se deshace aquí, lo
+/// segundo lo reconoce el sondeo por el contador.
+pub fn reanudar_huella(state: &mut BookosComp) {
+    state.bloqueo.huella_reanudaciones = state.bloqueo.huella_reanudaciones.wrapping_add(1);
+    state.bloqueo.huella_sin_lector = false;
+    comprobar_huella(state);
 }
 
 /// Demora local frente a intentos repetidos. PAM conserva su propia política;

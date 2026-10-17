@@ -65,7 +65,7 @@ impl Battery {
     /// parte cara: exige `current_now`, y eso es una consulta al controlador
     /// embebido —0,53 ms medidos— frente a los 0,02 de `capacity`. Quien llama
     /// decide con qué cadencia la quiere; ver `widgets::bateria::CADA_MINUTOS`.
-    pub(crate) fn read(con_minutos: bool) -> Option<Self> {
+    pub fn read(con_minutos: bool) -> Option<Self> {
         let path = battery_path()?;
         let percent = read_num(path.join("capacity"))?.min(100) as u8;
         let status = fs::read_to_string(path.join("status")).ok()?;
@@ -214,7 +214,7 @@ impl Network {
     /// `lo` se descarta siempre: el bucle local está arriba hasta en una
     /// máquina desconectada, así que contarlo haría que el panel jurase que
     /// hay red cuando no la hay.
-    pub(crate) fn read() -> Option<Self> {
+    pub fn read() -> Option<Self> {
         let mut interfaces: Vec<PathBuf> = fs::read_dir("/sys/class/net")
             .ok()?
             .filter_map(|e| e.ok())

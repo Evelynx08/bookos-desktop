@@ -671,7 +671,7 @@ impl Launchpad {
             if x - acentos.x - i as f32 * COLOR_PASO > COLOR_SLOT {
                 return None;
             }
-            return tema::Acento::TODOS
+            return tema::Acento::FIJOS
                 .get(i)
                 .copied()
                 .map(ColorCarpeta::Acento);
@@ -698,7 +698,7 @@ impl Launchpad {
     /// continua a golpe de flecha son doce pulsaciones para cruzar el rojo, y
     /// quien elige con el teclado quiere un color, no afinar el tono.
     fn colores_del_teclado() -> Vec<ColorCarpeta> {
-        tema::Acento::TODOS
+        tema::Acento::FIJOS
             .into_iter()
             .map(ColorCarpeta::Acento)
             .chain(
@@ -2273,7 +2273,7 @@ impl Launchpad {
         let rect = self.rect_paleta();
 
         let mut acentos = row![].spacing(COLOR_PASO - COLOR_SLOT);
-        for acento in tema::Acento::TODOS {
+        for acento in tema::Acento::FIJOS {
             acentos = acentos.push(
                 self.punto_color_view(acento.color(), puesto == Some(ColorCarpeta::Acento(acento))),
             );

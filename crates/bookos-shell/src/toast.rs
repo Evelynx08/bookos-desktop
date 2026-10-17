@@ -65,14 +65,18 @@ const QUIETO_CRITICA: Duration = Duration::from_secs(10);
 const MINIMO: Duration = Duration::from_secs(2);
 const MAXIMO: Duration = Duration::from_secs(15);
 /// Lo que tarda en entrar y en irse. Los mismos tokens que el resto.
-const ENTRADA: Duration = tema::D_POPOVER;
-pub const SALIDA: Duration = Duration::from_millis(280);
+const ENTRADA: Duration = tema::D_TARJETA;
+pub const SALIDA: Duration = tema::D_POPOVER;
+const RECORRIDO: f32 = 48.0;
 
 pub struct Toast {
     notificacion: Notificacion,
     /// Cuánto se queda quieto antes de empezar a irse.
     quieto: Duration,
     desde: Instant,
+    /// Alfa, escala y posición al despedirlo. Conserva el punto de entrada si
+    /// se pulsa antes de aterrizar, en vez de saltar a una tarjeta ya asentada.
+    partida: Option<(f32, f32, f32)>,
     /// Cuántos avisos tiene delante: 0 es el que se lee y se pulsa. Lo pone
     /// [`crate::Shell`] al reordenar la pila.
     profundidad: usize,
@@ -112,6 +116,7 @@ impl Toast {
             notificacion,
             quieto,
             desde: Instant::now(),
+            partida: None,
             profundidad: 0,
             fijo: None,
         }
@@ -132,6 +137,14 @@ impl Toast {
 
     /// Lo empuja a irse ya: es lo que hace pulsarlo.
     pub fn descartar(&mut self) {
+        if self.saliendo() {
+            return;
+        }
+        self.partida = Some((
+            self.alfa(),
+            self.escala() / self.encogido(),
+            self.desplazamiento_horizontal(),
+        ));
         // Se le deja la salida por delante en vez de quitarlo de golpe, para
         // que se vaya con la misma animación que si hubiera caducado.
         self.desde = Instant::now() - self.quieto;
@@ -142,7 +155,23 @@ impl Toast {
         if t < self.quieto {
             return tema::C_ENTRADA.eval(tema::fraccion(t, ENTRADA));
         }
-        1.0 - tema::C_SUAVE.eval(tema::fraccion(t - self.quieto, SALIDA))
+        self.partida.map_or(1.0, |p| p.0) * (1.0 - self.avance_salida())
+    }
+
+    fn avance_salida(&self) -> f32 {
+        let t = self.desde.elapsed().saturating_sub(self.quieto);
+        1.0 - tema::C_ENTRADA.eval(1.0 - tema::fraccion(t, SALIDA))
+    }
+
+    pub fn desplazamiento_horizontal(&self) -> f32 {
+        if tema::efectos_reducidos() {
+            return 0.0;
+        }
+        if self.saliendo() {
+            let origen = self.partida.map_or(0.0, |p| p.2);
+            return origen + (RECORRIDO - origen) * self.avance_salida();
+        }
+        RECORRIDO * (1.0 - tema::C_ENTRADA.eval(tema::fraccion(self.desde.elapsed(), ENTRADA)))
     }
 
     /// ¿Ha empezado ya a irse?
@@ -193,6 +222,13 @@ impl Toast {
 
     /// Entra creciendo un poco, como los popovers.
     pub fn escala(&self) -> f32 {
+        if tema::efectos_reducidos() {
+            return self.encogido();
+        }
+        if self.saliendo() {
+            let origen = self.partida.map_or(1.0, |p| p.1);
+            return (origen + (0.98 - origen) * self.avance_salida()) * self.encogido();
+        }
         let t = self.desde.elapsed();
         let entrada = if t >= ENTRADA {
             1.0
@@ -202,10 +238,11 @@ impl Toast {
         entrada * self.encogido()
     }
 
-    /// Solo mientras entra: lo demás es alfa, y de eso se encarga el compositor
-    /// con un único despertar programado.
+    /// El temporizador despierta al empezar la salida; desde ahí hacen falta
+    /// fotogramas hasta acabarla aunque no haya entrada del usuario.
     pub fn animando(&self) -> bool {
-        self.desde.elapsed() < ENTRADA
+        let t = self.desde.elapsed();
+        t < ENTRADA || (t >= self.quieto && t < self.quieto + SALIDA)
     }
 
     /// Las acciones que van en botón. `default` no es un botón: según la
@@ -568,6 +605,41 @@ mod tests {
         assert_eq!(t.alfa(), 1.0);
         std::thread::sleep(SALIDA / 2);
         assert!(t.alfa() < 1.0, "no se está yendo");
+        assert!(t.animando(), "la salida también necesita fotogramas");
+        assert!(t.desplazamiento_horizontal() > 0.0);
+        assert!(t.escala() < 1.0);
+    }
+
+    #[test]
+    fn la_caducidad_anima_la_salida_y_deja_de_pedir_fotogramas_al_acabar() {
+        let mut t = Toast::new(notif(false), -1);
+        t.desde = Instant::now() - ENTRADA;
+        assert!(!t.animando(), "quieto no debe pedir fotogramas");
+        t.desde = Instant::now() - t.quieto - SALIDA / 2;
+        assert!(t.saliendo());
+        assert!(t.animando());
+        assert!(t.alfa() > 0.0 && t.alfa() < 1.0);
+        t.desde = Instant::now() - t.quieto - SALIDA;
+        assert!(!t.animando());
+        assert!(t.queda().is_none());
+        assert_eq!(t.alfa(), 0.0);
+    }
+
+    #[test]
+    fn despedir_durante_la_entrada_conserva_la_posicion_y_no_reinicia_la_salida() {
+        let mut t = Toast::new(notif(false), -1);
+        t.desde = Instant::now() - ENTRADA / 4;
+        let alfa = t.alfa();
+        let x = t.desplazamiento_horizontal();
+        t.descartar();
+        assert!((t.alfa() - alfa).abs() < 0.02, "el alfa no debe saltar");
+        assert!(
+            (t.desplazamiento_horizontal() - x).abs() < 1.0,
+            "la posición no debe saltar"
+        );
+        let desde = t.desde;
+        t.descartar();
+        assert_eq!(t.desde, desde, "descartar de nuevo no alarga la salida");
     }
 
     /// El caso de KDE Connect: `default` más dos botones de largo distinto.

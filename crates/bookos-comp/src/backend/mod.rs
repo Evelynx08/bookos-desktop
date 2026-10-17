@@ -139,6 +139,16 @@ pub fn avanzar_animaciones(state: &mut BookosComp) {
         .space
         .elements()
         .any(|window| crate::ventanas::encogido(window).is_some());
+    // La captura congelada del genio solo hace falta mientras la ventana está
+    // recorriendo el embudo. Al terminar la apertura o la restauración,
+    // `encogido` pasa a `None` y había que soltar esos ~20 MB de textura GPU
+    // (además de evitar que un minimizado posterior reutilizara la foto vieja).
+    if !state.capturas.is_empty() {
+        use smithay::utils::IsAlive;
+        state
+            .capturas
+            .retain(|(w, _)| w.alive() && crate::ventanas::encogido(w).is_some());
+    }
     if minimizando || restaurando {
         state.genio_commit.increment();
     }
@@ -424,14 +434,17 @@ fn componer(
             crate::escritorios::con_cierre_visible(&expuestas, state.pointer_location)
     {
         let lado = (crate::escritorios::LADO_CERRAR as f64 * scale).round() as i32;
+        let tema = bookos_shell::tema::actual();
+        let señalado = boton.to_f64().contains(state.pointer_location);
         if state
             .boton_cerrar_vista
             .as_ref()
-            .is_none_or(|(l, _)| *l != lado)
+            .is_none_or(|(l, t, s, _)| (*l, *t, *s) != (lado, tema, señalado))
         {
-            state.boton_cerrar_vista = crate::escritorios::imagen_cerrar(lado).map(|b| (lado, b));
+            state.boton_cerrar_vista = crate::escritorios::imagen_cerrar(lado, señalado)
+                .map(|b| (lado, tema, señalado, b));
         }
-        if let Some((lado, buffer)) = state.boton_cerrar_vista.as_ref()
+        if let Some((lado, _, _, buffer)) = state.boton_cerrar_vista.as_ref()
             && let Ok(elemento) = MemoryRenderBufferRenderElement::from_buffer(
                 renderer,
                 boton.loc.to_f64().to_physical_precise_round(scale),
@@ -1233,7 +1246,7 @@ pub fn servir_captura_propia(state: &mut BookosComp, renderer: &mut GlesRenderer
     // La principal tiene el origen en (0,0); ver `pantallas::normalizar`.
     if output.current_location() != (0, 0).into() {
         return;
-    }
+    };
     state.captura_pedida = None;
 
     let escala = output.current_scale().fractional_scale();
@@ -1480,8 +1493,26 @@ pub fn recargar_fondo(state: &mut BookosComp, renderer: &mut GlesRenderer) {
         state.fondo_saliente = Some((anterior, std::time::Instant::now()));
     }
     state.fondo = Some(fondo);
+    actualizar_acento_del_fondo(state);
     programar_fondo_animado(state);
     state.needs_redraw = true;
+}
+
+pub fn actualizar_acento_del_fondo(state: &mut BookosComp) {
+    let Some(fondo) = state.fondo.as_ref() else {
+        return;
+    };
+    let cambio = bookos_shell::tema::actualizar_acento_del_fondo(fondo.rgba().0);
+    if cambio {
+        let acento = bookos_shell::tema::acento_actual();
+        if let Some(shell) = state.shell.as_mut() {
+            shell.aplicar_apariencia(bookos_shell::tema::actual(), acento);
+        }
+        if acento == bookos_shell::tema::Acento::Automatico {
+            crate::portal::apariencia_cambiada(state.bus_portal.as_ref());
+        }
+        state.needs_redraw = true;
+    }
 }
 
 /// ¿Se ve el fondo, o algo que sale de él, en alguna salida?
@@ -1713,9 +1744,11 @@ pub fn schedule_panel_tick(state: &mut BookosComp) {
 /// de nuevo la edad de la última entrada y se ajusta la alarma si el usuario
 /// acaba de interactuar.
 pub fn programar_bloqueo_inactividad(state: &mut BookosComp) {
+    use smithay::utils::IsAlive;
     if let Some(token) = state.tick_bloqueo.take() {
         state.loop_handle.remove(token);
     }
+    state.idle_inhibidores.retain(|s| s.alive());
     crate::atenuacion::programar(state);
     if state.bloqueo_inactividad.is_zero()
         || !state.idle_inhibidores.is_empty()
@@ -1738,7 +1771,9 @@ pub fn programar_bloqueo_inactividad(state: &mut BookosComp) {
     let result = state
         .loop_handle
         .insert_source(Timer::from_duration(espera), |_, _, state| {
+            use smithay::utils::IsAlive;
             state.tick_bloqueo = None;
+            state.idle_inhibidores.retain(|s| s.alive());
             if state
                 .shell
                 .as_ref()
@@ -1784,7 +1819,9 @@ pub fn cancelar_suspension_inactividad(state: &mut BookosComp) {
 /// liberarse el último, el plazo empieza de nuevo. La orden final pasa por
 /// logind, que conserva la última palabra sobre sus propios inhibidores.
 pub fn programar_suspension_inactividad(state: &mut BookosComp) {
+    use smithay::utils::IsAlive;
     cancelar_suspension_inactividad(state);
+    state.idle_inhibidores.retain(|s| s.alive());
     if state.suspension_inactividad.is_zero()
         || !state.idle_inhibidores.is_empty()
         || bookos_shell::mantener_despierto()
@@ -1799,7 +1836,9 @@ pub fn programar_suspension_inactividad(state: &mut BookosComp) {
     let resultado = state
         .loop_handle
         .insert_source(Timer::from_duration(espera), |_, _, state| {
+            use smithay::utils::IsAlive;
             state.tick_suspension = None;
+            state.idle_inhibidores.retain(|s| s.alive());
             let bloqueado = state
                 .shell
                 .as_ref()
@@ -1883,6 +1922,7 @@ pub fn escuchar_reanudacion(state: &mut BookosComp) {
             tracing::info!("reanudado: se enciende la pantalla");
             state.dpms_sordo_hasta = None;
             despertar_dpms(state);
+            crate::keybinds::reanudar_huella(state);
         }
     });
     if let Err(err) = insertado {

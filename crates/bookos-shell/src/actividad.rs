@@ -298,8 +298,8 @@ pub struct Actividad {
 }
 
 impl Actividad {
-    pub fn nueva(estado: Estado, animaciones: bool) -> Self {
-        let arte = preparar_portada(estado.portada.as_ref(), ARTE_PX);
+    pub fn nueva(mut estado: Estado, animaciones: bool) -> Self {
+        let arte = preparar_portada(estado.portada.take().as_ref(), ARTE_PX);
         let mut a = Self {
             estado,
             vista: Vista::Compacta,
@@ -339,17 +339,27 @@ impl Actividad {
         }
     }
 
-    pub fn actualizar(&mut self, estado: Estado) {
+    pub fn tiene_arte(&self) -> bool {
+        self.arte.is_some()
+    }
+
+    pub fn invalidar_arte(&mut self) {
+        self.arte = None;
+    }
+
+    pub fn tiene_miniatura(&self, id: &str) -> bool {
+        self.miniaturas.contains_key(id)
+    }
+
+    pub fn actualizar(&mut self, mut estado: Estado) {
         // La portada solo se vuelve a preparar si de verdad cambió: un
         // reproductor manda estado cada segundo para mover la barra de
         // progreso, y con la misma carátula.
-        let cambio = match (&self.estado.portada, &estado.portada) {
-            (Some(a), Some(b)) => a.width != b.width || a.height != b.height || a.rgba != b.rgba,
-            (None, None) => false,
-            _ => true,
-        };
-        if cambio {
-            self.arte = preparar_portada(estado.portada.as_ref(), ARTE_PX);
+        if let Some(portada) = estado.portada.take() {
+            self.arte = preparar_portada(Some(&portada), ARTE_PX);
+        } else if self.estado.titulo != estado.titulo && self.arte.is_some() {
+            // Si el reproductor limpió explícitamente la carátula al cambiar de pista.
+            self.arte = None;
         }
         self.estado = estado;
         self.guardar_miniaturas();

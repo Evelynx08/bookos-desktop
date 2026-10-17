@@ -31,6 +31,7 @@ mod multimedia;
 mod notificaciones;
 mod pantallas;
 mod portal;
+mod publicar;
 mod pw;
 mod selftest;
 mod shell;
@@ -45,6 +46,17 @@ use smithay::reexports::wayland_server::Display;
 use crate::state::BookosComp;
 
 fn main() -> anyhow::Result<()> {
+    // Los búferes del shell y del fondo son reservas de 1 a 21 MB que van y
+    // vienen (abrir el launchpad son 30 MB). glibc sube solo su umbral de mmap
+    // hasta 32 MB en cuanto se libera la primera, y desde ahí todas salen del
+    // heap de `brk`, que no encoge mientras quede algo vivo por encima. Con el
+    // umbral fijo cada una es un mmap propio y vuelve al sistema al soltarla.
+    // Medido en anidado tras abrir y cerrar launchpad, centro y buscador:
+    // 70,4 MB anónimos sin esto, 52,3 con ello. A 128 KiB daba lo mismo (51,7)
+    // y metía en mmap la máscara que el panel reserva en cada pintado.
+    // SAFETY: mallopt solo toca parámetros del asignador y aún no hay hilos.
+    unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, 1 << 20) };
+
     init_tracing();
 
     // Los argumentos se leen **antes** de construir nada. `--drm-info` y

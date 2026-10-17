@@ -111,6 +111,11 @@ pub struct Apariencia {
     vistas: Vec<Option<iced_core::image::Handle>>,
     hover_fondo: Realce,
     marca_fondo: Realce,
+    /// La casilla del acento automático ya rasterizada, con la paleta de la
+    /// que salió. Es interior porque la paleta cambia con la tarjeta abierta
+    /// —al elegir fondo o tema, y lo aplica el compositor un frame después— y
+    /// quien se entera es `view`, que solo tiene `&self`.
+    franjas: std::cell::RefCell<Option<([Color; 3], iced_core::image::Handle)>>,
 }
 
 impl Apariencia {
@@ -141,6 +146,23 @@ impl Apariencia {
             fondos,
             hover_fondo: Realce::nuevo(),
             marca_fondo,
+            franjas: Default::default(),
+        }
+    }
+
+    /// La imagen de la casilla automática, rehecha solo si cambió la paleta:
+    /// un `Handle` nuevo en cada `view` obligaría a iced a subirla otra vez
+    /// en cada fotograma.
+    fn franjas(&self) -> iced_core::image::Handle {
+        let paleta = tema::paleta_automatica();
+        let mut guardadas = self.franjas.borrow_mut();
+        match guardadas.as_ref() {
+            Some((de, imagen)) if *de == paleta => imagen.clone(),
+            _ => {
+                let imagen = imagen_de_franjas(paleta);
+                *guardadas = Some((paleta, imagen.clone()));
+                imagen
+            }
         }
     }
 
@@ -336,6 +358,7 @@ impl Apariencia {
                 }
                 fila = fila.push(casilla(
                     acento,
+                    (acento == Acento::Automatico).then(|| self.franjas()),
                     self.marca_color.intensidad(i),
                     self.hover_color.intensidad(i),
                 ));
@@ -745,26 +768,58 @@ fn miniatura<'a>(
         .into()
 }
 
+/// El círculo del acento automático: los colores del fondo en tres franjas, el
+/// dominante —el que se aplica— arriba.
+///
+/// Es una imagen y no tres contenedores porque tiny-skia limita el radio a la
+/// mitad del lado más corto: una franja de 10 px no puede llevar la curva de un
+/// círculo de 30.
+fn imagen_de_franjas(paleta: [Color; 3]) -> iced_core::image::Handle {
+    // A 3× del círculo, como las miniaturas de fondo.
+    const LADO: u32 = CIRCULO as u32 * 3;
+    let mut rgba: Vec<u8> = (0..LADO)
+        .flat_map(|y| {
+            let franja = paleta[(y * paleta.len() as u32 / LADO) as usize];
+            std::iter::repeat_n(franja.into_rgba8(), LADO as usize)
+        })
+        .flatten()
+        .collect();
+    crate::redondear_esquinas(&mut rgba, LADO, LADO, LADO as f32 / 2.0, crate::Alfa::Recto);
+    iced_core::image::Handle::from_rgba(LADO, LADO, rgba)
+}
+
 /// Una casilla de la rejilla: el círculo del color, con su anillo si está
-/// elegido y su halo si está señalado.
-fn casilla<'a>(acento: Acento, elegido: f32, señalado: f32) -> PanelElement<'a> {
+/// elegido y su halo si está señalado. `franjas` es la imagen del automático.
+fn casilla<'a>(
+    acento: Acento,
+    franjas: Option<iced_core::image::Handle>,
+    elegido: f32,
+    señalado: f32,
+) -> PanelElement<'a> {
     // El color de la casilla es el del acento **en el tema que está puesto**,
     // que es como se va a ver si se elige.
     let color = acento.color();
     // Señalado, el círculo crece 3 px sin mover a los vecinos: la casilla mide
     // 42 y el círculo 30, así que hay sitio de sobra dentro.
     let lado = CIRCULO + 3.0 * señalado;
-    let punto = container(Space::new())
-        .width(Length::Fixed(lado))
-        .height(Length::Fixed(lado))
-        .style(move |_| container::Style {
-            background: Some(color.into()),
-            border: Border {
-                radius: tema::R_PILL.into(),
+    let punto: PanelElement<'a> = match franjas {
+        Some(franjas) => iced_widget::image(franjas)
+            .width(Length::Fixed(lado))
+            .height(Length::Fixed(lado))
+            .into(),
+        None => container(Space::new())
+            .width(Length::Fixed(lado))
+            .height(Length::Fixed(lado))
+            .style(move |_| container::Style {
+                background: Some(color.into()),
+                border: Border {
+                    radius: tema::R_PILL.into(),
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
-            ..Default::default()
-        });
+            })
+            .into(),
+    };
     container(punto)
         .width(Length::Fixed(CASILLA))
         .height(Length::Fixed(CASILLA))

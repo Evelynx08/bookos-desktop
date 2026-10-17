@@ -712,9 +712,23 @@ impl SeatHandler for BookosComp {
         let cliente = focused.and_then(|s| self.display_handle.get_client(s.id()).ok());
         set_data_device_focus(&self.display_handle, seat, cliente.clone());
         set_primary_focus(&self.display_handle, seat, cliente);
-        let app = focused
-            .and_then(|s| self.window_for_surface(s))
-            .and_then(|w| app_id(&w));
+        let ventana = focused.and_then(|s| self.window_for_surface(s));
+        // El foco de entrada de X11 es aparte del de `wl_keyboard`, y Smithay
+        // solo lo pone desde el `KeyboardTarget` de `X11Surface`. Como aquí el
+        // foco es la `WlSurface`, no se ponía nunca: el servidor X se quedaba
+        // en `PointerRoot` (medido con `xdpyinfo`) y las teclas iban a la
+        // ventana X11 que tuviera el puntero encima, no a la enfocada. El
+        // `enter` repetido que le llega a XWayland va sin teclas y no hace nada.
+        if let Some(x11) = ventana.as_ref().and_then(|w| w.x11_surface()) {
+            smithay::input::keyboard::KeyboardTarget::enter(
+                x11,
+                seat,
+                self,
+                Vec::new(),
+                smithay::utils::SERIAL_COUNTER.next_serial(),
+            );
+        }
+        let app = ventana.and_then(|w| app_id(&w));
         if let Some(shell) = self.shell.as_mut() {
             shell.poner_app_enfocada(app);
         }
@@ -981,6 +995,8 @@ delegate_presentation!(BookosComp);
 
 impl IdleInhibitHandler for BookosComp {
     fn inhibit(&mut self, surface: WlSurface) {
+        use smithay::reexports::wayland_server::Resource as _;
+        self.idle_inhibidores.retain(|actual| actual.is_alive());
         if !self
             .idle_inhibidores
             .iter()
@@ -995,7 +1011,9 @@ impl IdleInhibitHandler for BookosComp {
     }
 
     fn uninhibit(&mut self, surface: WlSurface) {
-        self.idle_inhibidores.retain(|actual| actual != &surface);
+        use smithay::reexports::wayland_server::Resource as _;
+        self.idle_inhibidores
+            .retain(|actual| actual.is_alive() && actual != &surface);
         self.idle_notifier_state.set_is_inhibited(
             !self.idle_inhibidores.is_empty() || bookos_shell::mantener_despierto(),
         );
