@@ -22,6 +22,7 @@
 //! temporizador propio. El precio es hasta un minuto de retraso, que es el
 //! trato que este escritorio hace siempre a cambio de no despertar de más.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -62,6 +63,9 @@ pub struct Elemento {
     /// Qué ejecutar al abrirlo: el `Exec` de su `.desktop`, o `xdg-open`.
     orden: String,
     icono: Option<Icono>,
+    /// El color puesto a mano a una carpeta, el mismo que guarda
+    /// bookos-explorer. `None` es el automático por nombre.
+    color: Option<String>,
     /// Columna y fila que ocupa. Es lo que se guarda en disco, no los píxeles:
     /// así una posición sobrevive a cambiar de resolución.
     celda: (i32, i32),
@@ -79,17 +83,21 @@ pub struct Escritorio {
     /// Va aparte de sus celdas porque durante el arrastre no han cambiado de
     /// sitio todavía: solo se dibujan corridos.
     arrastre: Option<(f32, f32)>,
+    /// Si se enseñan los iconos. Apagado, la lista se queda vacía: no hay
+    /// superficies que componer ni nada que pulsar, y el clic cae al fondo.
+    visible: bool,
 }
 
 impl Escritorio {
     /// `alto_panel` y `pantalla` van en píxeles lógicos.
-    pub fn new(alto_panel: f32, pantalla: (f32, f32)) -> Self {
+    pub fn new(alto_panel: f32, pantalla: (f32, f32), visible: bool) -> Self {
         let mut escritorio = Self {
-            elementos: leer(),
+            elementos: if visible { leer() } else { Vec::new() },
             zona: (0.0, 0.0, 0.0, 0.0),
             filas: 1,
             columnas: 1,
             arrastre: None,
+            visible,
         };
         escritorio.recolocar(alto_panel, pantalla);
         escritorio
@@ -146,6 +154,9 @@ impl Escritorio {
     /// escritorio es la lista, y `mtime` del directorio cambia también cuando
     /// se toca un fichero que ya estaba.
     pub fn releer(&mut self, alto_panel: f32, pantalla: (f32, f32)) -> bool {
+        if !self.visible {
+            return false;
+        }
         let nuevos = leer();
         let iguales = nuevos.len() == self.elementos.len()
             && nuevos
@@ -219,6 +230,78 @@ impl Escritorio {
             self.releer(alto_panel, pantalla);
         }
         alguno
+    }
+
+    pub fn visible(&self) -> bool {
+        self.visible
+    }
+
+    /// Enseña u oculta los iconos. `true` si cambió algo.
+    pub fn mostrar(&mut self, visible: bool, alto_panel: f32, pantalla: (f32, f32)) -> bool {
+        if self.visible == visible {
+            return false;
+        }
+        self.visible = visible;
+        self.arrastre = None;
+        self.elementos = if visible { leer() } else { Vec::new() };
+        self.recolocar(alto_panel, pantalla);
+        true
+    }
+
+    /// El color de las carpetas seleccionadas, para marcar su muestra en el
+    /// menú. `None` si la selección no es solo de carpetas: un fichero no tiene
+    /// color que elegir. `Some(None)` es el automático, o colores mezclados.
+    pub fn color_seleccion(&self) -> Option<Option<&str>> {
+        let mut seleccion = self.elementos.iter().filter(|e| e.seleccionado).peekable();
+        seleccion.peek()?;
+        let mut comun: Option<Option<&str>> = None;
+        for elemento in seleccion {
+            if !elemento.ruta.is_dir() {
+                return None;
+            }
+            let suyo = elemento.color.as_deref();
+            comun = match comun {
+                None => Some(suyo),
+                Some(c) if c == suyo => Some(c),
+                Some(_) => Some(None),
+            };
+        }
+        comun
+    }
+
+    /// Pone `color` a las carpetas seleccionadas, o les devuelve el automático
+    /// con `None`. `true` si alguna cambió.
+    ///
+    /// Se escribe en el fichero de bookos-explorer y no en uno propio: una
+    /// carpeta es la misma en el escritorio que en el explorador, y dos colores
+    /// distintos para ella serían dos verdades.
+    pub fn colorear(&mut self, color: Option<&str>) -> bool {
+        if color.is_some_and(|c| !hex_valido(c)) {
+            tracing::warn!(?color, "color de carpeta no válido");
+            return false;
+        }
+        let rutas: Vec<String> = self
+            .elementos
+            .iter()
+            .filter(|e| e.seleccionado && e.ruta.is_dir())
+            .map(|e| e.ruta.to_string_lossy().into_owned())
+            .collect();
+        if rutas.is_empty() {
+            return false;
+        }
+        if let Err(err) = guardar_colores(&rutas, color) {
+            tracing::warn!("no se pudo guardar el color de la carpeta: {err}");
+            return false;
+        }
+        for elemento in self
+            .elementos
+            .iter_mut()
+            .filter(|e| e.seleccionado && e.ruta.is_dir())
+        {
+            elemento.color = color.map(str::to_string);
+            elemento.icono = Some(icono_carpeta(&elemento.nombre, color));
+        }
+        true
     }
 
     pub fn cuantos(&self) -> usize {
@@ -555,10 +638,11 @@ fn leer() -> Vec<Elemento> {
     let Ok(entradas) = std::fs::read_dir(&carpeta) else {
         return Vec::new();
     };
+    let colores = colores_explorer();
     let mut elementos: Vec<Elemento> = entradas
         .filter_map(|e| e.ok())
         .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
-        .filter_map(|e| Elemento::leer(&e.path()))
+        .filter_map(|e| Elemento::leer(&e.path(), &colores))
         .collect();
     elementos.sort_by(|a, b| {
         let carpeta_a = a.ruta.is_dir();
@@ -571,7 +655,7 @@ fn leer() -> Vec<Elemento> {
 }
 
 impl Elemento {
-    fn leer(ruta: &Path) -> Option<Self> {
+    fn leer(ruta: &Path, colores: &HashMap<String, String>) -> Option<Self> {
         let nombre_fichero = ruta.file_name()?.to_string_lossy().into_owned();
         // Un `.desktop` en el escritorio es un lanzador, no un fichero de
         // texto: enseña su `Name` y su icono, y al abrirlo se ejecuta su
@@ -583,46 +667,169 @@ impl Elemento {
                 nombre: app.nombre,
                 ruta: ruta.to_path_buf(),
                 orden: app.exec,
-                icono: crate::icono::cargar(&app.icono),
+                // Un lanzador cuyo icono no está en ningún tema no puede quedar
+                // en blanco: se le pone el de fichero, como a cualquier otro.
+                icono: crate::icono::cargar(&app.icono).or_else(|| Some(icono_fichero(ruta))),
+                color: None,
                 celda: (-1, -1),
                 seleccionado: false,
             });
         }
+        let carpeta = ruta.is_dir();
+        let color = carpeta
+            .then(|| colores.get(ruta.to_string_lossy().as_ref()).cloned())
+            .flatten()
+            .filter(|c| hex_valido(c));
+        let icono = match carpeta {
+            true => icono_carpeta(&nombre_fichero, color.as_deref()),
+            false => icono_fichero(ruta),
+        };
         Some(Self {
             nombre: nombre_fichero,
             ruta: ruta.to_path_buf(),
             orden: format!("xdg-open {}", entrecomillar(ruta)),
-            icono: crate::icono::cargar(nombre_icono(ruta)),
+            icono: Some(icono),
+            color,
             celda: (-1, -1),
             seleccionado: false,
         })
     }
 }
 
-/// El icono del tema que le toca a un fichero.
-///
-/// No se resuelve el tipo MIME de verdad —eso es leer y cruzar
-/// `shared-mime-info`, unos megas de XML— sino la extensión, que acierta en lo
-/// que la gente tiene de verdad en el escritorio. Lo que no se reconoce cae en
-/// el genérico, que es exactamente lo que enseñaría un MIME desconocido.
-fn nombre_icono(ruta: &Path) -> &'static str {
-    if ruta.is_dir() {
-        return "folder";
+// --- Iconos de carpeta y fichero ---------------------------------------------
+//
+// Los mismos que dibuja bookos-explorer (su `src/icons.js`, el «Sistema A»):
+// relleno sólido de un color por función y nada de tema de iconos. Con los del
+// tema —Breeze, aquí— una carpeta del escritorio y la misma carpeta abierta en
+// el explorador parecían de dos sistemas distintos, y además dependían de que
+// el tema tuviera `places/folder`. Los trazados y los tonos se copian tal cual:
+// si cambian allí, hay que cambiarlos aquí.
+
+/// Las muestras del selector de color, en el orden del explorador.
+pub const MUESTRAS: [&str; 6] = [
+    "#FFCC00", "#FF3B30", "#FF9500", "#34C759", "#007AFF", "#AF52DE",
+];
+
+const CARPETA_POR_DEFECTO: &str = "#3B9BFF";
+
+/// El color que le toca a una carpeta por su nombre, si no tiene uno puesto.
+fn color_automatico(nombre: &str) -> &'static str {
+    match nombre.to_lowercase().as_str() {
+        "downloads" | "descargas" => "#AF52DE",
+        "documents" | "documentos" => "#FF3B30",
+        "music" | "música" | "musica" => "#34C759",
+        "pictures" | "images" | "imágenes" | "imagenes" => "#FF9500",
+        "videos" | "vídeos" => "#5856D6",
+        "desktop" | "escritorio" => "#00C7BE",
+        "public" | "público" | "publico" => "#FFCC00",
+        "templates" | "plantillas" => "#FF2D55",
+        _ => CARPETA_POR_DEFECTO,
     }
+}
+
+/// La pestaña se aclara con opacidad y no con un segundo tono, como en el
+/// explorador: así un color nuevo es una sola cadena.
+fn icono_carpeta(nombre: &str, color: Option<&str>) -> Icono {
+    let c = color.unwrap_or_else(|| color_automatico(nombre));
+    crate::icono::desde_svg(&format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 82"><path d="M2 16a12 12 0 0 1 12-12h20.7a12 12 0 0 1 8.5 3.5L47 12h39a12 12 0 0 1 12 12v8H2z" fill="{c}" opacity=".55"/><rect x="2" y="20" width="96" height="60" rx="13" fill="{c}"/></svg>"#
+    ))
+}
+
+/// La hoja con la esquina doblada, del color de su tipo y con la extensión
+/// escrita encima.
+fn icono_fichero(ruta: &Path) -> Icono {
     let ext = ruta
         .extension()
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
-    match ext.as_str() {
-        "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "svg" | "avif" => "image-x-generic",
-        "mp4" | "mkv" | "webm" | "avi" | "mov" => "video-x-generic",
-        "mp3" | "flac" | "ogg" | "opus" | "wav" | "m4a" => "audio-x-generic",
-        "pdf" => "application-pdf",
-        "zip" | "tar" | "gz" | "xz" | "zst" | "bz2" | "7z" | "rar" => "package-x-generic",
-        "txt" | "md" | "log" | "conf" | "toml" | "json" | "rs" | "py" | "sh" | "c" | "h"
-        | "cpp" | "qml" => "text-x-generic",
-        _ => "text-x-generic",
+    let color = color_de_tipo(&ext);
+    // La etiqueta acaba dentro del SVG: los caracteres que lo romperían fuera.
+    let etiqueta: String = ext
+        .chars()
+        .filter(|c| !matches!(c, '&' | '<' | '>'))
+        .take(4)
+        .collect::<String>()
+        .to_uppercase();
+    // Familias con nombre antes de `sans-serif`: la base de fuentes de resvg
+    // resuelve el genérico a «Arial», que en Fedora no está, y con solo
+    // `sans-serif` la etiqueta no salía —se vio en la previsualización—.
+    let texto = match etiqueta.is_empty() {
+        true => String::new(),
+        false => format!(
+            r##"<text x="50" y="60" text-anchor="middle" font-size="21" font-weight="700" fill="#fff" font-family="Inter, Noto Sans, Cantarell, DejaVu Sans, sans-serif">{etiqueta}</text>"##
+        ),
+    };
+    crate::icono::desde_svg(&format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 82"><path d="M18 9a8 8 0 0 1 8-8h30l22 22v51a8 8 0 0 1-8 8H26a8 8 0 0 1-8-8z" fill="{color}"/><path d="M56 1l22 22H60a4 4 0 0 1-4-4z" fill="#fff" opacity=".45"/>{texto}</svg>"##
+    ))
+}
+
+/// El color de cada tipo de fichero, por extensión: la tabla `KINDS` del
+/// explorador. Lo que no se reconoce va en gris.
+fn color_de_tipo(ext: &str) -> &'static str {
+    match ext {
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "svg" | "avif" | "heic" | "ico"
+        | "tiff" | "tif" | "xcf" | "psd" | "kra" | "ora" | "odg" | "fodg" => "#FF9500",
+        "mp4" | "mkv" | "webm" | "mov" | "avi" | "m4v" | "wmv" | "flv" | "mpg" | "mpeg" => {
+            "#5856D6"
+        }
+        "mp3" | "flac" | "wav" | "ogg" | "opus" | "m4a" | "aac" | "wma" => "#34C759",
+        "zip" | "tar" | "gz" | "xz" | "bz2" | "7z" | "rar" | "zst" | "deb" | "rpm" | "pkg"
+        | "iso" => "#FF2D55",
+        "pdf" => "#FF3B30",
+        "doc" | "docx" | "docm" | "dotx" | "odt" | "ott" | "fodt" | "rtf" | "txt" | "md"
+        | "epub" => "#007AFF",
+        "xls" | "xlsx" | "xlsm" | "ods" | "ots" | "fods" | "csv" | "tsv" => "#00C7BE",
+        "ppt" | "pptx" | "pps" | "ppsx" | "odp" | "otp" | "fodp" | "key" => "#AF52DE",
+        "js" | "ts" | "jsx" | "tsx" | "rs" | "py" | "c" | "h" | "cpp" | "go" | "java" | "sh"
+        | "json" | "toml" | "yaml" | "yml" | "html" | "css" | "xml" | "sql" | "lua" | "rb"
+        | "php" => "#5AC8FA",
+        _ => "#8E8E93",
     }
+}
+
+/// Solo `#RRGGBB`, como exige el explorador: el valor acaba dentro de un
+/// atributo `fill`, y cualquier otra cosa sería inyectar en el SVG.
+fn hex_valido(c: &str) -> bool {
+    c.len() == 7 && c.starts_with('#') && c[1..].chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+/// `~/.config/bookos-explorer/colors.json`: ruta absoluta → color.
+fn ruta_colores() -> Option<PathBuf> {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(config.join("bookos-explorer/colors.json"))
+}
+
+/// Un fichero que no está o no se entiende es un mapa vacío: todas las
+/// carpetas en su color automático, que es lo que enseña el explorador igual.
+fn colores_explorer() -> HashMap<String, String> {
+    ruta_colores()
+        .and_then(|ruta| std::fs::read_to_string(ruta).ok())
+        .and_then(|texto| serde_json::from_str(&texto).ok())
+        .unwrap_or_default()
+}
+
+/// Lee, cambia esas rutas y reescribe. Se relee justo antes para no pisar lo
+/// que haya cambiado el explorador desde que se cargó el escritorio.
+fn guardar_colores(rutas: &[String], color: Option<&str>) -> std::io::Result<()> {
+    let ruta = ruta_colores().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "sin HOME ni XDG_CONFIG_HOME")
+    })?;
+    let mut mapa = colores_explorer();
+    for carpeta in rutas {
+        match color {
+            Some(c) => mapa.insert(carpeta.clone(), c.to_string()),
+            None => mapa.remove(carpeta),
+        };
+    }
+    if let Some(dir) = ruta.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let texto = serde_json::to_string(&mapa).map_err(std::io::Error::other)?;
+    std::fs::write(ruta, texto)
 }
 
 /// Entrecomilla una ruta para `sh -c`: es lo que ejecuta el compositor, y un
@@ -823,6 +1030,7 @@ mod tests {
                     ruta: PathBuf::from(format!("/tmp/fichero {n}")),
                     orden: String::new(),
                     icono: None,
+                    color: None,
                     celda: (-1, -1),
                     seleccionado: false,
                 })
@@ -831,6 +1039,7 @@ mod tests {
             filas: 1,
             columnas: 1,
             arrastre: None,
+            visible: true,
         };
         e.zona = (
             MARGEN_X,
@@ -884,6 +1093,31 @@ mod tests {
         e.arrastrar((0.0, -CELDA.1));
         assert!(e.soltar());
         assert_ne!(e.elementos[0].celda, e.elementos[1].celda);
+    }
+
+    /// Las muestras solo salen con carpetas seleccionadas, y marcan el color
+    /// solo si todas comparten el mismo.
+    #[test]
+    fn el_color_de_la_seleccion_es_el_comun_de_sus_carpetas() {
+        let mut e = escritorio(3, (1440.0, 900.0));
+        // `/tmp` es una carpeta en cualquier máquina; `/tmp/fichero n` no existe
+        // y cuenta como fichero.
+        e.elementos[0].ruta = PathBuf::from("/tmp");
+        e.elementos[1].ruta = PathBuf::from("/tmp");
+        assert_eq!(e.color_seleccion(), None, "sin selección no hay muestras");
+        e.seleccionar(Some(0), false);
+        e.seleccionar(Some(1), true);
+        e.elementos[0].color = Some("#FF3B30".into());
+        e.elementos[1].color = Some("#FF3B30".into());
+        assert_eq!(e.color_seleccion(), Some(Some("#FF3B30")));
+        e.elementos[1].color = None;
+        assert_eq!(
+            e.color_seleccion(),
+            Some(None),
+            "mezclados no marcan ninguna"
+        );
+        e.seleccionar(Some(2), true);
+        assert_eq!(e.color_seleccion(), None, "un fichero no tiene color");
     }
 
     /// Un nombre con comillas o espacios no puede convertirse en dos órdenes al
@@ -950,7 +1184,7 @@ mod tests {
             std::env::set_var("XDG_DATA_HOME", &datos_tmp);
         }
 
-        let mut e = Escritorio::new(32.0, (1440.0, 900.0));
+        let mut e = Escritorio::new(32.0, (1440.0, 900.0), true);
         assert_eq!(e.cuantos(), 0, "el directorio de prueba nace vacío");
 
         assert!(e.crear_carpeta(32.0, (1440.0, 900.0)));

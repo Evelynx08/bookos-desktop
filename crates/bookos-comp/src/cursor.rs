@@ -60,10 +60,9 @@ smithay::render_elements! {
     /// pintarlo dentro del buffer del shell obligaría a rasterizar la pantalla
     /// entera en CPU; aquí lo compone la GPU y no cuesta nada.
     Color=SolidColorRenderElement,
-    /// Una superficie compuesta a un tamaño distinto del suyo, que es como
-    /// crece una ventana al aparecer. Solo se usa **durante** la animación: una
-    /// ventana quieta va por `Surface`, sin capa de por medio, para no darle al
-    /// damage tracker geometría redondeada donde puede tener la exacta.
+    /// Una superficie a otro tamaño: la entrada de ventanas y la compensación
+    /// del cursor X11. Una ventana quieta va por `Surface` para conservar su
+    /// geometría exacta en el seguimiento de daños.
     Escalada=RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>,
     /// La barra de título mientras su ventana crece al aparecer. Va aparte de
     /// `Memory` por lo mismo que `Escalada`: una barra quieta no pasa por la
@@ -83,6 +82,10 @@ smithay::render_elements! {
 /// de su `index.theme`: es lo que busca xcursor. Su `Inherits=breeze_cursors`
 /// cubre los cursores raros que BookOS no dibuja.
 const TEMA: &str = "BookOS-Dark";
+
+pub fn nombre_tema() -> String {
+    std::env::var("XCURSOR_THEME").unwrap_or_else(|_| TEMA.to_string())
+}
 
 /// Un cursor ya cargado y listo para subir a textura.
 struct Imagen {
@@ -136,7 +139,7 @@ impl CursorTheme {
         let objetivo = (nominal as f64 * scale).round().max(1.0) as u32;
         // `XCURSOR_THEME` manda si está puesta: es lo que espera cualquiera que
         // venga de configurar el cursor por las vías de siempre.
-        let nombre = std::env::var("XCURSOR_THEME").unwrap_or_else(|_| TEMA.to_string());
+        let nombre = nombre_tema();
         let theme = Self {
             nombre,
             nominal,
@@ -231,7 +234,7 @@ impl CursorTheme {
 /// es si el tema no está instalado, si le falta ese nombre o si lo estamos
 /// pidiendo con el nombre equivocado, y las tres se parecen desde fuera.
 pub fn info() -> anyhow::Result<()> {
-    let tema = std::env::var("XCURSOR_THEME").unwrap_or_else(|_| TEMA.to_string());
+    let tema = nombre_tema();
     println!("tema: {tema}\n");
 
     // Los nombres tal y como los piden los clientes, no los del tema.
@@ -466,14 +469,13 @@ pub fn elements(
             // para clientes X11 y Wayland, así que no se le puede dar a unos
             // un tamaño y a otros otro.
             use smithay::reexports::wayland_server::Resource;
-            let scale = scale
-                * surface
-                    .client()
-                    .and_then(|c| {
-                        c.get_data::<smithay::xwayland::XWaylandClientData>()
-                            .map(|d| d.compositor_state.client_scale())
-                    })
-                    .unwrap_or(1.0);
+            let escala_x11 = surface
+                .client()
+                .and_then(|c| {
+                    c.get_data::<smithay::xwayland::XWaylandClientData>()
+                        .map(|d| d.compositor_state.client_scale())
+                })
+                .unwrap_or(1.0);
             let origin = (
                 location.x - hotspot.x as f64 * scale,
                 location.y - hotspot.y as f64 * scale,
@@ -489,7 +491,24 @@ pub fn elements(
                     1.0,
                     Kind::Cursor,
                 );
-            elements.into_iter().map(OverlayElement::Surface).collect()
+            elements
+                .into_iter()
+                .map(|elemento| {
+                    if escala_x11 == 1.0 {
+                        OverlayElement::Surface(elemento)
+                    } else {
+                        // La escala de `render_elements_from_surface_tree` solo
+                        // coloca las superficies. El tamaño se calcula después
+                        // con la escala de salida: hay que ampliar el elemento,
+                        // incluido el hotspot, alrededor del punto del ratón.
+                        OverlayElement::Escalada(RescaleRenderElement::from_element(
+                            elemento,
+                            location.to_i32_round(),
+                            escala_x11,
+                        ))
+                    }
+                })
+                .collect()
         }
     }
 }

@@ -9,6 +9,48 @@ if [ -f /etc/default/bookos-greeter ]; then
     . /etc/default/bookos-greeter
     set +a
 fi
+if [ -n "${HOME:-}" ] && [ -f "$HOME/greeter.env" ]; then
+    set -a
+    . "$HOME/greeter.env"
+    set +a
+fi
 export XKB_DEFAULT_LAYOUT="${XKB_DEFAULT_LAYOUT:-es}"
-exec dbus-run-session -- cage -s -- /usr/local/libexec/bookos-greeter \
+export LANG="${LANG:-es_ES.UTF-8}"
+
+# El touchpad, como en la sesión. Lo publicado es de la primera cuenta de
+# persona, la misma de la que el greeter saca la escala; sin nada publicado,
+# los valores de serie de `Entrada` y escala 1. La raíz admite escritura de
+# cualquiera: solo vale una carpeta que sea de su dueño, y los valores se
+# comprueban antes de pasarlos.
+touchpad=0.3 raton=0 toque=1 natural=1 escala=1
+cuenta="$(awk -F: '$3 >= 1000 && $3 < 60000 && $7 !~ /(nologin|false)$/ { print $1 ":" $3; exit }' /etc/passwd)"
+publicado="/var/lib/bookos/apariencia/${cuenta%%:*}"
+if [ -n "$cuenta" ] && [ -d "$publicado" ] && [ ! -L "$publicado" ] \
+    && [ "$(stat -c %u "$publicado")" = "${cuenta##*:}" ] && [ -f "$publicado/panel.conf" ]; then
+    while IFS='=' read -r clave valor; do
+        clave="${clave// /}" valor="${valor// /}"
+        case "$valor" in
+            si | sí | true | 1) logico=1 ;;
+            no | false | 0) logico=0 ;;
+            *) logico= ;;
+        esac
+        numero=
+        [[ "$valor" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] && numero="$valor"
+        case "$clave" in
+            velocidad_touchpad) touchpad="${numero:-$touchpad}" ;;
+            velocidad_raton) raton="${numero:-$raton}" ;;
+            toque_para_clic) toque="${logico:-$toque}" ;;
+            scroll_natural) natural="${logico:-$natural}" ;;
+            escala) escala="${numero:-$escala}" ;;
+        esac
+    done < "$publicado/panel.conf"
+fi
+export CAGE_TOUCHPAD_SPEED="$touchpad" CAGE_MOUSE_SPEED="$raton" CAGE_TAP="$toque" \
+    CAGE_NATURAL_SCROLL="$natural" CAGE_POINTER_SCALE="$escala"
+
+# El cage de serie no lee esas variables; se queda como reserva para que la
+# pantalla de acceso no desaparezca si falta el parcheado.
+cage=/usr/local/libexec/bookos-cage
+[ -x "$cage" ] || cage=cage
+exec dbus-run-session -- "$cage" -s -- /usr/local/libexec/bookos-greeter \
     --session /usr/local/bin/bookos-session

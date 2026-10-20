@@ -208,6 +208,20 @@ pub fn ejecutar_en(bus: &str, que: Orden) -> bool {
         Orden::Siguiente => "Next",
         Orden::Alternar => "PlayPause",
     };
+    llamar(bus, &[metodo])
+}
+
+/// Mueve la reproducción `desfase` segundos, hacia delante o hacia atrás.
+///
+/// `Seek` relativo y no `SetPosition`: este último pide el `mpris:trackid`, que
+/// `busctl` da como ruta de objeto y no todos los reproductores publican; el
+/// relativo lo implementan igual kdeconnect (`mprisremote`) y BookOS Player.
+pub fn saltar_en(bus: &str, desfase: i64) -> bool {
+    llamar(bus, &["Seek", "x", &(desfase * 1_000_000).to_string()])
+}
+
+/// Un método de `org.mpris.MediaPlayer2.Player` sin esperar la respuesta.
+fn llamar(bus: &str, metodo: &[&str]) -> bool {
     let Ok(mut hijo) = Command::new("busctl")
         .args([
             "--user",
@@ -215,8 +229,8 @@ pub fn ejecutar_en(bus: &str, que: Orden) -> bool {
             bus,
             "/org/mpris/MediaPlayer2",
             "org.mpris.MediaPlayer2.Player",
-            metodo,
         ])
+        .args(metodo)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

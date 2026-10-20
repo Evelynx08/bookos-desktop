@@ -268,6 +268,25 @@ pub fn tecla(state: &mut BookosComp, codigo: Keycode, estado: KeyState, time: u3
                 // es la propiedad que define un bloqueo.
                 return FilterResult::Intercept(accion);
             }
+            // Supr sobre el escritorio: a la papelera lo seleccionado. Solo
+            // si nadie tiene el teclado —pulsar el escritorio se lo quita a
+            // las ventanas— y sin una emergente abierta, que tiene sus propias
+            // teclas; si no, Supr es de quien esté escribiendo.
+            if matches!(
+                handle.modified_sym().raw(),
+                keysyms::KEY_Delete | keysyms::KEY_KP_Delete
+            ) && state
+                .seat
+                .get_keyboard()
+                .is_some_and(|k| k.current_focus().is_none())
+                && state.shell.as_ref().is_some_and(|s| {
+                    s.emergente_nombre().is_none() && s.escritorio_seleccion().contains(&true)
+                })
+            {
+                return FilterResult::Intercept(Some(crate::keybinds::Accion::DelShell(
+                    bookos_shell::Accion::EscritorioEliminarSeleccion,
+                )));
+            }
             // Una superficie emergente abierta se queda con las teclas
             // que entiende: es lo que permite cerrar el menú con Esc y
             // recorrerlo con las flechas sin que el cliente con foco
@@ -1350,6 +1369,10 @@ fn pulsar_escritorio(state: &mut BookosComp, punto: Point<f64, Logical>) -> bool
     {
         return false;
     }
+    // El escritorio se queda el teclado, como en cualquier gestor de
+    // archivos: sin esto la ventana de antes seguía con el foco y Supr le
+    // llegaba a ella en vez de borrar lo seleccionado aquí.
+    state.desenfocar();
     // Se apunta el clic pase lo que pase, aunque no sea doble: el siguiente
     // puede serlo con este de pareja.
     let doble = es_doble_clic(state);
@@ -1407,13 +1430,12 @@ fn pulsar_escritorio(state: &mut BookosComp, punto: Point<f64, Logical>) -> bool
     true
 }
 
-/// El clic derecho sobre el escritorio pelado: el menú de «Nueva carpeta» y
-/// «Eliminar».
+/// El clic derecho sobre el escritorio: sobre un icono, abrirlo o mandarlo a
+/// la papelera; en hueco vacío, carpeta nueva, fondo y pantalla.
 ///
-/// Reutiliza `MenuDock::ventana_en` —el mismo menú genérico que ya usa el
-/// clic derecho de una barra de título, pero anclado al punto del clic en vez
-/// de centrado— en vez de montar una emergente propia: montar una entera para
-/// dos entradas es más superficie de la que hace falta.
+/// Reutiliza `MenuDock` —el menú del dock, con sus filas compactas— anclado
+/// al punto del clic, en vez de montar una emergente propia para cuatro
+/// entradas.
 ///
 /// `true` si el clic era del escritorio y no debe llegar a nadie más.
 fn pulsar_derecho_escritorio(state: &mut BookosComp, punto: Point<f64, Logical>) -> bool {
@@ -1426,11 +1448,18 @@ fn pulsar_derecho_escritorio(state: &mut BookosComp, punto: Point<f64, Logical>)
     }
     // Clic derecho sobre un icono que no estaba seleccionado: lo selecciona
     // solo, como el clic izquierdo. Sobre uno que ya lo estaba, se deja la
-    // selección tal cual, para poder eliminar varios a la vez.
+    // selección tal cual, para poder eliminar varios a la vez. En hueco vacío
+    // se limpia, también como el izquierdo: si no, lo seleccionado antes
+    // seguía mandando y el menú ofrecía la papelera en vez del del escritorio.
     let icono = state
         .shell
         .as_ref()
         .and_then(|s| s.escritorio_en(punto.x, punto.y));
+    if icono.is_none()
+        && let Some(shell) = state.shell.as_mut()
+    {
+        shell.escritorio_seleccionar(None, false);
+    }
     if let Some(i) = icono {
         let ya = state
             .shell
@@ -1446,24 +1475,65 @@ fn pulsar_derecho_escritorio(state: &mut BookosComp, punto: Point<f64, Logical>)
         .shell
         .as_ref()
         .is_some_and(|s| s.escritorio_seleccion().iter().any(|&s| s));
-    let mut opciones = vec![(
-        "Nueva carpeta".to_string(),
-        bookos_shell::Accion::EscritorioNuevaCarpeta,
-    )];
-    if hay_seleccion {
-        opciones.push((
-            "Eliminar".to_string(),
-            bookos_shell::Accion::EscritorioEliminarSeleccion,
-        ));
-    }
+    use bookos_shell::Accion;
+    let opciones = if hay_seleccion {
+        // «Abrir» solo con un icono debajo del clic: con varios seleccionados
+        // por banda no hay uno que abrir, y abrirlos todos de golpe no es lo
+        // que nadie espera de un clic derecho.
+        let abrir = icono
+            .and_then(|i| state.shell.as_ref().and_then(|s| s.escritorio_abrir(i)))
+            .map(|accion| Some(("Abrir".to_string(), "abrir", accion)));
+        let divisor = abrir.is_some().then_some(None);
+        abrir
+            .into_iter()
+            .chain(divisor)
+            .chain([Some((
+                "Mover a la papelera".to_string(),
+                "papelera",
+                Accion::EscritorioEliminarSeleccion,
+            ))])
+            .collect()
+    } else {
+        let visibles = state.shell.as_ref().is_some_and(|s| s.escritorio_visible());
+        // Con los iconos ocultos, «Nueva carpeta» crearía algo que no se ve:
+        // sale solo cuando se ven.
+        let nueva = visibles.then_some(Some((
+            "Nueva carpeta".to_string(),
+            "carpeta-nueva",
+            Accion::EscritorioNuevaCarpeta,
+        )));
+        let iconos = match visibles {
+            true => ("Ocultar iconos".to_string(), "ojo-tachado"),
+            false => ("Mostrar iconos".to_string(), "ojo"),
+        };
+        nueva
+            .into_iter()
+            .chain(visibles.then_some(None))
+            .chain([
+                Some((
+                    "Cambiar fondo…".to_string(),
+                    "fondo",
+                    Accion::Lanzar("bookos-settings --page fondos".into()),
+                )),
+                Some((
+                    "Ajustes de pantalla".to_string(),
+                    "pantalla",
+                    Accion::Lanzar("bookos-settings --page pantalla".into()),
+                )),
+                None,
+                Some((iconos.0, iconos.1, Accion::EscritorioIconos(!visibles))),
+            ])
+            .collect()
+    };
     // Sobre un icono, el menú sale debajo de él, no encima tapando lo que se
-    // acaba de seleccionar. En hueco vacío, junto al propio clic.
+    // acaba de seleccionar, y con el aire de cualquier emergente: pegado a la
+    // celda realzada parecía parte de ella. En hueco vacío, junto al clic.
     let origen = icono
         .and_then(|i| state.shell.as_ref().and_then(|s| s.escritorio_rect(i)))
-        .map(|(rx, ry, _, rh)| (rx, ry + rh))
+        .map(|(rx, ry, _, rh)| (rx, ry + rh + crate::shell::SEPARACION as f32))
         .unwrap_or((punto.x as f32, punto.y as f32));
     if let Some(shell) = state.shell.as_mut() {
-        shell.menu_ventana_en(opciones, origen);
+        shell.menu_escritorio(opciones, origen);
     }
     state.needs_redraw = true;
     true
@@ -1593,6 +1663,7 @@ pub fn exponer(state: &mut BookosComp) {
         crate::keybinds::Accion::Conmutar(bookos_shell::conmutador::Modo::Ventanas, 0),
     );
     state.conmutador_pegado = state.shell.as_ref().is_some_and(|s| s.hay_conmutador());
+    state.conmutador_entrada = state.conmutador_pegado.then(std::time::Instant::now);
 }
 
 #[cfg(test)]

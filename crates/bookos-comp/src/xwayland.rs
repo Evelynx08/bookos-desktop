@@ -26,6 +26,7 @@
 //! lo leen y se dibujan grandes y nítidas; una aplicación que lo ignore se ve
 //! pequeña, que es el precio que pagan todos los escritorios que hacen esto.
 
+use std::io::Write;
 use std::os::fd::OwnedFd;
 
 use smithay::utils::{Logical, Rectangle};
@@ -119,34 +120,67 @@ pub fn actualizar_escala(state: &mut BookosComp) {
     let datos = cliente
         .get_data::<smithay::xwayland::XWaylandClientData>()
         .expect("el cliente de XWayland lleva sus datos desde el spawn");
-    if datos.compositor_state.client_scale() == escala {
-        return;
+    if datos.compositor_state.client_scale() != escala {
+        datos.compositor_state.set_client_scale(escala);
+        // Smithay solo reenvía el tamaño de la salida en la escala nueva dentro de
+        // `change_current_state`, y XWayland ya la tenía enlazada a escala 1. Sin
+        // esto su raíz se quedaba en lógicos (medido con `xdpyinfo`: 1440x900 en
+        // el panel de 2880x1800) mientras las ventanas iban en físicos: todo lo
+        // que caía fuera de ese cuarto de pantalla no recibía el puntero.
+        for salida in state.space.outputs() {
+            salida.change_current_state(None, None, None, None);
+        }
+        tracing::info!(escala, "escala de XWayland");
     }
-    datos.compositor_state.set_client_scale(escala);
-    // Smithay solo reenvía el tamaño de la salida en la escala nueva dentro de
-    // `change_current_state`, y XWayland ya la tenía enlazada a escala 1. Sin
-    // esto su raíz se quedaba en lógicos (medido con `xdpyinfo`: 1440x900 en
-    // el panel de 2880x1800) mientras las ventanas iban en físicos: todo lo
-    // que caía fuera de ese cuarto de pantalla no recibía el puntero.
-    for salida in state.space.outputs() {
-        salida.change_current_state(None, None, None, None);
-    }
-    tracing::info!(escala, "escala de XWayland");
     let Some(n) = state.display_x11 else {
         return;
     };
     // 96 es el DPI de referencia de X11: 192 equivale a escala 2.
     let dpi = (96.0 * escala).round() as u32;
-    match std::process::Command::new("/bin/sh")
-        .arg("-c")
-        .arg(format!("echo 'Xft.dpi: {dpi}' | xrdb -merge"))
+    let mut recursos = format!("Xft.dpi: {dpi}\n");
+    if let Some(tema) = state.cursor_theme.as_ref() {
+        let tamano = tema.tamano_logico();
+        recursos.push_str(&format!(
+            "Xcursor.theme: {}\nXcursor.size: {tamano}\n",
+            tema.nombre(),
+        ));
+        // GTK/Electron consultan XSettings; libXcursor también puede leer los
+        // recursos de la raíz. Ambos deben coincidir con los clientes lanzados
+        // desde el dock. El escalado del cursor X11 lo hace el compositor.
+        if let Some(wm) = state.xwm.as_mut()
+            && let Err(err) = wm.set_xsettings(
+                [
+                    (
+                        "Gtk/CursorThemeName".to_string(),
+                        tema.nombre().to_string().into(),
+                    ),
+                    ("Gtk/CursorThemeSize".to_string(), (tamano as i32).into()),
+                ]
+                .into_iter(),
+            )
+        {
+            tracing::warn!("no se pudieron publicar los ajustes del cursor X11: {err}");
+        }
+    }
+    match std::process::Command::new("xrdb")
+        .arg("-merge")
         .env("DISPLAY", format!(":{n}"))
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
     {
-        Ok(hijo) => state.hijos.push(hijo),
-        Err(err) => tracing::warn!("no se pudo fijar Xft.dpi: {err}"),
+        Ok(mut hijo) => {
+            let mut entrada = hijo
+                .stdin
+                .take()
+                .expect("xrdb se lanzó con stdin canalizado");
+            if let Err(err) = entrada.write_all(recursos.as_bytes()) {
+                tracing::warn!("no se pudieron escribir los recursos de X11: {err}");
+            }
+            state.hijos.push(hijo);
+        }
+        Err(err) => tracing::warn!("no se pudieron publicar los recursos de X11: {err}"),
     }
 }
 

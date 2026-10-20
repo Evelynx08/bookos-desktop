@@ -1,0 +1,117 @@
+diff -ruN a/meson.build b/meson.build
+--- a/meson.build
++++ b/meson.build
+@@ -40,6 +40,7 @@
+ wlroots        = dependency('wlroots-0.20', fallback: ['wlroots', 'wlroots'])
+ wayland_server = dependency('wayland-server')
+ xkbcommon      = dependency('xkbcommon')
++libinput       = dependency('libinput')
+ math           = cc.find_library('m')
+ 
+ have_xwayland = wlroots.get_variable(pkgconfig: 'have_xwayland', internal: 'have_xwayland') == 'true'
+@@ -113,6 +114,7 @@
+     wayland_server,
+     wlroots,
+     xkbcommon,
++    libinput,
+     math,
+   ],
+   install: true,
+diff -ruN a/seat.c b/seat.c
+--- a/seat.c
++++ b/seat.c
+@@ -15,7 +15,9 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <wayland-server-core.h>
++#include <libinput.h>
+ #include <wlr/backend.h>
++#include <wlr/backend/libinput.h>
+ #include <wlr/backend/multi.h>
+ #include <wlr/backend/session.h>
+ #include <wlr/types/wlr_cursor.h>
+@@ -203,6 +205,51 @@
+ 	update_capabilities(seat);
+ }
+ 
++/* BookOS: cage deja libinput con sus valores de serie —touchpad lento, sin
++ * toque para hacer clic, scroll al revés— y mueve el cursor en píxeles de la
++ * salida, que corre a escala 1. La sesión de BookOS mueve en lógicos a escala
++ * 2 con velocidad 0,3: en la pantalla de acceso el puntero iba unas 2,5 veces
++ * más lento. Todo sale del entorno; sin variables, cage se porta como el de
++ * serie. */
++static double pointer_scale = 1.0;
++
++static void
++configure_libinput(struct wlr_input_device *device)
++{
++	if (!wlr_input_device_is_libinput(device)) {
++		return;
++	}
++	struct libinput_device *dev = wlr_libinput_get_device_handle(device);
++	bool touchpad = libinput_device_config_tap_get_finger_count(dev) > 0;
++
++	const char *speed = getenv(touchpad ? "CAGE_TOUCHPAD_SPEED" : "CAGE_MOUSE_SPEED");
++	if (speed && libinput_device_config_accel_is_available(dev)) {
++		libinput_device_config_accel_set_profile(dev, LIBINPUT_CONFIG_ACCEL_PROFILE_ADAPTIVE);
++		libinput_device_config_accel_set_speed(dev, strtod(speed, NULL));
++	}
++
++	const char *natural = getenv("CAGE_NATURAL_SCROLL");
++	if (natural && libinput_device_config_scroll_has_natural_scroll(dev)) {
++		libinput_device_config_scroll_set_natural_scroll_enabled(dev, strcmp(natural, "1") == 0);
++	}
++
++	if (!touchpad) {
++		return;
++	}
++	const char *tap = getenv("CAGE_TAP");
++	if (tap) {
++		libinput_device_config_tap_set_enabled(dev, strcmp(tap, "1") == 0 ? LIBINPUT_CONFIG_TAP_ENABLED
++										   : LIBINPUT_CONFIG_TAP_DISABLED);
++		/* Lo mismo que hace la sesión: clic con dedos en vez de zonas, que
++		 * en un clickpad sin botones convierte un clic abajo a la derecha en
++		 * botón derecho sin querer, y el puntero quieto mientras se escribe. */
++		libinput_device_config_click_set_method(dev, LIBINPUT_CONFIG_CLICK_METHOD_CLICKFINGER);
++		if (libinput_device_config_dwt_is_available(dev)) {
++			libinput_device_config_dwt_set_enabled(dev, LIBINPUT_CONFIG_DWT_ENABLED);
++		}
++	}
++}
++
+ static void
+ handle_new_pointer(struct cg_seat *seat, struct wlr_pointer *wlr_pointer)
+ {
+@@ -214,6 +261,7 @@
+ 
+ 	pointer->seat = seat;
+ 	pointer->pointer = wlr_pointer;
++	configure_libinput(&wlr_pointer->base);
+ 	wlr_cursor_attach_input_device(seat->cursor, &wlr_pointer->base);
+ 
+ 	wl_list_insert(&seat->pointers, &pointer->link);
+@@ -670,9 +718,10 @@
+ 	struct cg_seat *seat = wl_container_of(listener, seat, cursor_motion_relative);
+ 	struct wlr_pointer_motion_event *event = data;
+ 
+-	wlr_cursor_move(seat->cursor, &event->pointer->base, event->delta_x, event->delta_y);
+-	process_cursor_motion(seat, event->time_msec, event->delta_x, event->delta_y, event->unaccel_dx,
+-			      event->unaccel_dy);
++	double dx = event->delta_x * pointer_scale;
++	double dy = event->delta_y * pointer_scale;
++	wlr_cursor_move(seat->cursor, &event->pointer->base, dx, dy);
++	process_cursor_motion(seat, event->time_msec, dx, dy, event->unaccel_dx, event->unaccel_dy);
+ 	wlr_idle_notifier_v1_notify_activity(seat->server->idle, seat->seat);
+ }
+ 
+@@ -823,6 +872,10 @@
+ 		return NULL;
+ 	}
+ 	seat->server = server;
++	const char *scale = getenv("CAGE_POINTER_SCALE");
++	if (scale && strtod(scale, NULL) > 0) {
++		pointer_scale = strtod(scale, NULL);
++	}
+ 	seat->destroy.notify = handle_destroy;
+ 	wl_signal_add(&seat->seat->events.destroy, &seat->destroy);
+ 

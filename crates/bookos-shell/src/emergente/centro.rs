@@ -65,17 +65,21 @@ const BOTON: f32 = 48.0;
 const REJILLA_MARGEN: f32 = 14.0;
 /// Aire entre las dos filas de la rejilla.
 const ENTRE_FILAS: f32 = 14.0;
-/// Alto de una celda de la rejilla: el círculo, un hueco y el rótulo.
-const CELDA: f32 = BOTON + 6.0 + 14.0;
+/// Alto de una celda de la rejilla: solo el círculo, sin rótulo debajo. Con
+/// iconos macizos se reconocen solos, y la tarjeta gana 40 px de alto.
+const CELDA: f32 = BOTON;
 /// Relleno de los grupos de los deslizadores y de lo que suena.
 const GRUPO_MARGEN: f32 = 12.0;
 /// Aire entre los dos deslizadores.
 const ENTRE_DESLIZADORES: f32 = 10.0;
 /// Lado de la carátula de lo que suena.
 const CARATULA: f32 = 48.0;
-/// Alto de la barra de avance de la canción: la misma píldora que el volumen,
-/// más estrecha, para que no se lea como otro volumen.
-const AVANCE: f32 = 10.0;
+/// Alto de la franja de la barra de avance: lo que mide el tirador. La barra
+/// era la píldora de 10 px del volumen y se leía como otro deslizador de
+/// volumen; ahora es un surco fino con su tirador, que dice «posición».
+const AVANCE: f32 = 12.0;
+/// Grueso del surco de la barra de avance.
+const SURCO_AVANCE: f32 = 4.0;
 /// Alto del renglón de los tiempos.
 const TIEMPOS: f32 = 14.0;
 /// Lado del botón de reproducir.
@@ -119,8 +123,6 @@ fn contenedor() -> Color {
 /// Un conmutador o una acción de la rejilla.
 struct Baldosa {
     icono: &'static str,
-    /// El rótulo de debajo. Es lo que hace, no cómo se llama el icono.
-    nombre: &'static str,
     /// Encendida: círculo en acento sólido. Apagada: color de la tarjeta.
     activa: bool,
     /// Qué ejecuta. `None` = lo resuelve el propio shell.
@@ -442,8 +444,8 @@ impl Centro {
             return None;
         }
         let columna = ((x - x0) / ancho_celda) as usize;
-        // El aire entre filas va con la de arriba: es donde cae el rótulo al
-        // apuntar con prisa, y no hay nada debajo que pudiera querer el clic.
+        // El aire entre filas va con la de arriba: al apuntar con prisa se cae
+        // por debajo del círculo, y no hay nada ahí que pudiera querer el clic.
         let fila = ((y - y0) / (CELDA + ENTRE_FILAS)) as usize;
         if columna >= COLUMNAS {
             return None;
@@ -510,6 +512,16 @@ impl Centro {
             width: control::BOTON,
             height: control::BOTON,
         }
+    }
+
+    /// Dónde está la barra de avance, con la holgura vertical que hace falta
+    /// para acertarle a un surco de 4 px.
+    fn avance_en(&self, x: f32, y: f32) -> Option<f32> {
+        let y0 = self.y_medios() + GRUPO_MARGEN + CARATULA + 10.0;
+        let x0 = MARGEN + GRUPO_MARGEN;
+        let ancho = ANCHO - x0 * 2.0;
+        (y >= y0 - 6.0 && y <= y0 + AVANCE + 6.0 && x >= x0 - 4.0 && x <= x0 + ancho + 4.0)
+            .then(|| ((x - x0) / ancho).clamp(0.0, 1.0))
     }
 
     /// Los tres mandos de lo que suena, si está.
@@ -619,6 +631,18 @@ impl Centro {
         if holgada(self.rect_pildora(Agarre::Brillo)).contains(punto) {
             self.agarre = Agarre::Brillo;
             self.poner_brillo(nivel);
+            return None;
+        }
+        if let Some(fraccion) = self.avance_en(x, y)
+            && let Some(sonando) = self.sonando.as_mut()
+            && let (Some(posicion), Some(duracion)) = (sonando.posicion, sonando.duracion)
+        {
+            let destino = (fraccion * duracion as f32).round() as u64;
+            if medios::saltar_en(&sonando.bus, destino as i64 - posicion as i64) {
+                // Como el play: sin esperar la lectura de vuelta, que con el
+                // móvil tarda hasta un segundo y el tirador parecería no moverse.
+                sonando.posicion = Some(destino);
+            }
             return None;
         }
         if let Some(orden) = self.medio_en(x, y) {
@@ -807,7 +831,7 @@ impl Centro {
         fondo: Color,
         tinta: Color,
     ) -> PanelElement<'static> {
-        let dibujo: PanelElement<'static> = match icono::propio(nombre) {
+        let dibujo: PanelElement<'static> = match icono::propio_solido(nombre) {
             Some(ic) => icono::ver_teñido_propio(&ic, icono_px, tinta),
             None => Space::new().width(Length::Fixed(icono_px)).into(),
         };
@@ -1025,31 +1049,11 @@ impl Centro {
         };
         let fondo = tema::mezclar(base, tema::tinta(), 0.08 * self.señalada.intensidad(i));
         let celda = (ANCHO - (MARGEN + REJILLA_MARGEN) * 2.0) / COLUMNAS as f32;
-        // El rótulo de una baldosa encendida va en texto pleno y el de una
-        // apagada en secundario: el estado se lee dos veces, en el círculo y
-        // en la palabra, que es lo que necesita quien no distingue el acento
-        // del gris de al lado.
-        let rotulo = text(baldosa.nombre)
-            .size(11.0)
-            .color(if baldosa.activa {
-                tema::texto()
-            } else {
-                tema::TEXTO2
-            })
-            .align_x(Horizontal::Center)
-            .width(Length::Fixed(celda));
-        container(
-            column![
-                Self::circulo(baldosa.icono, BOTON, 20.0, fondo, tinta),
-                Space::new().height(Length::Fixed(6.0)),
-                rotulo,
-            ]
-            .align_x(Horizontal::Center),
-        )
-        .width(Length::Fixed(celda))
-        .height(Length::Fixed(CELDA))
-        .center_x(Length::Fixed(celda))
-        .into()
+        container(Self::circulo(baldosa.icono, BOTON, 20.0, fondo, tinta))
+            .width(Length::Fixed(celda))
+            .height(Length::Fixed(CELDA))
+            .center_x(Length::Fixed(celda))
+            .into()
     }
 
     fn deslizador(&self, cual: Agarre) -> PanelElement<'_> {
@@ -1084,7 +1088,7 @@ impl Centro {
             ),
         };
         let dibujo = |nombre: &str, px: f32, color: Color| -> PanelElement<'static> {
-            match icono::propio(nombre) {
+            match icono::propio_solido(nombre) {
                 Some(ic) => icono::ver_teñido_propio(&ic, px, color),
                 None => Space::new().width(Length::Fixed(px)).into(),
             }
@@ -1117,9 +1121,8 @@ impl Centro {
 
     fn medios(&self, sonando: &Sonando) -> PanelElement<'_> {
         let ancho = ANCHO - (MARGEN + GRUPO_MARGEN) * 2.0;
-        let avance = (sonando.avance().unwrap_or(0.0) * 100.0).round() as u8;
         let ancho_texto = ancho - CARATULA - 12.0;
-        let caratula = container(match (&self.caratula, icono::propio("musica")) {
+        let caratula = container(match (&self.caratula, icono::propio_solido("musica")) {
             (Some(foto), _) => iced_widget::image(foto.clone())
                 .width(Length::Fixed(CARATULA))
                 .height(Length::Fixed(CARATULA))
@@ -1154,7 +1157,7 @@ impl Centro {
                 .color(tema::TEXTO2),
         ];
         let mando = |nombre: &str| -> PanelElement<'static> {
-            match icono::propio(nombre) {
+            match icono::propio_solido(nombre) {
                 Some(ic) => icono::ver_teñido_propio(&ic, 22.0, tema::texto()),
                 None => Space::new().width(Length::Fixed(22.0)).into(),
             }
@@ -1164,7 +1167,7 @@ impl Centro {
                 .align_y(Vertical::Center)
                 .height(Length::Fixed(CARATULA)),
             Space::new().height(Length::Fixed(10.0)),
-            control::pildora(ancho, AVANCE, avance, false, tema::elevado()),
+            barra_avance(ancho, sonando.avance()),
             Space::new().height(Length::Fixed(6.0)),
             row![
                 text(medios::reloj(sonando.posicion.unwrap_or(0)))
@@ -1282,35 +1285,30 @@ fn baldosas() -> Vec<Baldosa> {
     vec![
         Baldosa {
             icono: "avion",
-            nombre: "Avión",
             activa: avion,
             accion: None,
             interna: None,
         },
         Baldosa {
             icono: "notificaciones",
-            nombre: "Avisos",
             activa: false,
             accion: None,
             interna: None,
         },
         Baldosa {
             icono: "ahorro",
-            nombre: "Ahorro",
             activa: ahorro,
             accion: None,
             interna: None,
         },
         Baldosa {
             icono: "mantener",
-            nombre: "Despierta",
             activa: mantener_despierto(),
             accion: None,
             interna: Some(Interna::Mantener),
         },
         Baldosa {
             icono: "noche",
-            nombre: "Noche",
             activa: crate::luz_nocturna_encendida(),
             // La acción se arma al pulsar: lleva el estado al que se va, y
             // uno calculado aquí se quedaría viejo al segundo toque.
@@ -1319,21 +1317,18 @@ fn baldosas() -> Vec<Baldosa> {
         },
         Baldosa {
             icono: "compartir",
-            nombre: "Compartir",
             activa: false,
             accion: Some(Accion::Lanzar("bookos-share || kdeconnect-app".into())),
             interna: None,
         },
         Baldosa {
             icono: "captura",
-            nombre: "Captura",
             activa: false,
             accion: Some(Accion::AbrirCaptura),
             interna: None,
         },
         Baldosa {
             icono: "bloquear",
-            nombre: "Bloquear",
             activa: false,
             accion: Some(Accion::Bloquear),
             interna: None,
@@ -1450,6 +1445,44 @@ fn vigilar_medios(
     if let Err(err) = resultado {
         tracing::warn!("sin hilo para seguir lo que suena: {err}");
     }
+}
+
+/// El surco fino con lo reproducido en acento y un tirador al final.
+///
+/// Sin duración —el móvil a veces no la manda, y en una radio no la hay— queda
+/// el surco vacío y sin tirador: un tirador clavado al principio dice «0:00»,
+/// y eso es mentira.
+fn barra_avance<'a>(ancho: f32, avance: Option<f32>) -> PanelElement<'a> {
+    let pildora = |ancho: f32, alto: f32, color: Color| {
+        container(Space::new())
+            .width(Length::Fixed(ancho))
+            .height(Length::Fixed(alto))
+            .style(move |_: &iced_widget::Theme| container::Style {
+                background: Some(color.into()),
+                border: Border {
+                    radius: (alto / 2.0).into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+    };
+    let surco = container(pildora(ancho, SURCO_AVANCE, tema::elevado()))
+        .height(Length::Fixed(AVANCE))
+        .center_y(Length::Fixed(AVANCE));
+    let Some(avance) = avance else {
+        return surco.into();
+    };
+    // El tirador se mueve entre sus dos medios lados y no entre los bordes:
+    // así a 0 % y a 100 % no se sale del grupo.
+    let x = (ancho - AVANCE) * avance;
+    let lleno = container(pildora(x + AVANCE / 2.0, SURCO_AVANCE, tema::acento()))
+        .height(Length::Fixed(AVANCE))
+        .center_y(Length::Fixed(AVANCE));
+    let tirador = row![
+        Space::new().width(Length::Fixed(x)),
+        pildora(AVANCE, AVANCE, tema::acento()),
+    ];
+    iced_widget::stack![surco, lleno, tirador].into()
 }
 
 fn caratula(ruta: &str) -> Option<iced_widget::image::Handle> {

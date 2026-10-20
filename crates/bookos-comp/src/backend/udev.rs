@@ -229,6 +229,7 @@ pub fn run(
     state.genio = crate::genio::Genio::new(&mut renderer);
     state.contexto_gl = Some(smithay::backend::renderer::Renderer::context_id(&renderer));
     state.velo_captura = crate::captura::Velo::new(&mut renderer);
+    state.banda = crate::banda::Banda::new(&mut renderer);
     state.fondo = crate::fondo::Fondo::cargar(&state.fondo_config);
     crate::publicar::activar();
     crate::publicar::publicar(&state.fondo_config);
@@ -805,6 +806,9 @@ fn crear_salidas(
         tracing::info!(pantalla = %nombre, %id, crtc = ?crtc,
             modo = %format!("{}x{}@{}", w, h, modo.vrefresh()),
             escala, x = posicion.x, y = posicion.y, "salida multipantalla activa");
+        if salidas.is_empty() {
+            crate::publicar::escala_de_pantalla(escala);
+        }
         salidas.push(SalidaKms {
             output,
             global,
@@ -1288,7 +1292,12 @@ fn asignar_crtcs(opciones: &[Vec<crtc::Handle>]) -> Option<Vec<crtc::Handle>> {
 /// pantalla a 144 Hz no espera a otra de 60 Hz y cada swapchain conserva su
 /// propio daño.
 fn dibujar_todas(state: &mut BookosComp, u: &mut Udev) {
-    if !u.activa {
+    // Con DPMS apagado no se encola nada: tras `clear()` el siguiente
+    // `queue_frame` vuelve a encender el panel. Al dormir desde el diálogo, la
+    // entrada animada del bloqueo lo encendía justo después de apagarlo, y se
+    // veía el candado hasta que el equipo se suspendía. `needs_redraw` se
+    // conserva para que lo primero al encender sea el estado de entonces.
+    if !u.activa || !state.dpms_encendido {
         return;
     }
     // Antes de mirar nada: lo que se mueve solo avanza **una vez** por vuelta,

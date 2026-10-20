@@ -257,13 +257,45 @@ fn componer(
     // viva— y una celda sin fondo es un marco vacío flotando.
     let mostrando_ventanas =
         state.conmutador_modo == Some(bookos_shell::conmutador::Modo::Ventanas);
+    // Lo andado de la entrada de tres dedos, de 0 a 1. Las ventanas salen de
+    // donde estaban y la tarjeta aparece con ellas: sin viaje, la exposición
+    // brotaba de golpe y no se veía qué miniatura era qué ventana.
+    let entrada = match state.conmutador_entrada {
+        Some(desde) if state.conmutador_pegado && !bookos_shell::tema::efectos_reducidos() => {
+            bookos_shell::tema::C_SUAVE.eval(bookos_shell::tema::avance(
+                desde.elapsed(),
+                bookos_shell::tema::D_VENTANA,
+            )) as f64
+        }
+        _ => 1.0,
+    };
     if mostrando_ventanas {
         let huecos = state
             .shell
             .as_ref()
             .map(|s| s.conmutador_miniaturas())
             .unwrap_or_default();
+        let origen_salida = state
+            .space
+            .output_geometry(output)
+            .map(|g| g.loc)
+            .unwrap_or_default();
         for (window, hueco) in state.conmutador_destinos.iter().zip(huecos) {
+            let hueco = match state.space.element_geometry(window) {
+                Some(sitio) if entrada < 1.0 => {
+                    let mezclar = |a: i32, b: i32| a + ((b - a) as f64 * entrada).round() as i32;
+                    let desde = sitio.loc - origen_salida;
+                    Rectangle::new(
+                        (mezclar(desde.x, hueco.loc.x), mezclar(desde.y, hueco.loc.y)).into(),
+                        (
+                            mezclar(sitio.size.w, hueco.size.w),
+                            mezclar(sitio.size.h, hueco.size.h),
+                        )
+                            .into(),
+                    )
+                }
+                _ => hueco,
+            };
             elementos.extend(constrain_space_element::<GlesRenderer, _, OverlayElement>(
                 renderer,
                 window,
@@ -285,7 +317,7 @@ fn componer(
     if let Some(shell) = state.shell.as_ref() {
         elementos.extend(
             shell
-                .conmutador_extras(renderer)
+                .conmutador_extras(renderer, entrada as f32)
                 .into_iter()
                 .map(OverlayElement::Memory),
         );
@@ -296,7 +328,7 @@ fn componer(
     if let Some(elemento) = state
         .shell
         .as_ref()
-        .and_then(|shell| shell.conmutador_element(renderer))
+        .and_then(|shell| shell.conmutador_element(renderer, entrada as f32))
     {
         elementos.push(OverlayElement::Memory(elemento));
     }
@@ -878,12 +910,18 @@ fn componer(
     // por encima de los nombres, no por debajo.
     if !bloqueado && !completa {
         if let Some(shell) = state.shell.as_ref() {
-            elementos.extend(
-                shell
-                    .banda_elementos()
-                    .into_iter()
-                    .map(OverlayElement::Color),
-            );
+            match (state.banda.as_mut(), shell.banda()) {
+                (Some(banda), Some((rect, escala))) => {
+                    elementos.push(OverlayElement::Velo(banda.elemento(rect, escala)));
+                }
+                (None, Some(_)) => elementos.extend(
+                    shell
+                        .banda_elementos()
+                        .into_iter()
+                        .map(OverlayElement::Color),
+                ),
+                (_, None) => {}
+            }
         }
         let iconos = state
             .shell

@@ -215,6 +215,7 @@ pub struct Buscador {
 
 impl Buscador {
     pub fn new(pantalla: (f32, f32)) -> Self {
+        crate::icono::olvidar_ausentes();
         let apps = apps::leer();
         let mut buscador = Self {
             ancho: ancho_para(pantalla.0),

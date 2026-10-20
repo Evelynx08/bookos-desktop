@@ -78,13 +78,15 @@ fn intercambiar(
     Response::read_from(socket).context("No se pudo recibir la respuesta de greetd")
 }
 
-pub fn iniciar_sesion(programa: &str) -> Request {
+pub fn iniciar_sesion(programa: &str, teclado: &str, locale: &str) -> Request {
     Request::StartSession {
         cmd: vec![programa.into()],
         env: vec![
             "XDG_SESSION_TYPE=wayland".into(),
             "XDG_CURRENT_DESKTOP=BookOS".into(),
             "XDG_SESSION_DESKTOP=BookOS".into(),
+            format!("XKB_DEFAULT_LAYOUT={teclado}"),
+            format!("LANG={locale}"),
         ],
     }
 }
@@ -121,6 +123,8 @@ mod tests {
                 Request::StartSession { cmd, env } => {
                     assert_eq!(cmd, ["/usr/local/bin/bookos-session"]);
                     assert!(env.contains(&"XDG_SESSION_TYPE=wayland".into()));
+                    assert!(env.contains(&"XKB_DEFAULT_LAYOUT=es".into()));
+                    assert!(env.contains(&"LANG=es_ES.UTF-8".into()));
                     assert!(
                         !env.iter()
                             .any(|valor| valor.starts_with("WAYLAND_DISPLAY="))
@@ -160,7 +164,7 @@ mod tests {
             intercambiar(
                 ruta,
                 &mut socket,
-                &iniciar_sesion("/usr/local/bin/bookos-session")
+                &iniciar_sesion("/usr/local/bin/bookos-session", "es", "es_ES.UTF-8")
             )?,
             Response::Success
         ));

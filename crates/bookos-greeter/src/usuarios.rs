@@ -52,6 +52,7 @@ pub struct Apariencia {
     pub escala: Option<f64>,
     pub efectos_reducidos: bool,
     pub fondo: Option<PathBuf>,
+    pub teclado: Option<String>,
 }
 
 pub struct Persona {
@@ -102,6 +103,10 @@ impl Persona {
                 escala: config.escala,
                 efectos_reducidos: config.efectos == Efectos::Reducidos,
                 fondo,
+                teclado: config
+                    .teclado
+                    .map(|t| t.trim().to_lowercase())
+                    .filter(|t| !t.is_empty()),
             },
         }
     }
@@ -200,12 +205,28 @@ pub struct Fondo {
     pub losas: Vec<Vec<(Handle, f32, f32)>>,
 }
 
+type ClaveCache = (PathBuf, u32, u32, u32, bool);
+static CACHE_FONDOS: std::sync::Mutex< Vec<(ClaveCache, Fondo)> > =
+    std::sync::Mutex::new(Vec::new());
+
 pub fn cargar_fondo(
     ruta: &Path,
     (ancho, alto): (u32, u32),
     densidad: f32,
     automatico: bool,
 ) -> Option<Fondo> {
+    let clave = (
+        ruta.to_path_buf(),
+        ancho,
+        alto,
+        (densidad * 100.0).round() as u32,
+        automatico,
+    );
+    if let Ok(guard) = CACHE_FONDOS.lock()
+        && let Some((_, fondo)) = guard.iter().find(|(k, _)| *k == clave)
+    {
+        return Some(fondo.clone());
+    }
     let mut lector = image::ImageReader::open(ruta)
         .ok()?
         .with_guessed_format()
@@ -236,6 +257,8 @@ pub fn cargar_fondo(
         )
     };
     let lado = ((LOSA as f32 * densidad).round() as u32).max(1);
+    let raw = entero.as_raw();
+    let stride = (ancho * 4) as usize;
     let losas = (0..alto)
         .step_by(lado as usize)
         .map(|y| {
@@ -244,9 +267,14 @@ pub fn cargar_fondo(
                 .step_by(lado as usize)
                 .map(|x| {
                     let ancho_losa = lado.min(ancho - x);
-                    let losa = image::imageops::crop_imm(&entero, x, y, ancho_losa, alto_losa);
+                    let bytes_fila = (ancho_losa * 4) as usize;
+                    let mut buf = Vec::with_capacity(bytes_fila * alto_losa as usize);
+                    for fila_y in y..(y + alto_losa) {
+                        let inicio = fila_y as usize * stride + (x * 4) as usize;
+                        buf.extend_from_slice(&raw[inicio..inicio + bytes_fila]);
+                    }
                     (
-                        Handle::from_rgba(ancho_losa, alto_losa, losa.to_image().into_raw()),
+                        Handle::from_rgba(ancho_losa, alto_losa, buf),
                         ancho_losa as f32 / densidad,
                         alto_losa as f32 / densidad,
                     )
@@ -254,7 +282,14 @@ pub fn cargar_fondo(
                 .collect()
         })
         .collect();
-    Some(Fondo { losas })
+    let fondo = Fondo { losas };
+    if let Ok(mut guard) = CACHE_FONDOS.lock() {
+        if guard.len() >= 6 {
+            guard.remove(0);
+        }
+        guard.push((clave, fondo.clone()));
+    }
+    Some(fondo)
 }
 
 pub fn fondo_por_defecto(tema: Tema) -> Option<PathBuf> {

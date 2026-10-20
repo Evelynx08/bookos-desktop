@@ -6,23 +6,44 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::fondo::Eleccion;
 
 /// Lo que se publica de `panel.conf`. El resto —dock, atajos, escritorios— no
-/// le hace falta al greeter y no tiene por qué leerlo cualquiera.
-const CLAVES: [&str; 6] = [
+/// le hace falta al greeter y no tiene por qué leerlo cualquiera. Las de
+/// entrada no son para el greeter sino para el cage que lo aloja:
+/// `bookos-greeter-start` se las pasa para que el touchpad responda igual que
+/// en la sesión.
+const CLAVES: [&str; 11] = [
     "tema",
     "tema_claro_desde",
     "tema_oscuro_desde",
     "acento",
     "efectos",
     "escala",
+    "teclado",
+    "velocidad_touchpad",
+    "velocidad_raton",
+    "toque_para_clic",
+    "scroll_natural",
 ];
 const MAXIMO: u64 = 32 * 1024 * 1024;
 
 static ACTIVA: AtomicBool = AtomicBool::new(false);
+/// La escala con la que arrancó el panel principal, en bits de `f64`; 0 es que
+/// todavía no hay ninguna.
+///
+/// Con la escala en automático `panel.conf` no la lleva, y el greeter la
+/// deducía por su cuenta: 1800 / 1050 → 1,75 en un panel donde el compositor,
+/// por DPI, pone 2. La pantalla de acceso salía un 12 % más pequeña que el
+/// escritorio. Se publica la que se usa de verdad.
+static ESCALA: AtomicU64 = AtomicU64::new(0);
+
+/// Apunta la escala del panel principal para la próxima publicación.
+pub fn escala_de_pantalla(escala: f64) {
+    ESCALA.store(escala.to_bits(), Ordering::Relaxed);
+}
 
 /// Solo publica la sesión real. Anidado para desarrollar, con un `panel.conf`
 /// de prueba, pisaría la apariencia de verdad del usuario.
@@ -63,14 +84,7 @@ fn escribir(carpeta: &Path, fondos: &[(&str, Option<PathBuf>)]) -> std::io::Resu
     let config = bookos_shell::ruta_config()
         .and_then(|ruta| std::fs::read_to_string(ruta).ok())
         .unwrap_or_default();
-    let publico: String = config
-        .lines()
-        .filter(|linea| {
-            let clave = linea.split('=').next().unwrap_or_default().trim();
-            CLAVES.contains(&clave) || clave.starts_with("bloqueo_reloj")
-        })
-        .flat_map(|linea| [linea, "\n"])
-        .collect();
+    let publico = lo_publico(&config, f64::from_bits(ESCALA.load(Ordering::Relaxed)));
     reemplazar(&carpeta.join("panel.conf"), |temporal| {
         std::fs::write(temporal, &publico)
     })?;
@@ -95,6 +109,26 @@ fn escribir(carpeta: &Path, fondos: &[(&str, Option<PathBuf>)]) -> std::io::Resu
     .map(PathBuf::from)
     .find(|ruta| ruta.is_file());
     copiar(avatar.as_deref(), &carpeta.join("avatar"))
+}
+
+/// Las líneas de `panel.conf` que puede leer el greeter, más la escala en uso
+/// si la configuración no fija ninguna. `escala` 0 es «aún no se sabe».
+fn lo_publico(config: &str, escala: f64) -> String {
+    fn clave(linea: &str) -> &str {
+        linea.split('=').next().unwrap_or_default().trim()
+    }
+    let mut publico: String = config
+        .lines()
+        .filter(|linea| {
+            let clave = clave(linea);
+            CLAVES.contains(&clave) || clave.starts_with("bloqueo_reloj")
+        })
+        .flat_map(|linea| [linea, "\n"])
+        .collect();
+    if escala > 0.0 && !config.lines().any(|linea| clave(linea) == "escala") {
+        publico.push_str(&format!("escala = {escala}\n"));
+    }
+    publico
 }
 
 /// Copia `origen` si cambió, o retira lo publicado si ya no hay nada que
@@ -137,6 +171,17 @@ fn reemplazar(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Con la escala en automático se publica la que usa el compositor; con
+    /// una elegida, esa y no otra.
+    #[test]
+    fn la_escala_en_uso_va_solo_si_no_hay_una_elegida() {
+        let auto = lo_publico("tema = oscuro\ndock = konsole\n", 2.0);
+        assert_eq!(auto, "tema = oscuro\nescala = 2\n");
+        let elegida = lo_publico("escala = 1.5\n", 2.0);
+        assert_eq!(elegida, "escala = 1.5\n");
+        assert_eq!(lo_publico("tema = claro\n", 0.0), "tema = claro\n");
+    }
 
     #[test]
     fn publica_lo_que_cambia_y_retira_lo_que_ya_no_hay() -> std::io::Result<()> {

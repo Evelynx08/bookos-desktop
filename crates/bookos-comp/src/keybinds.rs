@@ -1013,6 +1013,22 @@ pub fn hacer(state: &mut BookosComp, accion: bookos_shell::Accion) {
             }
             state.needs_redraw = true;
         }
+        bookos_shell::Accion::EscritorioIconos(visibles) => {
+            let pantalla = state.pantalla_logica();
+            if let Some(shell) = state.shell.as_mut() {
+                shell.escritorio_mostrar(visibles, pantalla);
+            }
+            if let Err(err) = bookos_shell::guardar_iconos_escritorio(visibles) {
+                tracing::warn!("no se pudo guardar si se ven los iconos: {err}");
+            }
+            state.needs_redraw = true;
+        }
+        bookos_shell::Accion::EscritorioColor(color) => {
+            if let Some(shell) = state.shell.as_mut() {
+                shell.escritorio_colorear(color.as_deref());
+            }
+            state.needs_redraw = true;
+        }
         bookos_shell::Accion::AlternarEfectos => {
             let Some(shell) = state.shell.as_mut() else {
                 return;
@@ -1152,7 +1168,25 @@ pub fn hacer(state: &mut BookosComp, accion: bookos_shell::Accion) {
             // Se pide el cierre a todas sus ventanas, no solo a la primera: el
             // "Cerrar" del dock cierra la aplicación, y una que tenga tres
             // ventanas abiertas dejaría dos si se cerrara solo una.
-            for window in state.ventanas_de_app(&app_id) {
+            //
+            // Las minimizadas y las apartadas por «mostrar el escritorio»
+            // también: el dock las cuenta como abiertas —por eso sale
+            // «Cerrar»—, y con solo las del `Space` una aplicación minimizada
+            // ofrecía cerrarse y no hacía nada.
+            let mut ventanas = state.ventanas_de_app(&app_id);
+            ventanas.extend(
+                state
+                    .minimizadas
+                    .iter()
+                    .map(|(w, _)| w)
+                    .chain(state.escritorios.escondidas_activas())
+                    .filter(|w| {
+                        crate::handlers::app_id(w)
+                            .is_some_and(|suyo| bookos_shell::mismo_programa(&app_id, &suyo))
+                    })
+                    .cloned(),
+            );
+            for window in ventanas {
                 cerrar(&window);
             }
         }
@@ -1163,6 +1197,9 @@ pub fn hacer(state: &mut BookosComp, accion: bookos_shell::Accion) {
             // aplicación que se haya quedado abierta detrás.
             if crate::ventanas::hay_minimizada(state, &app_id) {
                 crate::ventanas::restaurar_minimizada(state, &app_id);
+                return;
+            }
+            if crate::escritorios::recuperar_app(state, &app_id) {
                 return;
             }
             // Mientras sigue viajando aún figura en el `Space`; una segunda

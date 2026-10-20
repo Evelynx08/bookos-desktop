@@ -453,7 +453,8 @@ fn renderiza_las_vistas_para_inspeccion() -> anyhow::Result<()> {
     };
     let directorio = PathBuf::from(directorio);
     std::fs::create_dir_all(&directorio)?;
-    let (ancho, alto, escala) = (2880, 1800, 1.75);
+    // La escala que pone BookOS en este panel: la que el greeter recibe ahora publicada.
+    let (ancho, alto, escala) = (2880, 1800, 2.0);
     let publicada = std::env::var_os("BOOKOS_GREETER_PREVIEW_PUBLICADO").map(PathBuf::from);
     let pregunta = || Estado::Pregunta {
         texto: "Contraseña:".into(),
@@ -592,3 +593,63 @@ fn renderiza_las_vistas_para_inspeccion() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn cambia_idioma_teclado_y_visibilidad_de_contrasena() {
+    let (mut acceso, _) = Acceso::nuevo(None, "/sesion-no-utilizada".into(), Vec::new());
+    let _ = acceso.actualizar(Mensaje::AbrirPanel(Some(Panel::Idioma)));
+    assert_eq!(acceso.panel_abierto, Some(Panel::Idioma));
+    assert!(acceso.menu.destino() > 0.0);
+
+    let _ = acceso.actualizar(Mensaje::ElegirIdioma(Idioma::En));
+    assert_eq!(acceso.idioma, Idioma::En);
+
+    let _ = acceso.actualizar(Mensaje::ElegirTeclado("us".into()));
+    assert_eq!(acceso.teclado.as_deref(), Some("US"));
+    assert_eq!(acceso.teclado_codigo, "us");
+
+    // Alt+Shift avanza a la siguiente distribución de la lista.
+    let _ = acceso.actualizar(Mensaje::SiguienteTeclado);
+    assert_eq!(acceso.teclado_codigo, "gb");
+
+    // Alternar visibilidad de contraseña y Bloq Mayús.
+    assert!(!acceso.mostrar_respuesta);
+    let _ = acceso.actualizar(Mensaje::AlternarMostrarClave);
+    assert!(acceso.mostrar_respuesta);
+    let _ = acceso.actualizar(Mensaje::AlternarMayusculas);
+    assert!(acceso.caps_lock);
+
+    // Esc con un panel abierto cierra el panel sin cancelar la sesión.
+    let _ = acceso.actualizar(Mensaje::Cancelar);
+    assert_eq!(acceso.panel_abierto, None);
+    assert_eq!(acceso.menu.destino(), 0.0);
+}
+
+#[test]
+fn gestiona_redes_wifi_y_perfiles_de_energia_en_vista_previa() {
+    let (mut acceso, _) = Acceso::nuevo(None, "/sesion-no-utilizada".into(), Vec::new());
+    let _ = acceso.actualizar(Mensaje::AbrirPanel(Some(Panel::Red)));
+    assert_eq!(acceso.panel_abierto, Some(Panel::Red));
+    assert_eq!(acceso.wifi_estado.ssid_actual.as_deref(), Some("BookOS-5G"));
+
+    // Elegir una red segura no guardada pide contraseña antes de conectar.
+    let _ = acceso.actualizar(Mensaje::WifiElegir(1));
+    assert_eq!(acceso.wifi_conectar_a.as_deref(), Some("Invitados"));
+    let _ = acceso.actualizar(Mensaje::WifiClave("clave1234".into()));
+    let _ = acceso.actualizar(Mensaje::WifiConectar);
+    assert_eq!(acceso.wifi_conectar_a, None);
+    assert_eq!(acceso.wifi_estado.ssid_actual.as_deref(), Some("Invitados"));
+
+    // Desconectar y apagar Wi-Fi.
+    let _ = acceso.actualizar(Mensaje::WifiDesconectar);
+    assert_eq!(acceso.wifi_estado.ssid_actual, None);
+    let _ = acceso.actualizar(Mensaje::WifiAlternar(false));
+    assert!(!acceso.wifi_estado.encendida);
+
+    // Cambiar el modo de energía en el panel de batería.
+    let _ = acceso.actualizar(Mensaje::AbrirPanel(Some(Panel::Bateria)));
+    assert_eq!(acceso.panel_abierto, Some(Panel::Bateria));
+    let _ = acceso.actualizar(Mensaje::PerfilEnergia("performance".into()));
+    assert_eq!(acceso.bateria_detalle.perfil, "performance");
+}
+

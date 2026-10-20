@@ -126,7 +126,8 @@ pub use config::{
     Actividades as ConfigActividades, Bloqueo as ConfigBloqueo, BrilloAutomatico, Config, Efectos,
     Entrada, FuenteReloj, LuzNocturna, MAXIMO_ESCRITORIOS, ModoLuzNocturna, Pasos,
     guardar_apariencia, guardar_brillo_automatico, guardar_configuracion, guardar_dock,
-    guardar_efectos, guardar_escritorios, guardar_esquiva, guardar_fondo, guardar_luz_nocturna,
+    guardar_efectos, guardar_escritorios, guardar_esquiva, guardar_fondo,
+    guardar_iconos_escritorio, guardar_luz_nocturna,
     luz_nocturna_encendida, marcar_luz_nocturna, olvidar_fondo, ruta as ruta_config,
 };
 pub use dock::{
@@ -141,7 +142,7 @@ pub use state::PanelData;
 /// La hora local de ahora, en `(hora, minuto)`. La necesita el compositor para
 /// el temporizador del tema automático.
 pub use state::hora_local_ahora;
-pub use state::{Battery, Link, Network};
+pub use state::{Battery, Fecha, Link, Network};
 pub use widget::Widget;
 pub use widgets::bateria_sobre_fondo;
 
@@ -293,6 +294,11 @@ pub enum Accion {
     EscritorioNuevaCarpeta,
     /// Mandar lo seleccionado del escritorio a la papelera, del mismo menú.
     EscritorioEliminarSeleccion,
+    /// Enseñar (`true`) u ocultar los iconos del escritorio.
+    EscritorioIconos(bool),
+    /// Color de las carpetas seleccionadas: `#RRGGBB`, o `None` para volver
+    /// al automático.
+    EscritorioColor(Option<String>),
 }
 
 impl Accion {
@@ -855,7 +861,11 @@ impl Shell {
             barras: std::collections::HashMap::new(),
             // Sin alto todavía: lo sabe el compositor y llega por
             // `escritorio_pantalla` antes del primer frame.
-            escritorio: escritorio::Escritorio::new(PANEL_HEIGHT as f32, (width as f32, 0.0)),
+            escritorio: escritorio::Escritorio::new(
+                PANEL_HEIGHT as f32,
+                (width as f32, 0.0),
+                config.iconos_escritorio,
+            ),
             escritorio_canvas: Canvas::new(
                 Size::new(escritorio::CELDA.0, escritorio::CELDA.1),
                 scale,
@@ -944,6 +954,11 @@ impl Shell {
     pub fn escritorio_eliminar_seleccion(&mut self, pantalla: (f32, f32)) -> bool {
         self.escritorio
             .eliminar_seleccionados(PANEL_HEIGHT as f32, pantalla)
+    }
+
+    /// Enseña u oculta los iconos. `true` si cambió.
+    pub fn escritorio_mostrar(&mut self, visible: bool, pantalla: (f32, f32)) -> bool {
+        self.escritorio.mostrar(visible, PANEL_HEIGHT as f32, pantalla)
     }
 
     /// Tamaño en píxeles físicos del buffer de **una** celda. Son todas
@@ -3086,8 +3101,15 @@ impl Shell {
 
     /// El menú de ventana anclado a un punto lógico de la pantalla: lo que
     /// pide el clic derecho sobre el escritorio, para salir junto al cursor.
-    pub fn menu_ventana_en(&mut self, opciones: Vec<(String, Accion)>, punto: (f32, f32)) {
-        self.abrir(Emergente::menu_ventana_en(opciones, punto));
+    pub fn menu_escritorio(
+        &mut self,
+        opciones: Vec<Option<(String, &'static str, Accion)>>,
+        punto: (f32, f32),
+    ) {
+        // Las muestras de color las decide el propio escritorio, que es quien
+        // sabe si lo seleccionado son carpetas.
+        let colores = self.escritorio.color_seleccion();
+        self.abrir(Emergente::menu_escritorio(opciones, colores, punto));
     }
 
     /// Ancla una aplicación al dock, o la desancla si ya estaba.

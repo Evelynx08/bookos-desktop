@@ -358,6 +358,8 @@ pub struct BookosComp {
     /// El shader del velo de la captura, compilado al arrancar el backend.
     /// `None` si el driver no lo acepta: el velo sale con esquinas rectas.
     pub velo_captura: Option<crate::captura::Velo>,
+    /// La banda elástica redondeada. Ver [`crate::banda`].
+    pub banda: Option<crate::banda::Banda>,
     /// Las ventanas congeladas que se están yendo al dock —o volviendo—, con la
     /// textura de la que sale su deformación.
     pub capturas: Vec<(smithay::desktop::Window, crate::genio::Captura)>,
@@ -405,6 +407,11 @@ pub struct BookosComp {
     /// tres dedos no tiene ninguno que sostener, así que sin esto la primera
     /// tecla que se soltara la daría por resuelta y saltaría a una ventana.
     pub conmutador_pegado: bool,
+    /// Cuándo se abrió la exposición de tres dedos, para que las ventanas
+    /// viajen desde su sitio hasta su miniatura. Alt+Tab y Meta+Tab no lo
+    /// ponen: se abren y se cierran en lo que dura una pulsación, y un viaje
+    /// de 260 ms los haría ir por detrás del dedo.
+    pub conmutador_entrada: Option<std::time::Instant>,
     /// La configuración del escritorio, leída una vez al arrancar.
     ///
     /// El backend la consulta para la escala **antes** de que exista el shell
@@ -797,6 +804,9 @@ impl BookosComp {
             // arriba lo ve. Sin esto el bucle se relajaba a mitad de la
             // transición y el cambio de escritorio salía a trompicones.
             || self.escritorios.deslizando()
+            || self
+                .conmutador_entrada
+                .is_some_and(|desde| desde.elapsed() < bookos_shell::tema::D_VENTANA)
     }
 
     pub fn new(
@@ -1027,8 +1037,10 @@ impl BookosComp {
             traductor: Default::default(),
             captura_tecla: false,
             conmutador_pegado: false,
+            conmutador_entrada: None,
             genio: None,
             velo_captura: None,
+            banda: None,
             capturas: Vec::new(),
             cierres: Vec::new(),
             arrastre_vista: None,

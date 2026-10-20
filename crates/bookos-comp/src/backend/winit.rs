@@ -169,6 +169,7 @@ pub fn run(
         backend.renderer(),
     ));
     state.velo_captura = crate::captura::Velo::new(backend.renderer());
+    state.banda = crate::banda::Banda::new(backend.renderer());
     state.fondo = crate::fondo::Fondo::cargar(&state.fondo_config);
     crate::backend::actualizar_acento_del_fondo(state);
     crate::backend::programar_fondo_animado(state);

@@ -394,6 +394,7 @@ pub struct Launchpad {
 
 impl Launchpad {
     pub fn new(pantalla: (f32, f32)) -> Self {
+        crate::icono::olvidar_ausentes();
         let apps = apps::leer();
         let guardado = crate::config::cargar_launchpad();
         let carpetas: Vec<Carpeta> = guardado

@@ -269,13 +269,15 @@ impl BookosComp {
         //
         // Las de **otros escritorios** no cuentan, y es a propósito: el dock
         // enseña lo que hay en el escritorio en el que estás. Viven en
-        // `escritorios::guardadas` y no se consultan aquí.
+        // `escritorios::guardadas` y no se consultan aquí. Las apartadas por
+        // «mostrar el escritorio» en este sí: siguen siendo de aquí.
         let ids: Vec<String> = self
             .space
             .elements()
             .chain(self.minimizadas.iter().map(|(w, _)| w))
+            .chain(self.escritorios.escondidas_activas())
             .filter(|w| w.alive())
-            .filter_map(app_id)
+            .filter_map(|w| crate::ventanas::app_id_de_grupo(self, w))
             .collect();
         if self.shell.as_mut().is_some_and(|s| s.ventanas(&ids)) {
             self.needs_redraw = true;

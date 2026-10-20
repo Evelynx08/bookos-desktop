@@ -25,7 +25,7 @@ pub(super) const FILA: f32 = 26.0;
 /// Alto del bloque separador, con su línea de 1 px en medio.
 pub(super) const DIVISOR: f32 = 7.0;
 /// Margen lateral de las filas dentro del menú.
-const MARGEN: f32 = 6.0;
+pub(super) const MARGEN: f32 = 6.0;
 /// Márgenes de arriba y de abajo del menú entero.
 const BORDE_SUP: f32 = 2.0;
 const BORDE_INF: f32 = 4.0;

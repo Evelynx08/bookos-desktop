@@ -8,6 +8,7 @@ mod apariencia;
 mod atenuacion;
 mod autenticar;
 mod backend;
+mod banda;
 mod brillo_auto;
 mod captura;
 mod cierre;

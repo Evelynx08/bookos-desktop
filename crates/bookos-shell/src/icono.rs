@@ -233,6 +233,15 @@ const PROPIOS: &[(&str, &[u8])] = &[
         include_bytes!("../assets/iconos/micro-silencio.svg"),
     ),
     // --- Los de los menús ------------------------------------------------
+    // Los cinco del clic derecho del escritorio, heroicons 24/outline.
+    (
+        "carpeta-nueva",
+        include_bytes!("../assets/iconos/carpeta-nueva.svg"),
+    ),
+    ("fondo", include_bytes!("../assets/iconos/fondo.svg")),
+    ("pantalla", include_bytes!("../assets/iconos/pantalla.svg")),
+    ("papelera", include_bytes!("../assets/iconos/papelera.svg")),
+    ("abrir", include_bytes!("../assets/iconos/abrir.svg")),
     ("acerca", include_bytes!("../assets/iconos/acerca.svg")),
     (
         "preferencias",
@@ -319,6 +328,139 @@ const PROPIOS: &[(&str, &[u8])] = &[
     ),
 ];
 
+/// Las variantes macizas que usa el centro de control: Heroicons 2.1.5
+/// `24/solid` de BookOS-HIG donde hay equivalente. Los propios se rellenan a
+/// partir de ellos —el altavoz de `speaker-wave` sin ondas, el wifi tachado con
+/// una máscara, el sol automático con la «A» calada en el disco— y el
+/// Bluetooth, que es solo trazo, va más grueso. El avión ya era macizo y no
+/// está.
+///
+/// Van aparte y no en lugar de los de contorno porque los nombres los comparten
+/// la barra, el OSD y los menús, que siguen con trazo. La segunda columna es la
+/// clave de la caché: estática, para no montar una cadena en cada fotograma.
+const SOLIDOS: &[(&str, &str, &[u8])] = &[
+    (
+        "ahorro",
+        "solido/ahorro",
+        include_bytes!("../assets/iconos/solido/ahorro.svg"),
+    ),
+    (
+        "anterior",
+        "solido/anterior",
+        include_bytes!("../assets/iconos/solido/anterior.svg"),
+    ),
+    (
+        "apagar",
+        "solido/apagar",
+        include_bytes!("../assets/iconos/solido/apagar.svg"),
+    ),
+    (
+        "bloquear",
+        "solido/bloquear",
+        include_bytes!("../assets/iconos/solido/bloquear.svg"),
+    ),
+    (
+        "bluetooth",
+        "solido/bluetooth",
+        include_bytes!("../assets/iconos/solido/bluetooth.svg"),
+    ),
+    (
+        "bluetooth-apagado",
+        "solido/bluetooth-apagado",
+        include_bytes!("../assets/iconos/solido/bluetooth-apagado.svg"),
+    ),
+    (
+        "brillo",
+        "solido/brillo",
+        include_bytes!("../assets/iconos/solido/brillo.svg"),
+    ),
+    (
+        "brillo-automatico",
+        "solido/brillo-automatico",
+        include_bytes!("../assets/iconos/solido/brillo-automatico.svg"),
+    ),
+    (
+        "captura",
+        "solido/captura",
+        include_bytes!("../assets/iconos/solido/captura.svg"),
+    ),
+    (
+        "compartir",
+        "solido/compartir",
+        include_bytes!("../assets/iconos/solido/compartir.svg"),
+    ),
+    (
+        "mantener",
+        "solido/mantener",
+        include_bytes!("../assets/iconos/solido/mantener.svg"),
+    ),
+    (
+        "musica",
+        "solido/musica",
+        include_bytes!("../assets/iconos/solido/musica.svg"),
+    ),
+    (
+        "noche",
+        "solido/noche",
+        include_bytes!("../assets/iconos/solido/noche.svg"),
+    ),
+    (
+        "notificaciones",
+        "solido/notificaciones",
+        include_bytes!("../assets/iconos/solido/notificaciones.svg"),
+    ),
+    (
+        "pausa",
+        "solido/pausa",
+        include_bytes!("../assets/iconos/solido/pausa.svg"),
+    ),
+    (
+        "preferencias",
+        "solido/preferencias",
+        include_bytes!("../assets/iconos/solido/preferencias.svg"),
+    ),
+    (
+        "reproducir",
+        "solido/reproducir",
+        include_bytes!("../assets/iconos/solido/reproducir.svg"),
+    ),
+    (
+        "siguiente",
+        "solido/siguiente",
+        include_bytes!("../assets/iconos/solido/siguiente.svg"),
+    ),
+    (
+        "sin-red",
+        "solido/sin-red",
+        include_bytes!("../assets/iconos/solido/sin-red.svg"),
+    ),
+    (
+        "volumen-alto",
+        "solido/volumen-alto",
+        include_bytes!("../assets/iconos/solido/volumen-alto.svg"),
+    ),
+    (
+        "volumen-bajo",
+        "solido/volumen-bajo",
+        include_bytes!("../assets/iconos/solido/volumen-bajo.svg"),
+    ),
+    (
+        "volumen-medio",
+        "solido/volumen-medio",
+        include_bytes!("../assets/iconos/solido/volumen-medio.svg"),
+    ),
+    (
+        "volumen-silencio",
+        "solido/volumen-silencio",
+        include_bytes!("../assets/iconos/solido/volumen-silencio.svg"),
+    ),
+    (
+        "wifi",
+        "solido/wifi",
+        include_bytes!("../assets/iconos/solido/wifi.svg"),
+    ),
+];
+
 /// Un icono propio por su nombre. `None` si no existe, que solo puede pasar por
 /// una errata al escribirlo.
 ///
@@ -331,6 +473,17 @@ const PROPIOS: &[(&str, &[u8])] = &[
 /// un frame del reproductor pasa de 9 ms a 2, y con la cola abierta de 19 a 5.
 pub fn propio(nombre: &str) -> Option<Icono> {
     con_cache(nombre, || propio_sin_cache(nombre))
+}
+
+/// La variante maciza de [`propio`], o el de siempre si no la tiene. Ver
+/// [`SOLIDOS`].
+pub fn propio_solido(nombre: &str) -> Option<Icono> {
+    match SOLIDOS.iter().find(|(n, _, _)| *n == nombre) {
+        Some((_, clave, bytes)) => {
+            con_cache(clave, || Some(Icono::Svg(svg::Handle::from_memory(*bytes))))
+        }
+        None => propio(nombre),
+    }
 }
 
 /// Resuelve únicamente el catálogo de BookOS sin tocar la caché compartida.
@@ -416,7 +569,9 @@ fn digito(numero: u32) -> &'static str {
 /// Devolviendo el mismo handle, esos 46 ms se pagan una vez por sesión.
 ///
 /// El `None` también se guarda: un icono que no está tampoco lo va a estar
-/// dentro de un segundo, y buscarlo son unos cientos de `stat`.
+/// dentro de un segundo, y buscarlo son unos cientos de `stat`. Pero sí puede
+/// estar tras instalar la app: [`olvidar_ausentes`] los tira al releer los
+/// `.desktop`.
 static CACHE: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, Option<Icono>>>,
 > = std::sync::OnceLock::new();
@@ -685,6 +840,22 @@ static DIRS: std::sync::Mutex<Option<std::sync::Arc<Vec<PathBuf>>>> = std::sync:
 /// próxima búsqueda mire el `icon-theme` de ahora. Sin esto el dock se quedaba
 /// con los iconos del arranque: `directorios()` y `CACHE` valen para toda la
 /// sesión y Ajustes alterna `BookOS-Tinted`/`-B` justo para que se note el cambio.
+/// Olvida los iconos que se buscaron y no estaban, y conserva los encontrados.
+///
+/// Una app abierta antes de instalar su paquete (o instalada desde la tienda
+/// con el dock ya pidiendo su icono) dejaba guardado el `None` toda la sesión,
+/// y el launchpad la enseñaba con la inicial aunque el icono ya estuviera en
+/// disco. Se llama donde se releen los `.desktop`, que es cuando una
+/// instalación se hace visible.
+pub fn olvidar_ausentes() {
+    if let Some(cache) = CACHE.get() {
+        cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, icono| icono.is_some());
+    }
+}
+
 pub fn recargar_tema() {
     *DIRS.lock().unwrap_or_else(|e| e.into_inner()) = None;
     if let Some(cache) = CACHE.get() {
@@ -804,6 +975,19 @@ mod tests {
     /// `cargar` consulta primero los iconos propios y ambos caminos comparten
     /// caché. Esta llamada a un icono externo reproducía el interbloqueo que
     /// dejaba BookOS detenido antes de su primer fotograma.
+    #[test]
+    fn olvidar_ausentes_solo_tira_los_que_no_estaban() {
+        let cache = CACHE.get_or_init(Default::default);
+        cache.lock().expect("caché sin envenenar").extend([
+            ("bookos-prueba-ausente".to_string(), None),
+            ("bookos-prueba-presente".to_string(), Some(desde_svg("<svg/>"))),
+        ]);
+        olvidar_ausentes();
+        let mapa = cache.lock().expect("caché sin envenenar");
+        assert!(!mapa.contains_key("bookos-prueba-ausente"));
+        assert!(mapa.contains_key("bookos-prueba-presente"));
+    }
+
     #[test]
     fn cargar_un_icono_externo_no_reentra_con_el_mutex_cogido() {
         assert!(cargar("network-disconnect").is_some());

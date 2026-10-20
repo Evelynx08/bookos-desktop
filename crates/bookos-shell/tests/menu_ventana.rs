@@ -26,3 +26,32 @@ fn menu_ventana_dibuja_y_envia_el_destino_exacto() {
         );
     }
 }
+
+/// El menú del clic derecho sobre carpetas del escritorio, con sus muestras de
+/// color.
+///
+/// Con `BOOKOS_MENU_ESCRITORIO_PNG=/ruta.png` guarda lo que pinta.
+#[test]
+fn menu_del_escritorio_dibuja_las_muestras() {
+    use bookos_shell::{Accion, Emergente};
+    let mut shell = comun::shell(2.0);
+    let opciones = vec![
+        Some(("Abrir".to_string(), "abrir", Accion::EscritorioNuevaCarpeta)),
+        None,
+        Some((
+            "Mover a la papelera".to_string(),
+            "papelera",
+            Accion::EscritorioEliminarSeleccion,
+        )),
+    ];
+    shell.abrir(Emergente::menu_escritorio(
+        opciones,
+        Some(Some("#FF3B30")),
+        (100.0, 100.0),
+    ));
+    let (w, h) = shell.emergente_buffer_size().unwrap();
+    let mut pixels = vec![0; (w * h * 4) as usize];
+    shell.draw_emergente(&mut pixels);
+    comun::volcar("BOOKOS_MENU_ESCRITORIO_PNG", &pixels, w, h);
+    assert!(comun::tinta(&pixels, w, h, 0, w) > 0);
+}

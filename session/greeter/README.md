@@ -11,8 +11,11 @@ la disposición de la ventana de acceso de macOS: fecha y hora arriba, teñidas
 con la paleta, y abajo las cuentas —avatar y nombre sueltos sobre el fondo—,
 que crecen al acercar el puntero.
 Elegir una lleva al bloque de avatar, nombre y campo; pulsar el nombre o Esc
-vuelve a la lista. Arriba a la derecha van la distribución de teclado, la
-batería, la red y el menú de apagar, reiniciar y suspender.
+vuelve a la lista. Arriba a la derecha van los controles interactivos de
+idioma y distribución de teclado (`Alt+Shift`), batería y modo de energía,
+red Wi-Fi (activar/desactivar, escanear, conectar con contraseña o desconectar)
+y el menú de apagar, reiniciar, suspender e hibernar. El campo de contraseña
+incluye botón para mostrar u ocultar los caracteres y aviso de `Bloq Mayús`.
 
 Incluye entrada manual de usuario («Otro usuario»), preguntas PAM secretas y
 visibles, mensajes informativos, cancelación y reintento. No presupone que la primera
@@ -46,9 +49,19 @@ el compositor y el programa de sesión. El instalador del greeter comprueba
 también `/etc/pam.d/greetd` o `/usr/lib/pam.d/greetd`: se utiliza la política de login de la distribución,
 sin sustituirla por la política de desbloqueo de BookOS.
 
+El cage de serie no configura libinput y mueve el puntero en píxeles de una
+salida a escala 1: el touchpad va unas 2,5 veces más lento que en la sesión y
+el toque no hace clic. `cage/bookos-entrada.patch` le hace leer del entorno la
+velocidad, el toque, el scroll natural y la escala del puntero, que
+`bookos-greeter-start` saca de lo que publica la primera cuenta. Se compila en
+un contenedor de Fedora (hace falta `podman`) y queda en `target/bookos-cage`:
+
 ```sh
+bash session/greeter/cage/compilar.sh
 sudo bash session/greeter/instalar.sh
 ```
+
+Si falta, el arranque cae al `cage` del sistema.
 
 Esto instala los binarios, crea la cuenta de sistema `bookos-greeter` y configura
 `greetd.service` mediante un drop-in. Conserva los archivos de configuración
@@ -57,17 +70,18 @@ debug, pasa `BOOKOS_GREETER_BIN` con su ruta absoluta mediante `sudo env`.
 `DESTDIR` permite preparar los archivos en un directorio de empaquetado sin
 crear usuarios ni ejecutar systemd.
 
-El teclado de bienvenida usa `es`. Puedes cambiarlo en
-`/etc/default/bookos-greeter`, por ejemplo `XKB_DEFAULT_LAYOUT=us`.
-Este archivo es configuración de shell propiedad de root y admite las variables
-`XKB_DEFAULT_*` de Cage. La distribución que se ve arriba a la derecha es solo
-un indicador: Cage la fija al arrancar.
+El teclado de bienvenida usa `es` por defecto. Puedes cambiarlo en
+`/etc/default/bookos-greeter` (por ejemplo `XKB_DEFAULT_LAYOUT=us`) o
+directamente desde el desplegable de idioma y teclado en la esquina superior
+derecha, que guarda la preferencia en `/var/lib/bookos-greeter/greeter.env`,
+traduce al vuelo los caracteres imprimibles y pasa `XKB_DEFAULT_LAYOUT` y
+`LANG` a la sesión de BookOS al entrar.
 
 ## Apariencia de cada usuario
 
 El greeter no puede leer `~/.config`, así que el compositor copia lo necesario
 a `/var/lib/bookos/apariencia/<login>/` al iniciar la sesión real y cada vez que
-se aplican ajustes: las claves de tema, acento, efectos, escala y reloj del
+se aplican ajustes: las claves de tema, acento, efectos, escala, teclado y reloj del
 bloqueo de `panel.conf`, la `palette.css` de BookOS Settings (de ahí salen el
 acento y el tono del reloj), el fondo de cada tema y el avatar. La carpeta raíz
 admite escritura de cualquiera (como `/tmp`), por lo que el greeter solo acepta
@@ -123,12 +137,12 @@ Para devolver greetd a la configuración de su paquete, elimina únicamente
 
 ## Alcance y validación
 
-No incluye selector de sesiones, teclado virtual ni cambio de distribución de
-teclado en vivo. La sesión está fijada a BookOS y Cage usa su comportamiento
-predeterminado de monitores. La lista sale de `/etc/passwd` (uid 1000–59999 con
-shell de entrada); las cuentas de red entran por «Otro usuario». La
-autenticación sigue siendo la de greetd, no la del desbloqueo: el login y el
-desbloqueo tienen identidades y ciclos de vida distintos.
+No incluye selector de sesiones ni teclado virtual en pantalla. La sesión está
+fijada a BookOS y Cage usa su comportamiento predeterminado de monitores. La
+lista sale de `/etc/passwd` (uid 1000–59999 con shell de entrada); las cuentas
+de red entran por «Otro usuario». La autenticación sigue siendo la de greetd,
+no la del desbloqueo: el login y el desbloqueo tienen identidades y ciclos de
+vida distintos.
 
 Las pruebas con IPC simulado verifican el protocolo y la transición de estados;
 no sustituyen una prueba en una TTY con el PAM y el hardware de la instalación.

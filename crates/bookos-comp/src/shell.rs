@@ -159,7 +159,7 @@ const FUERZA_PANTALLA: f32 = 3.0;
 ///
 /// Ocho es lo que separa una tarjeta flotante de la barra sin que se lea como
 /// desconectada de ella. Pegada, la emergente parecía parte del panel.
-const SEPARACION: f64 = 8.0;
+pub const SEPARACION: f64 = 8.0;
 
 /// Franja del borde de la pantalla que trae de vuelta a una barra apartada,
 /// en píxeles físicos.
@@ -839,6 +839,41 @@ impl ShellHost {
         cambio
     }
 
+    /// Enseña u oculta los iconos del escritorio. Rehace las superficies: al
+    /// ocultarlos no queda ninguna, y al volver hay una por icono.
+    pub fn escritorio_mostrar(&mut self, visible: bool, pantalla: (f32, f32)) -> bool {
+        if self.dead {
+            return false;
+        }
+        let cambio = self
+            .guard("iconos del escritorio", |host| {
+                host.shell.escritorio_mostrar(visible, pantalla)
+            })
+            .unwrap_or(false);
+        if cambio {
+            self.escritorio_recolocar();
+        }
+        cambio
+    }
+
+    /// Pone el color de las carpetas seleccionadas y repinta solo esas.
+    pub fn escritorio_colorear(&mut self, color: Option<&str>) -> bool {
+        if self.dead {
+            return false;
+        }
+        self.guard("color de carpeta", |host| {
+            if !host.shell.escritorio_mut().colorear(color) {
+                return false;
+            }
+            let seleccion = host.shell.escritorio().seleccion();
+            for (i, _) in seleccion.iter().enumerate().filter(|(_, s)| **s) {
+                host.pintar_celda(i);
+            }
+            true
+        })
+        .unwrap_or(false)
+    }
+
     /// Pone la banda elástica —en lógicos y ya normalizada— y marca lo que
     /// cruza. `previa` es la selección de antes de empezar a arrastrar.
     ///
@@ -924,7 +959,16 @@ impl ShellHost {
             .collect()
     }
 
-    /// La banda elástica: relleno y cuatro filos.
+    /// La banda que hay puesta, en lógicos, con la escala de la pantalla.
+    pub fn banda(&self) -> Option<((f64, f64, f64, f64), f64)> {
+        let banda = self
+            .banda
+            .filter(|&(_, _, w, h)| !self.dead && w >= 1.0 && h >= 1.0)?;
+        Some((banda, self.shell.scale() as f64))
+    }
+
+    /// La banda elástica con esquinas rectas: relleno y cuatro filos. Es la
+    /// reserva para cuando el driver no compila el shader de [`crate::banda`].
     ///
     /// Cinco rectángulos de color y no un buffer propio, por lo mismo que el
     /// velo del launchpad: la banda cambia de tamaño en **cada** movimiento del
@@ -936,58 +980,46 @@ impl ShellHost {
         use smithay::backend::renderer::element::Id;
         use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 
-        let Some((x, y, w, h)) = self.banda else {
+        let Some(((x, y, w, h), escala)) = self.banda() else {
             return Vec::new();
         };
-        if self.dead || w < 1.0 || h < 1.0 {
-            return Vec::new();
-        }
         // Los identificadores tienen que ser los mismos en cada frame: uno
         // nuevo por frame le diría al damage tracker que cambia toda la
         // pantalla, no solo donde estuvo la banda.
         static IDS: std::sync::OnceLock<[Id; 5]> = std::sync::OnceLock::new();
         let ids = IDS.get_or_init(|| std::array::from_fn(|_| Id::new()));
 
-        let escala = self.shell.scale() as f64;
         let acento = bookos_shell::tema::acento();
         let fisico = |v: f64| (v * escala).round() as i32;
         let (x, y, w, h) = (fisico(x), fisico(y), fisico(w), fisico(h));
         // Un píxel lógico de filo: a escala 2 son dos físicos, que es lo que
         // hace que el borde se vea igual de fino en cualquier pantalla.
-        let filo = escala.round().max(1.0) as i32;
-        // Dejamos libres las cuatro esquinas y metemos el relleno hacia
-        // dentro: con sólidos rectangulares es una aproximación ligera a un
-        // rectángulo redondeado y evita añadir otra textura solo para la
-        // selección.
-        let radio = (filo * 4).min(w / 2).min(h / 2).max(filo);
+        let filo = (escala.round().max(1.0) as i32)
+            .min(w / 2)
+            .min(h / 2)
+            .max(1);
+        // Los filos verticales van entre los horizontales para que ninguna
+        // esquina se pinte dos veces: al 90 % se notaría el cruce.
+        let interior = (h - filo * 2).max(1);
         let rectangulos = [
             (
                 Rectangle::new(
-                    (x + radio, y + radio).into(),
-                    ((w - radio * 2).max(1), (h - radio * 2).max(1)).into(),
+                    (x + filo, y + filo).into(),
+                    ((w - filo * 2).max(1), interior).into(),
                 ),
                 0.14,
             ),
+            (Rectangle::new((x, y).into(), (w, filo).into()), 0.9),
             (
-                Rectangle::new((x + radio, y).into(), ((w - radio * 2).max(1), filo).into()),
+                Rectangle::new((x, y + h - filo).into(), (w, filo).into()),
                 0.9,
             ),
             (
-                Rectangle::new(
-                    (x + radio, y + h - filo).into(),
-                    ((w - radio * 2).max(1), filo).into(),
-                ),
+                Rectangle::new((x, y + filo).into(), (filo, interior).into()),
                 0.9,
             ),
             (
-                Rectangle::new((x, y + radio).into(), (filo, (h - radio * 2).max(1)).into()),
-                0.9,
-            ),
-            (
-                Rectangle::new(
-                    (x + w - filo, y + radio).into(),
-                    (filo, (h - radio * 2).max(1)).into(),
-                ),
+                Rectangle::new((x + w - filo, y + filo).into(), (filo, interior).into()),
                 0.9,
             ),
         ];
@@ -1056,6 +1088,10 @@ impl ShellHost {
     /// ¿Llega el escritorio hasta este punto lógico **global**? Es
     /// [`Self::en_la_principal`] con nombre de lo que pregunta quien la usa: el
     /// escritorio ocupa la principal entera, iconos y hueco vacío incluidos.
+    pub fn escritorio_visible(&self) -> bool {
+        !self.dead && self.shell.escritorio().visible()
+    }
+
     pub fn escritorio_alcanza(&self, x: f64, y: f64) -> bool {
         !self.dead && self.en_la_principal(x, y)
     }
@@ -3133,9 +3169,11 @@ impl ShellHost {
             .collect()
     }
 
+    /// `alfa` es el fundido de la entrada de tres dedos; 1 el resto del tiempo.
     pub fn conmutador_element<R>(
         &self,
         renderer: &mut R,
+        alfa: f32,
     ) -> Option<MemoryRenderBufferRenderElement<R>>
     where
         R: Renderer + ImportMem,
@@ -3146,7 +3184,7 @@ impl ShellHost {
             renderer,
             surface.location,
             &surface.buffer,
-            Some(1.0),
+            Some(alfa),
             Some(surface.src),
             Some(surface.logical),
             Kind::Unspecified,
@@ -3321,7 +3359,11 @@ impl ShellHost {
 
     /// El recuadro y el rótulo del conmutador de ventanas, para componerlos
     /// entre las miniaturas y la tarjeta.
-    pub fn conmutador_extras<R>(&self, renderer: &mut R) -> Vec<MemoryRenderBufferRenderElement<R>>
+    pub fn conmutador_extras<R>(
+        &self,
+        renderer: &mut R,
+        alfa: f32,
+    ) -> Vec<MemoryRenderBufferRenderElement<R>>
     where
         R: Renderer + ImportMem,
         R::TextureId: Send + Clone + 'static,
@@ -3339,7 +3381,7 @@ impl ShellHost {
                 renderer,
                 location,
                 &surface.buffer,
-                Some(1.0),
+                Some(alfa),
                 Some(surface.src),
                 Some(surface.logical),
                 Kind::Unspecified,
@@ -3758,9 +3800,13 @@ impl ShellHost {
         self.sincronizar_emergente();
     }
 
-    pub fn menu_ventana_en(&mut self, opciones: Vec<(String, Accion)>, punto: (f32, f32)) {
-        self.guard("menú de ventana", |host| {
-            host.shell.menu_ventana_en(opciones, punto)
+    pub fn menu_escritorio(
+        &mut self,
+        opciones: Vec<Option<(String, &'static str, Accion)>>,
+        punto: (f32, f32),
+    ) {
+        self.guard("menú del escritorio", |host| {
+            host.shell.menu_escritorio(opciones, punto)
         });
         self.sincronizar_emergente();
     }

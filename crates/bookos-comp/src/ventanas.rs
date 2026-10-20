@@ -231,7 +231,7 @@ pub fn minimizar(state: &mut BookosComp, window: Window) {
     let Some(origen) = state.space.element_geometry(&window) else {
         return;
     };
-    let app_id = crate::handlers::app_id(&window).unwrap_or_default();
+    let app_id = app_id_de_grupo(state, &window).unwrap_or_default();
     let destino = destino_dock(state, &app_id, origen);
     encoger(&window, origen, destino, true);
     state.minimizando.push((window, origen.loc));
@@ -982,6 +982,126 @@ pub fn hueco(
     centrada
 }
 
+/// Centra un diálogo sobre su ventana, sin salirse del área útil.
+///
+/// Si no cabe, manda la esquina de arriba a la izquierda: es donde suelen estar
+/// el título y los campos, y un diálogo con la cabecera bajo el panel no se
+/// puede ni mover.
+fn encima_de(
+    tam: Size<i32, Logical>,
+    sobre: Rectangle<i32, Logical>,
+    area: Rectangle<i32, Logical>,
+) -> Point<i32, Logical> {
+    let x = sobre.loc.x + (sobre.size.w - tam.w) / 2;
+    let y = sobre.loc.y + (sobre.size.h - tam.h) / 2;
+    (
+        x.min(area.loc.x + area.size.w - tam.w).max(area.loc.x),
+        y.min(area.loc.y + area.size.h - tam.h).max(area.loc.y),
+    )
+        .into()
+}
+
+/// De quién depende una ventana que no es la principal de su programa.
+pub enum Duena {
+    /// Diálogo con padre declarado (`xdg_toplevel.parent`, `WM_TRANSIENT_FOR`)
+    /// o de tipo diálogo en X11. Se abre encima de ella.
+    Padre(Window),
+    /// Otra ventana del mismo proceso. Se coloca como cualquier ventana, pero
+    /// es del mismo programa.
+    Proceso(Window),
+}
+
+impl Duena {
+    pub fn ventana(&self) -> &Window {
+        match self {
+            Duena::Padre(w) | Duena::Proceso(w) => w,
+        }
+    }
+}
+
+/// La ventana principal de la que cuelga esta, o `None` si la principal es ella.
+///
+/// Sin esto cada diálogo era una ventana más: salía del dock con el genio, se
+/// ponía en el primer hueco libre lejos de su ventana y, si su `app_id` o su
+/// `WM_CLASS` no coincidían, tenía icono propio en el dock. VirtualBox lo hacía
+/// con cada diálogo de configuración.
+///
+/// Solo se agrupan ventanas del **mismo** proceso, no de procesos hijos: todo lo
+/// que se lanza desde una terminal es hijo suyo, y acabaría colgando de ella.
+pub fn duena(state: &BookosComp, window: &Window) -> Option<Duena> {
+    if let Some(mut padre) = padre(state, window) {
+        // Un diálogo abierto desde otro diálogo cuelga de la principal. El tope
+        // es por si un cliente se declara padre de sí mismo en círculo.
+        for _ in 0..8 {
+            match self::padre(state, &padre) {
+                Some(abuelo) if abuelo != *window => padre = abuelo,
+                _ => break,
+            }
+        }
+        return Some(Duena::Padre(padre));
+    }
+    let pid = pid_de(state, window)?;
+    // La más antigua del proceso es la principal: un programa abre primero su
+    // ventana y luego sus diálogos, no al revés. Solo cuentan las nacidas
+    // antes; si no, la principal pasaría a depender de su propio diálogo.
+    let mia = estado(window).nacida.get();
+    let principal = state
+        .space
+        .elements()
+        .filter(|w| *w != window && colocada(w) && padre(state, w).is_none())
+        .filter(|w| mia.is_none_or(|m| estado(w).nacida.get() < Some(m)))
+        .filter(|w| pid_de(state, w) == Some(pid))
+        .min_by_key(|w| estado(w).nacida.get())?
+        .clone();
+    use smithay::xwayland::xwm::WmWindowType as T;
+    let es_dialogo = window
+        .x11_surface()
+        .is_some_and(|x| matches!(x.window_type(), Some(T::Dialog | T::Utility)));
+    Some(if es_dialogo {
+        Duena::Padre(principal)
+    } else {
+        Duena::Proceso(principal)
+    })
+}
+
+/// El `app_id` con el que la ventana cuenta en el dock: el de su principal.
+pub fn app_id_de_grupo(state: &BookosComp, window: &Window) -> Option<String> {
+    duena(state, window)
+        .and_then(|d| crate::handlers::app_id(d.ventana()))
+        .or_else(|| crate::handlers::app_id(window))
+}
+
+fn padre(state: &BookosComp, window: &Window) -> Option<Window> {
+    if let Some(x11) = window.x11_surface() {
+        let id = x11.is_transient_for()?;
+        return state
+            .space
+            .elements()
+            .find(|w| w.x11_surface().is_some_and(|s| s.window_id() == id))
+            .cloned();
+    }
+    let superficie = window.toplevel()?.parent()?;
+    state.window_for_surface(&superficie)
+}
+
+/// El proceso que dibuja la ventana.
+///
+/// En X11 sale de `_NET_WM_PID` y no de las credenciales del cliente Wayland:
+/// todas las ventanas X11 llegan por la misma conexión, la de Xwayland, y con su
+/// pid todos los programas X11 serían uno.
+fn pid_de(state: &BookosComp, window: &Window) -> Option<u32> {
+    use smithay::reexports::wayland_server::Resource as _;
+    if let Some(x11) = window.x11_surface() {
+        return x11.pid();
+    }
+    let credenciales = window
+        .wl_surface()?
+        .client()?
+        .get_credentials(&state.display_handle)
+        .ok()?;
+    u32::try_from(credenciales.pid).ok()
+}
+
 /// Lo que el compositor sabe hacer con sus ventanas.
 ///
 /// Va en un `impl` aparte —y no en `handlers.rs`— porque nada de esto responde
@@ -1117,9 +1237,33 @@ impl BookosComp {
         if tam.w <= 0 || tam.h <= 0 {
             return;
         }
-        let ocupadas = self.esquinas_ocupadas(window);
-        let sitio = hueco(tam, crate::decoracion::area_util(self, window), &ocupadas);
-        tracing::debug!(?sitio, ?tam, otras = ocupadas.len(), "ventana colocada");
+        // Menús y tooltips X11 se quedan donde el cliente los puso: él calcula
+        // su sitio en coordenadas de X y no se le puede decir que se movió
+        // (Smithay rechaza `configure` en override-redirect). Colocados como una
+        // ventana más, el menú «Archivo» de VirtualBox salía en mitad de la
+        // pantalla mientras X lo creía bajo la barra de menús.
+        if window
+            .x11_surface()
+            .is_some_and(|x| x.is_override_redirect())
+        {
+            nace(window);
+            return;
+        }
+        let duena = duena(self, window);
+        let area = crate::decoracion::area_util(self, window);
+        let sitio = match &duena {
+            Some(Duena::Padre(padre)) => match self.space.element_geometry(padre) {
+                Some(sobre) => encima_de(tam, sobre, area),
+                None => hueco(tam, area, &self.esquinas_ocupadas(window)),
+            },
+            Some(Duena::Proceso(_)) | None => hueco(tam, area, &self.esquinas_ocupadas(window)),
+        };
+        tracing::debug!(
+            ?sitio,
+            ?tam,
+            secundaria = duena.is_some(),
+            "ventana colocada"
+        );
         // Un cliente X11 tiene que enterarse de dónde lo hemos puesto: sus
         // menús y diálogos se posicionan en coordenadas absolutas de la
         // pantalla X, y si cree seguir en el (0,0) los abre en la esquina.
@@ -1133,13 +1277,19 @@ impl BookosComp {
         // viva para congelar su primer buffer. Si la aplicación aún no tiene
         // icono, `destino_dock` usa el borde inferior bajo ella como origen
         // estable y evita que aparezca desde una esquina arbitraria.
-        let origen = self
-            .space
-            .element_geometry(window)
-            .unwrap_or(Rectangle::new(sitio, tam));
-        let app_id = crate::handlers::app_id(window).unwrap_or_default();
-        let destino = destino_dock(self, &app_id, origen);
-        encoger(window, origen, destino, false);
+        //
+        // Las secundarias no: el programa ya está abierto, y un diálogo que sale
+        // disparado del dock parece otra aplicación. Les basta el zoom de
+        // entrada de `nace`.
+        if duena.is_none() {
+            let origen = self
+                .space
+                .element_geometry(window)
+                .unwrap_or(Rectangle::new(sitio, tam));
+            let app_id = crate::handlers::app_id(window).unwrap_or_default();
+            let destino = destino_dock(self, &app_id, origen);
+            encoger(window, origen, destino, false);
+        }
         self.revisar_barras();
         // Una ventana que aparece se lleva el foco: es lo que espera cualquiera
         // al abrir un programa, y sin esto habría que pulsarla para escribir.
@@ -1168,7 +1318,15 @@ impl BookosComp {
         let Some(nacida) = estado(window).nacida.get() else {
             return;
         };
-        if nacida.elapsed() > VENTANA_DE_CRECIMIENTO || maximizada(window) || completa(window) {
+        // Las override-redirect, por lo mismo que en `colocar_si_es_nueva`: un
+        // menú largo que asoma bajo el área útil es cosa del cliente.
+        if nacida.elapsed() > VENTANA_DE_CRECIMIENTO
+            || maximizada(window)
+            || completa(window)
+            || window
+                .x11_surface()
+                .is_some_and(|x| x.is_override_redirect())
+        {
             return;
         }
         let Some(loc) = self.space.element_location(window) else {
@@ -1181,6 +1339,11 @@ impl BookosComp {
         }
         let sitio = hueco(tam, area, &self.esquinas_ocupadas(window));
         if sitio != loc {
+            // Sin esto el cliente X11 seguiría creyéndose en el sitio viejo y
+            // abriría sus menús desplazados: ver `colocar_si_es_nueva`.
+            if let Some(x11) = window.x11_surface() {
+                let _ = x11.configure(Rectangle::new(sitio, tam));
+            }
             self.space.map_element(window.clone(), sitio, false);
         }
     }
@@ -1219,6 +1382,26 @@ impl BookosComp {
         let surface = window.wl_surface().map(|s| s.into_owned());
         if let Some(kbd) = self.seat.get_keyboard() {
             kbd.set_focus(self, surface, SERIAL_COUNTER.next_serial());
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Quita el teclado a todas las ventanas: lo pide pulsar el escritorio.
+    ///
+    /// Además de soltar el foco, las desactiva. Sin eso la de antes seguía con
+    /// la barra de título encendida y el cursor de texto parpadeando, como si
+    /// lo que se tecleara fuera a ir a ella.
+    pub fn desenfocar(&mut self) {
+        let todas: Vec<Window> = self.space.elements().cloned().collect();
+        for ventana in &todas {
+            if ventana.set_activated(false)
+                && let Some(toplevel) = ventana.toplevel()
+            {
+                toplevel.send_pending_configure();
+            }
+        }
+        if let Some(kbd) = self.seat.get_keyboard() {
+            kbd.set_focus(self, None, SERIAL_COUNTER.next_serial());
         }
         self.needs_redraw = true;
     }
@@ -1790,6 +1973,21 @@ mod tests {
             cuartos[2].loc.y,
             "queda un hueco horizontal entre los cuartos"
         );
+    }
+
+    #[test]
+    fn el_dialogo_se_centra_en_su_ventana_sin_salirse_del_area() {
+        let a = area();
+        let tam = Size::from((400, 300));
+        let padre = Rectangle::new((200, 100).into(), (800, 600).into());
+        assert_eq!(encima_de(tam, padre, a), Point::from((400, 250)));
+        // Con la ventana pegada a la esquina, el diálogo se queda dentro en vez
+        // de meterse bajo el panel.
+        let arriba = Rectangle::new((-100, 0).into(), (300, 200).into());
+        assert_eq!(encima_de(tam, arriba, a), Point::from((0, 32)));
+        // Más grande que el área: manda la esquina de arriba a la izquierda.
+        let enorme = Size::from((3000, 2000));
+        assert_eq!(encima_de(enorme, padre, a), Point::from((0, 32)));
     }
 
     #[test]

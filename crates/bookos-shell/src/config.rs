@@ -44,6 +44,7 @@
 //! genio = si
 //! panel_esquiva = no
 //! dock_esquiva = no
+//! iconos_escritorio = si
 //! escritorios = 2
 //! nombres_escritorios = Escritorio 1, Escritorio 2
 //! dock = konsole:Terminal:utilities-terminal, bookos-explorer:Archivos:bookos-explorer, firefox:Navegador:firefox, bookos-settings:Ajustes:bookos-settings
@@ -332,6 +333,8 @@ pub struct Config {
     /// Meta+Alt+D). Se guardan al cambiar para que sobrevivan al reinicio.
     pub panel_esquiva: bool,
     pub dock_esquiva: bool,
+    /// Si se ven los iconos de la carpeta Escritorio sobre el fondo.
+    pub iconos_escritorio: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -607,6 +610,7 @@ impl Default for Config {
             genio: true,
             panel_esquiva: false,
             dock_esquiva: false,
+            iconos_escritorio: true,
         }
     }
 }
@@ -711,6 +715,11 @@ impl Config {
                 "dock_esquiva" => {
                     if let Some(v) = booleano(valor, ruta, n + 1) {
                         config.dock_esquiva = v;
+                    }
+                }
+                "iconos_escritorio" => {
+                    if let Some(v) = booleano(valor, ruta, n + 1) {
+                        config.iconos_escritorio = v;
                     }
                 }
                 "temporizador_siempre_visible" => {
@@ -1177,6 +1186,14 @@ pub fn guardar_luz_nocturna(modo: ModoLuzNocturna) -> std::io::Result<()> {
 /// `panel_esquiva` o `dock_esquiva`.
 pub fn guardar_esquiva(clave: &str, esquiva: bool) -> std::io::Result<()> {
     escribir_claves(&[(clave, if esquiva { "si" } else { "no" }.to_string())])
+}
+
+/// Persiste si se ven los iconos del escritorio.
+pub fn guardar_iconos_escritorio(visibles: bool) -> std::io::Result<()> {
+    escribir_claves(&[(
+        "iconos_escritorio",
+        if visibles { "si" } else { "no" }.to_string(),
+    )])
 }
 
 /// Punto único de persistencia para la API estructurada del compositor.

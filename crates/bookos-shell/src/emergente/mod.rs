@@ -156,8 +156,12 @@ impl Emergente {
 
     /// El mismo menú, pero anclado a un punto de la pantalla en vez de
     /// centrado: lo que quiere el clic derecho sobre el escritorio.
-    pub fn menu_ventana_en(opciones: Vec<(String, Accion)>, punto: (f32, f32)) -> Self {
-        Self::MenuDock(menu_dock::MenuDock::ventana_en(opciones, punto))
+    pub fn menu_escritorio(
+        opciones: Vec<Option<(String, &'static str, Accion)>>,
+        colores: Option<Option<&str>>,
+        punto: (f32, f32),
+    ) -> Self {
+        Self::MenuDock(menu_dock::MenuDock::escritorio(opciones, colores, punto))
     }
     pub fn menu() -> Self {
         Self::Menu(menu::Menu::new())

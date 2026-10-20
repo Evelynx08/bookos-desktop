@@ -639,10 +639,16 @@ pub fn tema_gtk() {
     // claro u oscuro.
     let tintado = bookos_shell::icono::tema_elegido().filter(|t| t.starts_with("BookOS-Tinted"));
     let iconos = tintado.as_deref().unwrap_or_else(|| tema_iconos(claro));
+    // GTK guarda sus propias preferencias y puede ignorar XCURSOR_THEME:
+    // dejarlas en Breeze cambiaba el puntero al entrar en una ventana GTK.
+    let cursor = crate::cursor::nombre_tema();
+    let tamano_cursor = bookos_shell::Config::cargar().cursor.to_string();
     let mut hijos = Vec::new();
     for (clave, valor) in [
         ("gtk-theme", tema.as_str()),
         ("icon-theme", iconos),
+        ("cursor-theme", cursor.as_str()),
+        ("cursor-size", tamano_cursor.as_str()),
         (
             "color-scheme",
             if claro { "prefer-light" } else { "prefer-dark" },
@@ -691,6 +697,8 @@ pub fn tema_gtk() {
         let mut valores = vec![
             ("gtk-theme-name", tema.as_str()),
             ("gtk-icon-theme-name", iconos),
+            ("gtk-cursor-theme-name", cursor.as_str()),
+            ("gtk-cursor-theme-size", tamano_cursor.as_str()),
             // Si se quedara en `true`, GTK cargaría `gtk-dark.css` del tema
             // claro y seguiría saliendo oscuro.
             ("gtk-application-prefer-dark-theme", oscuro),

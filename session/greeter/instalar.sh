@@ -33,6 +33,14 @@ if [ -z "$destino" ]; then
 fi
 
 install -Dm755 "$binario" "$destino/usr/local/libexec/bookos-greeter"
+# Sin el cage parcheado se arranca con el de serie: funciona, pero con el
+# touchpad lento y sin toque para hacer clic.
+cage_bin="${BOOKOS_CAGE_BIN:-$aqui/../../target/bookos-cage}"
+if [ -x "$cage_bin" ]; then
+    install -Dm755 "$cage_bin" "$destino/usr/local/libexec/bookos-cage"
+else
+    echo "Aviso: no está $cage_bin; compílalo con session/greeter/cage/compilar.sh." >&2
+fi
 # Cada sesión deja aquí su apariencia; con el bit pegajoso, como /tmp, nadie
 # puede borrar ni sustituir la carpeta de otro.
 install -d -m 1777 "$destino/var/lib/bookos/apariencia"
@@ -46,6 +54,7 @@ if [ ! -e "$destino/etc/default/bookos-greeter" ]; then
     printf 'XKB_DEFAULT_LAYOUT=es\n' > "$destino/etc/default/bookos-greeter"
     chmod 644 "$destino/etc/default/bookos-greeter"
 fi
+install -Dm644 "$aqui/50-bookos-greeter.rules" "$destino/etc/polkit-1/rules.d/50-bookos-greeter.rules"
 install -d "$destino/etc/systemd/system/greetd.service.d"
 if [ ! -e "$destino/etc/systemd/system/greetd.service.d/bookos.conf" ]; then
     printf '[Service]\nExecStart=\nExecStart=%s --config /etc/greetd/bookos.toml\n' \
